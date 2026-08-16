@@ -36,7 +36,7 @@ export const privateProAssetsRouter = createTRPCRouter({
       const config = getPrivateProServerConfig();
       if (input.requestedBytes > config.maxFileBytes) throw new Error('Attachment exceeds the configured file-size limit.');
       try {
-        return await getFirebasePrivateProAssetsService(config.uploadRateLimit).reserveUpload(ctx.privateProIdentity.uid, input);
+        return await getFirebasePrivateProAssetsService().reserveUpload(ctx.privateProIdentity.uid, input);
       } catch (error) {
         if (error instanceof PrivateProUploadRateLimitError)
           throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: error.message });

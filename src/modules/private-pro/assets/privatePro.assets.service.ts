@@ -143,7 +143,7 @@ export function createPrivateProAssetsService(
             windowId,
             requests,
             bytes,
-            expiresAtMs: (Math.floor(atMs / rateLimit.windowMs) + 2) * rateLimit.windowMs,
+            expiresAt: new Date((Math.floor(atMs / rateLimit.windowMs) + 2) * rateLimit.windowMs),
           });
         }
         if (account.usedBytes + account.reservedBytes + input.requestedBytes > account.quotaBytes)

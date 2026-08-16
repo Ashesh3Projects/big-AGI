@@ -1,6 +1,7 @@
 import type { Firestore, Transaction } from 'firebase-admin/firestore';
 
 import { getPrivateProFirestore, getPrivateProStorageBucket } from '../firebase/firebase.admin';
+import { getPrivateProServerConfig } from '../config/privatePro.config.server';
 import type {
   PrivateProAssetAccount,
   PrivateProAssetRecord,
@@ -127,6 +128,10 @@ export class FirebasePrivateProAssetsPort implements PrivateProAssetsPort {
 
 let firebaseAssetsService: ReturnType<typeof createPrivateProAssetsService> | undefined;
 
-export function getFirebasePrivateProAssetsService(rateLimit?: Parameters<typeof createPrivateProAssetsService>[2]) {
-  return firebaseAssetsService ??= createPrivateProAssetsService(new FirebasePrivateProAssetsPort(), Date.now, rateLimit);
+export function getFirebasePrivateProAssetsService() {
+  return firebaseAssetsService ??= createPrivateProAssetsService(
+    new FirebasePrivateProAssetsPort(),
+    Date.now,
+    getPrivateProServerConfig().uploadRateLimit,
+  );
 }

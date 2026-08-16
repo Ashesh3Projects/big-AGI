@@ -119,6 +119,12 @@ The checked-in `vercel.json` invokes `/api/private-pro/sweep-expired` daily, whi
 
 Upload reservations are also limited per UID by request count and requested bytes. The defaults allow 30 reservations and 256 MiB of requested data per 60-second window. Firestore updates the rate window in the same transaction as the quota reservation, so concurrent Vercel instances enforce one account-wide limit.
 
+Enable Firestore TTL for the rate-window collection group so expired counters are deleted automatically:
+
+```powershell
+gcloud firestore fields ttls update --collection-group=uploadRateWindows --field=expiresAt
+```
+
 ## Access management
 
 After changing `PRIVATE_PRO_ALLOWED_EMAILS`, run the entitlement synchronization command from an environment containing the same Firebase Admin credentials:

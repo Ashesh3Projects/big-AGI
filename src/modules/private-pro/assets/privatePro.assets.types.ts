@@ -56,5 +56,5 @@ export interface PrivateProAssetRateWindow {
   windowId: string;
   requests: number;
   bytes: number;
-  expiresAtMs: number;
+  expiresAt: Date;
 }

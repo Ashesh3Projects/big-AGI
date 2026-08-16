@@ -37,7 +37,7 @@ class MemoryAssetsPort implements PrivateProAssetsPort {
   assets = new Map<string, PrivateProAssetRecord>();
   objects = new Map<string, PrivateProStoredObjectMetadata>();
   deletedObjects: string[] = [];
-  rateWindows = new Map<string, { uid: string; windowId: string; requests: number; bytes: number; expiresAtMs: number }>();
+  rateWindows = new Map<string, { uid: string; windowId: string; requests: number; bytes: number; expiresAt: Date }>();
 
   async transaction<T>(_uid: string, callback: (transaction: PrivateProAssetsTransaction) => Promise<T>) {
     const account = structuredClone(this.account);
