@@ -1,0 +1,22 @@
+rules_version = '2';
+
+service firebase.storage {
+  match /b/{bucket}/o {
+    function canReadPrivateAsset(uid) {
+      return request.auth != null
+        && request.auth.uid == uid
+        && request.auth.token.keys().hasAll(['privatePro', 'privateProEpoch'])
+        && request.auth.token.privatePro == true
+        && request.auth.token.privateProEpoch is int;
+    }
+
+    match /users/{uid}/assets/{assetId} {
+      allow read: if canReadPrivateAsset(uid);
+      allow write: if false;
+    }
+
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
