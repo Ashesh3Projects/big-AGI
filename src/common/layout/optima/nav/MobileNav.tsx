@@ -7,6 +7,7 @@ import { checkDivider, checkVisibileIcon, NavItemApp, navItems } from '~/common/
 
 import { InvertedBar } from '../InvertedBar';
 import { MobileNavGroupBox, MobileNavIcon, mobileNavItemClasses } from './MobileNavIcon';
+import { PrivateProAccountControl } from '~/modules/private-pro/ui/PrivateProAccountControl';
 
 
 export function MobileNav(props: {
@@ -62,6 +63,7 @@ export function MobileNav(props: {
 
       <MobileNavGroupBox>
         {navAppItems}
+        <PrivateProAccountControl mobile />
       </MobileNavGroupBox>
 
     </InvertedBar>

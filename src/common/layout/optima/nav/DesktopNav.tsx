@@ -31,6 +31,7 @@ import { DesktopNavGroupBox, DesktopNavIcon, navItemClasses } from './DesktopNav
 import { InvertedBar, InvertedBarCornerItem } from '../InvertedBar';
 import { optimaActions, optimaOpenModels, optimaOpenPreferences, optimaToggleDrawer, useOptimaDrawerOpen, useOptimaDrawerPeeking, useOptimaModals } from '../useOptima';
 import { scratchClipSupported, useScratchClipVisibility } from '../scratchclip/store-scratchclip';
+import { PrivateProAccountControl } from '~/modules/private-pro/ui/PrivateProAccountControl';
 
 
 export const bigAgiProUrl = 'https://big-agi.com' + clientUtmSource('upgrade-apps');
@@ -334,6 +335,7 @@ export function DesktopNav(props: { component: React.ElementType, currentApp?: N
         {/*<UserNavIcon />*/}
         {navExtLinkItems}
         {navModalItems}
+        <PrivateProAccountControl />
       </DesktopNavGroupBox>
 
     </InvertedBar>
