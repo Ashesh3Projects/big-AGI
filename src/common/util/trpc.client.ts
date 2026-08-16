@@ -15,6 +15,7 @@ import { transformer } from '~/server/trpc/trpc.transformer';
 
 import { getBaseUrl } from './urlUtils';
 import { reactQueryClientSingleton } from '../app.queryclient';
+import { privateProGetRequestHeaders } from '~/modules/private-pro/auth/privatePro.auth.client';
 
 
 // configuration
@@ -61,6 +62,7 @@ export const apiAsync = createTRPCClient<AppRouterEdge>({
     httpLink({
       url: `${getBaseUrl()}/api/edge`,
       transformer: transformer,
+      headers: privateProGetRequestHeaders,
     }),
   ],
 });
@@ -81,12 +83,7 @@ export const apiQuery = createTRPCNext<AppRouterEdge>({
         httpLink({
           url: `${getBaseUrl()}/api/edge`,
           transformer: transformer,
-          // You can pass any HTTP headers you wish here
-          // async headers() {
-          //   return {
-          //     // authorization: getAuthCookie(),
-          //   };
-          // },
+          headers: privateProGetRequestHeaders,
         }),
       ],
     };
@@ -111,6 +108,7 @@ export const apiStream = createTRPCClient<AppRouterEdge>({
       url: `${getBaseUrl()}/api/edge`,
       transformer: transformer,
       fetch: streamingTransportFetch,
+      headers: privateProGetRequestHeaders,
       /**
        * WORKAROUND:
        * Due to the fact that we are sending large payloads with images, and having a 1MB max payload size
@@ -132,6 +130,7 @@ export const apiAsyncNode = createTRPCClient<AppRouterCloud>({
     httpLink({
       url: `${getBaseUrl()}/api/cloud`,
       transformer: transformer,
+      headers: privateProGetRequestHeaders,
     }),
   ],
 });
@@ -144,6 +143,7 @@ export const apiStreamNode = createTRPCClient<AppRouterCloud>({
       url: `${getBaseUrl()}/api/cloud`,
       transformer: transformer,
       fetch: streamingTransportFetch,
+      headers: privateProGetRequestHeaders,
       maxItems: 1, // to not wait for the last connection to close
     }),
   ],

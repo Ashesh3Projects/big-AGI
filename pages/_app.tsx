@@ -30,6 +30,8 @@ import { SnackbarInsert } from '~/common/components/snackbar/SnackbarInsert';
 import { hasGoogleAnalytics, OptionalGoogleAnalytics } from '~/common/components/3rdparty/GoogleAnalytics';
 import { hasPostHogAnalytics, OptionalPostHogAnalytics } from '~/common/components/3rdparty/PostHogAnalytics';
 import { OptionalUrlTrackingCleaner } from '~/common/components/3rdparty/UrlTrackingCleaner';
+import { ProviderPrivatePro } from '~/modules/private-pro/auth/ProviderPrivatePro';
+import { ProviderPrivateProSync } from '~/modules/private-pro/sync/ProviderPrivateProSync';
 
 
 const Big_AGI_App = ({ Component, emotionCache, pageProps }: MyAppProps) => {
@@ -47,18 +49,22 @@ const Big_AGI_App = ({ Component, emotionCache, pageProps }: MyAppProps) => {
     </Head>
 
     <ProviderTheming emotionCache={emotionCache}>
-      <ProviderSingleTab>
-        <ProviderBackendCapabilities>
-          {/* ^ Backend capabilities & SSR boundary */}
-          <ErrorBoundary outer>
-            <ProviderBootstrapLogic>
-              <SnackbarInsert />
-              {getLayout(<Component {...pageProps} />)}
-              <OverlaysInsert />
-            </ProviderBootstrapLogic>
-          </ErrorBoundary>
-        </ProviderBackendCapabilities>
-      </ProviderSingleTab>
+      <ProviderPrivatePro>
+        <ProviderSingleTab>
+          <ProviderBackendCapabilities>
+            {/* ^ Backend capabilities & SSR boundary */}
+            <ErrorBoundary outer>
+              <ProviderBootstrapLogic>
+                <ProviderPrivateProSync>
+                  <SnackbarInsert />
+                  {getLayout(<Component {...pageProps} />)}
+                  <OverlaysInsert />
+                </ProviderPrivateProSync>
+              </ProviderBootstrapLogic>
+            </ErrorBoundary>
+          </ProviderBackendCapabilities>
+        </ProviderSingleTab>
+      </ProviderPrivatePro>
     </ProviderTheming>
 
     {hasGoogleAnalytics && <OptionalGoogleAnalytics />}
