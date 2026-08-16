@@ -27,7 +27,6 @@ import { createPrivateProFirebaseTransport } from './privatePro.sync.transport';
 import { privateProSyncState } from './store-private-pro-sync';
 import { privateProHydrateDBAsset, privateProUploadDBAsset } from '../assets/privatePro.assets.client';
 import { PrivateProVaultResetDialog } from '../ui/PrivateProVaultResetDialog';
-import { apiAsyncNode } from '~/common/util/trpc.client';
 
 
 function createLocalStorePort(): PrivateProLocalStorePort {
@@ -145,7 +144,6 @@ export function ProviderPrivateProSync(props: { children: React.ReactNode }) {
         await engine.retryNow();
       },
     });
-    void apiAsyncNode.privateProAssets.sweepExpired.mutate().catch(() => undefined);
     let statusTimer: ReturnType<typeof setTimeout> | undefined;
     const refreshStatus = async () => {
       if (cancelled) return;

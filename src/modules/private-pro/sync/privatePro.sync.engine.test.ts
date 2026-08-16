@@ -171,6 +171,7 @@ describe('private Pro sync engine', () => {
     assert.deepEqual(privateProClassifySyncError({ data: { code: 'UNAUTHORIZED' }, message: 'sign in' }), { kind: 'blocked', phase: 'error', message: 'sign in' });
     assert.deepEqual(privateProClassifySyncError(new Error('Private Pro attachment quota exceeded.')), { kind: 'blocked', phase: 'quota-blocked', message: 'Private Pro attachment quota exceeded.' });
     assert.equal(privateProClassifySyncError({ data: { code: 'BAD_REQUEST' }, message: 'invalid schema' }).kind, 'blocked');
+    assert.deepEqual(privateProClassifySyncError({ data: { code: 'TOO_MANY_REQUESTS' }, message: 'Upload rate limit exceeded.' }), { kind: 'blocked', phase: 'error', message: 'Upload rate limit exceeded.' });
     assert.equal(privateProClassifySyncError(new TypeError('offline')).kind, 'retryable');
   });
 

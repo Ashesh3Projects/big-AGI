@@ -1,14 +1,18 @@
 import * as z from 'zod/v4';
+import { TRPCError } from '@trpc/server';
 
 import { createTRPCRouter } from '~/server/trpc/trpc.server';
 
 import { privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
 import { getPrivateProServerConfig } from '../config/privatePro.config.server';
+
 import { getFirebasePrivateProAssetsService } from './privatePro.assets.firebase';
+import { createPrivateProUploadRateLimiter, PrivateProUploadRateLimitError } from './privatePro.assets.service';
 
 
 const sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const idSchema = z.string().min(1).max(200);
+let uploadRateLimiter: ReturnType<typeof createPrivateProUploadRateLimiter> | undefined;
 
 const metadataSchema = z.object({
   assetType: z.string().min(1).max(40),
@@ -32,6 +36,14 @@ export const privateProAssetsRouter = createTRPCRouter({
     .mutation(({ ctx, input }) => {
       const config = getPrivateProServerConfig();
       if (input.requestedBytes > config.maxFileBytes) throw new Error('Attachment exceeds the configured file-size limit.');
+      try {
+        (uploadRateLimiter ??= createPrivateProUploadRateLimiter(config.uploadRateLimit))
+          .consume(ctx.privateProIdentity.uid, input.requestedBytes);
+      } catch (error) {
+        if (error instanceof PrivateProUploadRateLimitError)
+          throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: error.message });
+        throw error;
+      }
       return getFirebasePrivateProAssetsService().reserveUpload(ctx.privateProIdentity.uid, input);
     }),
 
@@ -51,6 +63,4 @@ export const privateProAssetsRouter = createTRPCRouter({
     .input(z.object({ operationId: z.string().min(8).max(160) }))
     .mutation(({ ctx, input }) => getFirebasePrivateProAssetsService().releaseReservation(ctx.privateProIdentity.uid, input.operationId)),
 
-  sweepExpired: privateProNodePremiumProcedure
-    .mutation(() => getFirebasePrivateProAssetsService().sweepExpiredReservations()),
 });

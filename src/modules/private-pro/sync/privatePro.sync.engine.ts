@@ -104,7 +104,7 @@ export function privateProClassifySyncError(error: unknown): PrivateProSyncProbl
   if (normalized.includes('quota')) return { kind: 'blocked', phase: 'quota-blocked', message };
 
   const code = errorCode(error);
-  if (code && ['UNAUTHORIZED', 'FORBIDDEN', 'BAD_REQUEST', 'PAYLOAD_TOO_LARGE', 'UNPROCESSABLE_CONTENT'].includes(code))
+  if (code && ['UNAUTHORIZED', 'FORBIDDEN', 'BAD_REQUEST', 'TOO_MANY_REQUESTS', 'PAYLOAD_TOO_LARGE', 'UNPROCESSABLE_CONTENT'].includes(code))
     return { kind: 'blocked', phase: 'error', message };
   if (normalized.includes('schema') || normalized.includes('validation') || normalized.includes('permission denied'))
     return { kind: 'blocked', phase: 'error', message };

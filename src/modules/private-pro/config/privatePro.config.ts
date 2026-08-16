@@ -1,6 +1,9 @@
 export const PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES = 1024 * 1024 * 1024;
 export const PRIVATE_PRO_MAX_FILE_BYTES = 64 * 1024 * 1024;
 export const PRIVATE_PRO_CHAT_CHUNK_BYTES = 180 * 1024;
+export const PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS = 60 * 1000;
+export const PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS = 30;
+export const PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES = 256 * 1024 * 1024;
 
 
 export const privateProClientConfig = {

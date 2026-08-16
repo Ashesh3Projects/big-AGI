@@ -4,6 +4,7 @@ import { describe, test } from 'node:test';
 import {
   isPrivateProEmailAllowed,
   normalizePrivateProEmail,
+  parsePrivateProPositiveInteger,
   parsePrivateProAllowlist,
 } from './privatePro.config.server';
 
@@ -25,5 +26,11 @@ describe('private Pro allowlist', () => {
 
     assert.equal(isPrivateProEmailAllowed('friend@example.com', allowlist), true);
     assert.equal(isPrivateProEmailAllowed('other@example.com', allowlist), false);
+  });
+
+  test('parses only positive integer limits', () => {
+    assert.equal(parsePrivateProPositiveInteger('30', 10, 'rate'), 30);
+    assert.equal(parsePrivateProPositiveInteger(undefined, 10, 'rate'), 10);
+    assert.throws(() => parsePrivateProPositiveInteger('0', 10, 'rate'), /positive integer/i);
   });
 });

@@ -17,6 +17,37 @@ export type {
 
 const RESERVATION_TTL_MS = 15 * 60 * 1000;
 
+export interface PrivateProUploadRateLimitOptions {
+  windowMs: number;
+  maxRequests: number;
+  maxBytes: number;
+}
+
+export class PrivateProUploadRateLimitError extends Error {
+  constructor() {
+    super('Private Pro attachment upload rate limit exceeded.');
+    this.name = 'PrivateProUploadRateLimitError';
+  }
+}
+
+export function createPrivateProUploadRateLimiter(options: PrivateProUploadRateLimitOptions, now: () => number = Date.now) {
+  const windows = new Map<string, { startedAtMs: number; requests: number; bytes: number }>();
+  return {
+    consume(uid: string, requestedBytes: number): void {
+      const atMs = now();
+      let window = windows.get(uid);
+      if (!window || atMs - window.startedAtMs >= options.windowMs) {
+        window = { startedAtMs: atMs, requests: 0, bytes: 0 };
+        windows.set(uid, window);
+      }
+      if (window.requests + 1 > options.maxRequests || window.bytes + requestedBytes > options.maxBytes)
+        throw new PrivateProUploadRateLimitError();
+      window.requests++;
+      window.bytes += requestedBytes;
+    },
+  };
+}
+
 export interface PrivateProAssetsTransaction {
   getAccount(): Promise<PrivateProAssetAccount>;
   saveAccount(account: PrivateProAssetAccount): Promise<void>;

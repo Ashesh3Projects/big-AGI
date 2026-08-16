@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 
 import {
   createPrivateProAssetsService,
+  createPrivateProUploadRateLimiter,
   type PrivateProAssetAccount,
   type PrivateProAssetMetadata,
   type PrivateProAssetRecord,
@@ -100,6 +101,25 @@ function reserveInput(overrides: Partial<Parameters<ReturnType<typeof createPriv
 
 
 describe('private Pro attachment quota service', () => {
+  test('limits reservation requests and requested bytes per UID window', () => {
+    let nowMs = 1000;
+    const limiter = createPrivateProUploadRateLimiter({ windowMs: 60_000, maxRequests: 2, maxBytes: 300 }, () => nowMs);
+
+    limiter.consume('uid-a', 100);
+    limiter.consume('uid-a', 200);
+    assert.throws(() => limiter.consume('uid-a', 1), /rate limit/i);
+    limiter.consume('uid-b', 300);
+
+    nowMs += 60_001;
+    limiter.consume('uid-a', 300);
+  });
+
+  test('rejects one request larger than the byte window', () => {
+    const limiter = createPrivateProUploadRateLimiter({ windowMs: 60_000, maxRequests: 10, maxBytes: 300 }, () => 1000);
+
+    assert.throws(() => limiter.consume('uid-a', 301), /rate limit/i);
+  });
+
   test('reserves bytes when finalized plus reserved usage remains within quota', async () => {
     const port = new MemoryAssetsPort();
     const service = createPrivateProAssetsService(port, () => 1000);

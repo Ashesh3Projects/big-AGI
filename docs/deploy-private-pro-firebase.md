@@ -105,6 +105,9 @@ FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nREPLACE_ME\n-----END PRIVATE 
 
 PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES=1073741824
 PRIVATE_PRO_MAX_FILE_BYTES=67108864
+PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS=60000
+PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS=30
+PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES=268435456
 CRON_SECRET=replace-with-a-long-random-secret
 ```
 
@@ -112,7 +115,9 @@ Firebase browser values and the App Check site key are public by design. The pri
 
 Do not put model/provider API keys into the private Pro sync configuration. Model settings and API keys remain browser-local.
 
-The checked-in `vercel.json` invokes `/api/private-pro/sweep-expired` daily, which is compatible with Vercel Hobby cron limits. Vercel sends `CRON_SECRET` as a bearer token. The job releases expired quota reservations and deletes any unfinalized attachment objects. Approved sign-ins also trigger an opportunistic sweep, so active deployments normally clean up sooner.
+The checked-in `vercel.json` invokes `/api/private-pro/sweep-expired` daily, which is compatible with Vercel Hobby cron limits. Vercel sends `CRON_SECRET` as a bearer token. The job releases expired quota reservations and deletes any unfinalized attachment objects.
+
+Upload reservations are also limited per UID by request count and requested bytes. The defaults allow 30 reservations and 256 MiB of requested data per 60-second window on each Vercel function instance. Keep the product quota as the authoritative cross-instance byte ceiling; these limits are abuse controls for request bursts.
 
 ## Access management
 

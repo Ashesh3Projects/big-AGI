@@ -69,6 +69,9 @@ HTTP_BASIC_AUTH_PASSWORD=
 PRIVATE_PRO_ALLOWED_EMAILS=
 PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES=1073741824
 PRIVATE_PRO_MAX_FILE_BYTES=67108864
+PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS=60000
+PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS=30
+PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES=268435456
 CRON_SECRET=
 FIREBASE_CLIENT_EMAIL=
 FIREBASE_PRIVATE_KEY=
@@ -169,6 +172,9 @@ See [Private Pro Firebase deployment](deploy-private-pro-firebase.md) for the co
 | `PRIVATE_PRO_ALLOWED_EMAILS`         | Comma-separated exact Google email allowlist.                                                       |
 | `PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES` | Attachment quota per account. Defaults to 1073741824 bytes.                                        |
 | `PRIVATE_PRO_MAX_FILE_BYTES`         | Maximum size of one synchronized attachment. Defaults to 67108864 bytes.                            |
+| `PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS`  | Per-instance upload reservation rate window per UID. Defaults to 60000 milliseconds.                |
+| `PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS` | Maximum reservation requests per UID and window. Defaults to 30.                                 |
+| `PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES`  | Maximum requested upload bytes per UID and window. Defaults to 268435456 bytes.                    |
 | `CRON_SECRET`                        | Secret Vercel sends to the scheduled expired-reservation cleanup endpoint. Server-only.             |
 | `FIREBASE_CLIENT_EMAIL`              | Firebase Admin service-account email. Server-only.                                                  |
 | `FIREBASE_PRIVATE_KEY`               | Firebase Admin private key. Server-only. Supports escaped `\n` line breaks.                        |
