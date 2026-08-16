@@ -1,4 +1,4 @@
-import { Chip, LinearProgress, Stack, Typography } from '@mui/joy';
+import { Button, Chip, LinearProgress, Stack, Typography } from '@mui/joy';
 
 import { humanReadableBytes } from '~/common/util/textUtils';
 
@@ -13,6 +13,7 @@ export function PrivateProSyncStatus() {
   const usedBytes = usePrivateProSyncStore(state => state.usedBytes);
   const reservedBytes = usePrivateProSyncStore(state => state.reservedBytes);
   const quotaBytes = usePrivateProSyncStore(state => state.quotaBytes);
+  const retry = usePrivateProSyncStore(state => state.retry);
 
   return (
     <Stack spacing={1}>
@@ -30,6 +31,9 @@ export function PrivateProSyncStatus() {
         {humanReadableBytes(usedBytes)} used, {humanReadableBytes(reservedBytes)} uploading, {humanReadableBytes(quotaBytes)} total
       </Typography>
       {lastError && <Typography level='body-xs' color='danger'>{lastError}</Typography>}
+      {(phase === 'offline' || phase === 'error' || phase === 'quota-blocked') && retry && (
+        <Button size='sm' variant='soft' onClick={() => void retry()}>Retry sync</Button>
+      )}
     </Stack>
   );
 }
