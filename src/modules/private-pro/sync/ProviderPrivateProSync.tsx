@@ -13,6 +13,7 @@ import {
   chatSyncUpsert,
 } from '~/common/stores/chat/store-chats';
 import { deviceGetGlobalDeviceId } from '~/common/stores/store-client';
+import { collectFragmentAssetIds } from '~/common/stores/chat/chat.gc';
 
 import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { parseSyncConversation, parseSyncPersona, serializeSyncConversation, serializeSyncPersona } from './privatePro.sync.serialize';
@@ -21,6 +22,7 @@ import { createPrivateProSyncEngine, type PrivateProLocalEntity, type PrivatePro
 import { privateProSyncDB } from './privatePro.sync.db';
 import { createPrivateProFirebaseTransport } from './privatePro.sync.transport';
 import { privateProSyncState } from './store-private-pro-sync';
+import { privateProHydrateDBAsset, privateProUploadDBAsset } from '../assets/privatePro.assets.client';
 
 
 function createLocalStorePort(): PrivateProLocalStorePort {
@@ -34,6 +36,10 @@ function createLocalStorePort(): PrivateProLocalStorePort {
           entityId: conversation.id,
           contentHash: await privateProHash(JSON.stringify(payload)),
           payload,
+          assetIds: [...conversation.messages.reduce((assetIds, message) => {
+            collectFragmentAssetIds(message.fragments, assetIds);
+            return assetIds;
+          }, new Set<string>())],
         };
       }));
       const personas = await Promise.all(personaSyncSnapshot().map(async persona => {
@@ -76,6 +82,14 @@ function createLocalStorePort(): PrivateProLocalStorePort {
         personaSyncUpsert(persona);
       }
       privateProSyncState().setState({ phase: 'conflict' });
+    },
+
+    async prepareForUpload(entity) {
+      for (const assetId of entity.assetIds ?? []) await privateProUploadDBAsset(assetId);
+    },
+
+    async prepareForRemoteApply(entity) {
+      for (const assetId of entity.assetIds ?? []) await privateProHydrateDBAsset(assetId);
     },
 
     subscribe(listener) {

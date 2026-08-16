@@ -9,6 +9,8 @@ export {
 export {
   // Generic operations
   deleteDBAsset,
+  getDBAssetsByIds,
+  putDBAsset,
   transferDBAssetContextScope,
   gcDBAssetsByScope,
   getDBAsset, // Add this if used directly

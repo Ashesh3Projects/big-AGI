@@ -7,6 +7,7 @@ export interface PrivateProLocalEntity {
   entityId: string;
   contentHash: string;
   payload: unknown;
+  assetIds?: string[];
 }
 
 export interface PrivateProLocalStorePort {
@@ -15,6 +16,8 @@ export interface PrivateProLocalStorePort {
   applyUpsert(entity: PrivateProLocalEntity): Promise<void>;
   applyDelete(entityType: PrivateProEntityType, entityId: string): Promise<void>;
   createConflictCopy(source: PrivateProLocalEntity): Promise<void>;
+  prepareForUpload?(entity: PrivateProLocalEntity): Promise<void>;
+  prepareForRemoteApply?(entity: PrivateProLocalEntity): Promise<void>;
   subscribe(listener: () => void): () => void;
 }
 
@@ -148,6 +151,7 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
         await withRemoteApply(() => deps.store.createConflictCopy(current));
 
       await deps.db.discardOperationsForEntity(deps.uid, type, id);
+      if (event.kind === 'upsert') await deps.store.prepareForRemoteApply?.(event.entity);
       await withRemoteApply(() => event.kind === 'upsert'
         ? deps.store.applyUpsert(event.entity)
         : deps.store.applyDelete(type, id)
@@ -260,6 +264,10 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
   const processOperation = async (operation: PrivateProOutboxOperation) => {
     if (operation.id === undefined) return;
     try {
+      if (operation.kind === 'upsert') {
+        const local = await deps.store.get(operation.entityType, operation.entityId);
+        if (local) await deps.store.prepareForUpload?.(local);
+      }
       const result = operation.kind === 'upsert'
         ? await deps.transport.upsert({
           operationId: operationId(operation),

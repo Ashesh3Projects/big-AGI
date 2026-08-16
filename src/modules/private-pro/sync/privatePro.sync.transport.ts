@@ -53,8 +53,18 @@ async function downloadChat(uid: string, manifest: RemoteChatManifest): Promise<
       resolve(snapshot.docs.map(chunkDoc => SyncChunkSchema.parse(chunkDoc.data())));
     }, reject);
   });
-  const payload = SyncConversationSchema.parse(JSON.parse(await joinSyncChunks(chunks)));
-  return { entityType: 'chat', entityId: manifest.chatId, contentHash: manifest.contentHash, payload };
+      const payload = SyncConversationSchema.parse(JSON.parse(await joinSyncChunks(chunks)));
+  const assetIds = new Set<string>();
+  for (const message of payload.conversation.messages) {
+    for (const fragment of message.fragments) {
+      const part = (fragment as { part?: { pt?: string; rt?: string; zType?: string; assetId?: string; _legacyImageRefPart?: { dataRef?: { reftype?: string; dblobAssetId?: string } } } }).part;
+      if (part?.pt === 'reference' && part.rt === 'zync' && part.zType === 'asset') {
+        const legacyId = part._legacyImageRefPart?.dataRef?.reftype === 'dblob' ? part._legacyImageRefPart.dataRef.dblobAssetId : undefined;
+        if (legacyId) assetIds.add(legacyId);
+      }
+    }
+  }
+  return { entityType: 'chat', entityId: manifest.chatId, contentHash: manifest.contentHash, payload, assetIds: [...assetIds] };
 }
 
 export function createPrivateProFirebaseTransport(uid: string): PrivateProSyncTransport {

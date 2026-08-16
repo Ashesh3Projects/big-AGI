@@ -76,6 +76,14 @@ export async function getDBAsset<T extends DBlobAsset = DBlobDBAsset>(id: DBlobA
   return await assetsTable.get(id) as T | undefined;
 }
 
+export async function getDBAssetsByIds(ids: DBlobAssetId[]): Promise<DBlobDBAsset[]> {
+  return (await assetsTable.bulkGet(ids)).filter((asset): asset is DBlobDBAsset => !!asset);
+}
+
+export async function putDBAsset(asset: DBlobDBAsset): Promise<void> {
+  await assetsTable.put(asset);
+}
+
 /**
  * Warning: this function all the matching assets data in memory - not suitable for large datasets.
  */
