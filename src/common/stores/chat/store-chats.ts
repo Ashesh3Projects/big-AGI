@@ -540,6 +540,36 @@ export const useChatStore = create<ConversationsStore>()(/*devtools(*/
 );
 
 
+/// Private sync adapters
+
+function _chatSyncEligible(conversation: DConversation): boolean {
+  return !conversation._isIncognito && !conversation.messages.some(message => message.pendingIncomplete);
+}
+
+export function chatSyncSnapshot(): DConversation[] {
+  return useChatStore.getState().conversations
+    .filter(_chatSyncEligible)
+    .map(conversation => {
+      const { _abortController: _unused, ...persisted } = conversation;
+      return { ...structuredClone(persisted), _abortController: null };
+    });
+}
+
+export function chatSyncUpsert(conversation: DConversation): void {
+  const synced = structuredClone(conversation);
+  V4ToHeadConverters.inMemHeadCleanDConversations([synced]);
+  useChatStore.setState(state => ({
+    conversations: [synced, ...state.conversations.filter(existing => existing.id !== synced.id)],
+  }));
+}
+
+export function chatSyncDelete(conversationId: DConversationId): void {
+  useChatStore.setState(state => ({
+    conversations: state.conversations.filter(conversation => conversation.id !== conversationId),
+  }));
+}
+
+
 // Convenience function to update a set of messages, using the current chatLLM
 function updateMessagesTokenCounts(messages: DMessage[], forceUpdate: boolean, debugFrom: string): number {
 

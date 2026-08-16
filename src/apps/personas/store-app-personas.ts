@@ -117,3 +117,23 @@ export function deleteSimplePersona(simplePersonaId: string) {
 export function deleteSimplePersonas(simplePersonaIds: Set<string>) {
   useAppPersonasStore.getState().deleteSimplePersonas(simplePersonaIds);
 }
+
+
+/// Private sync adapters
+
+export function personaSyncSnapshot(): SimplePersona[] {
+  return structuredClone(useAppPersonasStore.getState().simplePersonas);
+}
+
+export function personaSyncUpsert(persona: SimplePersona): void {
+  const synced = structuredClone(persona);
+  useAppPersonasStore.setState(state => ({
+    simplePersonas: [synced, ...state.simplePersonas.filter(existing => existing.id !== synced.id)].slice(0, MAX_SAVED_PROMPTS),
+  }));
+}
+
+export function personaSyncDelete(personaId: string): void {
+  useAppPersonasStore.setState(state => ({
+    simplePersonas: state.simplePersonas.filter(persona => persona.id !== personaId),
+  }));
+}
