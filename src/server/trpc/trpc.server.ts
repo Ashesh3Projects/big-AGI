@@ -8,9 +8,13 @@
  */
 import type { FetchCreateContextFnOptions } from '@trpc/server/adapters/fetch';
 import * as z from 'zod/v4';
-import { initTRPC } from '@trpc/server';
+import { initTRPC, TRPCError } from '@trpc/server';
 import { transformer } from './trpc.transformer';
 import { TRPCFetcherError } from './trpc.router.fetchers';
+
+import { getPrivateProServerConfig } from '~/modules/private-pro/config/privatePro.config.server';
+import { privateProIdentityCanAccessDeployment, privateProIdentityHasPremiumAccess } from '~/modules/private-pro/auth/privatePro.auth.types';
+import { extractFirebaseBearerToken, verifyFirebaseIdToken } from '~/modules/private-pro/firebase/firebase.token';
 
 
 /**
@@ -27,13 +31,27 @@ export type ChatGenerateContentContext = Awaited<ReturnType<typeof createTRPCFet
  * These allow you to access things when processing a request, like the database, the session, etc.
  */
 export const createTRPCFetchContext = async ({ req }: FetchCreateContextFnOptions) => {
-  // const user = { name: req.headers.get('username') ?? 'anonymous' };
-  // return { req, resHeaders };
+  const privateProConfig = getPrivateProServerConfig();
+  const privateProToken = extractFirebaseBearerToken(req.headers.get('authorization'));
+  let privateProIdentity = null;
+  let privateProAuthError: Error | null = null;
+  if (privateProToken) {
+    try {
+      privateProIdentity = await verifyFirebaseIdToken(privateProToken, {
+        projectId: privateProConfig.firebase.projectId,
+      });
+    } catch (error) {
+      privateProAuthError = error instanceof Error ? error : new Error('Firebase identity verification failed.');
+    }
+  }
+
   return {
     // only used by Backend Analytics
     hostName: req.headers?.get('host') ?? 'localhost',
     // enables cancelling upstream requests when the downstream request is aborted
     reqSignal: req.signal,
+    privateProIdentity,
+    privateProAuthError,
   };
 };
 
@@ -95,7 +113,14 @@ export const createTRPCRouter = t.router;
  *
  * @link https://trpc.io/docs/v11/procedures
  */
-export const publicProcedure = t.procedure;
+const requireDeploymentAccess = t.middleware(({ ctx, next }) => {
+  const config = getPrivateProServerConfig();
+  if (!privateProIdentityCanAccessDeployment(config.enabled, ctx.privateProIdentity, config.allowedEmails))
+    throw new TRPCError({ code: 'UNAUTHORIZED', message: ctx.privateProAuthError?.message ?? 'Authentication required.' });
+  return next();
+});
+
+export const publicProcedure = t.procedure.use(requireDeploymentAccess);
 
 /**
  * Edge procedures for the AI inference Edge network:
@@ -106,28 +131,51 @@ export const publicProcedure = t.procedure;
  * May be closed in the future if key material is on the server-side procedure, in which case
  * authentication will be required.
  */
-export const edgeProcedure = t.procedure;
+export const edgeProcedure = t.procedure.use(requireDeploymentAccess);
 
 
 /**
  * Authenticated users only. - FORWARD-LOOKING
  */
-export const authedProcedure = t.procedure;
+const requireAuthed = t.middleware(({ ctx, next }) => {
+  const config = getPrivateProServerConfig();
+  if (!ctx.privateProIdentity || !privateProIdentityCanAccessDeployment(true, ctx.privateProIdentity, config.allowedEmails))
+    throw new TRPCError({ code: 'UNAUTHORIZED', message: ctx.privateProAuthError?.message ?? 'Authentication required.' });
+  return next({
+    ctx: {
+      ...ctx,
+      privateProIdentity: ctx.privateProIdentity,
+    },
+  });
+});
+
+export const authedProcedure = t.procedure.use(requireAuthed);
 
 /**
  * Premium procedure - FORWARD-LOOKING
  */
-export const premiumProcedure = t.procedure;
+const requirePremium = requireAuthed.unstable_pipe(({ ctx, next }) => {
+  if (!privateProIdentityHasPremiumAccess(ctx.privateProIdentity))
+    throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro entitlement required.' });
+  return next({
+    ctx: {
+      ...ctx,
+      privateProIdentity: ctx.privateProIdentity,
+    },
+  });
+});
+
+export const premiumProcedure = t.procedure.use(requirePremium);
 
 /**
  * User-feature-gated procedure - FORWARD-LOOKING
  */
-export const authGatedProcedure = t.procedure;
+export const authGatedProcedure = authedProcedure;
 
 /**
  * Tenant Admin procedure - FORWARD-LOOKING
  */
-export const tenantAdminProcedure = t.procedure;
+export const tenantAdminProcedure = premiumProcedure;
 
 
 // /**
