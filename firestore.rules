@@ -68,6 +68,10 @@ service cloud.firestore {
         allow read, write: if false;
       }
 
+      match /uploadRateWindows/{windowId} {
+        allow read, write: if false;
+      }
+
       match /chatUploads/{uploadId} {
         allow read, write: if false;
 

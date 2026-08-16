@@ -3,7 +3,6 @@ import { describe, test } from 'node:test';
 
 import {
   createPrivateProAssetsService,
-  createPrivateProUploadRateLimiter,
   type PrivateProAssetAccount,
   type PrivateProAssetMetadata,
   type PrivateProAssetRecord,
@@ -38,11 +37,13 @@ class MemoryAssetsPort implements PrivateProAssetsPort {
   assets = new Map<string, PrivateProAssetRecord>();
   objects = new Map<string, PrivateProStoredObjectMetadata>();
   deletedObjects: string[] = [];
+  rateWindows = new Map<string, { uid: string; windowId: string; requests: number; bytes: number; expiresAtMs: number }>();
 
   async transaction<T>(_uid: string, callback: (transaction: PrivateProAssetsTransaction) => Promise<T>) {
     const account = structuredClone(this.account);
     const reservations = new Map([...this.reservations].map(([key, value]) => [key, structuredClone(value)]));
     const assets = new Map([...this.assets].map(([key, value]) => [key, structuredClone(value)]));
+    const rateWindows = new Map([...this.rateWindows].map(([key, value]) => [key, structuredClone(value)]));
     const transaction: PrivateProAssetsTransaction = {
       getAccount: async () => account,
       saveAccount: async next => { Object.assign(account, structuredClone(next)); },
@@ -51,11 +52,14 @@ class MemoryAssetsPort implements PrivateProAssetsPort {
       getAsset: async assetId => assets.get(assetId) ?? null,
       findAssetByHash: async hash => [...assets.values()].find(asset => asset.contentHash === hash && asset.status === 'ready') ?? null,
       saveAsset: async asset => { assets.set(asset.assetId, structuredClone(asset)); },
+      getRateWindow: async windowId => rateWindows.get(windowId) ?? null,
+      saveRateWindow: async window => { rateWindows.set(window.windowId, structuredClone(window)); },
     };
     const result = await callback(transaction);
     this.account = account;
     this.reservations = reservations;
     this.assets = assets;
+    this.rateWindows = rateWindows;
     return result;
   }
 
@@ -101,23 +105,24 @@ function reserveInput(overrides: Partial<Parameters<ReturnType<typeof createPriv
 
 
 describe('private Pro attachment quota service', () => {
-  test('limits reservation requests and requested bytes per UID window', () => {
+  test('limits reservation requests and requested bytes per UID window', async () => {
     let nowMs = 1000;
-    const limiter = createPrivateProUploadRateLimiter({ windowMs: 60_000, maxRequests: 2, maxBytes: 300 }, () => nowMs);
+    const port = new MemoryAssetsPort();
+    const service = createPrivateProAssetsService(port, () => nowMs, { windowMs: 60_000, maxRequests: 2, maxBytes: 300 });
 
-    limiter.consume('uid-a', 100);
-    limiter.consume('uid-a', 200);
-    assert.throws(() => limiter.consume('uid-a', 1), /rate limit/i);
-    limiter.consume('uid-b', 300);
+    await service.reserveUpload('uid-a', reserveInput({ operationId: 'asset-op-1', assetId: 'asset-1', contentHash: 'a'.repeat(64), requestedBytes: 100 }));
+    await service.reserveUpload('uid-a', reserveInput({ operationId: 'asset-op-2', assetId: 'asset-2', contentHash: 'b'.repeat(64), requestedBytes: 200 }));
+    await assert.rejects(service.reserveUpload('uid-a', reserveInput({ operationId: 'asset-op-3', assetId: 'asset-3', contentHash: 'c'.repeat(64), requestedBytes: 1 })), /rate limit/i);
 
     nowMs += 60_001;
-    limiter.consume('uid-a', 300);
+    await service.reserveUpload('uid-a', reserveInput({ operationId: 'asset-op-4', assetId: 'asset-4', contentHash: 'd'.repeat(64), requestedBytes: 300 }));
   });
 
-  test('rejects one request larger than the byte window', () => {
-    const limiter = createPrivateProUploadRateLimiter({ windowMs: 60_000, maxRequests: 10, maxBytes: 300 }, () => 1000);
+  test('rejects one request larger than the byte window', async () => {
+    const port = new MemoryAssetsPort();
+    const service = createPrivateProAssetsService(port, () => 1000, { windowMs: 60_000, maxRequests: 10, maxBytes: 300 });
 
-    assert.throws(() => limiter.consume('uid-a', 301), /rate limit/i);
+    await assert.rejects(service.reserveUpload('uid-a', reserveInput({ requestedBytes: 301 })), /rate limit/i);
   });
 
   test('reserves bytes when finalized plus reserved usage remains within quota', async () => {
@@ -162,13 +167,14 @@ describe('private Pro attachment quota service', () => {
 
   test('reuses the same reservation operation idempotently', async () => {
     const port = new MemoryAssetsPort();
-    const service = createPrivateProAssetsService(port, () => 1000);
+    const service = createPrivateProAssetsService(port, () => 1000, { windowMs: 60_000, maxRequests: 1, maxBytes: 200 });
 
     const first = await service.reserveUpload('uid-a', reserveInput());
     const second = await service.reserveUpload('uid-a', reserveInput());
 
     assert.deepEqual(second, first);
     assert.equal(port.account.reservedBytes, 250);
+    assert.equal([...port.rateWindows.values()][0]?.requests, 1);
   });
 
   test('finalizes using authoritative object metadata and moves bytes exactly once', async () => {

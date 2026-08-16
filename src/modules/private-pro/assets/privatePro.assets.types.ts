@@ -50,3 +50,11 @@ export interface PrivateProStoredObjectMetadata {
   contentType: string;
   contentHash: string;
 }
+
+export interface PrivateProAssetRateWindow {
+  uid: string;
+  windowId: string;
+  requests: number;
+  bytes: number;
+  expiresAtMs: number;
+}

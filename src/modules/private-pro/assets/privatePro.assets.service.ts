@@ -1,6 +1,7 @@
 import type {
   PrivateProAssetAccount,
   PrivateProAssetMetadata,
+  PrivateProAssetRateWindow,
   PrivateProAssetRecord,
   PrivateProAssetReservation,
   PrivateProStoredObjectMetadata,
@@ -9,6 +10,7 @@ import type {
 export type {
   PrivateProAssetAccount,
   PrivateProAssetMetadata,
+  PrivateProAssetRateWindow,
   PrivateProAssetRecord,
   PrivateProAssetReservation,
   PrivateProStoredObjectMetadata,
@@ -30,22 +32,8 @@ export class PrivateProUploadRateLimitError extends Error {
   }
 }
 
-export function createPrivateProUploadRateLimiter(options: PrivateProUploadRateLimitOptions, now: () => number = Date.now) {
-  const windows = new Map<string, { startedAtMs: number; requests: number; bytes: number }>();
-  return {
-    consume(uid: string, requestedBytes: number): void {
-      const atMs = now();
-      let window = windows.get(uid);
-      if (!window || atMs - window.startedAtMs >= options.windowMs) {
-        window = { startedAtMs: atMs, requests: 0, bytes: 0 };
-        windows.set(uid, window);
-      }
-      if (window.requests + 1 > options.maxRequests || window.bytes + requestedBytes > options.maxBytes)
-        throw new PrivateProUploadRateLimitError();
-      window.requests++;
-      window.bytes += requestedBytes;
-    },
-  };
+function rateWindowId(atMs: number, windowMs: number): string {
+  return Math.floor(atMs / windowMs).toString(36);
 }
 
 export interface PrivateProAssetsTransaction {
@@ -56,6 +44,8 @@ export interface PrivateProAssetsTransaction {
   getAsset(assetId: string): Promise<PrivateProAssetRecord | null>;
   findAssetByHash(contentHash: string): Promise<PrivateProAssetRecord | null>;
   saveAsset(asset: PrivateProAssetRecord): Promise<void>;
+  getRateWindow(windowId: string): Promise<PrivateProAssetRateWindow | null>;
+  saveRateWindow(window: PrivateProAssetRateWindow): Promise<void>;
 }
 
 export interface PrivateProAssetsPort {
@@ -101,7 +91,11 @@ function reservationResponse(reservation: PrivateProAssetReservation, upload: {
   };
 }
 
-export function createPrivateProAssetsService(port: PrivateProAssetsPort, now: () => number = Date.now) {
+export function createPrivateProAssetsService(
+  port: PrivateProAssetsPort,
+  now: () => number = Date.now,
+  rateLimit?: PrivateProUploadRateLimitOptions,
+) {
   const service = {
     async reserveUpload(uid: string, input: ReserveAssetUploadInput) {
       assertReserveInput(input);
@@ -135,6 +129,22 @@ export function createPrivateProAssetsService(port: PrivateProAssetsPort, now: (
           if (existingReservation.status === 'ready')
             return { status: 'already-uploaded' as const, assetId: existingReservation.assetId, byteSize: existingReservation.finalizedBytes ?? 0 };
           if (existingReservation.status === 'reserved') return existingReservation;
+        }
+        if (rateLimit) {
+          const atMs = now();
+          const windowId = rateWindowId(atMs, rateLimit.windowMs);
+          const window = await transaction.getRateWindow(windowId);
+          const requests = (window?.requests ?? 0) + 1;
+          const bytes = (window?.bytes ?? 0) + input.requestedBytes;
+          if (requests > rateLimit.maxRequests || bytes > rateLimit.maxBytes)
+            throw new PrivateProUploadRateLimitError();
+          await transaction.saveRateWindow({
+            uid,
+            windowId,
+            requests,
+            bytes,
+            expiresAtMs: (Math.floor(atMs / rateLimit.windowMs) + 2) * rateLimit.windowMs,
+          });
         }
         if (account.usedBytes + account.reservedBytes + input.requestedBytes > account.quotaBytes)
           throw new Error('Private Pro attachment quota exceeded.');

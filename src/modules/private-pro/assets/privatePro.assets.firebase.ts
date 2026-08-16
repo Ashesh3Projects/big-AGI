@@ -4,6 +4,7 @@ import { getPrivateProFirestore, getPrivateProStorageBucket } from '../firebase/
 import type {
   PrivateProAssetAccount,
   PrivateProAssetRecord,
+  PrivateProAssetRateWindow,
   PrivateProAssetReservation,
 } from './privatePro.assets.types';
 import type { PrivateProAssetsPort, PrivateProAssetsTransaction } from './privatePro.assets.service';
@@ -52,6 +53,15 @@ class FirebaseAssetsTransaction implements PrivateProAssetsTransaction {
 
   async saveAsset(asset: PrivateProAssetRecord) {
     this.transaction.set(this.db.doc(`users/${this.uid}/assets/${asset.assetId}`), asset);
+  }
+
+  async getRateWindow(windowId: string) {
+    const snapshot = await this.transaction.get(this.db.doc(`users/${this.uid}/uploadRateWindows/${windowId}`));
+    return snapshot.exists ? snapshot.data() as PrivateProAssetRateWindow : null;
+  }
+
+  async saveRateWindow(window: PrivateProAssetRateWindow) {
+    this.transaction.set(this.db.doc(`users/${this.uid}/uploadRateWindows/${window.windowId}`), window);
   }
 }
 
@@ -117,6 +127,6 @@ export class FirebasePrivateProAssetsPort implements PrivateProAssetsPort {
 
 let firebaseAssetsService: ReturnType<typeof createPrivateProAssetsService> | undefined;
 
-export function getFirebasePrivateProAssetsService() {
-  return firebaseAssetsService ??= createPrivateProAssetsService(new FirebasePrivateProAssetsPort());
+export function getFirebasePrivateProAssetsService(rateLimit?: Parameters<typeof createPrivateProAssetsService>[2]) {
+  return firebaseAssetsService ??= createPrivateProAssetsService(new FirebasePrivateProAssetsPort(), Date.now, rateLimit);
 }
