@@ -127,7 +127,12 @@ export class PrivateProSyncDB extends Dexie {
 
   async leaseNextOperation(uid: string, nowMs: number, leaseMs: number): Promise<PrivateProOutboxOperation | null> {
     return this.transaction('rw', this.outbox, async () => {
-      const candidates = await this.outbox.where('[uid+availableAtMs]').between([uid, Dexie.minKey], [uid, nowMs]).sortBy('availableAtMs');
+      const candidates = await this.outbox.where('[uid+availableAtMs]').between(
+        [uid, Dexie.minKey],
+        [uid, nowMs],
+        true,
+        true,
+      ).sortBy('availableAtMs');
       const candidate = candidates.find(operation => operation.leaseUntilMs <= nowMs);
       if (!candidate?.id) return null;
       const leaseUntilMs = nowMs + leaseMs;
@@ -164,8 +169,27 @@ export class PrivateProSyncDB extends Dexie {
     return this.outbox.where('uid').equals(uid).count();
   }
 
+  async makeOperationsDue(uid: string, nowMs: number): Promise<void> {
+    await this.outbox.where('uid').equals(uid).modify({ availableAtMs: nowMs, leaseUntilMs: 0 });
+  }
+
+  async discardOperation(id: number): Promise<void> {
+    await this.outbox.delete(id);
+  }
+
+  async discardOperationsForEntity(uid: string, entityType: PrivateProEntityType, entityId: string): Promise<void> {
+    const operations = await this.outbox.where('uid').equals(uid).filter(operation =>
+      operation.entityType === entityType && operation.entityId === entityId
+    ).primaryKeys();
+    await this.outbox.bulkDelete(operations);
+  }
+
   getEntityState(uid: string, entityKey: string): Promise<PrivateProEntityState | undefined> {
     return this.entities.get([uid, entityKey]);
+  }
+
+  listEntityStates(uid: string): Promise<PrivateProEntityState[]> {
+    return this.entities.where('uid').equals(uid).toArray();
   }
 
   async putEntityState(entity: PrivateProEntityState): Promise<void> {

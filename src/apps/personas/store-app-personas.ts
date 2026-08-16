@@ -137,3 +137,7 @@ export function personaSyncDelete(personaId: string): void {
     simplePersonas: state.simplePersonas.filter(persona => persona.id !== personaId),
   }));
 }
+
+export function personaSyncSubscribe(listener: () => void): () => void {
+  return useAppPersonasStore.subscribe(listener);
+}

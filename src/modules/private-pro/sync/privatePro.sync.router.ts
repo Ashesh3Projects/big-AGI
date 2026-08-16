@@ -14,7 +14,11 @@ const entityIdSchema = z.string().min(1).max(200);
 const deviceIdSchema = z.string().min(1).max(100);
 const baseRevisionSchema = z.number().int().nonnegative();
 
-const service = createPrivateProSyncService(new FirebasePrivateProSyncRepository());
+let service: ReturnType<typeof createPrivateProSyncService> | undefined;
+
+function privateProSyncService() {
+  return service ??= createPrivateProSyncService(new FirebasePrivateProSyncRepository());
+}
 
 export const privateProSyncRouter = createTRPCRouter({
   prepareChat: privateProNodePremiumProcedure
@@ -31,15 +35,15 @@ export const privateProSyncRouter = createTRPCRouter({
       })).min(1).max(400),
       deviceId: deviceIdSchema,
     }))
-    .mutation(({ ctx, input }) => service.prepareChat(ctx.privateProIdentity, input)),
+    .mutation(({ ctx, input }) => privateProSyncService().prepareChat(ctx.privateProIdentity, input)),
 
   putChatChunk: privateProNodePremiumProcedure
     .input(z.object({ operationId: operationIdSchema, chunk: SyncChunkSchema }))
-    .mutation(({ ctx, input }) => service.putChatChunk(ctx.privateProIdentity, input)),
+    .mutation(({ ctx, input }) => privateProSyncService().putChatChunk(ctx.privateProIdentity, input)),
 
   commitChat: privateProNodePremiumProcedure
     .input(z.object({ operationId: operationIdSchema }))
-    .mutation(({ ctx, input }) => service.commitChat(ctx.privateProIdentity, input)),
+    .mutation(({ ctx, input }) => privateProSyncService().commitChat(ctx.privateProIdentity, input)),
 
   deleteChat: privateProNodePremiumProcedure
     .input(z.object({
@@ -48,7 +52,7 @@ export const privateProSyncRouter = createTRPCRouter({
       baseRevision: baseRevisionSchema,
       deviceId: deviceIdSchema,
     }))
-    .mutation(({ ctx, input }) => service.deleteChat(ctx.privateProIdentity, input)),
+    .mutation(({ ctx, input }) => privateProSyncService().deleteChat(ctx.privateProIdentity, input)),
 
   putPersona: privateProNodePremiumProcedure
     .input(z.object({
@@ -58,7 +62,7 @@ export const privateProSyncRouter = createTRPCRouter({
       payload: SyncPersonaSchema,
       deviceId: deviceIdSchema,
     }))
-    .mutation(({ ctx, input }) => service.putPersona(ctx.privateProIdentity, input)),
+    .mutation(({ ctx, input }) => privateProSyncService().putPersona(ctx.privateProIdentity, input)),
 
   deletePersona: privateProNodePremiumProcedure
     .input(z.object({
@@ -67,5 +71,5 @@ export const privateProSyncRouter = createTRPCRouter({
       baseRevision: baseRevisionSchema,
       deviceId: deviceIdSchema,
     }))
-    .mutation(({ ctx, input }) => service.deletePersona(ctx.privateProIdentity, input)),
+    .mutation(({ ctx, input }) => privateProSyncService().deletePersona(ctx.privateProIdentity, input)),
 });

@@ -569,6 +569,10 @@ export function chatSyncDelete(conversationId: DConversationId): void {
   }));
 }
 
+export function chatSyncSubscribe(listener: () => void): () => void {
+  return useChatStore.subscribe(listener);
+}
+
 
 // Convenience function to update a set of messages, using the current chatLLM
 function updateMessagesTokenCounts(messages: DMessage[], forceUpdate: boolean, debugFrom: string): number {
