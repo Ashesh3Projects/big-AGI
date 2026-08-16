@@ -122,7 +122,7 @@ Upload reservations are also limited per UID by request count and requested byte
 Enable Firestore TTL for the rate-window collection group so expired counters are deleted automatically:
 
 ```powershell
-gcloud firestore fields ttls update --collection-group=uploadRateWindows --field=expiresAt
+gcloud firestore fields ttls update expiresAt --collection-group=uploadRateWindows --enable-ttl
 ```
 
 ## Access management
