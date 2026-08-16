@@ -7,7 +7,7 @@ import type {
   PrivateProPutPersonaRequest,
   PrivateProSyncRepository,
 } from './privatePro.sync.repository';
-import { joinSyncChunks } from './privatePro.sync.chunk';
+import { joinSyncChunks, privateProHash } from './privatePro.sync.chunk';
 import { SyncChunkSchema, type SyncChunk } from './privatePro.sync.schemas';
 
 
@@ -124,6 +124,10 @@ export function createPrivateProSyncService(repository: PrivateProSyncRepository
           throw new Error(`Sync chunk ${descriptor.id} failed prepared-upload validation.`);
       }
       if (chunks.length !== upload.chunks.length) throw new Error('Prepared chat upload contains unexpected chunks.');
+
+      const payload = await joinSyncChunks(chunks);
+      if (await privateProHash(payload) !== upload.contentHash)
+        throw new Error('Prepared chat payload failed its content hash.');
 
       return repository.commitChat(identity.uid, upload, [...chunks].sort((a, b) => a.index - b.index));
     },

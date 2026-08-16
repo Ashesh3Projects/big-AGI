@@ -8,7 +8,9 @@ import Dexie from 'dexie';
 import { PrivateProSyncDB } from './privatePro.sync.db';
 import {
   createPrivateProSyncEngine,
+  privateProClassifySyncError,
   privateProOperationId,
+  privateProRetryDelay,
   type PrivateProLocalEntity,
   type PrivateProLocalStorePort,
   type PrivateProRemoteEvent,
@@ -159,6 +161,19 @@ class FakeTransport implements PrivateProSyncTransport {
 
 
 describe('private Pro sync engine', () => {
+  test('uses capped exponential retry delays with jitter', () => {
+    assert.equal(privateProRetryDelay(0, () => 0.5), 1000);
+    assert.equal(privateProRetryDelay(3, () => 0.5), 8000);
+    assert.equal(privateProRetryDelay(20, () => 0.5), 60_000);
+  });
+
+  test('classifies authorization, quota, schema, and network failures', () => {
+    assert.deepEqual(privateProClassifySyncError({ data: { code: 'UNAUTHORIZED' }, message: 'sign in' }), { kind: 'blocked', phase: 'error', message: 'sign in' });
+    assert.deepEqual(privateProClassifySyncError(new Error('Private Pro attachment quota exceeded.')), { kind: 'blocked', phase: 'quota-blocked', message: 'Private Pro attachment quota exceeded.' });
+    assert.equal(privateProClassifySyncError({ data: { code: 'BAD_REQUEST' }, message: 'invalid schema' }).kind, 'blocked');
+    assert.equal(privateProClassifySyncError(new TypeError('offline')).kind, 'retryable');
+  });
+
   test('uses the device ID to avoid cross-device operation collisions', () => {
     const base = {
       id: 1,
@@ -227,6 +242,34 @@ describe('private Pro sync engine', () => {
     await engine.whenIdle();
     assert.equal(await db.outboxCount('uid-a'), 0);
     assert.deepEqual(transport.writes, ['chat:chat-1']);
+    engine.stop();
+  });
+
+  test('blocks terminal failures and surfaces their status', async (t) => {
+    const db = createDB(t);
+    const store = new FakeStore([entity('chat', 'chat-1', 'a')]);
+    const transport = new FakeTransport();
+    let attempts = 0;
+    transport.upsert = async () => {
+      attempts++;
+      throw { data: { code: 'UNAUTHORIZED' }, message: 'Session expired.' };
+    };
+    const statuses: Array<{ phase: 'offline' | 'quota-blocked' | 'error'; error: string }> = [];
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-a', deviceId: 'device-a', db, store, transport, now: () => 1000,
+      onStatus: status => statuses.push(status),
+    });
+
+    await engine.start();
+    await engine.whenIdle();
+
+    const operations = await db.outbox.where('uid').equals('uid-a').toArray();
+    assert.equal(operations.length, 1);
+    assert.equal(operations[0].blocked, true);
+    assert.deepEqual(statuses.at(-1), { phase: 'error', error: 'Session expired.' });
+    assert.equal(await db.leaseNextOperation('uid-a', 1000, 500), null);
+    await engine.scanNow();
+    assert.equal(attempts, 1);
     engine.stop();
   });
 

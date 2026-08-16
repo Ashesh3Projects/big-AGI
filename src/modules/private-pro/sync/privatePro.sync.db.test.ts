@@ -82,6 +82,21 @@ describe('private Pro sync database', () => {
     assert.equal(operation?.lastError, 'offline');
   });
 
+  test('blocks terminal operations until a manual retry', async (t) => {
+    const db = createDB(t);
+    const id = await db.enqueueOperation({
+      uid: 'uid-a', entityType: 'chat', entityId: 'chat-1', kind: 'upsert', baseRevision: 0,
+      contentHash: 'a'.repeat(64), payload: { schemaVersion: 1 }, deviceId: 'device-1', createdAtMs: 100,
+    });
+
+    await db.blockOperation(id, 'permission denied');
+    assert.equal((await db.getOutboxOperation(id))?.blocked, true);
+    assert.equal(await db.leaseNextOperation('uid-a', 1000, 500), null);
+
+    await db.makeOperationsDue('uid-a', 1100);
+    assert.equal((await db.leaseNextOperation('uid-a', 1100, 500))?.id, id);
+  });
+
   test('acknowledges an operation and updates entity state atomically', async (t) => {
     const db = createDB(t);
     const id = await db.enqueueOperation({

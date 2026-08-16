@@ -27,6 +27,7 @@ import { createPrivateProFirebaseTransport } from './privatePro.sync.transport';
 import { privateProSyncState } from './store-private-pro-sync';
 import { privateProHydrateDBAsset, privateProUploadDBAsset } from '../assets/privatePro.assets.client';
 import { PrivateProVaultResetDialog } from '../ui/PrivateProVaultResetDialog';
+import { apiAsyncNode } from '~/common/util/trpc.client';
 
 
 function createLocalStorePort(): PrivateProLocalStorePort {
@@ -136,7 +137,15 @@ export function ProviderPrivateProSync(props: { children: React.ReactNode }) {
       db: privateProSyncDB,
       store: createLocalStorePort(),
       transport: createPrivateProFirebaseTransport(user.uid),
+      onStatus: ({ phase, error }) => privateProSyncState().setState({ phase, lastError: error }),
     });
+    syncState.setState({
+      retry: async () => {
+        syncState.setState({ phase: 'syncing', lastError: null });
+        await engine.retryNow();
+      },
+    });
+    void apiAsyncNode.privateProAssets.sweepExpired.mutate().catch(() => undefined);
     let statusTimer: ReturnType<typeof setTimeout> | undefined;
     const refreshStatus = async () => {
       if (cancelled) return;
@@ -145,7 +154,7 @@ export function ProviderPrivateProSync(props: { children: React.ReactNode }) {
       const current = privateProSyncState();
       current.setState({
         pendingOperations,
-        ...(current.phase !== 'binding-conflict' && current.phase !== 'conflict' && current.phase !== 'error'
+        ...(current.phase !== 'binding-conflict' && current.phase !== 'conflict' && current.phase !== 'error' && current.phase !== 'quota-blocked'
           ? { phase: pendingOperations ? 'syncing' : 'synced' }
           : {}),
       });
@@ -169,6 +178,7 @@ export function ProviderPrivateProSync(props: { children: React.ReactNode }) {
       cancelled = true;
       if (statusTimer) clearTimeout(statusTimer);
       engine.stop();
+      privateProSyncState().setState({ retry: null });
     };
   }, [bootstrap, state, user]);
 

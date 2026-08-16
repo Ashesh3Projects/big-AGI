@@ -7,6 +7,7 @@ import type {
   PrivateProAssetReservation,
 } from './privatePro.assets.types';
 import type { PrivateProAssetsPort, PrivateProAssetsTransaction } from './privatePro.assets.service';
+import { createPrivateProAssetsService } from './privatePro.assets.service';
 
 
 class FirebaseAssetsTransaction implements PrivateProAssetsTransaction {
@@ -62,6 +63,18 @@ export class FirebasePrivateProAssetsPort implements PrivateProAssetsPort {
     return this.db.runTransaction(transaction => callback(new FirebaseAssetsTransaction(this.db, transaction, uid)));
   }
 
+  async listExpiredReservations(atMs: number, limit: number) {
+    const snapshot = await this.db.collectionGroup('quotaReservations')
+      .where('status', '==', 'reserved')
+      .where('expiresAtMs', '<=', atMs)
+      .limit(limit)
+      .get();
+    return snapshot.docs.flatMap(document => {
+      const uid = document.ref.parent.parent?.id;
+      return uid ? [{ uid, operationId: document.id }] : [];
+    });
+  }
+
   async createSignedUpload(objectPath: string, contentType: string, contentHash: string) {
     const requiredHeaders = {
       'content-type': contentType,
@@ -100,4 +113,10 @@ export class FirebasePrivateProAssetsPort implements PrivateProAssetsPort {
   async deleteObject(objectPath: string) {
     await this.bucket.file(objectPath).delete({ ignoreNotFound: true });
   }
+}
+
+let firebaseAssetsService: ReturnType<typeof createPrivateProAssetsService> | undefined;
+
+export function getFirebasePrivateProAssetsService() {
+  return firebaseAssetsService ??= createPrivateProAssetsService(new FirebasePrivateProAssetsPort());
 }

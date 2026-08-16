@@ -15,6 +15,10 @@ export function privateProIdentityCanAccessDeployment(
   allowlist: ReadonlySet<string>,
 ): boolean {
   if (!enabled) return true;
+  return !!identity?.emailVerified && allowlist.has(identity.email) && privateProIdentityHasPremiumAccess(identity);
+}
+
+export function privateProIdentityCanBootstrap(identity: PrivateProIdentity | null, allowlist: ReadonlySet<string>): identity is PrivateProIdentity {
   return !!identity?.emailVerified && allowlist.has(identity.email);
 }
 

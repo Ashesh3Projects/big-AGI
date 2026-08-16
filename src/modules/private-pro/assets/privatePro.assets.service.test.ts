@@ -58,6 +58,13 @@ class MemoryAssetsPort implements PrivateProAssetsPort {
     return result;
   }
 
+  async listExpiredReservations(atMs: number, limit: number) {
+    return [...this.reservations.values()]
+      .filter(reservation => reservation.status === 'reserved' && reservation.expiresAtMs <= atMs)
+      .slice(0, limit)
+      .map(reservation => ({ uid: reservation.uid, operationId: reservation.operationId }));
+  }
+
   async createSignedUpload(objectPath: string, contentType: string, contentHash: string) {
     return { uploadUrl: `https://upload.invalid/${objectPath}`, requiredHeaders: { 'content-type': contentType, 'x-goog-meta-sha256': contentHash } };
   }
@@ -193,6 +200,23 @@ describe('private Pro attachment quota service', () => {
     });
 
     assert.equal(await service.releaseExpiredReservation('uid-a', 'asset-op-1', 1000 + 16 * 60 * 1000), true);
+    assert.equal(port.account.reservedBytes, 50);
+    assert.deepEqual(port.deletedObjects, [reservation.objectPath]);
+  });
+
+  test('sweeps expired reservations without knowing their operation IDs', async () => {
+    const port = new MemoryAssetsPort();
+    const service = createPrivateProAssetsService(port, () => 1000);
+    const reservation = await service.reserveUpload('uid-a', reserveInput());
+    assert.equal(reservation.status, 'upload-required');
+    port.objects.set(reservation.objectPath, {
+      objectPath: reservation.objectPath,
+      byteSize: 200,
+      contentType: 'image/png',
+      contentHash: 'a'.repeat(64),
+    });
+
+    assert.deepEqual(await service.sweepExpiredReservations(1000 + 16 * 60 * 1000), { released: 1 });
     assert.equal(port.account.reservedBytes, 50);
     assert.deepEqual(port.deletedObjects, [reservation.objectPath]);
   });

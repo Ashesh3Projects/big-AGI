@@ -4,6 +4,7 @@ import { describe, test } from 'node:test';
 import {
   bootstrapPrivateProAccount,
   activatePrivateProAccountRecord,
+  PrivateProAccessDeniedError,
   privateProAccountIsCurrent,
   type PrivateProAccountRecord,
   type PrivateProAuthAdminPort,
@@ -124,7 +125,10 @@ describe('private Pro account bootstrap', () => {
         attachmentQuotaBytes: 1024,
         nowMs: 5000,
       }),
-      /not allowed/i,
+      error => {
+        assert.ok(error instanceof PrivateProAccessDeniedError);
+        return true;
+      },
     );
     assert.equal(admin.saved, 0);
   });

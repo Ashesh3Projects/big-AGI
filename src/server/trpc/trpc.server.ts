@@ -13,7 +13,7 @@ import { transformer } from './trpc.transformer';
 import { TRPCFetcherError } from './trpc.router.fetchers';
 
 import { getPrivateProServerConfig } from '~/modules/private-pro/config/privatePro.config.server';
-import { privateProIdentityCanAccessDeployment, privateProIdentityHasPremiumAccess } from '~/modules/private-pro/auth/privatePro.auth.types';
+import { privateProIdentityCanAccessDeployment, privateProIdentityCanBootstrap, privateProIdentityHasPremiumAccess } from '~/modules/private-pro/auth/privatePro.auth.types';
 import { extractFirebaseBearerToken, verifyFirebaseIdToken } from '~/modules/private-pro/firebase/firebase.token';
 
 
@@ -140,7 +140,7 @@ export const edgeProcedure = t.procedure.use(requireDeploymentAccess);
  */
 const requireAuthed = t.middleware(({ ctx, next }) => {
   const config = getPrivateProServerConfig();
-  if (!ctx.privateProIdentity || !privateProIdentityCanAccessDeployment(true, ctx.privateProIdentity, config.allowedEmails))
+  if (!privateProIdentityCanBootstrap(ctx.privateProIdentity, config.allowedEmails))
     throw new TRPCError({ code: 'UNAUTHORIZED', message: ctx.privateProAuthError?.message ?? 'Authentication required.' });
   return next({
     ctx: {

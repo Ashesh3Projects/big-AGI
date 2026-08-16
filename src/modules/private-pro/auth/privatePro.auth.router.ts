@@ -1,3 +1,5 @@
+import { TRPCError } from '@trpc/server';
+
 import { createTRPCRouter } from '~/server/trpc/trpc.server';
 
 import { getPrivateProServerConfig } from '../config/privatePro.config.server';
@@ -6,6 +8,7 @@ import { privateProBootstrapProcedure, privateProNodePremiumProcedure } from './
 import {
   bootstrapPrivateProAccount,
   activatePrivateProAccountRecord,
+  PrivateProAccessDeniedError,
   type PrivateProAccountRecord,
   type PrivateProAuthAdminPort,
 } from './privatePro.auth.service';
@@ -38,11 +41,17 @@ function createPrivateProAuthAdminPort(): PrivateProAuthAdminPort {
 export const privateProAuthRouter = createTRPCRouter({
   bootstrap: privateProBootstrapProcedure.mutation(async ({ ctx }) => {
     const config = getPrivateProServerConfig();
-    return bootstrapPrivateProAccount(ctx.privateProIdentity, createPrivateProAuthAdminPort(), {
-      allowedEmails: config.allowedEmails,
-      attachmentQuotaBytes: config.attachmentQuotaBytes,
-      nowMs: Date.now(),
-    });
+    try {
+      return await bootstrapPrivateProAccount(ctx.privateProIdentity, createPrivateProAuthAdminPort(), {
+        allowedEmails: config.allowedEmails,
+        attachmentQuotaBytes: config.attachmentQuotaBytes,
+        nowMs: Date.now(),
+      });
+    } catch (error) {
+      if (error instanceof PrivateProAccessDeniedError)
+        throw new TRPCError({ code: 'UNAUTHORIZED', message: error.message });
+      throw error;
+    }
   }),
   status: privateProNodePremiumProcedure.query(({ ctx }) => ({
     uid: ctx.privateProAccount.uid,

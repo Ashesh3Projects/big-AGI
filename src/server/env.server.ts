@@ -133,6 +133,7 @@ export const env = createEnv({
     PRIVATE_PRO_MAX_FILE_BYTES: z.string().regex(/^\d+$/).optional(),
     FIREBASE_CLIENT_EMAIL: z.string().optional(),
     FIREBASE_PRIVATE_KEY: z.string().optional(),
+    CRON_SECRET: z.string().optional(),
 
     // AIX: Strict parsing mode - if omitted: strict in dev (throws on unknown API values), tolerant in prod (warns)
     // Set to 'true' to force strict mode in production (useful for debugging API drift)

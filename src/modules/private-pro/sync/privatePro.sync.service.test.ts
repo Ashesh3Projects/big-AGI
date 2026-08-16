@@ -131,7 +131,7 @@ function prepareRequest(operationId = 'op-1') {
     operationId,
     chatId: 'chat-1',
     baseRevision: 0,
-    contentHash: 'b'.repeat(64),
+    contentHash: CHUNK.hash,
     chunks: [{ id: CHUNK.id, index: CHUNK.index, byteLength: CHUNK.byteLength, hash: CHUNK.hash }],
     deviceId: 'device-1',
   };
@@ -188,6 +188,19 @@ describe('private Pro revisioned sync service', () => {
       service.putChatChunk(IDENTITY, { operationId: 'op-1', chunk: { ...CHUNK, payloadBase64: 'YWJk' } }),
       /failed validation/i,
     );
+  });
+
+  test('refuses a chat whose assembled payload does not match the manifest hash', async () => {
+    const repository = new MemorySyncRepository();
+    const service = createPrivateProSyncService(repository, () => 1000);
+    await service.prepareChat(IDENTITY, { ...prepareRequest(), contentHash: 'b'.repeat(64) });
+    await service.putChatChunk(IDENTITY, { operationId: 'op-1', chunk: CHUNK });
+
+    await assert.rejects(
+      service.commitChat(IDENTITY, { operationId: 'op-1' }),
+      /content hash/i,
+    );
+    assert.equal(repository.chats.size, 0);
   });
 
   test('a tombstone prevents a stale offline chat from being resurrected', async () => {

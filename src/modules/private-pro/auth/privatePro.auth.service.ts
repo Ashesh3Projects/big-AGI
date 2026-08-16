@@ -2,6 +2,13 @@ import { isPrivateProEmailAllowed } from '../config/privatePro.config.server';
 import type { PrivateProIdentity } from './privatePro.auth.types';
 
 
+export class PrivateProAccessDeniedError extends Error {
+  constructor() {
+    super('This Google account is not allowed to use private Pro.');
+    this.name = 'PrivateProAccessDeniedError';
+  }
+}
+
 export interface PrivateProAccountRecord {
   uid: string;
   email: string;
@@ -67,7 +74,7 @@ export async function bootstrapPrivateProAccount(
   options: PrivateProBootstrapOptions,
 ): Promise<PrivateProBootstrap> {
   if (!identity.emailVerified || !isPrivateProEmailAllowed(identity.email, options.allowedEmails))
-    throw new Error('This Google account is not allowed to use private Pro.');
+    throw new PrivateProAccessDeniedError();
 
   const account = await admin.activateAccount({
     uid: identity.uid,

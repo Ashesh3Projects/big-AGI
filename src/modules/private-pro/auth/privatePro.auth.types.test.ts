@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 
 import {
   privateProIdentityCanAccessDeployment,
+  privateProIdentityCanBootstrap,
   privateProIdentityHasPremiumAccess,
   type PrivateProIdentity,
 } from './privatePro.auth.types';
@@ -27,10 +28,13 @@ describe('private Pro access decisions', () => {
   test('requires an allowlisted verified identity when enabled', () => {
     const allowlist = new Set(['friend@example.com']);
 
-    assert.equal(privateProIdentityCanAccessDeployment(true, VERIFIED_IDENTITY, allowlist), true);
+    assert.equal(privateProIdentityCanAccessDeployment(true, VERIFIED_IDENTITY, allowlist), false);
+    assert.equal(privateProIdentityCanAccessDeployment(true, { ...VERIFIED_IDENTITY, privatePro: true, privateProEpoch: 1 }, allowlist), true);
     assert.equal(privateProIdentityCanAccessDeployment(true, null, allowlist), false);
     assert.equal(privateProIdentityCanAccessDeployment(true, { ...VERIFIED_IDENTITY, email: 'other@example.com' }, allowlist), false);
     assert.equal(privateProIdentityCanAccessDeployment(true, { ...VERIFIED_IDENTITY, emailVerified: false }, allowlist), false);
+    assert.equal(privateProIdentityCanBootstrap(VERIFIED_IDENTITY, allowlist), true);
+    assert.equal(privateProIdentityCanBootstrap({ ...VERIFIED_IDENTITY, email: 'other@example.com' }, allowlist), false);
   });
 
   test('requires both the private Pro claim and a positive access epoch', () => {

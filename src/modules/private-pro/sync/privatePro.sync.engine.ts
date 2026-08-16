@@ -54,6 +54,13 @@ export interface PrivateProSyncTransport {
 }
 
 export type PrivateProSyncStartResult = 'started' | 'already-started' | 'binding-conflict';
+export type PrivateProSyncProblemPhase = 'offline' | 'quota-blocked' | 'error';
+
+export interface PrivateProSyncProblem {
+  kind: 'retryable' | 'blocked';
+  phase: PrivateProSyncProblemPhase;
+  message: string;
+}
 
 export interface PrivateProSyncEngine {
   start(): Promise<PrivateProSyncStartResult>;
@@ -70,10 +77,45 @@ interface PrivateProSyncEngineDependencies {
   store: PrivateProLocalStorePort;
   transport: PrivateProSyncTransport;
   now?: () => number;
+  random?: () => number;
+  onStatus?: (status: { phase: PrivateProSyncProblemPhase; error: string }) => void;
 }
 
 const LEASE_MS = 30_000;
-const RETRY_DELAY_MS = 5_000;
+const MAX_RETRY_DELAY_MS = 60_000;
+
+function errorCode(error: unknown): string | null {
+  if (!error || typeof error !== 'object') return null;
+  const data = 'data' in error ? error.data : undefined;
+  return data && typeof data === 'object' && 'code' in data && typeof data.code === 'string'
+    ? data.code
+    : null;
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (error && typeof error === 'object' && 'message' in error && typeof error.message === 'string') return error.message;
+  return 'Private sync failed.';
+}
+
+export function privateProClassifySyncError(error: unknown): PrivateProSyncProblem {
+  const message = errorMessage(error);
+  const normalized = message.toLowerCase();
+  if (normalized.includes('quota')) return { kind: 'blocked', phase: 'quota-blocked', message };
+
+  const code = errorCode(error);
+  if (code && ['UNAUTHORIZED', 'FORBIDDEN', 'BAD_REQUEST', 'PAYLOAD_TOO_LARGE', 'UNPROCESSABLE_CONTENT'].includes(code))
+    return { kind: 'blocked', phase: 'error', message };
+  if (normalized.includes('schema') || normalized.includes('validation') || normalized.includes('permission denied'))
+    return { kind: 'blocked', phase: 'error', message };
+  return { kind: 'retryable', phase: 'offline', message };
+}
+
+export function privateProRetryDelay(attempts: number, random: () => number = Math.random): number {
+  const exponential = Math.min(MAX_RETRY_DELAY_MS, 1000 * 2 ** Math.max(0, attempts));
+  const jitter = 0.75 + Math.min(1, Math.max(0, random())) * 0.5;
+  return Math.round(exponential * jitter);
+}
 
 function entityKey(entityType: PrivateProEntityType, entityId: string): string {
   return `${entityType}:${entityId}`;
@@ -96,6 +138,7 @@ export function privateProOperationId(operation: PrivateProOutboxOperation): str
 
 export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencies): PrivateProSyncEngine {
   const now = deps.now ?? Date.now;
+  const random = deps.random ?? Math.random;
   let started = false;
   let stopped = false;
   let suppressLocalEvents = 0;
@@ -173,7 +216,10 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
   };
 
   const enqueueEntity = async (entity: PrivateProLocalEntity, baseRevision: number) => {
-    await deps.db.discardOperationsForEntity(deps.uid, entity.entityType, entity.entityId);
+    await deps.db.discardOperationsForEntity(deps.uid, entity.entityType, entity.entityId, {
+      kind: 'upsert',
+      contentHash: entity.contentHash,
+    });
     await deps.db.enqueueOperation({
       uid: deps.uid,
       entityType: entity.entityType,
@@ -312,7 +358,10 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
         updatedAtMs: now(),
       });
     } catch (error) {
-      await deps.db.retryOperation(operation.id, error instanceof Error ? error.message : 'Private sync failed.', now(), RETRY_DELAY_MS);
+      const problem = privateProClassifySyncError(error);
+      if (problem.kind === 'blocked') await deps.db.blockOperation(operation.id, problem.message);
+      else await deps.db.retryOperation(operation.id, problem.message, now(), privateProRetryDelay(operation.attempts, random));
+      deps.onStatus?.({ phase: problem.phase, error: problem.message });
     }
   };
 

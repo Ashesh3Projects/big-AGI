@@ -29,6 +29,7 @@ export interface PrivateProAssetsTransaction {
 
 export interface PrivateProAssetsPort {
   transaction<T>(uid: string, callback: (transaction: PrivateProAssetsTransaction) => Promise<T>): Promise<T>;
+  listExpiredReservations(atMs: number, limit: number): Promise<Array<{ uid: string; operationId: string }>>;
   createSignedUpload(objectPath: string, contentType: string, contentHash: string): Promise<{
     uploadUrl: string;
     requiredHeaders: Record<string, string>;
@@ -70,7 +71,7 @@ function reservationResponse(reservation: PrivateProAssetReservation, upload: {
 }
 
 export function createPrivateProAssetsService(port: PrivateProAssetsPort, now: () => number = Date.now) {
-  return {
+  const service = {
     async reserveUpload(uid: string, input: ReserveAssetUploadInput) {
       assertReserveInput(input);
       const reservation = await port.transaction(uid, async transaction => {
@@ -242,5 +243,17 @@ export function createPrivateProAssetsService(port: PrivateProAssetsPort, now: (
       await port.deleteObject(objectPath).catch(() => undefined);
       return true;
     },
+
+    async sweepExpiredReservations(atMs = now(), limit = 100) {
+      const reservations = await port.listExpiredReservations(atMs, limit);
+      let released = 0;
+      for (const reservation of reservations) {
+        if (await service.releaseExpiredReservation(reservation.uid, reservation.operationId, atMs)) released++;
+      }
+      return { released };
+    },
   };
+  return service;
 }
+
+export type PrivateProAssetsService = ReturnType<typeof createPrivateProAssetsService>;

@@ -19,6 +19,7 @@ interface PrivateProSyncState {
   reservedBytes: number;
   quotaBytes: number;
   lastError: string | null;
+  retry: (() => Promise<void>) | null;
   setState: (state: Partial<Omit<PrivateProSyncState, 'setState'>>) => void;
 }
 
@@ -29,6 +30,7 @@ export const usePrivateProSyncStore = create<PrivateProSyncState>()(set => ({
   reservedBytes: 0,
   quotaBytes: 1024 * 1024 * 1024,
   lastError: null,
+  retry: null,
   setState: state => set(state),
 }));
 

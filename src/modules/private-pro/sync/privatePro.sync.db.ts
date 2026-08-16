@@ -26,6 +26,7 @@ export interface PrivateProOutboxOperation {
   availableAtMs: number;
   leaseUntilMs: number;
   attempts: number;
+  blocked?: boolean;
   lastError?: string;
 }
 
@@ -133,7 +134,7 @@ export class PrivateProSyncDB extends Dexie {
         true,
         true,
       ).sortBy('availableAtMs');
-      const candidate = candidates.find(operation => operation.leaseUntilMs <= nowMs);
+      const candidate = candidates.find(operation => !operation.blocked && operation.leaseUntilMs <= nowMs);
       if (!candidate?.id) return null;
       const leaseUntilMs = nowMs + leaseMs;
       await this.outbox.update(candidate.id, { leaseUntilMs });
@@ -148,6 +149,19 @@ export class PrivateProSyncDB extends Dexie {
       await this.outbox.update(id, {
         attempts: operation.attempts + 1,
         availableAtMs: nowMs + delayMs,
+        leaseUntilMs: 0,
+        lastError: error,
+      });
+    });
+  }
+
+  async blockOperation(id: number, error: string): Promise<void> {
+    await this.transaction('rw', this.outbox, async () => {
+      const operation = await this.outbox.get(id);
+      if (!operation) return;
+      await this.outbox.update(id, {
+        attempts: operation.attempts + 1,
+        blocked: true,
         leaseUntilMs: 0,
         lastError: error,
       });
@@ -170,16 +184,23 @@ export class PrivateProSyncDB extends Dexie {
   }
 
   async makeOperationsDue(uid: string, nowMs: number): Promise<void> {
-    await this.outbox.where('uid').equals(uid).modify({ availableAtMs: nowMs, leaseUntilMs: 0 });
+    await this.outbox.where('uid').equals(uid).modify({ availableAtMs: nowMs, leaseUntilMs: 0, blocked: false });
   }
 
   async discardOperation(id: number): Promise<void> {
     await this.outbox.delete(id);
   }
 
-  async discardOperationsForEntity(uid: string, entityType: PrivateProEntityType, entityId: string): Promise<void> {
+  async discardOperationsForEntity(
+    uid: string,
+    entityType: PrivateProEntityType,
+    entityId: string,
+    preserve?: Pick<PrivateProOutboxOperation, 'kind' | 'contentHash'>,
+  ): Promise<void> {
     const operations = await this.outbox.where('uid').equals(uid).filter(operation =>
-      operation.entityType === entityType && operation.entityId === entityId
+      operation.entityType === entityType &&
+      operation.entityId === entityId &&
+      (!preserve || operation.kind !== preserve.kind || operation.contentHash !== preserve.contentHash)
     ).primaryKeys();
     await this.outbox.bulkDelete(operations);
   }
