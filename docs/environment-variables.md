@@ -65,11 +65,26 @@ ELEVENLABS_VOICE_ID=
 HTTP_BASIC_AUTH_USERNAME=
 HTTP_BASIC_AUTH_PASSWORD=
 
+# Private Pro Firebase deployment (see deploy-private-pro-firebase.md)
+PRIVATE_PRO_ALLOWED_EMAILS=
+PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES=1073741824
+PRIVATE_PRO_MAX_FILE_BYTES=67108864
+FIREBASE_CLIENT_EMAIL=
+FIREBASE_PRIVATE_KEY=
+
 
 # Frontend variables 
 NEXT_PUBLIC_MOTD=
 NEXT_PUBLIC_GA4_MEASUREMENT_ID=
 NEXT_PUBLIC_GOOGLE_DRIVE_CLIENT_ID=
+NEXT_PUBLIC_PRIVATE_PRO_ENABLED=
+NEXT_PUBLIC_FIREBASE_API_KEY=
+NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN=
+NEXT_PUBLIC_FIREBASE_PROJECT_ID=
+NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=
+NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=
+NEXT_PUBLIC_FIREBASE_APP_ID=
+NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY=
 NEXT_PUBLIC_PLANTUML_SERVER_URL=
 NEXT_PUBLIC_POSTHOG_KEY=
 ```
@@ -144,6 +159,18 @@ Enable the app to Talk, Draw, and Google things up.
 | `HTTP_BASIC_AUTH_USERNAME` | See the [Authentication](deploy-authentication.md) guide. Username for HTTP Basic Authentication.                       |
 | `HTTP_BASIC_AUTH_PASSWORD` | Password for HTTP Basic Authentication.                                                                                 |
 
+### Private Pro Firebase
+
+See [Private Pro Firebase deployment](deploy-private-pro-firebase.md) for the complete setup and security model.
+
+| Variable                             | Description                                                                                         |
+|:-------------------------------------|:----------------------------------------------------------------------------------------------------|
+| `PRIVATE_PRO_ALLOWED_EMAILS`         | Comma-separated exact Google email allowlist.                                                       |
+| `PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES` | Attachment quota per account. Defaults to 1073741824 bytes.                                        |
+| `PRIVATE_PRO_MAX_FILE_BYTES`         | Maximum size of one synchronized attachment. Defaults to 67108864 bytes.                            |
+| `FIREBASE_CLIENT_EMAIL`              | Firebase Admin service-account email. Server-only.                                                  |
+| `FIREBASE_PRIVATE_KEY`               | Firebase Admin private key. Server-only. Supports escaped `\n` line breaks.                        |
+
 ### Frontend Variables
 
 The value of these variables are passed to the frontend (Web UI) - make sure they do not contain secrets.
@@ -154,6 +181,14 @@ The value of these variables are passed to the frontend (Web UI) - make sure the
 | `NEXT_PUBLIC_MOTD`                | Message of the Day - displays a dismissible banner at the top of the app (see [customizations](customizations.md) for the template variables). Example: 🔔 Welcome to our deployment! Version {{app_build_pkgver}} built on {{app_build_time}}. |
 | `NEXT_PUBLIC_GA4_MEASUREMENT_ID`  | (optional) The measurement ID for Google Analytics 4. (see [deploy-analytics](deploy-analytics.md))                                                                                                                                             |
 | `NEXT_PUBLIC_GOOGLE_DRIVE_CLIENT_ID` | (optional) Google OAuth Client ID for Drive Picker. Can reuse `AUTH_GOOGLE_ID`. See [Google Drive](config-feature-google-drive.md)                                                                                                          |
+| `NEXT_PUBLIC_PRIVATE_PRO_ENABLED`    | Set to `true` to require allowlisted Firebase authentication and enable cloud sync.                                                                                          |
+| `NEXT_PUBLIC_FIREBASE_API_KEY`       | Firebase Web App API key. Public browser configuration.                                                                                                                      |
+| `NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN`   | Firebase Authentication domain.                                                                                                                                              |
+| `NEXT_PUBLIC_FIREBASE_PROJECT_ID`    | Firebase project ID used for ID-token verification and browser services.                                                                                                     |
+| `NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET` | Cloud Storage bucket for synchronized attachments.                                                                                                                          |
+| `NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID` | Firebase Web App sender ID.                                                                                                                                             |
+| `NEXT_PUBLIC_FIREBASE_APP_ID`        | Firebase Web App ID.                                                                                                                                                          |
+| `NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY` | reCAPTCHA v3 App Check site key. When set, protected Vercel mutations require App Check.                                                                                |
 | `NEXT_PUBLIC_PLANTUML_SERVER_URL` | The URL of the PlantUML server, used for rendering UML diagrams. Allows using custom local servers.                                                                                                                                             |
 | `NEXT_PUBLIC_POSTHOG_KEY`         | (optional) Key for PostHog analytics. (see [deploy-analytics](deploy-analytics.md))                                                                                                                                                             |
 
