@@ -8,6 +8,7 @@ import Dexie from 'dexie';
 import { PrivateProSyncDB } from './privatePro.sync.db';
 import {
   createPrivateProSyncEngine,
+  privateProOperationId,
   type PrivateProLocalEntity,
   type PrivateProLocalStorePort,
   type PrivateProRemoteEvent,
@@ -36,6 +37,7 @@ function entity(entityType: 'chat' | 'persona', id: string, value: string): Priv
 
 class FakeStore implements PrivateProLocalStorePort {
   entities = new Map<string, PrivateProLocalEntity>();
+  deferred = new Set<string>();
   conflicts: PrivateProLocalEntity[] = [];
   listeners = new Set<() => void>();
   applyingRemote = false;
@@ -45,11 +47,17 @@ class FakeStore implements PrivateProLocalStorePort {
   }
 
   async snapshot() {
-    return [...this.entities.values()].map(item => structuredClone(item));
+    return [...this.entities.entries()]
+      .filter(([key]) => !this.deferred.has(key))
+      .map(([, item]) => structuredClone(item));
   }
 
   async get(entityType: 'chat' | 'persona', entityId: string) {
     return structuredClone(this.entities.get(`${entityType}:${entityId}`) ?? null);
+  }
+
+  async exists(entityType: 'chat' | 'persona', entityId: string) {
+    return this.entities.has(`${entityType}:${entityId}`);
   }
 
   async applyUpsert(entity: PrivateProLocalEntity) {
@@ -151,6 +159,29 @@ class FakeTransport implements PrivateProSyncTransport {
 
 
 describe('private Pro sync engine', () => {
+  test('uses the device ID to avoid cross-device operation collisions', () => {
+    const base = {
+      id: 1,
+      dedupeKey: 'key',
+      uid: 'uid-a',
+      entityType: 'chat' as const,
+      entityId: 'chat-1',
+      kind: 'upsert' as const,
+      baseRevision: 0,
+      contentHash: 'a'.repeat(64),
+      payload: {},
+      createdAtMs: 100,
+      availableAtMs: 100,
+      leaseUntilMs: 0,
+      attempts: 0,
+    };
+
+    assert.notEqual(
+      privateProOperationId({ ...base, deviceId: 'device-a' }),
+      privateProOperationId({ ...base, deviceId: 'device-b' }),
+    );
+  });
+
   test('automatically migrates existing local entities and resumes idempotently', async (t) => {
     const db = createDB(t);
     const store = new FakeStore([entity('chat', 'chat-1', 'a'), entity('persona', 'persona-1', 'b')]);
@@ -196,6 +227,28 @@ describe('private Pro sync engine', () => {
     await engine.whenIdle();
     assert.equal(await db.outboxCount('uid-a'), 0);
     assert.deepEqual(transport.writes, ['chat:chat-1']);
+    engine.stop();
+  });
+
+  test('does not delete a temporarily deferred local chat', async (t) => {
+    const db = createDB(t);
+    const local = entity('chat', 'chat-streaming', 'a');
+    const store = new FakeStore([local]);
+    store.deferred.add('chat:chat-streaming');
+    await db.putEntityState({
+      uid: 'uid-a', entityKey: 'chat:chat-streaming', entityType: 'chat', entityId: 'chat-streaming',
+      remoteRevision: 1, localHash: local.contentHash, remoteHash: local.contentHash, updatedAtMs: 100,
+    });
+    const transport = new FakeTransport();
+    transport.remote.set('chat:chat-streaming', { kind: 'upsert', revision: 1, entity: local });
+    const engine = createPrivateProSyncEngine({ uid: 'uid-a', deviceId: 'device-a', db, store, transport, now: () => 1000 });
+
+    await engine.start();
+    await engine.whenIdle();
+
+    assert.deepEqual(transport.writes, []);
+    assert.equal(await db.outboxCount('uid-a'), 0);
+    assert.notEqual(await store.get('chat', 'chat-streaming'), null);
     engine.stop();
   });
 
@@ -254,6 +307,23 @@ describe('private Pro sync engine', () => {
 
     assert.equal(store.conflicts.length, 1);
     assert.equal((await store.get('chat', 'chat-1'))?.contentHash, remote.contentHash);
+    assert.equal(await db.outboxCount('uid-a'), 0);
+    engine.stop();
+  });
+
+  test('resolves an upload conflict against a remote tombstone', async (t) => {
+    const db = createDB(t);
+    const local = entity('chat', 'chat-deleted', 'a');
+    const store = new FakeStore([local]);
+    const transport = new FakeTransport();
+    transport.remote.set('chat:chat-deleted', { kind: 'delete', entityType: 'chat', entityId: 'chat-deleted', revision: 2 });
+    const engine = createPrivateProSyncEngine({ uid: 'uid-a', deviceId: 'device-a', db, store, transport, now: () => 1000 });
+
+    await engine.start();
+    await engine.whenIdle();
+
+    assert.equal(store.conflicts.length, 1);
+    assert.equal(await store.get('chat', 'chat-deleted'), null);
     assert.equal(await db.outboxCount('uid-a'), 0);
     engine.stop();
   });

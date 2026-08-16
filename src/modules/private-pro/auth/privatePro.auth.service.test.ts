@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 
 import {
   bootstrapPrivateProAccount,
+  activatePrivateProAccountRecord,
   privateProAccountIsCurrent,
   type PrivateProAccountRecord,
   type PrivateProAuthAdminPort,
@@ -25,13 +26,10 @@ class FakeAdminPort implements PrivateProAuthAdminPort {
   claims: { privatePro: true; privateProEpoch: number } | null = null;
   saved = 0;
 
-  async getAccount() {
-    return this.account;
-  }
-
-  async saveAccount(record: PrivateProAccountRecord) {
-    this.account = structuredClone(record);
+  async activateAccount(input: { uid: string; email: string; quotaBytes: number; nowMs: number }) {
+    this.account = activatePrivateProAccountRecord(this.account, input);
     this.saved++;
+    return structuredClone(this.account);
   }
 
   async setClaims(_uid: string, claims: { privatePro: true; privateProEpoch: number }) {

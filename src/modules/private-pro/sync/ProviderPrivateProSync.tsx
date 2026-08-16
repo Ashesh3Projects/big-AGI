@@ -1,13 +1,16 @@
 import * as React from 'react';
+import { Alert, Button, CircularProgress, Sheet, Stack, Typography } from '@mui/joy';
 
 import {
   personaSyncDelete,
+  personaSyncExists,
   personaSyncSnapshot,
   personaSyncSubscribe,
   personaSyncUpsert,
 } from '../../../apps/personas/store-app-personas';
 import {
   chatSyncDelete,
+  chatSyncExists,
   chatSyncSnapshot,
   chatSyncSubscribe,
   chatSyncUpsert,
@@ -23,6 +26,7 @@ import { privateProSyncDB } from './privatePro.sync.db';
 import { createPrivateProFirebaseTransport } from './privatePro.sync.transport';
 import { privateProSyncState } from './store-private-pro-sync';
 import { privateProHydrateDBAsset, privateProUploadDBAsset } from '../assets/privatePro.assets.client';
+import { PrivateProVaultResetDialog } from '../ui/PrivateProVaultResetDialog';
 
 
 function createLocalStorePort(): PrivateProLocalStorePort {
@@ -56,6 +60,10 @@ function createLocalStorePort(): PrivateProLocalStorePort {
 
     async get(entityType, entityId) {
       return (await this.snapshot()).find(entity => entity.entityType === entityType && entity.entityId === entityId) ?? null;
+    },
+
+    async exists(entityType, entityId) {
+      return entityType === 'chat' ? chatSyncExists(entityId) : personaSyncExists(entityId);
     },
 
     async applyUpsert(entity) {
@@ -104,12 +112,24 @@ function createLocalStorePort(): PrivateProLocalStorePort {
 }
 
 export function ProviderPrivateProSync(props: { children: React.ReactNode }) {
-  const { state, user } = usePrivateProAuth();
+  const { state, user, bootstrap, signOut } = usePrivateProAuth();
+  const [bindingGate, setBindingGate] = React.useState<{ uid: string; status: 'checking' | 'ready' | 'conflict' } | null>(null);
 
   React.useEffect(() => {
-    if (state !== 'signed-in' || !user) return;
+    if (state !== 'signed-in' || !user) {
+      setBindingGate(null);
+      return;
+    }
+    let cancelled = false;
+    setBindingGate({ uid: user.uid, status: 'checking' });
     const syncState = privateProSyncState();
-    syncState.setState({ phase: 'migrating', lastError: null });
+    syncState.setState({
+      phase: 'migrating',
+      lastError: null,
+      usedBytes: bootstrap?.usedBytes ?? 0,
+      reservedBytes: bootstrap?.reservedBytes ?? 0,
+      quotaBytes: bootstrap?.quotaBytes ?? 1024 * 1024 * 1024,
+    });
     const engine = createPrivateProSyncEngine({
       uid: user.uid,
       deviceId: deviceGetGlobalDeviceId(),
@@ -117,15 +137,64 @@ export function ProviderPrivateProSync(props: { children: React.ReactNode }) {
       store: createLocalStorePort(),
       transport: createPrivateProFirebaseTransport(user.uid),
     });
+    let statusTimer: ReturnType<typeof setTimeout> | undefined;
+    const refreshStatus = async () => {
+      if (cancelled) return;
+      const pendingOperations = await privateProSyncDB.outboxCount(user.uid);
+      if (cancelled) return;
+      const current = privateProSyncState();
+      current.setState({
+        pendingOperations,
+        ...(current.phase !== 'binding-conflict' && current.phase !== 'conflict' && current.phase !== 'error'
+          ? { phase: pendingOperations ? 'syncing' : 'synced' }
+          : {}),
+      });
+      statusTimer = setTimeout(() => void refreshStatus(), pendingOperations ? 2000 : 30000);
+    };
     void engine.start().then(result => {
+      if (cancelled) return;
+      setBindingGate({ uid: user.uid, status: result === 'binding-conflict' ? 'conflict' : 'ready' });
       syncState.setState({ phase: result === 'binding-conflict' ? 'binding-conflict' : 'syncing' });
-      if (result === 'started') void engine.whenIdle().then(() => syncState.setState({ phase: 'synced' }));
-    }).catch(error => syncState.setState({
-      phase: 'error',
-      lastError: error instanceof Error ? error.message : 'Private sync failed to start.',
-    }));
-    return () => engine.stop();
-  }, [state, user]);
+      if (result === 'started') {
+        void engine.whenIdle().then(refreshStatus);
+      }
+    }).catch(error => {
+      if (cancelled) return;
+      syncState.setState({
+        phase: 'error',
+        lastError: error instanceof Error ? error.message : 'Private sync failed to start.',
+      });
+    });
+    return () => {
+      cancelled = true;
+      if (statusTimer) clearTimeout(statusTimer);
+      engine.stop();
+    };
+  }, [bootstrap, state, user]);
+
+  if (state === 'signed-in' && user && (bindingGate?.uid !== user.uid || bindingGate.status === 'checking')) {
+    return (
+      <Sheet sx={{ minHeight: '100vh', display: 'grid', placeItems: 'center' }}>
+        <Stack spacing={1.5} alignItems='center'>
+          <CircularProgress />
+          <Typography textColor='text.secondary'>Opening your private vault...</Typography>
+        </Stack>
+      </Sheet>
+    );
+  }
+
+  if (state === 'signed-in' && user && bindingGate?.uid === user.uid && bindingGate.status === 'conflict') {
+    return (
+      <Sheet sx={{ minHeight: '100vh', display: 'grid', placeItems: 'center', p: 2 }}>
+        <Stack spacing={2} sx={{ width: 'min(100%, 520px)' }}>
+          <Typography level='h2'>Different account on this browser</Typography>
+          <Alert color='warning'>This browser contains a local vault bound to another Google account. Its chats are hidden to prevent uploading or exposing them to the current account.</Alert>
+          <Button variant='soft' color='neutral' onClick={() => void signOut()}>Sign out and use the original account</Button>
+          <PrivateProVaultResetDialog onDone={() => setBindingGate({ uid: user.uid, status: 'checking' })} />
+        </Stack>
+      </Sheet>
+    );
+  }
 
   return props.children;
 }

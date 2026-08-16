@@ -26,7 +26,7 @@ const CHUNK: SyncChunk = {
   id: '000000',
   index: 0,
   byteLength: 3,
-  hash: 'a'.repeat(64),
+  hash: 'ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad',
   payloadBase64: 'YWJj',
 };
 
@@ -183,6 +183,10 @@ describe('private Pro revisioned sync service', () => {
     await assert.rejects(
       service.putChatChunk(IDENTITY, { operationId: 'op-1', chunk: { ...CHUNK, hash: 'd'.repeat(64) } }),
       /does not match/i,
+    );
+    await assert.rejects(
+      service.putChatChunk(IDENTITY, { operationId: 'op-1', chunk: { ...CHUNK, payloadBase64: 'YWJk' } }),
+      /failed validation/i,
     );
   });
 

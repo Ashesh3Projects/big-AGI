@@ -4,6 +4,7 @@ import type { DBlobAssetId, DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import { convert_Base64_To_UInt8Array, convert_UInt8Array_To_Base64 } from '~/common/util/blobUtils';
 
 import { privateProHash } from '../sync/privatePro.sync.chunk';
+import { privateProSyncState } from '../sync/store-private-pro-sync';
 
 
 function assetMetadata(asset: DBlobDBAsset) {
@@ -38,8 +39,22 @@ export async function privateProUploadDBAsset(assetId: DBlobAssetId): Promise<vo
     headers: reservation.requiredHeaders,
     body: bytes,
   });
-  if (!response.ok) throw new Error(`Attachment upload failed with HTTP ${response.status}.`);
+  if (!response.ok) {
+    await apiAsyncNode.privateProAssets.releaseReservation.mutate({ operationId }).catch(() => undefined);
+    await refreshPrivateProQuota().catch(() => undefined);
+    throw new Error(`Attachment upload failed with HTTP ${response.status}.`);
+  }
   await apiAsyncNode.privateProAssets.finalizeUpload.mutate({ operationId });
+  await refreshPrivateProQuota();
+}
+
+async function refreshPrivateProQuota(): Promise<void> {
+  const status = await apiAsyncNode.privateProAuth.status.query();
+  privateProSyncState().setState({
+    usedBytes: status.usedBytes,
+    reservedBytes: status.reservedBytes,
+    quotaBytes: status.quotaBytes,
+  });
 }
 
 export async function privateProHydrateDBAsset(assetId: DBlobAssetId): Promise<void> {

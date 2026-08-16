@@ -39,6 +39,9 @@ export async function verifyFirebaseIdToken(token: string, options: VerifyFireba
     typeof payload.exp !== 'number'
   )
     throw new Error('Firebase identity requires a verified email.');
+  const firebaseClaim = payload.firebase;
+  if (!firebaseClaim || typeof firebaseClaim !== 'object' || !('sign_in_provider' in firebaseClaim) || firebaseClaim.sign_in_provider !== 'google.com')
+    throw new Error('Private Pro requires Google sign-in.');
 
   const privateProEpoch = payload.privateProEpoch;
   return {

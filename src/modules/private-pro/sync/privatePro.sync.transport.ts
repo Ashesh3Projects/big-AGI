@@ -1,6 +1,7 @@
 import {
   collection,
   doc,
+  getDoc,
   onSnapshot,
   orderBy,
   query,
@@ -114,36 +115,35 @@ export function createPrivateProFirebaseTransport(uid: string): PrivateProSyncTr
 
     async fetch(entityType, entityId) {
       const firestore = getPrivateProClientFirestore();
-      return new Promise<PrivateProRemoteEvent | null>((resolve, reject) => {
-        const reference = entityType === 'chat'
+      const [canonicalSnapshot, tombstoneSnapshot] = await Promise.all([
+        getDoc(entityType === 'chat'
           ? doc(firestore, `users/${uid}/chats/${entityId}`)
-          : doc(firestore, `users/${uid}/personas/${entityId}`);
-        const unsubscribe = onSnapshot(reference, async snapshot => {
-          unsubscribe();
-          if (!snapshot.exists()) return resolve(null);
-          try {
-            if (entityType === 'chat') {
-              const manifest = snapshot.data();
-              if (!isManifest(manifest)) throw new Error('Remote chat manifest is invalid.');
-              resolve({ kind: 'upsert', revision: manifest.revision, entity: await downloadChat(uid, manifest) });
-            } else {
-              const persona = snapshot.data() as RemotePersonaDocument;
-              resolve({
-                kind: 'upsert',
-                revision: persona.revision,
-                entity: {
-                  entityType: 'persona',
-                  entityId: persona.personaId,
-                  contentHash: persona.contentHash,
-                  payload: SyncPersonaSchema.parse(persona.payload),
-                },
-              });
-            }
-          } catch (error) {
-            reject(error);
-          }
-        }, reject);
-      });
+          : doc(firestore, `users/${uid}/personas/${entityId}`)),
+        getDoc(doc(firestore, `users/${uid}/tombstones/${entityType}:${entityId}`)),
+      ]);
+      const tombstone = tombstoneSnapshot.exists() ? tombstoneSnapshot.data() as RemoteTombstoneDocument : null;
+      const canonicalRevision = canonicalSnapshot.exists() && typeof canonicalSnapshot.data().revision === 'number'
+        ? canonicalSnapshot.data().revision as number
+        : 0;
+      if (tombstone && tombstone.revision >= canonicalRevision)
+        return { kind: 'delete', ...tombstone };
+      if (!canonicalSnapshot.exists()) return null;
+      if (entityType === 'chat') {
+        const manifest = canonicalSnapshot.data();
+        if (!isManifest(manifest)) throw new Error('Remote chat manifest is invalid.');
+        return { kind: 'upsert', revision: manifest.revision, entity: await downloadChat(uid, manifest) };
+      }
+      const persona = canonicalSnapshot.data() as RemotePersonaDocument;
+      return {
+        kind: 'upsert',
+        revision: persona.revision,
+        entity: {
+          entityType: 'persona',
+          entityId: persona.personaId,
+          contentHash: persona.contentHash,
+          payload: SyncPersonaSchema.parse(persona.payload),
+        },
+      };
     },
 
     subscribe(_uid, listener) {

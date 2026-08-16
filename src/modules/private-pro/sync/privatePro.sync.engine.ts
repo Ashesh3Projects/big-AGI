@@ -13,6 +13,7 @@ export interface PrivateProLocalEntity {
 export interface PrivateProLocalStorePort {
   snapshot(): Promise<PrivateProLocalEntity[]>;
   get(entityType: PrivateProEntityType, entityId: string): Promise<PrivateProLocalEntity | null>;
+  exists(entityType: PrivateProEntityType, entityId: string): Promise<boolean>;
   applyUpsert(entity: PrivateProLocalEntity): Promise<void>;
   applyDelete(entityType: PrivateProEntityType, entityId: string): Promise<void>;
   createConflictCopy(source: PrivateProLocalEntity): Promise<void>;
@@ -87,9 +88,10 @@ function assertLocalEntity(value: PrivateProLocalEntity): void {
     throw new Error('Remote sync entity failed validation.');
 }
 
-function operationId(operation: PrivateProOutboxOperation): string {
+export function privateProOperationId(operation: PrivateProOutboxOperation): string {
   if (operation.id === undefined) throw new Error('Private sync operation is missing its ID.');
-  return `sync-${operation.id.toString(36).padStart(8, '0')}`;
+  const deviceId = operation.deviceId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 100);
+  return `sync-${deviceId}-${operation.id.toString(36).padStart(8, '0')}`;
 }
 
 export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencies): PrivateProSyncEngine {
@@ -225,7 +227,7 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
 
     const knownStates = await deps.db.listEntityStates(deps.uid);
     for (const state of knownStates) {
-      if (state.remoteHash === null || localKeys.has(state.entityKey)) continue;
+      if (state.remoteHash === null || localKeys.has(state.entityKey) || await deps.store.exists(state.entityType, state.entityId)) continue;
       await deps.db.discardOperationsForEntity(deps.uid, state.entityType, state.entityId);
       await deps.db.enqueueOperation({
         uid: deps.uid,
@@ -270,7 +272,7 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
       }
       const result = operation.kind === 'upsert'
         ? await deps.transport.upsert({
-          operationId: operationId(operation),
+          operationId: privateProOperationId(operation),
           entityType: operation.entityType,
           entityId: operation.entityId,
           contentHash: operation.contentHash,
@@ -279,7 +281,7 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
           deviceId: operation.deviceId,
         })
         : await deps.transport.delete({
-          operationId: operationId(operation),
+          operationId: privateProOperationId(operation),
           entityType: operation.entityType,
           entityId: operation.entityId,
           baseRevision: operation.baseRevision,

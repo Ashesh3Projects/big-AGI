@@ -311,4 +311,3 @@ Deployment documentation will cover:
 ## Implementation boundaries
 
 The hosted layer will be isolated under focused authentication and sync modules. Existing chat and persona stores receive narrow adapters or subscriptions instead of broad rewrites. The `authedProcedure` and `premiumProcedure` compatibility points become real middleware on branch `pro`. Cloud/auth/sync changes remain branch-specific and are not intended for upstream `main`.
-

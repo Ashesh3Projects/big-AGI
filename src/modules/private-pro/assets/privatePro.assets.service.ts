@@ -80,8 +80,19 @@ export function createPrivateProAssetsService(port: PrivateProAssetsPort, now: (
           transaction.findAssetByHash(input.contentHash),
         ]);
         if (!account.active || account.uid !== uid) throw new Error('Private Pro account is inactive.');
-        if (duplicate)
-          return { status: 'already-uploaded' as const, assetId: duplicate.assetId, byteSize: duplicate.byteSize };
+        if (duplicate) {
+          if (duplicate.assetId !== input.assetId) {
+            const updatedAtMs = now();
+            await transaction.saveAsset({
+              ...duplicate,
+              assetId: input.assetId,
+              metadata: structuredClone(input.metadata),
+              createdAtMs: updatedAtMs,
+              updatedAtMs,
+            });
+          }
+          return { status: 'already-uploaded' as const, assetId: input.assetId, byteSize: duplicate.byteSize };
+        }
         if (existingReservation) {
           if (
             existingReservation.assetId !== input.assetId ||
@@ -91,8 +102,7 @@ export function createPrivateProAssetsService(port: PrivateProAssetsPort, now: (
           ) throw new Error('Attachment operation ID is already used by different content.');
           if (existingReservation.status === 'ready')
             return { status: 'already-uploaded' as const, assetId: existingReservation.assetId, byteSize: existingReservation.finalizedBytes ?? 0 };
-          if (existingReservation.status === 'released') throw new Error('Attachment reservation has expired.');
-          return existingReservation;
+          if (existingReservation.status === 'reserved') return existingReservation;
         }
         if (account.usedBytes + account.reservedBytes + input.requestedBytes > account.quotaBytes)
           throw new Error('Private Pro attachment quota exceeded.');
@@ -208,6 +218,22 @@ export function createPrivateProAssetsService(port: PrivateProAssetsPort, now: (
           transaction.getReservation(operationId),
         ]);
         if (!reservation || reservation.status !== 'reserved' || reservation.expiresAtMs > atMs) return null;
+        await transaction.saveAccount({ ...account, reservedBytes: Math.max(0, account.reservedBytes - reservation.requestedBytes) });
+        await transaction.saveReservation({ ...reservation, status: 'released' });
+        return reservation.objectPath;
+      });
+      if (!objectPath) return false;
+      await port.deleteObject(objectPath).catch(() => undefined);
+      return true;
+    },
+
+    async releaseReservation(uid: string, operationId: string) {
+      const objectPath = await port.transaction(uid, async transaction => {
+        const [account, reservation] = await Promise.all([
+          transaction.getAccount(),
+          transaction.getReservation(operationId),
+        ]);
+        if (!reservation || reservation.status !== 'reserved') return null;
         await transaction.saveAccount({ ...account, reservedBytes: Math.max(0, account.reservedBytes - reservation.requestedBytes) });
         await transaction.saveReservation({ ...reservation, status: 'released' });
         return reservation.objectPath;

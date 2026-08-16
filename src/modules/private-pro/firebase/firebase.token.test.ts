@@ -18,6 +18,7 @@ async function createToken(overrides: Record<string, unknown> = {}, audience: st
     email_verified: true,
     privatePro: true,
     privateProEpoch: 7,
+    firebase: { sign_in_provider: 'google.com' },
     ...overrides,
   })
     .setProtectedHeader({ alg: 'RS256', kid: 'test-key' })
@@ -84,6 +85,15 @@ describe('Firebase ID token verification', () => {
     await assert.rejects(
       verifyFirebaseIdToken(token, { projectId: PROJECT_ID, jwks }),
       /verified email/i,
+    );
+  });
+
+  test('rejects a verified identity from a non-Google provider', async () => {
+    const { token, jwks } = await createToken({ firebase: { sign_in_provider: 'password' } });
+
+    await assert.rejects(
+      verifyFirebaseIdToken(token, { projectId: PROJECT_ID, jwks }),
+      /Google sign-in/i,
     );
   });
 });

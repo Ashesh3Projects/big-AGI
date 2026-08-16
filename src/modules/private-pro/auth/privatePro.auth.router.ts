@@ -5,6 +5,7 @@ import { getPrivateProAdminAuth, getPrivateProFirestore } from '../firebase/fire
 import { privateProBootstrapProcedure, privateProNodePremiumProcedure } from './privatePro.auth.procedures.server';
 import {
   bootstrapPrivateProAccount,
+  activatePrivateProAccountRecord,
   type PrivateProAccountRecord,
   type PrivateProAuthAdminPort,
 } from './privatePro.auth.service';
@@ -14,12 +15,15 @@ function createPrivateProAuthAdminPort(): PrivateProAuthAdminPort {
   const auth = getPrivateProAdminAuth();
   const firestore = getPrivateProFirestore();
   return {
-    async getAccount(uid) {
-      const snapshot = await firestore.doc(`users/${uid}`).get();
-      return snapshot.exists ? snapshot.data() as PrivateProAccountRecord : null;
-    },
-    async saveAccount(record) {
-      await firestore.doc(`users/${record.uid}`).set(record);
+    async activateAccount(input) {
+      const reference = firestore.doc(`users/${input.uid}`);
+      return firestore.runTransaction(async transaction => {
+        const snapshot = await transaction.get(reference);
+        const existing = snapshot.exists ? snapshot.data() as PrivateProAccountRecord : null;
+        const account = activatePrivateProAccountRecord(existing, input);
+        transaction.set(reference, account);
+        return account;
+      });
     },
     async setClaims(uid, claims) {
       const user = await auth.getUser(uid);

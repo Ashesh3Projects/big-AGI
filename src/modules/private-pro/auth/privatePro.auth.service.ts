@@ -24,8 +24,12 @@ export interface PrivateProBootstrap {
 }
 
 export interface PrivateProAuthAdminPort {
-  getAccount(uid: string): Promise<PrivateProAccountRecord | null>;
-  saveAccount(record: PrivateProAccountRecord): Promise<void>;
+  activateAccount(input: {
+    uid: string;
+    email: string;
+    quotaBytes: number;
+    nowMs: number;
+  }): Promise<PrivateProAccountRecord>;
   setClaims(uid: string, claims: { privatePro: true; privateProEpoch: number }): Promise<void>;
   revokeRefreshTokens(uid: string): Promise<void>;
 }
@@ -34,6 +38,26 @@ export interface PrivateProBootstrapOptions {
   allowedEmails: ReadonlySet<string>;
   attachmentQuotaBytes: number;
   nowMs: number;
+}
+
+export function activatePrivateProAccountRecord(
+  existing: PrivateProAccountRecord | null,
+  input: { uid: string; email: string; quotaBytes: number; nowMs: number },
+): PrivateProAccountRecord {
+  const accessEpoch = existing
+    ? existing.active ? Math.max(1, existing.accessEpoch) : Math.max(1, existing.accessEpoch + 1)
+    : 1;
+  return {
+    uid: input.uid,
+    email: input.email,
+    active: true,
+    accessEpoch,
+    quotaBytes: input.quotaBytes,
+    usedBytes: existing?.usedBytes ?? 0,
+    reservedBytes: existing?.reservedBytes ?? 0,
+    createdAtMs: existing?.createdAtMs ?? input.nowMs,
+    updatedAtMs: input.nowMs,
+  };
 }
 
 
@@ -45,24 +69,13 @@ export async function bootstrapPrivateProAccount(
   if (!identity.emailVerified || !isPrivateProEmailAllowed(identity.email, options.allowedEmails))
     throw new Error('This Google account is not allowed to use private Pro.');
 
-  const existing = await admin.getAccount(identity.uid);
-  const accessEpoch = existing
-    ? existing.active ? Math.max(1, existing.accessEpoch) : Math.max(1, existing.accessEpoch + 1)
-    : 1;
-  const account: PrivateProAccountRecord = {
+  const account = await admin.activateAccount({
     uid: identity.uid,
     email: identity.email,
-    active: true,
-    accessEpoch,
     quotaBytes: options.attachmentQuotaBytes,
-    usedBytes: existing?.usedBytes ?? 0,
-    reservedBytes: existing?.reservedBytes ?? 0,
-    createdAtMs: existing?.createdAtMs ?? options.nowMs,
-    updatedAtMs: options.nowMs,
-  };
-
-  await admin.saveAccount(account);
-  await admin.setClaims(identity.uid, { privatePro: true, privateProEpoch: accessEpoch });
+    nowMs: options.nowMs,
+  });
+  await admin.setClaims(identity.uid, { privatePro: true, privateProEpoch: account.accessEpoch });
 
   return {
     uid: account.uid,

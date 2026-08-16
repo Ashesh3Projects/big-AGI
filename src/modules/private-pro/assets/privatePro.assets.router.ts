@@ -52,4 +52,8 @@ export const privateProAssetsRouter = createTRPCRouter({
   releaseExpired: privateProNodePremiumProcedure
     .input(z.object({ operationId: z.string().min(8).max(160) }))
     .mutation(({ ctx, input }) => assetsService().releaseExpiredReservation(ctx.privateProIdentity.uid, input.operationId)),
+
+  releaseReservation: privateProNodePremiumProcedure
+    .input(z.object({ operationId: z.string().min(8).max(160) }))
+    .mutation(({ ctx, input }) => assetsService().releaseReservation(ctx.privateProIdentity.uid, input.operationId)),
 });

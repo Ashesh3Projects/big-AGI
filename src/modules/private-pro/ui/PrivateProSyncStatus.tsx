@@ -2,18 +2,17 @@ import { Chip, LinearProgress, Stack, Typography } from '@mui/joy';
 
 import { humanReadableBytes } from '~/common/util/textUtils';
 
-import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { usePrivateProSyncStore } from '../sync/store-private-pro-sync';
 import { privateProSyncLabel } from './privatePro.ui';
 
 
 export function PrivateProSyncStatus() {
-  const { bootstrap } = usePrivateProAuth();
   const phase = usePrivateProSyncStore(state => state.phase);
   const pendingOperations = usePrivateProSyncStore(state => state.pendingOperations);
   const lastError = usePrivateProSyncStore(state => state.lastError);
-  const usedBytes = bootstrap?.usedBytes ?? 0;
-  const quotaBytes = bootstrap?.quotaBytes ?? 1;
+  const usedBytes = usePrivateProSyncStore(state => state.usedBytes);
+  const reservedBytes = usePrivateProSyncStore(state => state.reservedBytes);
+  const quotaBytes = usePrivateProSyncStore(state => state.quotaBytes);
 
   return (
     <Stack spacing={1}>
@@ -28,7 +27,7 @@ export function PrivateProSyncStatus() {
       </Typography>
       <LinearProgress determinate value={Math.min(100, 100 * usedBytes / quotaBytes)} />
       <Typography level='body-xs' textColor='text.secondary'>
-        {humanReadableBytes(usedBytes)} of {humanReadableBytes(quotaBytes)} attachment storage
+        {humanReadableBytes(usedBytes)} used, {humanReadableBytes(reservedBytes)} uploading, {humanReadableBytes(quotaBytes)} total
       </Typography>
       {lastError && <Typography level='body-xs' color='danger'>{lastError}</Typography>}
     </Stack>

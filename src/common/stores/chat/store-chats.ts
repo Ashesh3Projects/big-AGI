@@ -569,6 +569,14 @@ export function chatSyncDelete(conversationId: DConversationId): void {
   }));
 }
 
+export function chatSyncExists(conversationId: DConversationId): boolean {
+  return useChatStore.getState().conversations.some(conversation => conversation.id === conversationId);
+}
+
+export function chatSyncResetAll(): void {
+  useChatStore.setState({ conversations: [createDConversation(undefined)] });
+}
+
 export function chatSyncSubscribe(listener: () => void): () => void {
   return useChatStore.subscribe(listener);
 }

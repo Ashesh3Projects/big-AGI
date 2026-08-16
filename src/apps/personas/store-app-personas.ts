@@ -138,6 +138,14 @@ export function personaSyncDelete(personaId: string): void {
   }));
 }
 
+export function personaSyncExists(personaId: string): boolean {
+  return useAppPersonasStore.getState().simplePersonas.some(persona => persona.id === personaId);
+}
+
+export function personaSyncResetAll(): void {
+  useAppPersonasStore.setState({ simplePersonas: [] });
+}
+
 export function personaSyncSubscribe(listener: () => void): () => void {
   return useAppPersonasStore.subscribe(listener);
 }

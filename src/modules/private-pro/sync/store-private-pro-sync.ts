@@ -15,6 +15,9 @@ export type PrivateProSyncPhase =
 interface PrivateProSyncState {
   phase: PrivateProSyncPhase;
   pendingOperations: number;
+  usedBytes: number;
+  reservedBytes: number;
+  quotaBytes: number;
   lastError: string | null;
   setState: (state: Partial<Omit<PrivateProSyncState, 'setState'>>) => void;
 }
@@ -22,6 +25,9 @@ interface PrivateProSyncState {
 export const usePrivateProSyncStore = create<PrivateProSyncState>()(set => ({
   phase: 'local',
   pendingOperations: 0,
+  usedBytes: 0,
+  reservedBytes: 0,
+  quotaBytes: 1024 * 1024 * 1024,
   lastError: null,
   setState: state => set(state),
 }));

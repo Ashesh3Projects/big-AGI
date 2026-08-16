@@ -7,6 +7,7 @@ import type {
   PrivateProPutPersonaRequest,
   PrivateProSyncRepository,
 } from './privatePro.sync.repository';
+import { joinSyncChunks } from './privatePro.sync.chunk';
 import { SyncChunkSchema, type SyncChunk } from './privatePro.sync.schemas';
 
 
@@ -100,6 +101,11 @@ export function createPrivateProSyncService(repository: PrivateProSyncRepository
       const expected = upload.chunks.find(descriptor => descriptor.id === chunk.id);
       if (!expected || expected.index !== chunk.index || expected.byteLength !== chunk.byteLength || expected.hash !== chunk.hash)
         throw new Error(`Sync chunk ${chunk.id} does not match the prepared upload.`);
+      try {
+        await joinSyncChunks([{ ...chunk, index: 0 }]);
+      } catch {
+        throw new Error(`Sync chunk ${chunk.id} failed validation.`);
+      }
       await repository.putUploadChunk(identity.uid, request.operationId, chunk);
     },
 

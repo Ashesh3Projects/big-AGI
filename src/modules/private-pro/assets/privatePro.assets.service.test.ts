@@ -126,10 +126,11 @@ describe('private Pro attachment quota service', () => {
 
     assert.deepEqual(await service.reserveUpload('uid-a', reserveInput()), {
       status: 'already-uploaded',
-      assetId: 'existing',
+      assetId: 'asset-1',
       byteSize: 200,
     });
     assert.equal(port.account.reservedBytes, 50);
+    assert.equal(port.assets.get('asset-1')?.objectPath, 'users/uid-a/assets/existing');
   });
 
   test('reuses the same reservation operation idempotently', async () => {
@@ -194,5 +195,30 @@ describe('private Pro attachment quota service', () => {
     assert.equal(await service.releaseExpiredReservation('uid-a', 'asset-op-1', 1000 + 16 * 60 * 1000), true);
     assert.equal(port.account.reservedBytes, 50);
     assert.deepEqual(port.deletedObjects, [reservation.objectPath]);
+  });
+
+  test('releases a failed upload immediately and idempotently', async () => {
+    const port = new MemoryAssetsPort();
+    const service = createPrivateProAssetsService(port, () => 1000);
+    const reservation = await service.reserveUpload('uid-a', reserveInput());
+    assert.equal(reservation.status, 'upload-required');
+
+    assert.equal(await service.releaseReservation('uid-a', 'asset-op-1'), true);
+    assert.equal(await service.releaseReservation('uid-a', 'asset-op-1'), false);
+    assert.equal(port.account.reservedBytes, 50);
+    assert.deepEqual(port.deletedObjects, [reservation.objectPath]);
+  });
+
+  test('reuses the deterministic operation id after a released upload', async () => {
+    const port = new MemoryAssetsPort();
+    const service = createPrivateProAssetsService(port, () => 1000);
+    await service.reserveUpload('uid-a', reserveInput());
+    await service.releaseReservation('uid-a', 'asset-op-1');
+
+    const retried = await service.reserveUpload('uid-a', reserveInput());
+
+    assert.equal(retried.status, 'upload-required');
+    assert.equal(port.account.reservedBytes, 250);
+    assert.equal(port.reservations.get('asset-op-1')?.status, 'reserved');
   });
 });

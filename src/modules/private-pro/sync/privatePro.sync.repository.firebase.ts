@@ -93,7 +93,17 @@ export class FirebasePrivateProSyncRepository implements PrivateProSyncRepositor
   }
 
   async putUpload(uid: string, upload: PrivateProChatUpload): Promise<void> {
-    await uploadRef(this.db, uid, upload.operationId).create(upload);
+    const reference = uploadRef(this.db, uid, upload.operationId);
+    await this.db.runTransaction(async transaction => {
+      const snapshot = await transaction.get(reference);
+      if (snapshot.exists) {
+        const existing = snapshot.data() as PrivateProChatUpload;
+        if (JSON.stringify(existing) !== JSON.stringify(upload))
+          throw new Error('Sync operation ID is already used by different content.');
+        return;
+      }
+      transaction.create(reference, upload);
+    });
   }
 
   async putUploadChunk(uid: string, operationId: string, chunk: SyncChunk): Promise<void> {
