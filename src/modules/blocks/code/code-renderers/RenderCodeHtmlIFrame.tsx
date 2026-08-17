@@ -1,6 +1,11 @@
 import * as React from 'react';
 
 
+export function htmlSandboxPolicy(): string {
+  return 'allow-scripts allow-forms';
+}
+
+
 const simpleCssReset = `
 *, *::before, *::after { box-sizing: border-box; }
 body, html { margin: 0; padding: 0; }
@@ -37,20 +42,15 @@ function _renderHtmlInIFrame(iframeDoc: Document, htmlString: string) {
   // Write the HTML to the iframe
   iframeDoc.open();
   try {
+    const meta = iframeDoc.createElement('meta');
+    meta.httpEquiv = 'Content-Security-Policy';
+    meta.content = "default-src 'none'; img-src data: blob: https:; media-src data: blob: https:; style-src 'unsafe-inline'; script-src 'unsafe-inline'; connect-src https:; form-action 'none'; base-uri 'none'";
+    iframeDoc.head.appendChild(meta);
     iframeDoc.write(modifiedHtml);
   } catch (error) {
     console.error('Error writing to iframe:', error);
   }
   iframeDoc.close();
-
-  // Enhanced Security with Content Security Policy
-  // NOTE: 2024-06-15 disabled until we understand exactly all the implications
-  // In theory we want script from self, images from everywhere, and styles from self
-  // const meta = iframeDoc.createElement('meta');
-  // meta.httpEquiv = 'Content-Security-Policy';
-  // // meta.content = 'default-src \'self\'; script-src \'self\';';
-  // meta.content = 'script-src \'self\' \'unsafe-inline\';';
-  // iframeDoc.head.appendChild(meta);
 
   // Adding this event listener to prevent arrow keys from scrolling the parent page
   iframeDoc.addEventListener('keydown', (event: any) => {
@@ -89,7 +89,7 @@ export function RenderCodeHtmlIFrame(props: { htmlCode: string, isFullscreen?: b
       style={props.isFullscreen ? blocksRenderHTMLIFrameFullScreenCss : blocksRenderHTMLIFrameCss}
       title='Sandboxed Web Content'
       aria-label='Interactive content frame'
-      sandbox='allow-scripts allow-same-origin allow-forms' // restrict to only these
+      sandbox={htmlSandboxPolicy()}
       loading='lazy' // do not load until visible in the viewport
     />
   );
