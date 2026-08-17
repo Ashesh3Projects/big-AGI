@@ -17,11 +17,11 @@ export const PRIVATE_PRO_ENCRYPTED_BACKUP_SCHEMA_VERSION = 1;
 const MAX_VAULT_ID_LENGTH = 512;
 const MAX_ASSET_ID_LENGTH = 512;
 const MAX_CHUNK_ID_LENGTH = 512;
-const MAX_ASSET_CIPHERTEXT_BYTES = 64 * 1024 * 1024;
+export const PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_MAX_RECORDS = 100_000;
 const DEFAULT_MAX_ASSET_CHUNKS = 100_000;
-const DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES = 2 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024;
+export const PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES = 128 * 1024 * 1024;
+export const PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES = 96 * 1024 * 1024;
 const TRANSCRIPT_MAC_BYTES = 32;
 const TRANSCRIPT_INITIAL_STATE: Uint8Array<ArrayBufferLike> = new Uint8Array(TRANSCRIPT_MAC_BYTES);
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -61,8 +61,8 @@ const BackupAssetSchema = z.object({
   chunkIndex: z.number().int().nonnegative().safe(),
   keyVersion: z.number().int().positive().safe(),
   nonceBase64: canonicalBase64Schema(12).refine(value => atob(value).length === 12, 'Encrypted asset nonces must be 96 bits.'),
-  ciphertextBase64: canonicalBase64Schema(MAX_ASSET_CIPHERTEXT_BYTES),
-  ciphertextBytes: z.number().int().positive().max(MAX_ASSET_CIPHERTEXT_BYTES).safe(),
+  ciphertextBase64: canonicalBase64Schema(PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES),
+  ciphertextBytes: z.number().int().positive().max(PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES).safe(),
 }).strict().refine(value => atob(value.ciphertextBase64).length === value.ciphertextBytes, {
   message: 'Encrypted asset ciphertextBytes must match its decoded ciphertext length.',
   path: ['ciphertextBytes'],
@@ -72,7 +72,7 @@ const BackupEndSchema = z.object({
   kind: z.literal('end'),
   recordCount: z.number().int().nonnegative().safe(),
   assetCount: z.number().int().nonnegative().safe(),
-  totalCiphertextBytes: z.number().int().nonnegative().max(DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES).safe(),
+  totalCiphertextBytes: z.number().int().nonnegative().max(PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES).safe(),
   transcriptMacBase64: canonicalBase64Schema(TRANSCRIPT_MAC_BYTES)
     .refine(value => atob(value).length === TRANSCRIPT_MAC_BYTES, 'Encrypted backup transcript MACs must be 256 bits.'),
 }).strict();
@@ -142,8 +142,8 @@ function limitsWithDefaults(input: Partial<PrivateProEncryptedBackupLimits> = {}
   const limits = {
     maxRecords: input.maxRecords ?? DEFAULT_MAX_RECORDS,
     maxAssetChunks: input.maxAssetChunks ?? DEFAULT_MAX_ASSET_CHUNKS,
-    maxTotalCiphertextBytes: input.maxTotalCiphertextBytes ?? DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES,
-    maxLineBytes: input.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES,
+    maxTotalCiphertextBytes: input.maxTotalCiphertextBytes ?? PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES,
+    maxLineBytes: input.maxLineBytes ?? PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES,
   };
   if (Object.values(limits).some(value => !Number.isSafeInteger(value) || value < 0))
     throw new Error('Private Pro encrypted backup limits must be nonnegative safe integers.');
@@ -329,34 +329,43 @@ async function* readLines(
 ): AsyncGenerator<{ text: string; bytes: Uint8Array }> {
   const reader = stream.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
-  let buffered = '';
+  const lineChunks: Uint8Array[] = [];
   let bufferedLineBytes = 0;
   try {
     while (true) {
       const result = await reader.read();
       if (result.done) break;
-      for (const byte of result.value) {
-        if (byte === 0x0a) {
-          if (++bufferedLineBytes > maximumLineBytes)
-            throw new Error('Private Pro encrypted backup contains an oversized line.');
-          bufferedLineBytes = 0;
-        }
-        else if (++bufferedLineBytes > maximumLineBytes)
+      let segmentStart = 0;
+      for (let index = 0; index < result.value.byteLength; index++) {
+        if (result.value[index] !== 0x0a) continue;
+        const segment = result.value.slice(segmentStart, index + 1);
+        bufferedLineBytes += segment.byteLength;
+        if (bufferedLineBytes > maximumLineBytes)
           throw new Error('Private Pro encrypted backup contains an oversized line.');
-      }
-      buffered += decoder.decode(result.value, { stream: true });
-      let newlineIndex = buffered.indexOf('\n');
-      while (newlineIndex >= 0) {
-        const line = buffered.slice(0, newlineIndex);
-        buffered = buffered.slice(newlineIndex + 1);
-        if (!line.trim())
+        lineChunks.push(segment);
+        const lineBytes = new Uint8Array(bufferedLineBytes);
+        let offset = 0;
+        for (const chunk of lineChunks) {
+          lineBytes.set(chunk, offset);
+          offset += chunk.byteLength;
+        }
+        const lineText = decoder.decode(lineBytes.slice(0, -1));
+        if (!lineText.trim())
           throw new Error('Private Pro encrypted backup cannot contain blank lines.');
-        yield { text: line, bytes: new TextEncoder().encode(`${line}\n`) };
-        newlineIndex = buffered.indexOf('\n');
+        yield { text: lineText, bytes: lineBytes };
+        lineChunks.length = 0;
+        bufferedLineBytes = 0;
+        segmentStart = index + 1;
+      }
+      if (segmentStart < result.value.byteLength) {
+        const tail = result.value.slice(segmentStart);
+        bufferedLineBytes += tail.byteLength;
+        if (bufferedLineBytes > maximumLineBytes)
+          throw new Error('Private Pro encrypted backup contains an oversized line.');
+        lineChunks.push(tail);
       }
     }
-    buffered += decoder.decode();
-    if (buffered.length)
+    if (bufferedLineBytes)
       throw new Error('Private Pro encrypted backup must end with a newline immediately after its end marker.');
   } finally {
     reader.releaseLock();

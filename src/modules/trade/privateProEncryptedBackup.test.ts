@@ -6,12 +6,18 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { deriveVaultSubkey, decryptVaultRecord, encryptVaultRecord, importVaultMasterKey } from '../private-pro/vault/privatePro.vault.crypto';
 import { generateRecoveryKey } from '../private-pro/vault/privatePro.vault.recovery';
-import { PRIVATE_PRO_PBKDF2_MIN_ITERATIONS } from '../private-pro/vault/privatePro.vault.schemas';
+import {
+  PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
+  PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
+} from '../private-pro/vault/privatePro.vault.schemas';
 import type { PrivateProVaultEnvelope, PrivateProVaultKeyset } from '../private-pro/vault/privatePro.vault.types';
 import { FlashBackup } from './BackupRestore';
 import {
   createPrivateProEncryptedBackupStream,
   importPrivateProEncryptedBackup,
+  PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES,
+  PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES,
+  PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES,
   type PrivateProEncryptedBackupApplyInput,
   type PrivateProEncryptedBackupAsset,
   type PrivateProEncryptedBackupSource,
@@ -411,6 +417,79 @@ describe('private Pro encrypted backup', () => {
       );
     }
     assert.equal(applyCalls, 0);
+  });
+
+  test('uses a 128 MiB in-memory aggregate cap and a line cap that fits maximum ciphertext records', () => {
+    assert.equal(PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES, 128 * 1024 * 1024);
+    assert.equal(PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES, 96 * 1024 * 1024);
+
+    const encodedAssetCiphertextBytes = Math.ceil(PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES / 3) * 4;
+    const assetMetadataBytes = new TextEncoder().encode(`${JSON.stringify({
+      kind: 'asset',
+      formatVersion: 1,
+      assetId: '\0'.repeat(512),
+      chunkId: '\0'.repeat(512),
+      chunkIndex: Number.MAX_SAFE_INTEGER,
+      keyVersion: Number.MAX_SAFE_INTEGER,
+      nonceBase64: 'A'.repeat(16),
+      ciphertextBase64: '',
+      ciphertextBytes: PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES,
+    })}\n`).byteLength;
+    assert.equal(
+      PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES >= encodedAssetCiphertextBytes + assetMetadataBytes,
+      true,
+    );
+
+    const encodedRecordCiphertextBytes = Math.ceil(PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES / 3) * 4;
+    const recordMetadataBytes = new TextEncoder().encode(`${JSON.stringify({
+      kind: 'record',
+      envelope: {
+        formatVersion: 1,
+        recordType: 'credential-service',
+        recordId: '\0'.repeat(512),
+        schemaVersion: Number.MAX_SAFE_INTEGER,
+        keyVersion: Number.MAX_SAFE_INTEGER,
+        revision: Number.MAX_SAFE_INTEGER,
+        nonceBase64: 'A'.repeat(16),
+        ciphertextBase64: '',
+        ciphertextBytes: PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
+      },
+    })}\n`).byteLength;
+    assert.equal(
+      PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES >= encodedRecordCiphertextBytes + recordMetadataBytes,
+      true,
+    );
+  });
+
+  test('counts the exact raw UTF-8 line bytes at the configured boundary', async () => {
+    const { source } = await fixture();
+    const output = await collectStream(createPrivateProEncryptedBackupStream(source));
+    const lines = new TextDecoder().decode(output.bytes).trimEnd().split('\n');
+    const maximumLineBytes = Math.max(...lines.map(line => new TextEncoder().encode(`${line}\n`).byteLength));
+
+    await collectStream(createPrivateProEncryptedBackupStream(source, { maxLineBytes: maximumLineBytes }));
+    await assert.rejects(
+      collectStream(createPrivateProEncryptedBackupStream(source, { maxLineBytes: maximumLineBytes - 1 })),
+      /oversized line/i,
+    );
+
+    await importPrivateProEncryptedBackup(
+      streamFromBytes(output.bytes),
+      { kind: 'password', password: PASSWORD },
+      async () => undefined,
+      async () => undefined,
+      { maxLineBytes: maximumLineBytes },
+    );
+    await assert.rejects(
+      importPrivateProEncryptedBackup(
+        streamFromBytes(output.bytes),
+        { kind: 'password', password: PASSWORD },
+        async () => undefined,
+        async () => undefined,
+        { maxLineBytes: maximumLineBytes - 1 },
+      ),
+      /oversized line/i,
+    );
   });
 
   test('requires header, records, assets, end, and immediate EOF with no blank lines', async () => {
