@@ -1,5 +1,4 @@
 import { FirebaseError } from 'firebase/app';
-import { getToken as getAppCheckToken } from 'firebase/app-check';
 import {
   browserLocalPersistence,
   GoogleAuthProvider,
@@ -12,7 +11,7 @@ import {
 } from 'firebase/auth';
 
 import { privateProClientConfig } from '../config/privatePro.config';
-import { getPrivateProClientAppCheck, getPrivateProFirebaseAuth } from '../firebase/firebase.client';
+import { getPrivateProFirebaseAuth, privateProGetAppCheckToken } from '../firebase/firebase.client';
 
 
 export function privateProOnAuthStateChanged(callback: (user: User | null) => void): () => void {
@@ -54,8 +53,7 @@ export async function privateProGetRequestHeaders(): Promise<Record<string, stri
   const user = getPrivateProFirebaseAuth().currentUser;
   if (!user) return {};
 
-  const appCheck = getPrivateProClientAppCheck();
-  const appCheckToken = appCheck ? (await getAppCheckToken(appCheck, false)).token : '';
+  const appCheckToken = await privateProGetAppCheckToken();
   return {
     authorization: `Bearer ${await user.getIdToken()}`,
     ...(appCheckToken && { 'x-firebase-appcheck': appCheckToken }),

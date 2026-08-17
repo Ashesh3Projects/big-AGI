@@ -34,13 +34,30 @@ Use narrowly scoped Google Cloud roles where practical. The service-account JSON
 
 ## App Check
 
-1. Register the Firebase Web App with reCAPTCHA v3 App Check.
-2. Add the Vercel production domain and custom domain to the reCAPTCHA site configuration.
-3. Set `NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY` in Vercel.
-4. Deploy and verify bootstrap/sync requests carry `x-firebase-appcheck`.
-5. Enable App Check enforcement gradually in the Firebase console after production traffic is verified.
+Use reCAPTCHA Enterprise. Do not register a reCAPTCHA v3 provider.
 
-Protected Vercel mutations verify App Check whenever the site-key variable is configured. Firestore and Storage SDK enforcement is configured in Firebase.
+1. Create a score-based reCAPTCHA Enterprise site key for the exact production domains.
+2. Register the Firebase Web App with the reCAPTCHA Enterprise App Check provider and that site key.
+3. Leave Firebase product enforcement disabled initially. This is the metrics-only phase.
+4. Set `NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY` in the Vercel Production environment and redeploy.
+5. Verify every private Pro bootstrap, sync, and attachment request carries `x-firebase-appcheck`, and verify the Firebase App Check metrics show valid production traffic.
+6. Enable enforcement for Firestore, then Storage, observing errors and metrics after each change.
+
+Production private Pro refuses to start without the site key. Protected Vercel procedures also reject missing or invalid App Check tokens before account and data operations. App Check is additive: Firebase ID-token verification, allowlist status, active-account checks, and access-epoch checks remain mandatory.
+
+For local development or Firebase Emulator Suite use, App Check enforcement may remain disabled. When testing token exchange against a real Firebase project, register a debug token in Firebase Console - App Check - Apps - Manage debug tokens. Before Firebase initializes, set the browser global to that exact registered value:
+
+```js
+self.FIREBASE_APPCHECK_DEBUG_TOKEN = 'registered-debug-token';
+```
+
+Development defaults to Firebase's generated debug-token path when a site key is configured. Copy the generated token from the browser console and register it before expecting valid exchange. Never set a debug token in the Vercel Production environment or commit one to source control.
+
+Rollback order:
+
+1. Disable Firestore or Storage App Check enforcement in Firebase for the affected product.
+2. Keep the reCAPTCHA Enterprise registration, production site key, and Vercel server verification active while diagnosing metrics and client failures.
+3. Never disable Firebase ID-token verification, active-account checks, allowlist enforcement, or access-epoch checks as part of App Check rollback.
 
 ## Storage CORS
 
@@ -98,7 +115,7 @@ NEXT_PUBLIC_FIREBASE_PROJECT_ID=your-project
 NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET=your-project.firebasestorage.app
 NEXT_PUBLIC_FIREBASE_MESSAGING_SENDER_ID=1234567890
 NEXT_PUBLIC_FIREBASE_APP_ID=1:1234567890:web:example
-NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY=example-public-site-key
+NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY=example-recaptcha-enterprise-site-key
 
 FIREBASE_CLIENT_EMAIL=firebase-adminsdk@example-project.iam.gserviceaccount.com
 FIREBASE_PRIVATE_KEY="-----BEGIN PRIVATE KEY-----\nREPLACE_ME\n-----END PRIVATE KEY-----\n"
@@ -112,6 +129,8 @@ CRON_SECRET=replace-with-a-long-random-secret
 ```
 
 Firebase browser values and the App Check site key are public by design. The private key and service-account email are server configuration. Vercel stores multiline private keys safely; the application also accepts escaped `\n` sequences.
+
+Set the App Check site key for Production before enabling `NEXT_PUBLIC_PRIVATE_PRO_ENABLED=true`. Any Vercel Preview that enables private Pro must also set it. Local Development may omit it for emulator work. Do not add `FIREBASE_APPCHECK_DEBUG_TOKEN` to Vercel Production.
 
 Do not put model/provider API keys into the private Pro sync configuration. Model settings and API keys remain browser-local.
 
@@ -167,13 +186,15 @@ The suite verifies cross-account denial, claim and epoch enforcement, inactive-a
 1. Push branch `pro` using your normal Git workflow.
 2. Select branch `pro` for the Vercel production project or create a separate Vercel project.
 3. Add all environment variables.
-4. Deploy Firebase rules and indexes.
-5. Apply Storage CORS.
-6. Deploy Vercel.
-7. Sign in with one allowlisted Google account.
-8. Confirm existing local chats, personas, and referenced attachments enter the migration queue automatically.
-9. Open the app on a second browser/device and confirm the same private vault downloads.
-10. Try a non-allowlisted account and confirm it receives Access denied.
+4. Register reCAPTCHA Enterprise App Check in metrics-only mode.
+5. Deploy Firebase rules and indexes.
+6. Apply Storage CORS.
+7. Deploy Vercel and verify valid App Check metrics and request headers.
+8. Enable Firestore and Storage App Check enforcement in that order.
+9. Sign in with one allowlisted Google account.
+10. Confirm existing local chats, personas, and referenced attachments enter the migration queue automatically.
+11. Open the app on a second browser/device and confirm the same private vault downloads.
+12. Try a non-allowlisted account and confirm it receives Access denied.
 
 ## Production checks
 
@@ -185,6 +206,7 @@ The suite verifies cross-account denial, claim and epoch enforcement, inactive-a
 - Concurrent edits preserve a conflict copy.
 - Direct Firestore writes and direct Storage uploads fail.
 - Removing an email and running access sync blocks its server mutations.
+- Missing or invalid `x-firebase-appcheck` blocks every private Pro procedure.
 
 ## Usage and spending
 

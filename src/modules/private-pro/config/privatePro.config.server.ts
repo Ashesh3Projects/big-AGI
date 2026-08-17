@@ -50,25 +50,64 @@ export interface PrivateProServerConfig {
   appCheckEnforced: boolean;
 }
 
+export interface PrivateProServerConfigInput {
+  enabled: boolean;
+  nodeEnv: string | undefined;
+  allowedEmails: string | undefined;
+  firebaseProjectId: string | undefined;
+  firebaseClientEmail: string | undefined;
+  firebasePrivateKey: string | undefined;
+  firebaseStorageBucket: string | undefined;
+  appCheckSiteKey: string | undefined;
+}
+
+export function parsePrivateProServerConfig(input: PrivateProServerConfigInput): PrivateProServerConfig {
+  const allowedEmails = parsePrivateProAllowlist(input.allowedEmails);
+  if (input.enabled && allowedEmails.size === 0)
+    throw new Error('PRIVATE_PRO_ALLOWED_EMAILS is required when private Pro is enabled.');
+
+  const appCheckSiteKey = input.appCheckSiteKey?.trim() ?? '';
+  if (input.enabled && input.nodeEnv === 'production' && !appCheckSiteKey)
+    throw new Error('Firebase App Check is required when private Pro is enabled in production.');
+
+  return {
+    enabled: input.enabled,
+    allowedEmails,
+    firebase: {
+      projectId: input.firebaseProjectId ?? '',
+      clientEmail: input.firebaseClientEmail ?? '',
+      privateKey: (input.firebasePrivateKey ?? '').replaceAll('\\n', '\n'),
+      storageBucket: input.firebaseStorageBucket ?? '',
+    },
+    attachmentQuotaBytes: PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
+    maxFileBytes: PRIVATE_PRO_MAX_FILE_BYTES,
+    uploadRateLimit: {
+      windowMs: PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS,
+      maxRequests: PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS,
+      maxBytes: PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES,
+    },
+    appCheckEnforced: input.enabled && !!appCheckSiteKey,
+  };
+}
+
 let cachedConfig: PrivateProServerConfig | undefined;
 
 export function getPrivateProServerConfig(): PrivateProServerConfig {
   if (cachedConfig) return cachedConfig;
 
-  const enabled = env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
-  const allowedEmails = parsePrivateProAllowlist(env.PRIVATE_PRO_ALLOWED_EMAILS);
-  if (enabled && allowedEmails.size === 0)
-    throw new Error('PRIVATE_PRO_ALLOWED_EMAILS is required when private Pro is enabled.');
+  const parsedConfig = parsePrivateProServerConfig({
+    enabled: env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true',
+    nodeEnv: process.env.NODE_ENV,
+    allowedEmails: env.PRIVATE_PRO_ALLOWED_EMAILS,
+    firebaseProjectId: env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
+    firebaseClientEmail: env.FIREBASE_CLIENT_EMAIL,
+    firebasePrivateKey: env.FIREBASE_PRIVATE_KEY,
+    firebaseStorageBucket: env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
+    appCheckSiteKey: env.NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY,
+  });
 
   cachedConfig = {
-    enabled,
-    allowedEmails,
-    firebase: {
-      projectId: env.NEXT_PUBLIC_FIREBASE_PROJECT_ID ?? '',
-      clientEmail: env.FIREBASE_CLIENT_EMAIL ?? '',
-      privateKey: (env.FIREBASE_PRIVATE_KEY ?? '').replaceAll('\\n', '\n'),
-      storageBucket: env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET ?? '',
-    },
+    ...parsedConfig,
     attachmentQuotaBytes: parsePrivateProPositiveInteger(
       env.PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
       PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
@@ -84,7 +123,6 @@ export function getPrivateProServerConfig(): PrivateProServerConfig {
       maxRequests: parsePrivateProPositiveInteger(env.PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS, PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS, 'PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS'),
       maxBytes: parsePrivateProPositiveInteger(env.PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES, PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES, 'PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES'),
     },
-    appCheckEnforced: enabled && !!env.NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY,
   };
 
   return cachedConfig;

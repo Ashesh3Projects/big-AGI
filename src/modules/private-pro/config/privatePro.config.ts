@@ -8,6 +8,7 @@ export const PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES = 256 * 1024 * 1024;
 
 export const privateProClientConfig = {
   enabled: process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true',
+  appCheckRequired: process.env.NODE_ENV === 'production' && process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true',
   firebase: {
     apiKey: process.env.NEXT_PUBLIC_FIREBASE_API_KEY ?? '',
     authDomain: process.env.NEXT_PUBLIC_FIREBASE_AUTH_DOMAIN ?? '',
@@ -28,6 +29,7 @@ export function privateProClientConfigComplete(): boolean {
     firebase.projectId &&
     firebase.storageBucket &&
     firebase.messagingSenderId &&
-    firebase.appId
+    firebase.appId &&
+    (!privateProClientConfig.appCheckRequired || privateProClientConfig.appCheckSiteKey)
   );
 }
