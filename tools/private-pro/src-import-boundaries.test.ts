@@ -38,3 +38,18 @@ test('the production src tree contains no test-helper modules', async () => {
 
   assert.deepEqual(testHelpers, []);
 });
+
+test('default npm test runs the private Pro tools suite before src tests', async () => {
+  const packageJson = JSON.parse(await readFile(path.resolve(import.meta.dirname, '../../package.json'), 'utf8')) as {
+    scripts?: Record<string, string>;
+  };
+
+  assert.equal(
+    packageJson.scripts?.['test:private-pro-tools'],
+    'cross-env NODE_ENV=development tsx --test "tools/private-pro/**/*.test.ts"',
+  );
+  assert.equal(
+    packageJson.scripts?.test,
+    'npm run test:private-pro-tools && cross-env NODE_ENV=development tsx --test "src/**/*.test.ts"',
+  );
+});
