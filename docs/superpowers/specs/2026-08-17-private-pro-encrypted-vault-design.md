@@ -99,6 +99,8 @@ Firestore stores account state, wrapped-key metadata, encrypted record manifests
 
 PBKDF2-SHA-256 may be supported only as a compatibility fallback for browsers where the selected Argon2id implementation cannot run. New vaults prefer Argon2id.
 
+Implementation note (2026-08-17): use exactly `hash-wasm@4.12.0` for Argon2id. It is MIT licensed, dependency-free, ships its WebAssembly bytes inside the installed package and worker bundle, and requires no CDN or runtime WASM fetch. The Argon2-only distribution is about 30 KB before application bundling. Run it only inside the dedicated module worker. The production CSP permits the narrow `wasm-unsafe-eval` source required to compile locally bundled WebAssembly, while continuing to forbid general `unsafe-eval`. The rejected alternatives were `argon2-browser@1.18.0` (last published in 2022 and Emscripten loader complexity), `argon2id@1.0.1` (last published in 2023), `@very-amused/argon2-wasm@0.4.1` (larger pthread-oriented package with cross-origin-isolation complexity), and `@noble/hashes@2.3.0` (current and audited, but pure JavaScript rather than the required WASM worker). The package-lock integrity hash pins the bundled implementation, and the package adds no transitive advisories.
+
 ### Recovery key
 
 - Generate an independent random 256-bit recovery key.

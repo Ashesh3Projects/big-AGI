@@ -14,7 +14,7 @@ test('private Pro emits the required browser security headers', () => {
   assert.equal(headers.get('referrer-policy'), 'no-referrer');
   assert.equal(headers.get('cross-origin-opener-policy'), 'same-origin-allow-popups');
   assert.match(headers.get('permissions-policy') ?? '', /geolocation=\(\)/);
-  assert.doesNotMatch(headers.get('content-security-policy') ?? '', /unsafe-eval/);
+  assert.doesNotMatch(headers.get('content-security-policy') ?? '', /(?:^|\s)'unsafe-eval'(?:\s|;|$)/);
 });
 
 test('private Pro CSP permits Firebase, Google sign-in, media, workers, and supported AI providers', () => {
@@ -29,6 +29,8 @@ test('private Pro CSP permits Firebase, Google sign-in, media, workers, and supp
   assert.match(policy, /img-src[^;]*data:[^;]*blob:/);
   assert.match(policy, /media-src[^;]*data:[^;]*blob:/);
   assert.match(policy, /worker-src[^;]*'self'[^;]*blob:/);
+  assert.match(policy, /script-src[^;]*'wasm-unsafe-eval'/);
+  assert.doesNotMatch(policy, /script-src[^;]*'unsafe-eval'/);
   assert.match(policy, /connect-src[^;]*https:\/\/api\.openai\.com/);
   assert.match(policy, /connect-src[^;]*https:\/\/api\.anthropic\.com/);
   assert.match(policy, /connect-src[^;]*https:\/\/generativelanguage\.googleapis\.com/);
@@ -53,5 +55,5 @@ test('private Pro CSP permits custom secure endpoints without permitting analyti
   assert.ok(!connectSources.includes('*'));
   assert.ok(!connectSources.includes('http:'));
   assert.deepEqual(connectSources.filter(source => source.startsWith('http://')), ['http://localhost:*', 'http://127.0.0.1:*']);
-  assert.doesNotMatch(policy, /unsafe-eval/);
+  assert.doesNotMatch(policy, /(?:^|\s)'unsafe-eval'(?:\s|;|$)/);
 });

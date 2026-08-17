@@ -81,7 +81,7 @@ export function privateProContentSecurityPolicy(): string {
     `object-src 'none'`,
     `frame-ancestors 'none'`,
     `form-action 'self' https://accounts.google.com`,
-    `script-src 'self' 'unsafe-inline' https://apis.google.com https://accounts.google.com https://www.gstatic.com https://www.google.com https://www.recaptcha.net`,
+    `script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval' https://apis.google.com https://accounts.google.com https://www.gstatic.com https://www.google.com https://www.recaptcha.net`,
     `style-src 'self' 'unsafe-inline' https://fonts.googleapis.com`,
     `font-src 'self' data: https://fonts.gstatic.com`,
     `img-src 'self' data: blob: https:`,
