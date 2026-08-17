@@ -7,7 +7,7 @@ import Dexie from 'dexie';
 
 import { PrivateProVaultDB } from './privatePro.vault.db';
 import { PrivateProVaultSession } from './privatePro.vault.session';
-import type { PrivateProVaultEnvelope, PrivateProVaultWrappedKeyEnvelope } from './privatePro.vault.types';
+import type { PrivateProVaultEnvelope, PrivateProVaultOperation, PrivateProVaultWrappedKeyEnvelope } from './privatePro.vault.types';
 
 
 const UID_A = 'uid-a';
@@ -233,5 +233,39 @@ describe('private Pro encrypted vault database', () => {
 
     assert.equal(session.getMasterKey(UID_A), null);
     assert.notEqual(await db.getDeviceKey(UID_A), null);
+  });
+
+  test('backfills legacy outbox sequences after the current maximum in primary-key order', async (t) => {
+    const db = createDB(t);
+    const operation = (operationId: string): PrivateProVaultOperation => ({
+      formatVersion: 1,
+      operationId,
+      kind: 'delete',
+      baseRevision: 0,
+      tombstone: {
+        formatVersion: 1,
+        recordType: 'settings',
+        recordId: operationId.padEnd(43, 'x').slice(0, 43),
+        revision: 1,
+        keyVersion: 1,
+        operationId,
+        deletedAtMs: operationId === 'legacy-a' ? Number.MAX_SAFE_INTEGER : 0,
+      },
+    });
+    await db.outbox.bulkPut([
+      { uid: UID_A, operationId: 'legacy-z', operation: operation('legacy-z'), createdAtMs: 0 },
+      { uid: UID_A, operationId: 'current', operation: operation('current'), createdAtMs: 50, localSequence: 5 },
+      { uid: UID_A, operationId: 'legacy-a', operation: operation('legacy-a'), createdAtMs: Number.MAX_SAFE_INTEGER, localSequence: 0 },
+    ]);
+
+    const maximum = await db.backfillOutboxLocalSequences(UID_A);
+    const rows = await db.outbox.where('uid').equals(UID_A).toArray();
+
+    assert.equal(maximum, 7);
+    assert.deepEqual(Object.fromEntries(rows.map(row => [row.operationId, row.localSequence])), {
+      current: 5,
+      'legacy-a': 6,
+      'legacy-z': 7,
+    });
   });
 });

@@ -107,6 +107,7 @@ class TestVaultServer {
   readonly fetches: string[][] = [];
   failAfterCommitOnce = false;
   delayRecordFetch: Promise<void> | null = null;
+  delayWrite: Promise<void> | null = null;
   private serverSequence = 0;
   private readonly receipts = new Map<string, { operation: PrivateProVaultOperation; result: PrivateProVaultWriteResult }>();
 
@@ -133,6 +134,7 @@ class TestVaultServer {
 
   async write(operation: PrivateProVaultOperation): Promise<PrivateProVaultWriteResult> {
     this.operations.push(structuredClone(operation));
+    await this.delayWrite;
     const receipt = this.receipts.get(operation.operationId);
     if (receipt) {
       assert.deepEqual(operation, receipt.operation, 'an operation ID must replay identical encrypted content');
@@ -221,6 +223,12 @@ async function createClient(
     operationPrefix?: string;
     rejectThemeValue?: string;
     rejectThemeApplyValue?: string;
+    clearSession?: () => Promise<void>;
+    persistCurrent?: (
+      index: readonly PrivateProVaultIndexEntry[],
+      envelopes: readonly PrivateProVaultEnvelope[],
+      persist: () => Promise<void>,
+    ) => Promise<void>;
   } = {},
 ): Promise<TestClient> {
   const dbName = `private-pro-vault-engine-${name}-${crypto.randomUUID()}`;
@@ -253,6 +261,8 @@ async function createClient(
     store,
     now: options.now ?? (() => 1),
     createOperationId: () => `${options.operationPrefix ?? name}-${++operationSequence}`,
+    clearSession: options.clearSession,
+    persistCurrent: options.persistCurrent,
   });
   return { db, engine, serializers, store, transport };
 }
@@ -448,6 +458,104 @@ describe('private Pro blocking multi-device vault engine', () => {
     assert.equal(server.operations.length, 0);
   });
 
+  test('restores runtime and leaves encrypted cache unchanged when hydration persistence fails', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    const client = await createClient(t, server, masterKey, 'persist-failure', {
+      persistCurrent: async (_index, _envelopes, persist) => {
+        await persist();
+        throw new Error('injected durable commit failure');
+      },
+    });
+    const oldEnvelope = await encryptedEnvelope(masterKey, 'settings', THEME_ID, 1, { id: 'theme', value: 'light' });
+    await client.db.putEncryptedRecord(UID, oldEnvelope);
+    await client.db.revisions.put({ uid: UID, recordType: 'settings', recordId: THEME_ID, revision: 1 });
+    await serializer(client, 'settings').mutate(THEME_ID, { id: 'theme', value: 'light' });
+    server.records.set(THEME_ID, {
+      envelope: await encryptedEnvelope(masterKey, 'settings', THEME_ID, 2, { id: 'theme', value: 'dark' }),
+      serverUpdatedAtMs: 2,
+    });
+    await assert.rejects(client.engine.hydrateBeforeOpen(), /durable commit failure/i);
+
+    assert.equal(serializer(client, 'settings').values.get(THEME_ID)?.value, 'light');
+    assert.deepEqual(await client.db.listEncryptedRecords(UID), [oldEnvelope]);
+    assert.equal((await client.db.revisions.get([UID, 'settings', THEME_ID]))?.revision, 1);
+    assert.equal(client.store.getState().phase, 'error');
+    assert.equal(client.store.getState().ready, false);
+  });
+
+  test('stop invalidates a deferred upload before local acknowledgement or status changes', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    const client = await createClient(t, server, masterKey, 'stop-upload');
+    await openClient(client);
+    let releaseWrite = () => {};
+    server.delayWrite = new Promise<void>(resolve => releaseWrite = resolve);
+
+    await serializer(client, 'settings').mutate(THEME_ID, { id: 'theme', value: 'dark' });
+    while (server.operations.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    client.engine.stop();
+    releaseWrite();
+    await client.engine.whenCurrent();
+
+    assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 1);
+    assert.equal(await client.db.revisions.get([UID, 'settings', THEME_ID]), undefined);
+    assert.equal(client.store.getState().phase, 'ready');
+    assert.equal(client.store.getState().ready, true);
+  });
+
+  test('logout waits for deferred hydration cancellation and cannot be repopulated by the late fetch', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    server.records.set(THEME_ID, {
+      envelope: await encryptedEnvelope(masterKey, 'settings', THEME_ID, 1, { id: 'theme', value: 'dark' }),
+      serverUpdatedAtMs: 1,
+    });
+    let sessionClears = 0;
+    const client = await createClient(t, server, masterKey, 'logout-fetch', {
+      clearSession: async () => { sessionClears++; },
+    });
+    await client.db.outbox.put({
+      uid: UID,
+      operationId: 'existing-outbox',
+      operation: {
+        formatVersion: 1,
+        operationId: 'existing-outbox',
+        kind: 'delete',
+        baseRevision: 0,
+        tombstone: {
+          formatVersion: 1,
+          recordType: 'settings',
+          recordId: THEME_ID,
+          revision: 1,
+          keyVersion: 1,
+          operationId: 'existing-outbox',
+          deletedAtMs: 999,
+        },
+      },
+      createdAtMs: 999,
+    });
+    let releaseFetch = () => {};
+    server.delayRecordFetch = new Promise<void>(resolve => releaseFetch = resolve);
+
+    const hydration = client.engine.hydrateBeforeOpen();
+    while (server.fetches.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    let logoutSettled = false;
+    const logout = client.engine.logoutAndClear().then(() => logoutSettled = true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(logoutSettled, false);
+    releaseFetch();
+    await Promise.allSettled([hydration, logout]);
+
+    assert.equal(sessionClears, 1);
+    assert.equal(await client.db.records.where('uid').equals(UID).count(), 0);
+    assert.equal(await client.db.revisions.where('uid').equals(UID).count(), 0);
+    assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 0);
+    assert.equal(serializer(client, 'settings').values.size, 0);
+    assert.equal(client.store.getState().phase, 'locked');
+    assert.equal(client.store.getState().ready, false);
+  });
+
   test('encrypts a local mutation that races with disconnect and drains it only after refetch', async (t) => {
     const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
     const server = new TestVaultServer();
@@ -486,6 +594,42 @@ describe('private Pro blocking multi-device vault engine', () => {
 
     assert.equal(serializer(client, 'settings').values.get(THEME_ID)?.value, 'light');
     assert.equal(server.records.get(THEME_ID)?.envelope.revision, 2);
+  });
+
+  test('backfills mixed legacy outbox rows by primary key after sequenced rows and ignores timestamps', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    const client = await createClient(t, server, masterKey, 'legacy-sequence', { now: () => 0 });
+    await openClient(client);
+    client.transport.setOnline(false);
+    await serializer(client, 'settings').mutate(THEME_ID, { id: 'theme', value: 'dark' });
+    await client.engine.whenCurrent();
+    const legacyOperation = (operationId: string, recordId: string, deletedAtMs: number): PrivateProVaultOperation => ({
+      formatVersion: 1,
+      operationId,
+      kind: 'delete',
+      baseRevision: 0,
+      tombstone: {
+        formatVersion: 1,
+        recordType: 'settings',
+        recordId,
+        revision: 1,
+        keyVersion: 1,
+        operationId,
+        deletedAtMs,
+      },
+    });
+    const legacyAId = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+    const legacyBId = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
+    await client.db.outbox.bulkPut([
+      { uid: UID, operationId: 'legacy-b', operation: legacyOperation('legacy-b', legacyBId, 0), createdAtMs: 0, localSequence: 0 },
+      { uid: UID, operationId: 'legacy-a', operation: legacyOperation('legacy-a', legacyAId, Number.MAX_SAFE_INTEGER), createdAtMs: Number.MAX_SAFE_INTEGER },
+    ]);
+
+    client.transport.setOnline(true);
+    await client.engine.whenCurrent();
+
+    assert.deepEqual(server.operations.map(operation => operation.operationId), ['legacy-sequence-1', 'legacy-a', 'legacy-b']);
   });
 
   test('preserves both chat versions by uploading a conflict copy', async (t) => {

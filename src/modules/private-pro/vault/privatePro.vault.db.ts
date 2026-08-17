@@ -137,6 +137,24 @@ export class PrivateProVaultDB extends Dexie {
     const records = await this.records.where('uid').equals(uid).sortBy('recordId');
     return records.map(record => structuredClone(record.envelope));
   }
+
+  async backfillOutboxLocalSequences(uid: string): Promise<number> {
+    return this.transaction('rw', this.outbox, async () => {
+      const records = (await this.outbox.where('uid').equals(uid).toArray()).sort((left, right) =>
+        left.operationId < right.operationId ? -1 : left.operationId > right.operationId ? 1 : 0);
+      let maximum = records.reduce((current, record) =>
+        Number.isSafeInteger(record.localSequence) && record.localSequence! > 0
+          ? Math.max(current, record.localSequence!)
+          : current,
+      0);
+      for (const record of records) {
+        if (Number.isSafeInteger(record.localSequence) && record.localSequence! > 0) continue;
+        maximum++;
+        await this.outbox.update([uid, record.operationId], { localSequence: maximum });
+      }
+      return maximum;
+    });
+  }
 }
 
 export const privateProVaultDB = new PrivateProVaultDB();

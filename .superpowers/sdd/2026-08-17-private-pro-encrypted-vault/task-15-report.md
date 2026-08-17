@@ -78,3 +78,30 @@ GREEN:
 
 - Task 17 must add record chunk transport before records above the current 700 KiB Firestore-safe limit can sync.
 - Task 16 must integrate the store gate so application controls remain inaccessible whenever `ready` is false.
+
+## Fix round 1
+
+Addressed all three concurrency and persistence review findings.
+
+- Added a monotonic run epoch to every queued engine run. `stop()` invalidates the epoch and unsubscribes synchronously. Every awaited transport, crypto, serializer, database, and status boundary checks the epoch before the next side effect.
+- `logoutAndClear()` now invalidates the run, waits for the serialized work tail to settle, clears the in-memory session, then clears all UID-scoped durable and runtime state. A late deferred fetch cannot repopulate the vault.
+- Hydration now snapshots both runtime state and encrypted records/revisions. A runtime apply failure, durable commit failure, post-commit injected failure, or cancellation restores the prior runtime in reverse serializer order and restores the prior encrypted cache/revisions.
+- Added a transactional database backfill for missing or zero outbox `localSequence` values. Legacy rows are assigned after the current maximum in deterministic `[uid+operationId]` primary-key order.
+- Outbox draining now sorts only by `localSequence`, with operation ID as a deterministic tie-breaker. Device `createdAtMs` and tombstone `deletedAtMs` remain metadata only.
+
+Fix TDD RED:
+
+```text
+db.backfillOutboxLocalSequences is not a function
+persist failure left runtime dark instead of restoring light
+stop removed the deferred operation from outbox
+logout did not clear the session hook
+legacy-b drained before the sequenced and primary-key ordered rows
+```
+
+Fix verification:
+
+- Engine, database, and serializer suites - 26 passed, 0 failed.
+- Focused affected-file ESLint - passed.
+- `npm run tscheck` - passed.
+- `git diff --check` - passed with Git line-ending notices only.
