@@ -17,11 +17,11 @@ export const PRIVATE_PRO_ENCRYPTED_BACKUP_SCHEMA_VERSION = 1;
 const MAX_VAULT_ID_LENGTH = 512;
 const MAX_ASSET_ID_LENGTH = 512;
 const MAX_CHUNK_ID_LENGTH = 512;
-export const PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES = 64 * 1024 * 1024;
+export const PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES = 4 * 1024 * 1024;
 const DEFAULT_MAX_RECORDS = 100_000;
 const DEFAULT_MAX_ASSET_CHUNKS = 100_000;
 export const PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES = 128 * 1024 * 1024;
-export const PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES = 96 * 1024 * 1024;
+export const PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES = 6 * 1024 * 1024;
 const TRANSCRIPT_MAC_BYTES = 32;
 const TRANSCRIPT_INITIAL_STATE: Uint8Array<ArrayBufferLike> = new Uint8Array(TRANSCRIPT_MAC_BYTES);
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
@@ -349,7 +349,7 @@ async function* readLines(
           lineBytes.set(chunk, offset);
           offset += chunk.byteLength;
         }
-        const lineText = decoder.decode(lineBytes.slice(0, -1));
+        const lineText = decoder.decode(lineBytes.subarray(0, -1));
         if (!lineText.trim())
           throw new Error('Private Pro encrypted backup cannot contain blank lines.');
         yield { text: lineText, bytes: lineBytes };

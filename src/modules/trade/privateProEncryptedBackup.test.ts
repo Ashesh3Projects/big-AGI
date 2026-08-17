@@ -8,7 +8,6 @@ import { deriveVaultSubkey, decryptVaultRecord, encryptVaultRecord, importVaultM
 import { generateRecoveryKey } from '../private-pro/vault/privatePro.vault.recovery';
 import {
   PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
-  PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
 } from '../private-pro/vault/privatePro.vault.schemas';
 import type { PrivateProVaultEnvelope, PrivateProVaultKeyset } from '../private-pro/vault/privatePro.vault.types';
 import { FlashBackup } from './BackupRestore';
@@ -37,6 +36,12 @@ function bytesToBase64(bytes: Uint8Array): string {
 
 function base64ToBytes(value: string): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(atob(value), character => character.charCodeAt(0));
+}
+
+function zeroBytesBase64(byteLength: number): string {
+  const completeGroups = Math.floor(byteLength / 3);
+  const remainder = byteLength % 3;
+  return `${'AAAA'.repeat(completeGroups)}${remainder === 1 ? 'AA==' : remainder === 2 ? 'AAA=' : ''}`;
 }
 
 async function passwordWrappingKey(password: string): Promise<CryptoKey> {
@@ -419,9 +424,10 @@ describe('private Pro encrypted backup', () => {
     assert.equal(applyCalls, 0);
   });
 
-  test('uses a 128 MiB in-memory aggregate cap and a line cap that fits maximum ciphertext records', () => {
+  test('uses a 128 MiB aggregate, 4 MiB asset chunks, and a line cap that fits a maximum asset chunk', () => {
     assert.equal(PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES, 128 * 1024 * 1024);
-    assert.equal(PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES, 96 * 1024 * 1024);
+    assert.equal(PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES, 4 * 1024 * 1024);
+    assert.equal(PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES, 6 * 1024 * 1024);
 
     const encodedAssetCiphertextBytes = Math.ceil(PRIVATE_PRO_ENCRYPTED_BACKUP_MAX_ASSET_CIPHERTEXT_BYTES / 3) * 4;
     const assetMetadataBytes = new TextEncoder().encode(`${JSON.stringify({
@@ -440,25 +446,64 @@ describe('private Pro encrypted backup', () => {
       true,
     );
 
-    const encodedRecordCiphertextBytes = Math.ceil(PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES / 3) * 4;
-    const recordMetadataBytes = new TextEncoder().encode(`${JSON.stringify({
-      kind: 'record',
-      envelope: {
-        formatVersion: 1,
-        recordType: 'credential-service',
-        recordId: '\0'.repeat(512),
-        schemaVersion: Number.MAX_SAFE_INTEGER,
-        keyVersion: Number.MAX_SAFE_INTEGER,
-        revision: Number.MAX_SAFE_INTEGER,
-        nonceBase64: 'A'.repeat(16),
-        ciphertextBase64: '',
-        ciphertextBytes: PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
-      },
-    })}\n`).byteLength;
-    assert.equal(
-      PRIVATE_PRO_ENCRYPTED_BACKUP_DEFAULT_MAX_LINE_BYTES >= encodedRecordCiphertextBytes + recordMetadataBytes,
-      true,
+  });
+
+  test('rejects asset chunk metadata above the 4 MiB ciphertext format limit', async () => {
+    const { source } = await fixture();
+    const oversizedBytes = 4 * 1024 * 1024 + 1;
+    const oversizedAsset: PrivateProEncryptedBackupAsset = {
+      kind: 'asset',
+      formatVersion: 1,
+      assetId: 'opaque-asset',
+      chunkId: 'chunk-too-large',
+      chunkIndex: 0,
+      keyVersion: 1,
+      nonceBase64: bytesToBase64(new Uint8Array(12)),
+      ciphertextBase64: zeroBytesBase64(oversizedBytes),
+      ciphertextBytes: oversizedBytes,
+    };
+    const oversizedSource: PrivateProEncryptedBackupSource = {
+      ...source,
+      assets: async function* () { yield oversizedAsset; },
+    };
+
+    await assert.rejects(
+      collectStream(createPrivateProEncryptedBackupStream(oversizedSource)),
+      /less than or equal|ciphertextBytes|too big|maximum/i,
     );
+  });
+
+  test('imports multiple ordered chunks for one asset identity', async () => {
+    const { source } = await fixture();
+    const chunks: PrivateProEncryptedBackupAsset[] = [0, 1].map(index => ({
+      kind: 'asset',
+      formatVersion: 1,
+      assetId: 'opaque-multi-chunk-asset',
+      chunkId: `chunk-${index}`,
+      chunkIndex: index,
+      keyVersion: 1,
+      nonceBase64: bytesToBase64(new Uint8Array(12).fill(index + 1)),
+      ciphertextBase64: bytesToBase64(new Uint8Array(20).fill(index + 2)),
+      ciphertextBytes: 20,
+    }));
+    const multiChunkSource: PrivateProEncryptedBackupSource = {
+      ...source,
+      assets: async function* () { yield* chunks; },
+    };
+    const output = await collectStream(createPrivateProEncryptedBackupStream(multiChunkSource));
+    let imported: readonly PrivateProEncryptedBackupAsset[] = [];
+
+    await importPrivateProEncryptedBackup(
+      streamFromBytes(output.bytes),
+      { kind: 'password', password: PASSWORD },
+      async () => undefined,
+      async input => { imported = input.assets; },
+    );
+
+    assert.deepEqual(imported.map(chunk => [chunk.assetId, chunk.chunkId, chunk.chunkIndex]), [
+      ['opaque-multi-chunk-asset', 'chunk-0', 0],
+      ['opaque-multi-chunk-asset', 'chunk-1', 1],
+    ]);
   });
 
   test('counts the exact raw UTF-8 line bytes at the configured boundary', async () => {
