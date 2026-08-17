@@ -2,8 +2,13 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import {
+  PRIVATE_PRO_VAULT_ARGON2ID_MAX_PARALLELISM,
+  PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS,
+  PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB,
+  PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM,
   PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
   PrivateProVaultEnvelopeSchema,
+  PrivateProVaultPasswordEnvelopeSchema,
 } from './privatePro.vault.schemas';
 
 
@@ -14,6 +19,21 @@ const VALID_ENVELOPE = {
   schemaVersion: 1,
   keyVersion: 1,
   revision: 1,
+  nonceBase64: 'AAECAwQFBgcICQoL',
+  ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODw==',
+  ciphertextBytes: 16,
+} as const;
+
+const VALID_PASSWORD_ENVELOPE = {
+  formatVersion: 1,
+  keyVersion: 1,
+  kdf: {
+    algorithm: 'argon2id',
+    saltBase64: 'AAECAwQFBgcICQoLDA0ODw==',
+    memoryKiB: PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB,
+    iterations: PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS,
+    parallelism: PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM,
+  },
   nonceBase64: 'AAECAwQFBgcICQoL',
   ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODw==',
   ciphertextBytes: 16,
@@ -41,6 +61,13 @@ describe('private Pro vault schemas', () => {
     assert.equal(PrivateProVaultEnvelopeSchema.safeParse({ ...VALID_ENVELOPE, ciphertextBase64: 'not base64!' }).success, false);
   });
 
+  test('rejects a base64 alias with nonzero unused ciphertext bits', () => {
+    assert.equal(PrivateProVaultEnvelopeSchema.safeParse({
+      ...VALID_ENVELOPE,
+      ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODx==',
+    }).success, false);
+  });
+
   test('rejects oversized ciphertext', () => {
     assert.equal(PrivateProVaultEnvelopeSchema.safeParse({
       ...VALID_ENVELOPE,
@@ -50,5 +77,45 @@ describe('private Pro vault schemas', () => {
 
   test('rejects unexpected envelope fields', () => {
     assert.equal(PrivateProVaultEnvelopeSchema.safeParse({ ...VALID_ENVELOPE, plaintext: 'must not be accepted' }).success, false);
+  });
+
+  test('rejects an Argon2id memory cost below the security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse({
+      ...VALID_PASSWORD_ENVELOPE,
+      kdf: { ...VALID_PASSWORD_ENVELOPE.kdf, memoryKiB: PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB - 1 },
+    }).success, false);
+  });
+
+  test('accepts the Argon2id memory security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse(VALID_PASSWORD_ENVELOPE).success, true);
+  });
+
+  test('rejects Argon2id iterations below the security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse({
+      ...VALID_PASSWORD_ENVELOPE,
+      kdf: { ...VALID_PASSWORD_ENVELOPE.kdf, iterations: PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS - 1 },
+    }).success, false);
+  });
+
+  test('accepts the Argon2id iteration security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse(VALID_PASSWORD_ENVELOPE).success, true);
+  });
+
+  test('rejects Argon2id parallelism below the security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse({
+      ...VALID_PASSWORD_ENVELOPE,
+      kdf: { ...VALID_PASSWORD_ENVELOPE.kdf, parallelism: PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM - 1 },
+    }).success, false);
+  });
+
+  test('accepts the Argon2id parallelism security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse(VALID_PASSWORD_ENVELOPE).success, true);
+  });
+
+  test('rejects Argon2id parallelism above the bounded range', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse({
+      ...VALID_PASSWORD_ENVELOPE,
+      kdf: { ...VALID_PASSWORD_ENVELOPE.kdf, parallelism: PRIVATE_PRO_VAULT_ARGON2ID_MAX_PARALLELISM + 1 },
+    }).success, false);
   });
 });

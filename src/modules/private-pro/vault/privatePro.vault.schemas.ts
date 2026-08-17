@@ -19,6 +19,12 @@ import type {
 export const PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES = 16 * 1024 * 1024;
 export const PRIVATE_PRO_VAULT_MAX_WRAPPED_KEY_CIPHERTEXT_BYTES = 8 * 1024;
 export const PRIVATE_PRO_VAULT_MAX_RECORD_INDEX_ENTRIES = 500;
+export const PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB = 64 * 1024;
+export const PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS = 3;
+export const PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM = 1;
+export const PRIVATE_PRO_VAULT_ARGON2ID_MAX_MEMORY_KIB = 1024 * 1024;
+export const PRIVATE_PRO_VAULT_ARGON2ID_MAX_ITERATIONS = 100;
+export const PRIVATE_PRO_VAULT_ARGON2ID_MAX_PARALLELISM = 4;
 
 const PRIVATE_PRO_VAULT_MAX_IDENTIFIER_LENGTH = 256;
 const PRIVATE_PRO_VAULT_MAX_CURSOR_LENGTH = 512;
@@ -40,11 +46,20 @@ function decodedBase64ByteLength(base64: string): number {
   return base64.length / 4 * 3 - padding;
 }
 
+function isCanonicalBase64(base64: string): boolean {
+  try {
+    return btoa(atob(base64)) === base64;
+  } catch {
+    return false;
+  }
+}
+
 function base64Schema(minBytes: number, maxBytes: number) {
   return z.string()
     .min(4)
     .max(maxBase64Length(maxBytes))
     .regex(CANONICAL_BASE64, 'Expected canonical base64.')
+    .refine(isCanonicalBase64, 'Expected canonical base64.')
     .refine(value => {
       const decodedBytes = decodedBase64ByteLength(value);
       return decodedBytes >= minBytes && decodedBytes <= maxBytes;
@@ -112,9 +127,9 @@ export const PrivateProVaultWrappedKeyEnvelopeSchema = encryptedFieldsSchema(PRI
 const PrivateProVaultArgon2idSchema = z.object({
   algorithm: z.literal('argon2id'),
   saltBase64: PrivateProVaultSaltSchema,
-  memoryKiB: boundedPositiveInteger(1024 * 1024),
-  iterations: boundedPositiveInteger(100),
-  parallelism: boundedPositiveInteger(64),
+  memoryKiB: z.number().int().min(PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB).max(PRIVATE_PRO_VAULT_ARGON2ID_MAX_MEMORY_KIB),
+  iterations: z.number().int().min(PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS).max(PRIVATE_PRO_VAULT_ARGON2ID_MAX_ITERATIONS),
+  parallelism: z.number().int().min(PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM).max(PRIVATE_PRO_VAULT_ARGON2ID_MAX_PARALLELISM),
 }).strict();
 
 const PrivateProVaultPbkdf2Schema = z.object({
