@@ -28,6 +28,22 @@ const EXCLUDED = {
   incomplete: 'sentinel-incomplete-message',
   pane: 'sentinel-pane-state',
   modal: 'sentinel-modal-state',
+  nestedSetup: 'sentinel-nested-setup-token',
+  nestedAsrx: 'sentinel-nested-asrx-session',
+  nestedSpeex: 'sentinel-nested-speex-metrics',
+} as const;
+
+const CURRENT_SERVICE_SETUP_FIELDS = {
+  alibabaOaiKey: 'alibaba-key', alibabaOaiHost: 'https://alibaba.example',
+  anthropicKey: 'anthropic-key', anthropicHost: 'https://anthropic.example', inferenceGeoUS: true,
+  azureEndpoint: 'https://azure.example', azureKey: 'azure-key',
+  bedrockBearerToken: 'bedrock-bearer', bedrockAccessKeyId: 'bedrock-access', bedrockSecretAccessKey: 'bedrock-secret', bedrockSessionToken: 'bedrock-session', bedrockRegion: 'us-east-1',
+  cerebrasKey: 'cerebras-key', cohereKey: 'cohere-key', cohereHost: 'https://cohere.example', deepseekKey: 'deepseek-key', deepseekHost: 'https://deepseek.example',
+  geminiKey: 'gemini-key', geminiHost: 'https://gemini.example', minSafetyLevel: 'BLOCK_LOW_AND_ABOVE', groqKey: 'groq-key',
+  localAIHost: 'http://localai.example', localAIKey: 'localai-key', mode: 'selfhosted', modularKey: 'modular-key', modularHost: 'https://modular.example', moonshotKey: 'moonshot-key',
+  nvidiaKey: 'nvidia-key', nvidiaHost: 'https://nvidia.example', oaiKey: INCLUDED.providerKey, oaiOrg: 'sentinel-openai-org', oaiHost: INCLUDED.providerEndpoint,
+  ollamaHost: 'http://ollama.example', perplexityKey: 'perplexity-key', requireParameters: true, sakanaKey: 'sakana-key', sakanaHost: 'https://sakana.example',
+  togetherKey: 'together-key', togetherHost: 'https://together.example', togetherFreeTrial: true, xaiKey: 'xai-key', zaiKey: 'zai-key', zaiHost: 'https://zai.example', csf: true,
 } as const;
 
 
@@ -51,7 +67,8 @@ test('portable serializer registry includes only explicit portable state', async
     { folderVaultApply, folderVaultResetAll },
     { scratchClipVaultApply, scratchClipVaultReset },
     { googleVaultApply },
-    { speechVaultApply },
+    { useASRxStore },
+    { useSpeexStore },
     { shareVaultApply },
   ] = await Promise.all([
     import('./privatePro.vault.serializers'),
@@ -62,7 +79,8 @@ test('portable serializer registry includes only explicit portable state', async
     import('../../../common/stores/folders/store-chat-folders'),
     import('../../../common/layout/optima/scratchclip/store-scratchclip'),
     import('../../google/store-module-google'),
-    import('./serializers/settings'),
+    import('../../asrx/store-module-asrx'),
+    import('../../speex/store-module-speex'),
     import('../../trade/link/store-share-link'),
   ]);
 
@@ -71,7 +89,10 @@ test('portable serializer registry includes only explicit portable state', async
       id: 'openai',
       label: 'OpenAI compatible',
       vId: 'openai',
-      setup: { oaiKey: INCLUDED.providerKey, oaiHost: INCLUDED.providerEndpoint },
+      setup: {
+        ...CURRENT_SERVICE_SETUP_FIELDS,
+        runtime: { firebaseToken: EXCLUDED.nestedSetup },
+      },
       firebaseToken: EXCLUDED.firebaseToken,
       loggerData: EXCLUDED.logger,
     } as never],
@@ -145,20 +166,33 @@ test('portable serializer registry includes only explicit portable state', async
   scratchClipVaultReset();
   scratchClipVaultApply({ history: [{ id: 'clip-portable', text: INCLUDED.scratch, timestamp: 1, source: 'textarea' }] });
   googleVaultApply({ googleCloudApiKey: INCLUDED.googleKey, googleCSEId: 'sentinel-cse', restrictToDomain: 'example.com' });
-  speechVaultApply({
-    asrx: { engines: {}, activeEngineId: null },
-    speex: {
+  useASRxStore.setState({
+      engines: {
+        'asrx-portable': {
+          engineId: 'asrx-portable', vendorType: 'deepgram', label: 'Transcription', isAutoDetected: false,
+          isAutoLinked: false, isDeleted: false,
+          credentials: { type: 'api-key', apiKey: 'sentinel-asrx-key', apiHost: 'https://sentinel-asrx.example', session: EXCLUDED.nestedAsrx },
+          profile: { dialect: 'deepgram', asrModel: 'nova-3', language: 'en', smartFormat: true, runtime: { deviceId: EXCLUDED.deviceId } },
+          createdAt: 1, updatedAt: 2,
+          authSession: EXCLUDED.nestedAsrx,
+        },
+      },
+      activeEngineId: 'asrx-portable',
+      hasInitializedLlms: true,
+  } as never);
+  useSpeexStore.setState({
       engines: {
         'speech-portable': {
           engineId: 'speech-portable', vendorType: 'elevenlabs', label: 'Speech', isAutoDetected: false,
           isAutoLinked: false, isDeleted: false, credentials: { type: 'api-key', apiKey: INCLUDED.speechKey },
-          voice: { dialect: 'elevenlabs', ttsVoiceId: 'voice' }, createdAt: 1, updatedAt: 2,
+          voice: { dialect: 'elevenlabs', ttsVoiceId: 'voice', logs: EXCLUDED.nestedSpeex },
+          metrics: { value: EXCLUDED.nestedSpeex }, createdAt: 1, updatedAt: 2,
         },
       },
       activeEngineId: 'speech-portable',
       ttsCharLimit: 4096,
-    },
-  });
+      hasInitializedLlms: true,
+  } as never);
   shareVaultApply({
     chatLinkItems: [{
       chatTitle: 'Shared', objectId: 'share-portable', createdAt: '2026-08-17T00:00:00.000Z',
@@ -175,8 +209,17 @@ test('portable serializer registry includes only explicit portable state', async
   })))).flatMap(group => group.records.map(record => ({ ...group, ...record })));
   const json = JSON.stringify(snapshot);
 
+  const modelSerializer = serializers.find(serializer => serializer.recordType === 'model-service');
+  const modelRecord = snapshot.find(record => record.recordType === 'model-service');
+  assert(modelSerializer && modelRecord);
+  const crossServiceValue = structuredClone(modelRecord.value) as { serviceId: string; models: Array<{ sId: string }> };
+  crossServiceValue.models[0].sId = 'other-service';
+  await assert.rejects(modelSerializer.apply(modelRecord.recordId, crossServiceValue), /serviceId|service ID/);
+
   for (const sentinel of Object.values(INCLUDED))
     assert.equal(json.includes(sentinel), true, `expected portable sentinel ${sentinel}`);
+  for (const value of Object.values(CURRENT_SERVICE_SETUP_FIELDS))
+    assert.equal(json.includes(String(value)), true, `expected current model service setup value ${value}`);
   for (const sentinel of Object.values(EXCLUDED))
     assert.equal(json.includes(sentinel), false, `unexpected non-portable sentinel ${sentinel}`);
 
