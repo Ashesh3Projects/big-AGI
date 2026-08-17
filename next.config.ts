@@ -3,6 +3,8 @@ import type { WebpackConfigContext } from 'next/dist/server/config-shared';
 import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
+import { privateProSecurityHeaders } from './src/common/security/securityHeaders';
+
 // Build information: from CI, or git commit hash
 let buildHash = process.env.NEXT_PUBLIC_BUILD_HASH || process.env.GITHUB_SHA || process.env.VERCEL_GIT_COMMIT_SHA; // Docker or custom, GitHub Actions, Vercel
 try {
@@ -31,6 +33,12 @@ buildType && console.log(` 🧠 big-AGI: building for ${buildType}...\n`);
 /** @type {import('next').NextConfig} */
 let nextConfig: NextConfig = {
   reactStrictMode: !process.env.NO_STRICT_MODE, // default: enabled
+
+  ...(process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true' && {
+    async headers() {
+      return [{ source: '/:path*', headers: privateProSecurityHeaders() }];
+    },
+  }),
 
   // build-time lint: default ON (a build is the last gate); NO_LINT_BUILD=1 skips the ~15s
   // typed pass when CI already ran `npm run lint` as its own step
