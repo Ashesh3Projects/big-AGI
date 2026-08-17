@@ -9,6 +9,7 @@ import {
   PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
   PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
   PrivateProVaultEnvelopeSchema,
+  PrivateProVaultDeviceRegistrationSchema,
   PrivateProVaultPasswordEnvelopeSchema,
 } from './privatePro.vault.schemas';
 
@@ -138,5 +139,27 @@ describe('private Pro vault schemas', () => {
 
   test('accepts the PBKDF2 compatibility security floor', () => {
     assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse(VALID_PBKDF2_PASSWORD_ENVELOPE).success, true);
+  });
+
+  test('accepts only strict public P-256 registration JWK fields', () => {
+    const valid = {
+      algorithm: 'ECDSA-P256-SHA256',
+      keyVersion: 1,
+      publicJwk: {
+        kty: 'EC', crv: 'P-256',
+        x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
+        y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
+      },
+      privateKeyEnvelope: { nonceBase64: 'AAECAwQFBgcICQoL', ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODw==', ciphertextBytes: 16 },
+    };
+    assert.equal(PrivateProVaultDeviceRegistrationSchema.safeParse(valid).success, true);
+    assert.equal(PrivateProVaultDeviceRegistrationSchema.safeParse({
+      ...valid,
+      publicJwk: { ...valid.publicJwk, d: 'private-material' },
+    }).success, false);
+    assert.equal(PrivateProVaultDeviceRegistrationSchema.safeParse({
+      ...valid,
+      publicJwk: { ...valid.publicJwk, crv: 'P-384' },
+    }).success, false);
   });
 });

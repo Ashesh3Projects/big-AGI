@@ -13,6 +13,7 @@ import {
   PrivateProVaultTombstoneSchema,
 } from './privatePro.vault.schemas';
 import type { PrivateProVaultEnvelope, PrivateProVaultKeyset, PrivateProVaultTombstone } from './privatePro.vault.types';
+import { verifyPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 
 
 const OPAQUE_RECORD_ID = /^[A-Za-z0-9_-]{43}$/;
@@ -64,6 +65,8 @@ export interface RevokeVaultDeviceInput {
 export interface RegisterVaultDeviceInput {
   deviceId: string;
   keyVersion: number;
+  operationId: string;
+  signatureBase64: string;
 }
 
 export type CommitVaultMigrationResult =
@@ -116,6 +119,8 @@ function repeatOutcome(outcome: PrivateProVaultOperationOutcome) {
         : { status: 'conflict' as const, currentPhase: outcome.currentPhase };
     case 'device':
       return { status: 'unchanged' as const, revokedAtMs: outcome.revokedAtMs };
+    case 'device-registration':
+      return { status: 'unchanged' as const, device: outcome.device };
   }
 }
 
@@ -151,11 +156,19 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
     async registerDevice(uid: string, input: RegisterVaultDeviceInput) {
       assertUid(uid);
       assertOpaqueRecordId(input.deviceId, 'device ID');
+      assertOperationId(input.operationId);
       if (!Number.isSafeInteger(input.keyVersion) || input.keyVersion <= 0) throw new Error('Vault device key version is invalid.');
       return repository.transaction(uid, async transaction => {
-        const [storedKeyset, existing] = await Promise.all([transaction.getKeyset(), transaction.getDevice(input.deviceId)]);
+        const storedKeyset = await transaction.getKeyset();
         if (!storedKeyset || storedKeyset.keyVersion !== input.keyVersion) throw new Error('Vault device key version is stale.');
+        const existing = await transaction.getDevice(input.deviceId);
         if (existing?.revokedAtMs !== null && existing?.revokedAtMs !== undefined) throw new Error('Vault device is revoked.');
+        const requestFingerprint = fingerprint({ kind: 'register-device', ...input });
+        const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
+        if (repeated) return repeated as { status: 'unchanged'; device: Awaited<ReturnType<typeof transaction.getDevice>> & object };
+        if (!await verifyPrivateProVaultDeviceRegistration(storedKeyset.keyset.deviceRegistration.publicJwk, {
+          formatVersion: 1, uid, deviceId: input.deviceId, keyVersion: input.keyVersion, operationId: input.operationId,
+        }, input.signatureBase64)) throw new Error('Vault device registration proof is invalid.');
         if (existing) return { status: 'registered' as const, device: existing };
         const timestamp = now();
         const device = {
@@ -167,6 +180,7 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
           revokedAtMs: null,
         };
         await transaction.setDevice(device);
+        await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome: { kind: 'device-registration', status: 'committed', device } });
         return { status: 'registered' as const, device };
       });
     },

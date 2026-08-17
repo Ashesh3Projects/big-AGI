@@ -31,6 +31,7 @@ import { createPrivateProVaultStore, privateProVaultStore, type PrivateProVaultP
 import { createPrivateProVaultTransport } from './privatePro.vault.transport';
 import type { PrivateProVaultDeviceMetadata, PrivateProVaultKeyset } from './privatePro.vault.types';
 import { clearPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
+import { signPrivateProVaultDeviceRegistration, unlockPrivateProVaultDeviceRegistrationKey } from './privatePro.vault.registration';
 
 
 export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'migrating' | 'error';
@@ -334,7 +335,7 @@ function createProductionDependencies(
       return result.status === 'conflict' ? 'conflict' : 'committed';
     },
     async setup(password) {
-      const created = await createPrivateProVaultKeyset(password);
+      const created = await createPrivateProVaultKeyset(password, user.uid);
       runtime.keyset = created.keyset;
       runtime.masterKey = created.masterKey;
       return created;
@@ -358,7 +359,15 @@ function createProductionDependencies(
       runtime.keyset = keyset;
     },
     async register(keyset) {
-      await apiAsyncNode.privateProVault.registerDevice.mutate({ deviceId, keyVersion: keyset.keyVersion });
+      const existing = await apiAsyncNode.privateProVault.bootstrap.mutate({ deviceId });
+      if (existing.device && existing.device.revokedAtMs === null && existing.device.keyVersion === keyset.keyVersion) return;
+      if (!runtime.masterKey) throw new Error('Vault master key is unavailable.');
+      const operationId = `register-${crypto.randomUUID()}`;
+      const privateKey = await unlockPrivateProVaultDeviceRegistrationKey(runtime.masterKey, user.uid, keyset.deviceRegistration, keyset.keyVersion);
+      const signatureBase64 = await signPrivateProVaultDeviceRegistration(privateKey, {
+        formatVersion: 1, uid: user.uid, deviceId, keyVersion: keyset.keyVersion, operationId,
+      });
+      await apiAsyncNode.privateProVault.registerDevice.mutate({ operationId, deviceId, keyVersion: keyset.keyVersion, signatureBase64 });
     },
     async activate(masterKey, keyset) {
       await runtime.engine?.stopAndWait();

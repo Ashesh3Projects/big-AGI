@@ -5,6 +5,7 @@ import type {
   PrivateProVaultDeviceMetadata,
   PrivateProVaultEnvelope,
   PrivateProVaultKeyset,
+  PrivateProVaultDeviceRegistration,
   PrivateProVaultOperation,
   PrivateProVaultPasswordEnvelope,
   PrivateProVaultPutOperation,
@@ -159,14 +160,31 @@ export const PrivateProVaultRecoveryEnvelopeSchema = z.object({
   path: ['ciphertextBytes'],
 }) satisfies z.ZodType<PrivateProVaultRecoveryEnvelope>;
 
+const PrivateProVaultPublicJwkSchema = z.object({
+  kty: z.literal('EC'),
+  crv: z.literal('P-256'),
+  x: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+  y: z.string().regex(/^[A-Za-z0-9_-]{43}$/),
+}).strict();
+
+export const PrivateProVaultDeviceRegistrationSchema = z.object({
+  algorithm: z.literal('ECDSA-P256-SHA256'),
+  keyVersion: boundedPositiveInteger(),
+  publicJwk: PrivateProVaultPublicJwkSchema,
+  privateKeyEnvelope: PrivateProVaultWrappedKeyEnvelopeSchema,
+}).strict() satisfies z.ZodType<PrivateProVaultDeviceRegistration>;
+
 export const PrivateProVaultKeysetSchema = z.object({
   formatVersion: z.literal(1),
   keyVersion: boundedPositiveInteger(),
   wrappingVersion: boundedPositiveInteger(),
+  deviceRegistration: PrivateProVaultDeviceRegistrationSchema,
   passwordEnvelope: PrivateProVaultPasswordEnvelopeSchema,
   recoveryEnvelope: PrivateProVaultRecoveryEnvelopeSchema,
 }).strict().refine(value =>
-  value.keyVersion === value.passwordEnvelope.keyVersion && value.keyVersion === value.recoveryEnvelope.keyVersion,
+  value.keyVersion === value.passwordEnvelope.keyVersion
+  && value.keyVersion === value.recoveryEnvelope.keyVersion
+  && value.keyVersion === value.deviceRegistration.keyVersion,
 {
   message: 'Keyset envelope versions must match keyVersion.',
   path: ['keyVersion'],

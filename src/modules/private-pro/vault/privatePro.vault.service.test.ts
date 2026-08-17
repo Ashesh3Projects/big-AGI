@@ -15,6 +15,8 @@ import {
   type PrivateProVaultStoredTombstone,
 } from './privatePro.vault.repository';
 import { createPrivateProVaultService } from './privatePro.vault.service';
+import { importVaultMasterKey } from './privatePro.vault.crypto';
+import { createPrivateProVaultDeviceRegistration, signPrivateProVaultDeviceRegistration, unlockPrivateProVaultDeviceRegistrationKey } from './privatePro.vault.registration';
 import type {
   PrivateProVaultEnvelope,
   PrivateProVaultKeyset,
@@ -62,6 +64,16 @@ function keyset(keyVersion: number, wrappingVersion = keyVersion): PrivateProVau
     formatVersion: 1,
     keyVersion,
     wrappingVersion,
+    deviceRegistration: {
+      algorithm: 'ECDSA-P256-SHA256',
+      keyVersion,
+      publicJwk: {
+        kty: 'EC', crv: 'P-256',
+        x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
+        y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
+      },
+      privateKeyEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
+    },
     passwordEnvelope: {
       formatVersion: 1,
       keyVersion,
@@ -189,6 +201,23 @@ function serviceFixture() {
   let now = 1_000;
   const service = createPrivateProVaultService(repository, () => now++);
   return { repository, service };
+}
+
+async function registrationFixture(deviceId: string, operationId: string) {
+  const masterKey = await importVaultMasterKey(new Uint8Array(32).fill(0x42));
+  const deviceRegistration = await createPrivateProVaultDeviceRegistration(masterKey, UID_A, 1);
+  const privateKey = await unlockPrivateProVaultDeviceRegistrationKey(masterKey, UID_A, deviceRegistration, 1);
+  return {
+    keyset: { ...keyset(1), deviceRegistration },
+    input: {
+      deviceId,
+      keyVersion: 1,
+      operationId,
+      signatureBase64: await signPrivateProVaultDeviceRegistration(privateKey, {
+        formatVersion: 1, uid: UID_A, deviceId, keyVersion: 1, operationId,
+      }),
+    },
+  };
 }
 
 
@@ -417,13 +446,14 @@ describe('Private Pro encrypted vault service', () => {
   test('does not register an unknown device during bootstrap and preserves known revocation', async () => {
     const { service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
+    const registration = await registrationFixture(deviceId, 'register-device-1');
+    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: registration.keyset });
 
     assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
-      keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
+      keyset: { keyset: registration.keyset, serverUpdatedAtMs: 1_000 },
       device: null,
     });
-    assert.deepEqual(await service.registerDevice(UID_A, { deviceId, keyVersion: 1 }), {
+    assert.deepEqual(await service.registerDevice(UID_A, registration.input), {
       status: 'registered',
       device: {
         formatVersion: 1,
@@ -438,9 +468,9 @@ describe('Private Pro encrypted vault service', () => {
       status: 'committed',
       revokedAtMs: 1_002,
     });
-    await assert.rejects(service.registerDevice(UID_A, { deviceId, keyVersion: 1 }), /revoked/i);
+    await assert.rejects(service.registerDevice(UID_A, registration.input), /revoked/i);
     assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
-      keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
+      keyset: { keyset: registration.keyset, serverUpdatedAtMs: 1_000 },
       device: {
         formatVersion: 1,
         deviceId,
@@ -460,11 +490,25 @@ describe('Private Pro encrypted vault service', () => {
     }]);
   });
 
+  test('rejects unsigned, tampered, and operation-collision device registration', async () => {
+    const { service } = serviceFixture();
+    const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
+    const registration = await registrationFixture(deviceId, 'register-device-proof');
+    await service.putKeyset(UID_A, { operationId: 'keyset-proof', baseWrappingVersion: 0, keyset: registration.keyset });
+
+    await assert.rejects(service.registerDevice(UID_A, { ...registration.input, signatureBase64: '' }), /proof/i);
+    await assert.rejects(service.registerDevice(UID_A, { ...registration.input, deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }), /proof/i);
+    assert.equal((await service.registerDevice(UID_A, registration.input)).status, 'registered');
+    assert.equal((await service.registerDevice(UID_A, registration.input)).status, 'unchanged');
+    await assert.rejects(service.registerDevice(UID_A, { ...registration.input, deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }), /operation ID/i);
+  });
+
   test('makes device revocation idempotent without accepting device key material', async () => {
     const { repository, service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
-    await service.registerDevice(UID_A, { deviceId, keyVersion: 1 });
+    const registration = await registrationFixture(deviceId, 'register-device-idempotent');
+    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: registration.keyset });
+    await service.registerDevice(UID_A, registration.input);
     const input = { operationId: 'revoke-device-1', deviceId };
 
     assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'committed', revokedAtMs: 1_002 });

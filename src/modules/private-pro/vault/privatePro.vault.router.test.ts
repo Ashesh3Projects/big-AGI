@@ -48,7 +48,7 @@ const service = {
       ...device,
     }));
   },
-  registerDevice: async (uid: string, input: { deviceId: string; keyVersion: number }) => {
+  registerDevice: async (uid: string, input: { deviceId: string; keyVersion: number; operationId: string; signatureBase64: string }) => {
     state.calls.push({ method: 'registerDevice', uid, input });
     state.devices.set(input.deviceId, { deviceId: input.deviceId, keyVersion: input.keyVersion, revokedAtMs: null });
     return { status: 'registered' as const, device: { formatVersion: 1 as const, createdAtMs: 1, lastSeenAtMs: 1, ...state.devices.get(input.deviceId)! } };
@@ -196,7 +196,7 @@ describe('private Pro vault router input bounds', () => {
 
     await caller.bootstrap({ deviceId: DEVICE_ID });
     await caller.listDevices();
-    await caller.registerDevice({ deviceId: DEVICE_ID, keyVersion: 1 });
+    await caller.registerDevice({ operationId: 'register-device-1', deviceId: DEVICE_ID, keyVersion: 1, signatureBase64: 'AA==' });
     await caller.getIndex({ pageSize: 1 });
     await caller.getRecords({ opaqueRecordIds: [RECORD_ID] });
     await caller.putRecord({
@@ -249,11 +249,11 @@ describe('private Pro vault router input bounds', () => {
     const caller = (await router()).createCaller(context(identity()));
 
     await caller.putKeyset({ operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) });
-    await caller.registerDevice({ deviceId: DEVICE_ID, keyVersion: 1 });
+    await caller.registerDevice({ operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, signatureBase64: 'AA==' });
 
     assert.deepEqual(state.calls, [
       { method: 'putKeyset', uid: UID, input: { operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) } },
-      { method: 'registerDevice', uid: UID, input: { deviceId: DEVICE_ID, keyVersion: 1 } },
+      { method: 'registerDevice', uid: UID, input: { operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, signatureBase64: 'AA==' } },
     ]);
   });
 
@@ -261,7 +261,7 @@ describe('private Pro vault router input bounds', () => {
     state.account = account();
     const caller = (await router()).createCaller(context(identity()));
 
-    await assert.rejects(caller.registerDevice({ deviceId: RECORD_ID, keyVersion: 1 }), error => {
+    await assert.rejects(caller.registerDevice({ operationId: 'register-device-mismatch', deviceId: RECORD_ID, keyVersion: 1, signatureBase64: 'AA==' }), error => {
       assert.equal((error as { code?: string }).code, 'FORBIDDEN');
       return true;
     });
@@ -303,6 +303,16 @@ function keyset(keyVersion: number) {
     formatVersion: 1 as const,
     keyVersion,
     wrappingVersion: 1,
+    deviceRegistration: {
+      algorithm: 'ECDSA-P256-SHA256' as const,
+      keyVersion,
+      publicJwk: {
+        kty: 'EC' as const, crv: 'P-256' as const,
+        x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
+        y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
+      },
+      privateKeyEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
+    },
     passwordEnvelope: {
       formatVersion: 1 as const,
       keyVersion,

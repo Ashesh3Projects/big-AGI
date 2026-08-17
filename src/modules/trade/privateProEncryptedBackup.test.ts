@@ -119,6 +119,16 @@ async function fixture(): Promise<{
     formatVersion: 1,
     keyVersion: 1,
     wrappingVersion: 1,
+    deviceRegistration: {
+      algorithm: 'ECDSA-P256-SHA256',
+      keyVersion: 1,
+      publicJwk: {
+        kty: 'EC', crv: 'P-256',
+        x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
+        y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
+      },
+      privateKeyEnvelope: { nonceBase64: bytesToBase64(new Uint8Array(12)), ciphertextBase64: bytesToBase64(new Uint8Array(16)), ciphertextBytes: 16 },
+    },
     passwordEnvelope: {
       formatVersion: 1,
       keyVersion: 1,

@@ -166,6 +166,16 @@ async function keysetFixture(password: string): Promise<{ keyset: PrivateProVaul
       formatVersion: 1,
       keyVersion: 1,
       wrappingVersion: 1,
+      deviceRegistration: {
+        algorithm: 'ECDSA-P256-SHA256',
+        keyVersion: 1,
+        publicJwk: {
+          kty: 'EC', crv: 'P-256',
+          x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
+          y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
+        },
+        privateKeyEnvelope: { nonceBase64: bytesToBase64(new Uint8Array(12)), ciphertextBase64: bytesToBase64(new Uint8Array(16)), ciphertextBytes: 16 },
+      },
       passwordEnvelope: {
         formatVersion: 1,
         keyVersion: 1,
@@ -257,6 +267,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.equal(harness.counts.passwordUnlock, 0);
     assert.equal(harness.counts.activate, 1);
+    assert.equal(harness.counts.register, 0);
   });
 
   test('new devices unlock with the password and remember the device', async () => {
@@ -270,6 +281,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.equal(harness.counts.passwordUnlock, 1);
     assert.equal(harness.counts.remember, 1);
+    assert.equal(harness.counts.register, 1);
   });
 
   test('recovery keys unlock and expose no recovery secret in state', async () => {

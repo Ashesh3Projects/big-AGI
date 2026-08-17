@@ -48,7 +48,8 @@ export type PrivateProVaultOperationOutcome =
   | { kind: 'keyset'; status: 'conflict'; currentWrappingVersion: number }
   | { kind: 'migration'; status: 'committed'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
   | { kind: 'migration'; status: 'conflict'; currentPhase: PrivateProVaultMigrationPhase | null }
-  | { kind: 'device'; status: 'committed'; revokedAtMs: number };
+  | { kind: 'device'; status: 'committed'; revokedAtMs: number }
+  | { kind: 'device-registration'; status: 'committed'; device: PrivateProVaultStoredDevice };
 
 export interface PrivateProVaultOperationReceipt {
   operationId: string;

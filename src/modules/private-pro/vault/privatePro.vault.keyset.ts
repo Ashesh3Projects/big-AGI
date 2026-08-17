@@ -17,6 +17,7 @@ import type {
   PrivateProVaultRecoveryEnvelope,
   PrivateProVaultWrappedKeyEnvelope,
 } from './privatePro.vault.types';
+import { createPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 
 
 const WRAP_ALGORITHM = 'AES-GCM';
@@ -134,7 +135,7 @@ async function createRecoveryEnvelope(
   };
 }
 
-export async function createPrivateProVaultKeyset(password: string): Promise<{
+export async function createPrivateProVaultKeyset(password: string, uid: string): Promise<{
   keyset: PrivateProVaultKeyset;
   masterKey: CryptoKey;
   recoveryKey: string;
@@ -143,14 +144,16 @@ export async function createPrivateProVaultKeyset(password: string): Promise<{
   const recovery = generateRecoveryKey();
   try {
     const keyVersion = 1;
+    const masterKey = await importVaultMasterKey(masterKeyBytes);
     const keyset = PrivateProVaultKeysetSchema.parse({
       formatVersion: 1,
       keyVersion,
       wrappingVersion: 1,
+      deviceRegistration: await createPrivateProVaultDeviceRegistration(masterKey, uid, keyVersion),
       passwordEnvelope: await createPasswordEnvelope(masterKeyBytes, password, keyVersion),
       recoveryEnvelope: await createRecoveryEnvelope(masterKeyBytes, recovery.display, keyVersion, 1),
     });
-    return { keyset, masterKey: await importVaultMasterKey(masterKeyBytes), recoveryKey: recovery.display };
+    return { keyset, masterKey, recoveryKey: recovery.display };
   } finally {
     masterKeyBytes.fill(0);
     recovery.bytes.fill(0);
@@ -245,6 +248,7 @@ async function rewrapPrivateProVaultPasswordWithKey(
         ciphertextBytes: passwordCiphertext.byteLength,
       },
       recoveryEnvelope: keyset.recoveryEnvelope,
+      deviceRegistration: keyset.deviceRegistration,
     });
   } catch {
     throw new Error('Vault password or recovery key is incorrect.');

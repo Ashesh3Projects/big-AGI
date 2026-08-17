@@ -56,7 +56,12 @@ export function createPrivateProVaultRouter(
   listDevices: deviceProcedure.query(({ ctx }) => vaultCall(() => service().listDevices(ctx.privateProIdentity.uid))),
 
   registerDevice: procedure
-    .input(z.object({ deviceId: opaqueIdSchema, keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict())
+    .input(z.object({
+      operationId: operationIdSchema,
+      deviceId: opaqueIdSchema,
+      keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      signatureBase64: z.string().min(1).max(256),
+    }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => {
       if (ctx.privateProDeviceId !== input.deviceId)
         throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
