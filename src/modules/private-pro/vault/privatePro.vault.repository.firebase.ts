@@ -2,7 +2,6 @@ import { FieldPath, type CollectionReference, type DocumentData, type Firestore,
 
 import { getPrivateProFirestore } from '../firebase/firebase.admin';
 import type {
-  PrivateProVaultIndexEntry,
   PrivateProVaultMigrationState,
   PrivateProVaultOperationReceipt,
   PrivateProVaultRepository,
@@ -11,6 +10,7 @@ import type {
   PrivateProVaultStoredRecord,
   PrivateProVaultStoredTombstone,
 } from './privatePro.vault.repository';
+import { mergePrivateProVaultIndexEntries } from './privatePro.vault.repository';
 import { createPrivateProVaultService } from './privatePro.vault.service';
 
 
@@ -88,29 +88,6 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
   }
 }
 
-function recordIndexEntry(data: PrivateProVaultStoredRecord): PrivateProVaultIndexEntry {
-  return {
-    kind: 'record',
-    opaqueRecordId: data.opaqueRecordId,
-    recordType: data.envelope.recordType,
-    revision: data.revision,
-    keyVersion: data.envelope.keyVersion,
-    ciphertextBytes: data.envelope.ciphertextBytes,
-    serverUpdatedAtMs: data.serverUpdatedAtMs,
-  };
-}
-
-function tombstoneIndexEntry(data: PrivateProVaultStoredTombstone): PrivateProVaultIndexEntry {
-  return {
-    kind: 'tombstone',
-    opaqueRecordId: data.opaqueRecordId,
-    recordType: data.tombstone.recordType,
-    revision: data.revision,
-    keyVersion: data.tombstone.keyVersion,
-    serverUpdatedAtMs: data.serverUpdatedAtMs,
-  };
-}
-
 export class FirebasePrivateProVaultRepository implements PrivateProVaultRepository {
   constructor(private readonly db: Firestore = getPrivateProFirestore()) {}
 
@@ -123,14 +100,15 @@ export class FirebasePrivateProVaultRepository implements PrivateProVaultReposit
       const ordered = collection.orderBy(FieldPath.documentId()).limit(limit);
       return afterOpaqueRecordId === null ? ordered : ordered.startAfter(afterOpaqueRecordId);
     };
-    const [records, tombstones] = await Promise.all([
-      createQuery(recordCollection(this.db, uid)).get(),
-      createQuery(tombstoneCollection(this.db, uid)).get(),
-    ]);
-    return [
-      ...records.docs.map(document => recordIndexEntry(document.data() as PrivateProVaultStoredRecord)),
-      ...tombstones.docs.map(document => tombstoneIndexEntry(document.data() as PrivateProVaultStoredTombstone)),
-    ].sort((left, right) => left.opaqueRecordId.localeCompare(right.opaqueRecordId)).slice(0, limit);
+    const [records, tombstones] = await this.db.runTransaction(transaction => Promise.all([
+      transaction.get(createQuery(recordCollection(this.db, uid))),
+      transaction.get(createQuery(tombstoneCollection(this.db, uid))),
+    ]), { readOnly: true });
+    return mergePrivateProVaultIndexEntries(
+      records.docs.map(document => document.data() as PrivateProVaultStoredRecord),
+      tombstones.docs.map(document => document.data() as PrivateProVaultStoredTombstone),
+      limit,
+    );
   }
 
   async getRecords(uid: string, opaqueRecordIds: readonly string[]) {

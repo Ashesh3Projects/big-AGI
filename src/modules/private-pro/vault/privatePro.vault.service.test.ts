@@ -3,6 +3,8 @@ import { describe, test } from 'node:test';
 
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
+  comparePrivateProVaultOpaqueIds,
+  mergePrivateProVaultIndexEntries,
   type PrivateProVaultMigrationState,
   type PrivateProVaultOperationReceipt,
   type PrivateProVaultRepository,
@@ -161,8 +163,8 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         keyVersion: value.tombstone.keyVersion,
         serverUpdatedAtMs: value.serverUpdatedAtMs,
       })),
-    ].filter(entry => afterOpaqueRecordId === null || entry.opaqueRecordId > afterOpaqueRecordId)
-      .sort((left, right) => left.opaqueRecordId.localeCompare(right.opaqueRecordId));
+    ].filter(entry => afterOpaqueRecordId === null || comparePrivateProVaultOpaqueIds(entry.opaqueRecordId, afterOpaqueRecordId) > 0)
+      .sort((left, right) => comparePrivateProVaultOpaqueIds(left.opaqueRecordId, right.opaqueRecordId));
     return clone(entries.slice(0, limit));
   }
 
@@ -329,6 +331,57 @@ describe('Private Pro encrypted vault service', () => {
     assert.equal(second.nextCursor, null);
     await assert.rejects(service.getIndex(UID_A, { pageSize: 501 }), /page size/i);
     await assert.rejects(service.getIndex(UID_A, { pageSize: 1, cursor: 'records/not-opaque' }), /cursor/i);
+  });
+
+  test('pages mixed-case opaque IDs in Firestore document ID order without skipping', async () => {
+    const { service } = serviceFixture();
+    const recordIds = [`A${'x'.repeat(42)}`, `Z${'x'.repeat(42)}`, `a${'x'.repeat(42)}`];
+    for (const [index, recordId] of recordIds.entries()) {
+      await service.putRecord(UID_A, {
+        operationId: `put-mixed-case-${index}`,
+        opaqueRecordId: recordId,
+        baseRevision: 0,
+        envelope: envelope(recordId, 1),
+      });
+    }
+    await service.deleteRecord(UID_A, {
+      operationId: 'delete-mixed-case-z',
+      opaqueRecordId: recordIds[1],
+      baseRevision: 1,
+      tombstone: tombstone(recordIds[1], 2, 'delete-mixed-case-z'),
+    });
+
+    const traversed: string[] = [];
+    let cursor: string | null = null;
+    do {
+      const page = await service.getIndex(UID_A, { pageSize: 1, cursor });
+      traversed.push(...page.entries.map(entry => entry.opaqueRecordId));
+      cursor = page.nextCursor;
+    } while (cursor !== null);
+
+    assert.deepEqual(traversed, recordIds);
+  });
+
+  test('merges record and tombstone snapshots with one deterministic bounded ordering', () => {
+    const record = {
+      opaqueRecordId: `a${'x'.repeat(42)}`,
+      revision: 1,
+      serverUpdatedAtMs: 1,
+      envelope: envelope(`a${'x'.repeat(42)}`, 1),
+    };
+    const deletedId = `Z${'x'.repeat(42)}`;
+    const deleted = {
+      opaqueRecordId: deletedId,
+      revision: 1,
+      serverUpdatedAtMs: 2,
+      tombstone: tombstone(deletedId, 1, 'delete-z'),
+    };
+
+    assert.deepEqual(mergePrivateProVaultIndexEntries([record], [deleted], 2).map(entry => entry.opaqueRecordId), [
+      deletedId,
+      record.opaqueRecordId,
+    ]);
+    assert.deepEqual(mergePrivateProVaultIndexEntries([record], [deleted], 1).map(entry => entry.opaqueRecordId), [deletedId]);
   });
 
   test('compare-and-swaps the wrapped keyset', async () => {

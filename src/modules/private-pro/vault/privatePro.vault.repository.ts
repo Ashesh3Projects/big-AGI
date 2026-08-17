@@ -84,3 +84,41 @@ export interface PrivateProVaultRepository {
   listIndexEntries(uid: string, afterOpaqueRecordId: string | null, limit: number): Promise<PrivateProVaultIndexEntry[]>;
   getRecords(uid: string, opaqueRecordIds: readonly string[]): Promise<PrivateProVaultStoredRecord[]>;
 }
+
+export function comparePrivateProVaultOpaqueIds(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
+function recordIndexEntry(record: PrivateProVaultStoredRecord): PrivateProVaultIndexEntry {
+  return {
+    kind: 'record',
+    opaqueRecordId: record.opaqueRecordId,
+    recordType: record.envelope.recordType,
+    revision: record.revision,
+    keyVersion: record.envelope.keyVersion,
+    ciphertextBytes: record.envelope.ciphertextBytes,
+    serverUpdatedAtMs: record.serverUpdatedAtMs,
+  };
+}
+
+function tombstoneIndexEntry(tombstone: PrivateProVaultStoredTombstone): PrivateProVaultIndexEntry {
+  return {
+    kind: 'tombstone',
+    opaqueRecordId: tombstone.opaqueRecordId,
+    recordType: tombstone.tombstone.recordType,
+    revision: tombstone.revision,
+    keyVersion: tombstone.tombstone.keyVersion,
+    serverUpdatedAtMs: tombstone.serverUpdatedAtMs,
+  };
+}
+
+export function mergePrivateProVaultIndexEntries(
+  records: readonly PrivateProVaultStoredRecord[],
+  tombstones: readonly PrivateProVaultStoredTombstone[],
+  limit: number,
+): PrivateProVaultIndexEntry[] {
+  return [
+    ...records.map(recordIndexEntry),
+    ...tombstones.map(tombstoneIndexEntry),
+  ].sort((left, right) => comparePrivateProVaultOpaqueIds(left.opaqueRecordId, right.opaqueRecordId)).slice(0, limit);
+}
