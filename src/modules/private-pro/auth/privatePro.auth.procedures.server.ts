@@ -12,15 +12,38 @@ export const privateProBootstrapProcedure = authedProcedure.use(async ({ ctx, ne
   return next();
 });
 
-export const privateProNodePremiumProcedure = premiumProcedure
+export interface PrivateProPremiumProcedureDependencies {
+  verifyAppCheckToken(token: string | null): Promise<void>;
+  getAccount(uid: string): Promise<PrivateProAccountRecord | null>;
+}
+
+const privateProPremiumProcedureDependencies: PrivateProPremiumProcedureDependencies = {
+  verifyAppCheckToken: verifyPrivateProAppCheckToken,
+  async getAccount(uid) {
+    const snapshot = await getPrivateProFirestore().doc(`users/${uid}`).get();
+    return snapshot.exists ? snapshot.data() as PrivateProAccountRecord : null;
+  },
+};
+
+export function createPrivateProNodePremiumProcedure(
+  dependencies: PrivateProPremiumProcedureDependencies = privateProPremiumProcedureDependencies,
+) {
+  return premiumProcedure
   .use(async ({ ctx, next }) => {
-    await verifyPrivateProAppCheckToken(ctx.privateProAppCheckToken);
+    await dependencies.verifyAppCheckToken(ctx.privateProAppCheckToken);
     return next();
   })
   .use(async ({ ctx, next }) => {
-    const snapshot = await getPrivateProFirestore().doc(`users/${ctx.privateProIdentity.uid}`).get();
-    const account = snapshot.exists ? snapshot.data() as PrivateProAccountRecord : null;
+    let account: PrivateProAccountRecord | null;
+    try {
+      account = await dependencies.getAccount(ctx.privateProIdentity.uid);
+    } catch {
+      throw new TRPCError({ code: 'INTERNAL_SERVER_ERROR', message: 'Private Pro authorization failed.' });
+    }
     if (!privateProAccountIsCurrent(ctx.privateProIdentity, account))
       throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro account is inactive or stale.' });
     return next({ ctx: { ...ctx, privateProAccount: account } });
   });
+}
+
+export const privateProNodePremiumProcedure = createPrivateProNodePremiumProcedure();

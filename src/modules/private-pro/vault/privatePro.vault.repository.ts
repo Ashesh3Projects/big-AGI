@@ -1,4 +1,5 @@
 import type {
+  PrivateProVaultDeviceMetadata,
   PrivateProVaultEnvelope,
   PrivateProVaultKeyset,
   PrivateProVaultRecordType,
@@ -29,6 +30,8 @@ export interface PrivateProVaultStoredKeyset {
   keyset: PrivateProVaultKeyset;
 }
 
+export type PrivateProVaultStoredDevice = PrivateProVaultDeviceMetadata;
+
 export type PrivateProVaultMigrationPhase = string;
 
 export interface PrivateProVaultMigrationState {
@@ -43,7 +46,8 @@ export type PrivateProVaultOperationOutcome =
   | { kind: 'keyset'; status: 'committed'; keyVersion: number; serverUpdatedAtMs: number }
   | { kind: 'keyset'; status: 'conflict'; currentKeyVersion: number }
   | { kind: 'migration'; status: 'committed'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
-  | { kind: 'migration'; status: 'conflict'; currentPhase: PrivateProVaultMigrationPhase | null };
+  | { kind: 'migration'; status: 'conflict'; currentPhase: PrivateProVaultMigrationPhase | null }
+  | { kind: 'device'; status: 'committed'; revokedAtMs: number };
 
 export interface PrivateProVaultOperationReceipt {
   operationId: string;
@@ -75,6 +79,8 @@ export interface PrivateProVaultRepositoryTransaction {
   createOperation(operation: PrivateProVaultOperationReceipt): Promise<void>;
   getKeyset(): Promise<PrivateProVaultStoredKeyset | null>;
   setKeyset(keyset: PrivateProVaultStoredKeyset): Promise<void>;
+  getDevice(deviceId: string): Promise<PrivateProVaultStoredDevice | null>;
+  setDevice(device: PrivateProVaultStoredDevice): Promise<void>;
   getMigration(migrationId: string): Promise<PrivateProVaultMigrationState | null>;
   setMigration(migration: PrivateProVaultMigrationState): Promise<void>;
 }

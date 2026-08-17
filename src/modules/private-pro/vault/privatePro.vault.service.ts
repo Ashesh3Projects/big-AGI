@@ -56,6 +56,11 @@ export interface CommitVaultMigrationInput {
   phase: PrivateProVaultMigrationPhase;
 }
 
+export interface RevokeVaultDeviceInput {
+  operationId: string;
+  deviceId: string;
+}
+
 export type CommitVaultMigrationResult =
   | { status: 'committed'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
   | { status: 'unchanged'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
@@ -104,6 +109,8 @@ function repeatOutcome(outcome: PrivateProVaultOperationOutcome) {
       return outcome.status === 'committed'
         ? { status: 'unchanged' as const, phase: outcome.phase, serverUpdatedAtMs: outcome.serverUpdatedAtMs }
         : { status: 'conflict' as const, currentPhase: outcome.currentPhase };
+    case 'device':
+      return { status: 'unchanged' as const, revokedAtMs: outcome.revokedAtMs };
   }
 }
 
@@ -121,6 +128,31 @@ async function existingOperation(
 
 export function createPrivateProVaultService(repository: PrivateProVaultRepository, now: () => number = Date.now) {
   return {
+    async bootstrap(uid: string, deviceId: string) {
+      assertUid(uid);
+      assertOpaqueRecordId(deviceId, 'device ID');
+      return repository.transaction(uid, async transaction => {
+        const [storedKeyset, existingDevice] = await Promise.all([
+          transaction.getKeyset(),
+          transaction.getDevice(deviceId),
+        ]);
+        const timestamp = now();
+        const device = existingDevice || storedKeyset ? {
+          formatVersion: 1 as const,
+          deviceId,
+          keyVersion: storedKeyset?.keyVersion ?? existingDevice!.keyVersion,
+          createdAtMs: existingDevice?.createdAtMs ?? timestamp,
+          lastSeenAtMs: timestamp,
+          revokedAtMs: existingDevice?.revokedAtMs ?? null,
+        } : null;
+        if (device) await transaction.setDevice(device);
+        return {
+          keyset: storedKeyset ? { keyset: storedKeyset.keyset, serverUpdatedAtMs: storedKeyset.serverUpdatedAtMs } : null,
+          device,
+        };
+      });
+    },
+
     async putRecord(uid: string, input: PutVaultRecordInput): Promise<PutVaultRecordResult> {
       assertUid(uid);
       assertOperationId(input.operationId);
@@ -247,6 +279,24 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
       assertUid(uid);
       const stored = await repository.transaction(uid, transaction => transaction.getKeyset());
       return stored ? { keyset: stored.keyset, serverUpdatedAtMs: stored.serverUpdatedAtMs } : null;
+    },
+
+    async revokeDevice(uid: string, input: RevokeVaultDeviceInput) {
+      assertUid(uid);
+      assertOperationId(input.operationId);
+      assertOpaqueRecordId(input.deviceId, 'device ID');
+      const requestFingerprint = fingerprint({ kind: 'revoke-device', ...input });
+      return repository.transaction(uid, async transaction => {
+        const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
+        if (repeated) return repeated as { status: 'unchanged'; revokedAtMs: number };
+        const existing = await transaction.getDevice(input.deviceId);
+        if (!existing) throw new Error('Vault device is not registered.');
+        const revokedAtMs = existing.revokedAtMs ?? now();
+        await transaction.setDevice({ ...existing, revokedAtMs });
+        const outcome = { kind: 'device', status: 'committed', revokedAtMs } as const;
+        await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
+        return { status: 'committed' as const, revokedAtMs };
+      });
     },
 
     async commitMigration(uid: string, input: CommitVaultMigrationInput): Promise<CommitVaultMigrationResult> {

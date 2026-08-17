@@ -7,6 +7,7 @@ import type {
   PrivateProVaultRepository,
   PrivateProVaultRepositoryTransaction,
   PrivateProVaultStoredKeyset,
+  PrivateProVaultStoredDevice,
   PrivateProVaultStoredRecord,
   PrivateProVaultStoredTombstone,
 } from './privatePro.vault.repository';
@@ -76,6 +77,15 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
 
   async setKeyset(keyset: PrivateProVaultStoredKeyset) {
     this.transaction.set(this.db.doc(`${vaultRoot(this.uid)}/keysets/current`), keyset);
+  }
+
+  async getDevice(deviceId: string) {
+    const snapshot = await this.transaction.get(this.db.doc(`${vaultRoot(this.uid)}/devices/${deviceId}`));
+    return snapshot.exists ? snapshot.data() as PrivateProVaultStoredDevice : null;
+  }
+
+  async setDevice(device: PrivateProVaultStoredDevice) {
+    this.transaction.set(this.db.doc(`${vaultRoot(this.uid)}/devices/${device.deviceId}`), device);
   }
 
   async getMigration(migrationId: string) {

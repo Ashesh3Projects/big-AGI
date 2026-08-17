@@ -10,6 +10,7 @@ import {
   type PrivateProVaultRepository,
   type PrivateProVaultRepositoryTransaction,
   type PrivateProVaultStoredKeyset,
+  type PrivateProVaultStoredDevice,
   type PrivateProVaultStoredRecord,
   type PrivateProVaultStoredTombstone,
 } from './privatePro.vault.repository';
@@ -100,6 +101,7 @@ interface MemoryVault {
   tombstones: Map<string, PrivateProVaultStoredTombstone>;
   operations: Map<string, PrivateProVaultOperationReceipt>;
   keyset: PrivateProVaultStoredKeyset | null;
+  devices: Map<string, PrivateProVaultStoredDevice>;
   migrations: Map<string, PrivateProVaultMigrationState>;
 }
 
@@ -114,6 +116,7 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         tombstones: new Map(),
         operations: new Map(),
         keyset: null,
+        devices: new Map(),
         migrations: new Map(),
       };
       this.vaults.set(uid, vault);
@@ -137,6 +140,8 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
       },
       getKeyset: async () => clone(vault.keyset),
       setKeyset: async value => { vault.keyset = clone(value); },
+      getDevice: async deviceId => clone(vault.devices.get(deviceId) ?? null),
+      setDevice: async device => { vault.devices.set(device.deviceId, clone(device)); },
       getMigration: async migrationId => clone(vault.migrations.get(migrationId) ?? null),
       setMigration: async migration => { vault.migrations.set(migration.migrationId, clone(migration)); },
     };
@@ -405,6 +410,53 @@ describe('Private Pro encrypted vault service', () => {
       keyset: keyset(2),
       serverUpdatedAtMs: 1_001,
     });
+  });
+
+  test('bootstraps only opaque remembered-device metadata and preserves revocation', async () => {
+    const { service } = serviceFixture();
+    const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
+    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseKeyVersion: 0, keyset: keyset(1) });
+
+    assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
+      keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
+      device: {
+        formatVersion: 1,
+        deviceId,
+        keyVersion: 1,
+        createdAtMs: 1_001,
+        lastSeenAtMs: 1_001,
+        revokedAtMs: null,
+      },
+    });
+    assert.deepEqual(await service.revokeDevice(UID_A, { operationId: 'revoke-device-1', deviceId }), {
+      status: 'committed',
+      revokedAtMs: 1_002,
+    });
+    assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
+      keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
+      device: {
+        formatVersion: 1,
+        deviceId,
+        keyVersion: 1,
+        createdAtMs: 1_001,
+        lastSeenAtMs: 1_003,
+        revokedAtMs: 1_002,
+      },
+    });
+  });
+
+  test('makes device revocation idempotent without accepting device key material', async () => {
+    const { repository, service } = serviceFixture();
+    const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
+    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseKeyVersion: 0, keyset: keyset(1) });
+    await service.bootstrap(UID_A, deviceId);
+    const input = { operationId: 'revoke-device-1', deviceId };
+
+    assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'committed', revokedAtMs: 1_002 });
+    assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'unchanged', revokedAtMs: 1_002 });
+    const stored = await repository.transaction(UID_A, transaction => transaction.getDevice(deviceId));
+    assert.ok(stored);
+    assert.deepEqual(Object.keys(stored).sort(), ['createdAtMs', 'deviceId', 'formatVersion', 'keyVersion', 'lastSeenAtMs', 'revokedAtMs']);
   });
 
   test('compare-and-swaps migration phases and makes retries idempotent', async () => {
