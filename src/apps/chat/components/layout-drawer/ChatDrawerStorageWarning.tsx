@@ -4,6 +4,7 @@ import { Box, Button, ColorPaletteProp, Divider, IconButton, Input, Link, ModalC
 import CloseRoundedIcon from '@mui/icons-material/CloseRounded';
 
 import { GoodModal } from '~/common/components/modals/GoodModal';
+import { privateProClientConfig } from '~/modules/private-pro/config/privatePro.config';
 
 import { useChatStorageWarning } from '../../store-app-chat';
 
@@ -106,7 +107,7 @@ export function ChatDrawerStorageWarning() {
   }, [dismissStorageWarning]);
 
 
-  if (dismissed) return null;
+  if (privateProClientConfig.enabled || dismissed) return null;
 
   return <>
 
