@@ -62,6 +62,11 @@ export interface PrivateProVaultQuarantineRecord {
 }
 
 
+function hasExactKeyUsages(key: CryptoKey, expectedUsages: readonly KeyUsage[]): boolean {
+  return key.usages.length === expectedUsages.length
+    && expectedUsages.every(usage => key.usages.includes(usage));
+}
+
 function assertRememberedDeviceKey(key: CryptoKey): void {
   const algorithm = key.algorithm;
   if (
@@ -70,10 +75,9 @@ function assertRememberedDeviceKey(key: CryptoKey): void {
     || algorithm.name !== 'AES-GCM'
     || !('length' in algorithm)
     || algorithm.length !== 256
-    || !key.usages.includes('wrapKey')
-    || !key.usages.includes('unwrapKey')
+    || !hasExactKeyUsages(key, ['wrapKey', 'unwrapKey'])
   )
-    throw new Error('Remembered device keys must be non-exportable AES-GCM 256-bit keys with wrapKey and unwrapKey usage.');
+    throw new Error('Remembered device keys must be non-exportable AES-GCM 256-bit keys with exactly wrapKey and unwrapKey usages.');
 }
 
 

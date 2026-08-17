@@ -7,15 +7,20 @@ interface PrivateProVaultUnlockedSession {
 }
 
 
+function hasExactKeyUsages(key: CryptoKey, expectedUsages: readonly KeyUsage[]): boolean {
+  return key.usages.length === expectedUsages.length
+    && expectedUsages.every(usage => key.usages.includes(usage));
+}
+
 function assertMasterKey(key: CryptoKey): void {
   const algorithm = key.algorithm;
   if (
     key.type !== 'secret'
     || key.extractable
     || algorithm.name !== 'HKDF'
-    || !key.usages.includes('deriveKey')
+    || !hasExactKeyUsages(key, ['deriveKey'])
   )
-    throw new Error('Vault sessions require a non-exportable HKDF master key with deriveKey usage.');
+    throw new Error('Vault sessions require a non-exportable HKDF master key with exactly deriveKey usage.');
 }
 
 
@@ -38,7 +43,8 @@ export class PrivateProVaultSession {
   }
 
   async logoutAndClear(uid: string): Promise<void> {
-    this.lock();
+    if (this.unlocked?.uid === uid)
+      this.lock();
     await this.db.deleteDeviceUnlock(uid);
   }
 }

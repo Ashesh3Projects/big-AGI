@@ -63,6 +63,14 @@ function generateDeviceKey(): Promise<CryptoKey> {
   ) as Promise<CryptoKey>;
 }
 
+function generateDeviceKeyWithExtraUsage(): Promise<CryptoKey> {
+  return crypto.subtle.generateKey(
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'wrapKey', 'unwrapKey'],
+  ) as Promise<CryptoKey>;
+}
+
 function importMasterKey(): Promise<CryptoKey> {
   return crypto.subtle.importKey(
     'raw',
@@ -70,6 +78,16 @@ function importMasterKey(): Promise<CryptoKey> {
     'HKDF',
     false,
     ['deriveKey'],
+  );
+}
+
+function importMasterKeyWithExtraUsage(): Promise<CryptoKey> {
+  return crypto.subtle.importKey(
+    'raw',
+    crypto.getRandomValues(new Uint8Array(32)),
+    'HKDF',
+    false,
+    ['deriveBits', 'deriveKey'],
   );
 }
 
@@ -140,6 +158,13 @@ describe('private Pro encrypted vault database', () => {
     assert.deepEqual(await db.listEncryptedRecords(UID_B), [ENVELOPE_B]);
   });
 
+  test('rejects remembered device keys with extra usages', async (t) => {
+    const db = createDB(t);
+
+    await assert.rejects(db.storeDeviceKey(UID_A, await generateDeviceKeyWithExtraUsage()), /exactly wrapKey and unwrapKey/i);
+    assert.equal(await db.getDeviceKey(UID_A), null);
+  });
+
   test('rejects plaintext fields instead of persisting them with an encrypted record', async (t) => {
     const db = createDB(t);
     const recordWithPlaintext = {
@@ -172,6 +197,29 @@ describe('private Pro encrypted vault database', () => {
     assert.equal(await db.wrappedKeys.get(UID_A), undefined);
     assert.notEqual(await db.getDeviceKey(UID_B), null);
     assert.notEqual(await db.wrappedKeys.get(UID_B), undefined);
+  });
+
+  test('logout for another UID preserves the currently unlocked session', async (t) => {
+    const db = createDB(t);
+    const session = new PrivateProVaultSession(db);
+    const masterKey = await importMasterKey();
+    await db.storeDeviceKey(UID_B, await generateDeviceKey());
+    await db.wrappedKeys.put({ uid: UID_B, envelope: WRAPPED_KEY_B });
+    session.unlock(UID_A, masterKey);
+
+    await session.logoutAndClear(UID_B);
+
+    assert.equal(session.getMasterKey(UID_A), masterKey);
+    assert.equal(await db.getDeviceKey(UID_B), null);
+    assert.equal(await db.wrappedKeys.get(UID_B), undefined);
+  });
+
+  test('rejects master keys with extra usages', async (t) => {
+    const db = createDB(t);
+    const session = new PrivateProVaultSession(db);
+
+    await assert.rejects(async () => session.unlock(UID_A, await importMasterKeyWithExtraUsage()), /exactly deriveKey/i);
+    assert.equal(session.getMasterKey(UID_A), null);
   });
 
   test('lock drops the master key without deleting remembered unlock data', async (t) => {
