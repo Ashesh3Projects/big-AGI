@@ -1,6 +1,6 @@
 import { argon2id } from 'hash-wasm';
 
-import type { VaultArgon2idWorkerRequest } from './privatePro.vault.password.worker';
+import type { VaultArgon2idWorkerRequest } from '../../../src/modules/private-pro/vault/privatePro.vault.password.worker';
 
 
 type WorkerTestResponse = {

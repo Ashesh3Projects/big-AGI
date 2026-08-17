@@ -9,7 +9,7 @@ import {
   privateProVaultArgon2idWorkerUrl,
   type VaultPasswordKdfParams,
 } from './privatePro.vault.password';
-import { realArgon2idWorkerResponse, withVaultPasswordWorker } from './privatePro.vault.password.test-helpers';
+import { realArgon2idWorkerResponse, withVaultPasswordWorker } from '../../../../tools/private-pro/test-helpers/privatePro.vault.password.test-helpers';
 import { generateRecoveryKey, parseRecoveryKey } from './privatePro.vault.recovery';
 import {
   PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS,
