@@ -51,6 +51,7 @@ interface PrivateProVaultEngineDependencies {
   now?: () => number;
   createOperationId?: () => string;
   clearSession?: () => Promise<void>;
+  beforeAcknowledgeCommit?: () => Promise<void>;
   persistCurrent?: (
     index: readonly PrivateProVaultIndexEntry[],
     envelopes: readonly PrivateProVaultEnvelope[],
@@ -61,7 +62,7 @@ interface PrivateProVaultEngineDependencies {
 export interface PrivateProVaultEngine {
   hydrateBeforeOpen(): Promise<void>;
   start(): Promise<void>;
-  stop(): void;
+  stop(): Promise<void>;
   whenCurrent(): Promise<void>;
   logoutAndClear(): Promise<void>;
 }
@@ -113,6 +114,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
   let unsubscribeSerializers: Array<() => void> = [];
   let nextLocalSequence: number | undefined;
   let runEpoch = 0;
+  let stopping = Promise.resolve();
 
   const assertCurrent = (epoch: number) => {
     if (epoch !== runEpoch) throw new PrivateProVaultRunCancelledError();
@@ -353,6 +355,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
         await deps.db.records.delete([deps.uid, recordType, recordId]);
       }
       await deps.db.revisions.put({ uid: deps.uid, recordType, recordId, revision });
+      await deps.beforeAcknowledgeCommit?.();
     }));
   };
 
@@ -534,12 +537,14 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
 
   return {
     async hydrateBeforeOpen() {
+      await stopping;
       stopped = false;
       const epoch = ++runEpoch;
       await queue(currentEpoch => reconcile(currentEpoch, true), epoch);
     },
 
     async start() {
+      await stopping;
       if (!started) {
         started = true;
         stopped = false;
@@ -560,8 +565,11 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
       }
     },
 
-    stop() {
+    async stop() {
       invalidateRun();
+      const barrier = this.whenCurrent();
+      stopping = barrier.catch(() => {});
+      await barrier;
     },
 
     async whenCurrent() {
@@ -573,8 +581,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
     },
 
     async logoutAndClear() {
-      invalidateRun();
-      await this.whenCurrent();
+      await this.stop();
       await (deps.clearSession ? deps.clearSession() : privateProVaultSession.logoutAndClear(deps.uid));
       await deps.db.transaction('rw', [
         deps.db.deviceKeys,

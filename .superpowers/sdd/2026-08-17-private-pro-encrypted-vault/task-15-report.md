@@ -105,3 +105,28 @@ Fix verification:
 - Focused affected-file ESLint - passed.
 - `npm run tscheck` - passed.
 - `git diff --check` - passed with Git line-ending notices only.
+
+## Fix round 2
+
+Closed the remaining acknowledgement commit race.
+
+- Changed `PrivateProVaultEngine.stop()` to return `Promise<void>`.
+- `stop()` invalidates the epoch and unsubscribes synchronously, then waits for the current serialized tail, including any IndexedDB acknowledgement transaction that already started.
+- A remote write stopped before acknowledgement leaves the encrypted outbox operation intact.
+- A stop during an acknowledgement transaction stays pending until the transaction commits, then exposes a consistent committed record/revision with the outbox entry removed.
+- `hydrateBeforeOpen()` and `start()` await the stable stopping barrier, so no new run starts while the previous transaction tail is settling.
+- `logoutAndClear()` awaits `stop()` before session, durable, and runtime clearing.
+
+Fix TDD RED:
+
+```text
+stop returned void instead of a barrier promise
+acknowledgement defer hook was never reached
+```
+
+Fix verification:
+
+- Engine, database, and serializer suites - 27 passed, 0 failed.
+- Focused affected-file ESLint - passed.
+- `npm run tscheck` - passed.
+- `git diff --check` - passed with Git line-ending notices only.

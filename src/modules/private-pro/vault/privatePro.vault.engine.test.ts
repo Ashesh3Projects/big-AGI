@@ -224,6 +224,7 @@ async function createClient(
     rejectThemeValue?: string;
     rejectThemeApplyValue?: string;
     clearSession?: () => Promise<void>;
+    beforeAcknowledgeCommit?: () => Promise<void>;
     persistCurrent?: (
       index: readonly PrivateProVaultIndexEntry[],
       envelopes: readonly PrivateProVaultEnvelope[],
@@ -262,6 +263,7 @@ async function createClient(
     now: options.now ?? (() => 1),
     createOperationId: () => `${options.operationPrefix ?? name}-${++operationSequence}`,
     clearSession: options.clearSession,
+    beforeAcknowledgeCommit: options.beforeAcknowledgeCommit,
     persistCurrent: options.persistCurrent,
   });
   return { db, engine, serializers, store, transport };
@@ -494,12 +496,48 @@ describe('private Pro blocking multi-device vault engine', () => {
 
     await serializer(client, 'settings').mutate(THEME_ID, { id: 'theme', value: 'dark' });
     while (server.operations.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
-    client.engine.stop();
+    let stopSettled = false;
+    const stopping = client.engine.stop().then(() => stopSettled = true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(stopSettled, false);
     releaseWrite();
-    await client.engine.whenCurrent();
+    await stopping;
 
     assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 1);
     assert.equal(await client.db.revisions.get([UID, 'settings', THEME_ID]), undefined);
+    assert.equal(client.store.getState().phase, 'ready');
+    assert.equal(client.store.getState().ready, true);
+  });
+
+  test('stop waits for a started acknowledgement transaction to commit atomically', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    let acknowledgeStarted = false;
+    let releaseAcknowledge = () => {};
+    const acknowledgeGate = new Promise<void>(resolve => releaseAcknowledge = resolve);
+    const client = await createClient(t, server, masterKey, 'stop-acknowledge', {
+      beforeAcknowledgeCommit: async () => {
+        acknowledgeStarted = true;
+        await acknowledgeGate;
+      },
+    });
+    await openClient(client);
+
+    await serializer(client, 'settings').mutate(THEME_ID, { id: 'theme', value: 'dark' });
+    while (server.operations.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(acknowledgeStarted, true);
+    let stopSettled = false;
+    const stopping = client.engine.stop().then(() => stopSettled = true);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(stopSettled, false);
+
+    releaseAcknowledge();
+    await stopping;
+
+    assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 0);
+    assert.equal((await client.db.revisions.get([UID, 'settings', THEME_ID]))?.revision, 1);
+    assert.equal((await client.db.records.get([UID, 'settings', THEME_ID]))?.revision, 1);
     assert.equal(client.store.getState().phase, 'ready');
     assert.equal(client.store.getState().ready, true);
   });
