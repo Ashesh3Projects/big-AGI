@@ -20,6 +20,7 @@
     "test:firebase:exec": "firebase emulators:exec --only firestore,storage --project demo-private-pro \"npm run test:firebase\"",
     "private-pro:sync-access": "tsx tools/private-pro/manage-access.ts sync",
     "private-pro:revoke": "tsx tools/private-pro/manage-access.ts revoke",
+    "private-pro:security-audit": "tsx tools/private-pro/security-audit.ts",
     "postinstall": "prisma generate --no-hints",
     "gen:icon-sprites": "node tools/develop/gen-icon-sprites/generate-llm-sprites.ts",
     "db:push": "prisma db push",
