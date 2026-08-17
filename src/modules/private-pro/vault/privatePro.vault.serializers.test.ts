@@ -31,6 +31,12 @@ const EXCLUDED = {
   nestedSetup: 'sentinel-nested-setup-token',
   nestedAsrx: 'sentinel-nested-asrx-session',
   nestedSpeex: 'sentinel-nested-speex-metrics',
+  nestedBenchmark: 'sentinel-nested-benchmark',
+  nestedPricing: 'sentinel-nested-pricing',
+  nestedParameterSpec: 'sentinel-nested-parameter-spec',
+  nestedInitialParameter: 'sentinel-nested-initial-parameter',
+  nestedUserPricing: 'sentinel-nested-user-pricing',
+  nestedUserParameter: 'sentinel-nested-user-parameter',
 } as const;
 
 const CURRENT_SERVICE_SETUP_FIELDS = {
@@ -105,9 +111,33 @@ test('portable serializer registry includes only explicit portable state', async
       contextTokens: 128000,
       maxOutputTokens: 4096,
       interfaces: ['oai-chat'],
-      parameterSpecs: [],
-      initialParameters: { llmRef: 'upstream-model' },
-      userParameters: { llmTemperature: 0.73, llmRef: INCLUDED.customParameter },
+      benchmark: { cbaElo: 1337, runtime: { logs: EXCLUDED.nestedBenchmark } },
+      pricing: {
+        chat: {
+          input: [{ upTo: 100000, price: 1.25 }, { upTo: null, price: 'free' }],
+          output: 4.5,
+          cache: { cType: 'ant-bp', read: 0.1, write: 0.2, duration: 300 },
+          _isFree: false,
+          metrics: EXCLUDED.nestedPricing,
+        },
+      },
+      parameterSpecs: [{
+        paramId: 'llmVndOaiEffort', required: true, hidden: false, initialValue: 'high', enumValues: ['low', 'medium', 'high'],
+        runtime: { deviceId: EXCLUDED.nestedParameterSpec },
+      }, {
+        paramId: 'llmVndGeminiThinkingBudget', rangeOverride: [0, 24576],
+      }],
+      initialParameters: {
+        llmRef: 'upstream-model', llmTemperature: 0.5, llmResponseTokens: 4096, llmVndOaiEffort: 'medium',
+        runtime: { token: EXCLUDED.nestedInitialParameter },
+      },
+      userPricing: {
+        chat: { input: 'free', output: 8, cache: { cType: 'oai-ac', read: 0.25 }, runtime: EXCLUDED.nestedUserPricing },
+      },
+      userParameters: {
+        llmTemperature: 0.73, llmRef: INCLUDED.customParameter, llmForceNoStream: true, llmVndGeminiGoogleSearch: '1w',
+        runtime: { logger: EXCLUDED.nestedUserParameter },
+      },
       sId: 'openai',
       vId: 'openai',
       deviceId: EXCLUDED.deviceId,
@@ -220,6 +250,8 @@ test('portable serializer registry includes only explicit portable state', async
     assert.equal(json.includes(sentinel), true, `expected portable sentinel ${sentinel}`);
   for (const value of Object.values(CURRENT_SERVICE_SETUP_FIELDS))
     assert.equal(json.includes(String(value)), true, `expected current model service setup value ${value}`);
+  for (const value of ['1337', '100000', '1.25', '4.5', 'ant-bp', '0.1', '0.2', '300', 'llmVndOaiEffort', 'high', 'llmVndGeminiThinkingBudget', '24576', '4096', 'medium', 'oai-ac', '0.25', 'llmForceNoStream', 'llmVndGeminiGoogleSearch', '1w'])
+    assert.equal(json.includes(value), true, `expected legitimate model nested value ${value}`);
   for (const sentinel of Object.values(EXCLUDED))
     assert.equal(json.includes(sentinel), false, `unexpected non-portable sentinel ${sentinel}`);
 
