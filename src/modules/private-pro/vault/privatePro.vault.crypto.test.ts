@@ -34,6 +34,14 @@ async function recordKey(aad: VaultRecordAADInput = RECORD_AAD): Promise<CryptoK
   return deriveVaultSubkey(masterKey, 'record-encryption', `${aad.recordType}/${aad.recordId}`, ['encrypt', 'decrypt']);
 }
 
+function generateAesKey(length: 128 | 192 | 256, usages: KeyUsage[]): Promise<CryptoKey> {
+  return crypto.subtle.generateKey({ name: 'AES-GCM', length }, false, usages) as Promise<CryptoKey>;
+}
+
+function generateHmacKey(hash: 'SHA-256' | 'SHA-384', usages: KeyUsage[]): Promise<CryptoKey> {
+  return crypto.subtle.generateKey({ name: 'HMAC', hash }, false, usages) as Promise<CryptoKey>;
+}
+
 function mutateBase64Byte(base64: string): string {
   const bytes = Uint8Array.from(atob(base64), character => character.charCodeAt(0));
   bytes[0] ^= 1;
@@ -104,6 +112,32 @@ describe('private Pro vault cryptography', () => {
     assert.equal(nonces.size, 10_000);
   });
 
+  test('rejects record encryption keys with the wrong algorithm, length, or usage', async () => {
+    const hmacKey = await generateHmacKey('SHA-256', ['sign']);
+    const aes128Key = await generateAesKey(128, ['encrypt']);
+    const aes192Key = await generateAesKey(192, ['encrypt']);
+    const decryptOnlyKey = await generateAesKey(256, ['decrypt']);
+
+    await assert.rejects(encryptVaultRecord(hmacKey, RECORD_AAD, PLAINTEXT), /AES-GCM 256-bit key with encrypt usage/);
+    await assert.rejects(encryptVaultRecord(aes128Key, RECORD_AAD, PLAINTEXT), /AES-GCM 256-bit key with encrypt usage/);
+    await assert.rejects(encryptVaultRecord(aes192Key, RECORD_AAD, PLAINTEXT), /AES-GCM 256-bit key with encrypt usage/);
+    await assert.rejects(encryptVaultRecord(decryptOnlyKey, RECORD_AAD, PLAINTEXT), /AES-GCM 256-bit key with encrypt usage/);
+  });
+
+  test('rejects record decryption keys with the wrong algorithm, length, or usage', async () => {
+    const key = await recordKey();
+    const envelope = await encryptVaultRecord(key, RECORD_AAD, PLAINTEXT);
+    const hmacKey = await generateHmacKey('SHA-256', ['sign']);
+    const aes128Key = await generateAesKey(128, ['decrypt']);
+    const aes192Key = await generateAesKey(192, ['decrypt']);
+    const encryptOnlyKey = await generateAesKey(256, ['encrypt']);
+
+    await assert.rejects(decryptVaultRecord(hmacKey, envelope, VAULT_CONTEXT), /AES-GCM 256-bit key with decrypt usage/);
+    await assert.rejects(decryptVaultRecord(aes128Key, envelope, VAULT_CONTEXT), /AES-GCM 256-bit key with decrypt usage/);
+    await assert.rejects(decryptVaultRecord(aes192Key, envelope, VAULT_CONTEXT), /AES-GCM 256-bit key with decrypt usage/);
+    await assert.rejects(decryptVaultRecord(encryptOnlyKey, envelope, VAULT_CONTEXT), /AES-GCM 256-bit key with decrypt usage/);
+  });
+
   test('generates and imports a non-exportable 256-bit master key by default', async () => {
     const bytes = generateVaultMasterKeyBytes();
     const key = await importVaultMasterKey(bytes);
@@ -133,6 +167,14 @@ describe('private Pro vault cryptography', () => {
     assert.notEqual(await hmacVaultIdentifier(identifierKeyA, 'service', 'secret'), await hmacVaultIdentifier(identifierKeyOtherId, 'service', 'secret'));
   });
 
+  test('rejects subkey derivation keys with the wrong algorithm or usage', async () => {
+    const aesKey = await generateAesKey(256, ['encrypt']);
+    const deriveBitsOnlyKey = await crypto.subtle.importKey('raw', new Uint8Array(32), 'HKDF', false, ['deriveBits']);
+
+    await assert.rejects(deriveVaultSubkey(aesKey, 'identifier', 'vault', ['sign']), /HKDF key with deriveKey usage/);
+    await assert.rejects(deriveVaultSubkey(deriveBitsOnlyKey, 'identifier', 'vault', ['sign']), /HKDF key with deriveKey usage/);
+  });
+
   test('matches the HKDF and HMAC known-answer vector', async () => {
     const masterKey = await importVaultMasterKey(new Uint8Array(32).fill(0x24));
     const identifierKey = await deriveVaultSubkey(masterKey, 'identifier', 'namespace-a', ['sign']);
@@ -151,5 +193,52 @@ describe('private Pro vault cryptography', () => {
     assert.match(identifier, /^[A-Za-z0-9_-]{43}$/);
     assert.notEqual(identifier, await hmacVaultIdentifier(key, 'model-service', 'same-value'));
     assert.notEqual(identifier, await hmacVaultIdentifier(key, 'credential-service', 'different-value'));
+  });
+
+  test('rejects HMAC identifier keys with the wrong algorithm, hash, or usage', async () => {
+    const aesKey = await generateAesKey(256, ['encrypt']);
+    const sha384Key = await generateHmacKey('SHA-384', ['sign']);
+    const verifyOnlyKey = await generateHmacKey('SHA-256', ['verify']);
+
+    await assert.rejects(hmacVaultIdentifier(aesKey, 'service', 'secret'), /HMAC SHA-256 key with sign usage/);
+    await assert.rejects(hmacVaultIdentifier(sha384Key, 'service', 'secret'), /HMAC SHA-256 key with sign usage/);
+    await assert.rejects(hmacVaultIdentifier(verifyOnlyKey, 'service', 'secret'), /HMAC SHA-256 key with sign usage/);
+  });
+
+  test('rejects unpaired UTF-16 surrogates in authenticated-data strings', () => {
+    for (const surrogate of ['\uD800', '\uDC00']) {
+      assert.throws(() => vaultRecordAAD({ ...RECORD_AAD, vaultId: surrogate }), /Unicode scalar values/);
+      assert.throws(() => vaultRecordAAD({ ...RECORD_AAD, recordId: surrogate }), /Unicode scalar values/);
+      assert.throws(() => vaultRecordAAD({ ...RECORD_AAD, recordType: surrogate as VaultRecordAADInput['recordType'] }), /Unicode scalar values/);
+    }
+  });
+
+  test('rejects unpaired UTF-16 surrogates in HKDF purpose and ID', async () => {
+    const masterKey = await importVaultMasterKey(new Uint8Array(32).fill(0x66));
+
+    for (const surrogate of ['\uD800', '\uDC00']) {
+      await assert.rejects(deriveVaultSubkey(masterKey, surrogate, 'vault', ['sign']), /Unicode scalar values/);
+      await assert.rejects(deriveVaultSubkey(masterKey, 'identifier', surrogate, ['sign']), /Unicode scalar values/);
+    }
+  });
+
+  test('rejects unpaired UTF-16 surrogates in HMAC namespace and value', async () => {
+    const masterKey = await importVaultMasterKey(new Uint8Array(32).fill(0x77));
+    const key = await deriveVaultSubkey(masterKey, 'identifier', 'vault', ['sign']);
+
+    for (const surrogate of ['\uD800', '\uDC00']) {
+      await assert.rejects(hmacVaultIdentifier(key, surrogate, 'secret'), /Unicode scalar values/);
+      await assert.rejects(hmacVaultIdentifier(key, 'service', surrogate), /Unicode scalar values/);
+    }
+  });
+
+  test('accepts U+FFFD as a distinct Unicode scalar value', async () => {
+    const masterKey = await importVaultMasterKey(new Uint8Array(32).fill(0x78));
+    const key = await deriveVaultSubkey(masterKey, 'identifier', '\uFFFD', ['sign']);
+    const replacementIdentifier = await hmacVaultIdentifier(key, '\uFFFD', '\uFFFD');
+    const ordinaryIdentifier = await hmacVaultIdentifier(key, 'replacement', 'replacement');
+
+    assert.notEqual(replacementIdentifier, ordinaryIdentifier);
+    assert.notDeepEqual(vaultRecordAAD({ ...RECORD_AAD, vaultId: '\uFFFD' }), vaultRecordAAD(RECORD_AAD));
   });
 });

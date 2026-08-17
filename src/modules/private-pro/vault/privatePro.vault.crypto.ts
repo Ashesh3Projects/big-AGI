@@ -25,12 +25,31 @@ export interface VaultRecordAADInput extends PrivateProVaultContext {
 }
 
 
+function assertUnicodeScalarString(value: string): void {
+  for (let index = 0; index < value.length; index++) {
+    const codeUnit = value.charCodeAt(index);
+    if (codeUnit >= 0xD800 && codeUnit <= 0xDBFF) {
+      const lowSurrogate = value.charCodeAt(index + 1);
+      if (!(lowSurrogate >= 0xDC00 && lowSurrogate <= 0xDFFF))
+        throw new Error('Canonical strings must contain only Unicode scalar values.');
+      index++;
+    } else if (codeUnit >= 0xDC00 && codeUnit <= 0xDFFF) {
+      throw new Error('Canonical strings must contain only Unicode scalar values.');
+    }
+  }
+}
+
 function utf8(value: string): Uint8Array<ArrayBuffer> {
+  assertUnicodeScalarString(value);
   return new TextEncoder().encode(value);
 }
 
 function lengthPrefixed(...values: string[]): Uint8Array<ArrayBuffer> {
-  return utf8(values.map(value => `${utf8(value).byteLength}:${value}`).join('|'));
+  const encodedValues = values.map(value => {
+    assertUnicodeScalarString(value);
+    return `${utf8(value).byteLength}:${value}`;
+  });
+  return utf8(encodedValues.join('|'));
 }
 
 function bytesToBase64(bytes: Uint8Array): string {
@@ -59,6 +78,38 @@ function recordAADFromEnvelope(envelope: PrivateProVaultEnvelope, context: Priva
     keyVersion: envelope.keyVersion,
     revision: envelope.revision,
   };
+}
+
+function assertAesGcmKey(key: CryptoKey, usage: 'encrypt' | 'decrypt'): void {
+  const algorithm = key.algorithm;
+  if (
+    key.type !== 'secret'
+    || algorithm.name !== 'AES-GCM'
+    || !('length' in algorithm)
+    || algorithm.length !== AES_GCM_KEY_BITS
+    || !key.usages.includes(usage)
+  )
+    throw new Error(`Vault record operations require an AES-GCM 256-bit key with ${usage} usage.`);
+}
+
+function assertHkdfKey(key: CryptoKey): void {
+  if (key.type !== 'secret' || key.algorithm.name !== 'HKDF' || !key.usages.includes('deriveKey'))
+    throw new Error('Vault subkey derivation requires an HKDF key with deriveKey usage.');
+}
+
+function assertHmacSha256Key(key: CryptoKey): void {
+  const algorithm = key.algorithm;
+  const hash = 'hash' in algorithm ? algorithm.hash : undefined;
+  if (
+    key.type !== 'secret'
+    || algorithm.name !== 'HMAC'
+    || typeof hash !== 'object'
+    || hash === null
+    || !('name' in hash)
+    || hash.name !== 'SHA-256'
+    || !key.usages.includes('sign')
+  )
+    throw new Error('Vault identifiers require an HMAC SHA-256 key with sign usage.');
 }
 
 
@@ -94,6 +145,7 @@ export async function encryptVaultRecord(
   aad: VaultRecordAADInput,
   plaintext: Uint8Array,
 ): Promise<PrivateProVaultEnvelope> {
+  assertAesGcmKey(key, 'encrypt');
   const nonce = crypto.getRandomValues(new Uint8Array(AES_GCM_NONCE_BYTES));
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt({
     name: 'AES-GCM',
@@ -119,6 +171,7 @@ export async function decryptVaultRecord(
   envelope: PrivateProVaultEnvelope,
   context: PrivateProVaultContext,
 ): Promise<Uint8Array> {
+  assertAesGcmKey(key, 'decrypt');
   const validatedEnvelope = PrivateProVaultEnvelopeSchema.parse(envelope);
   const plaintext = await crypto.subtle.decrypt({
     name: 'AES-GCM',
@@ -128,12 +181,13 @@ export async function decryptVaultRecord(
   return new Uint8Array(plaintext);
 }
 
-export function deriveVaultSubkey(
+export async function deriveVaultSubkey(
   masterKey: CryptoKey,
   purpose: string,
   id: string,
   usages: KeyUsage[],
 ): Promise<CryptoKey> {
+  assertHkdfKey(masterKey);
   if (!purpose || !id)
     throw new Error('Vault subkey purpose and ID must be non-empty.');
 
@@ -158,6 +212,7 @@ export function deriveVaultSubkey(
 }
 
 export async function hmacVaultIdentifier(key: CryptoKey, namespace: string, value: string): Promise<string> {
+  assertHmacSha256Key(key);
   const signature = await crypto.subtle.sign('HMAC', key, lengthPrefixed(
     'big-agi/private-pro/vault/identifier/v1',
     namespace,
