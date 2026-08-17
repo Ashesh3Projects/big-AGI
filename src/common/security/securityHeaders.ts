@@ -17,8 +17,11 @@ const FIREBASE_AND_GOOGLE_CONNECT_SOURCES = [
 ];
 
 const AI_PROVIDER_CONNECT_SOURCES = [
+  'https:',
+  'wss:',
   'https://api.openai.com',
   'https://api.anthropic.com',
+  'https://api.deepgram.com',
   'https://generativelanguage.googleapis.com',
   'https://api.groq.com',
   'https://api.mistral.ai',

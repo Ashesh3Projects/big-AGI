@@ -39,14 +39,19 @@ test('private Pro CSP permits Firebase, Google sign-in, media, workers, and supp
   assert.match(policy, /connect-src[^;]*https:\/\/api\.together\.xyz/);
   assert.match(policy, /connect-src[^;]*https:\/\/api\.x\.ai/);
   assert.match(policy, /connect-src[^;]*https:\/\/\*\.openai\.azure\.com/);
+  assert.match(policy, /connect-src[^;]*https:\/\/api\.deepgram\.com/);
 });
 
-test('private Pro CSP excludes analytics and unrestricted network access', () => {
+test('private Pro CSP permits custom secure endpoints without permitting analytics or arbitrary insecure endpoints', () => {
   const policy = privateProContentSecurityPolicy();
   const connectSource = policy.match(/(?:^|; )connect-src ([^;]+)/)?.[1] ?? '';
+  const connectSources = connectSource.split(/\s+/);
 
+  assert.ok(connectSources.includes('https:'));
+  assert.ok(connectSources.includes('wss:'));
   assert.doesNotMatch(policy, /posthog|google-analytics|googletagmanager|analytics\.google/);
-  assert.doesNotMatch(connectSource, /(?:^|\s)https:(?:\s|$)/);
-  assert.doesNotMatch(connectSource, /(?:^|\s)wss:(?:\s|$)/);
+  assert.ok(!connectSources.includes('*'));
+  assert.ok(!connectSources.includes('http:'));
+  assert.deepEqual(connectSources.filter(source => source.startsWith('http://')), ['http://localhost:*', 'http://127.0.0.1:*']);
   assert.doesNotMatch(policy, /unsafe-eval/);
 });
