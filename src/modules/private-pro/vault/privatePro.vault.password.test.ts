@@ -1,14 +1,15 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
+import * as passwordModule from './privatePro.vault.password';
+import * as passwordWorkerModule from './privatePro.vault.password.worker';
 import {
   derivePasswordWrappingKey,
   derivePasswordWrappingKeyWithCompatibility,
   privateProVaultArgon2idWorkerUrl,
-  VaultPasswordWorkerIncompatibilityError,
   type VaultPasswordKdfParams,
 } from './privatePro.vault.password';
-import { deriveArgon2idBytesInWorker } from './privatePro.vault.password.worker';
+import { realArgon2idWorkerResponse, withVaultPasswordWorker } from './privatePro.vault.password.test-helpers';
 import { generateRecoveryKey, parseRecoveryKey } from './privatePro.vault.recovery';
 import {
   PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS,
@@ -35,7 +36,10 @@ function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
 }
 
 async function unwrapKnownMasterKey(password: string): Promise<Uint8Array> {
-  const wrappingKey = await derivePasswordWrappingKey(password, KNOWN_ANSWER_PARAMS, deriveArgon2idBytesInWorker);
+  const wrappingKey = await withVaultPasswordWorker(
+    realArgon2idWorkerResponse,
+    () => derivePasswordWrappingKey(password, KNOWN_ANSWER_PARAMS),
+  );
   const unwrapped = await crypto.subtle.unwrapKey(
     'raw',
     base64ToBytes(KNOWN_WRAPPED_MASTER_KEY_BASE64),
@@ -62,7 +66,10 @@ describe('private Pro vault password derivation', () => {
   });
 
   test('returns a non-exportable 256-bit AES-GCM wrapping key', async () => {
-    const key = await derivePasswordWrappingKey('correct horse battery staple', KNOWN_ANSWER_PARAMS, deriveArgon2idBytesInWorker);
+    const key = await withVaultPasswordWorker(
+      realArgon2idWorkerResponse,
+      () => derivePasswordWrappingKey('correct horse battery staple', KNOWN_ANSWER_PARAMS),
+    );
 
     assert.equal(key.algorithm.name, 'AES-GCM');
     assert.equal('length' in key.algorithm ? key.algorithm.length : undefined, 256);
@@ -78,7 +85,7 @@ describe('private Pro vault password derivation', () => {
       { ...KNOWN_ANSWER_PARAMS, parallelism: PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM - 1 },
     ]) {
       await assert.rejects(
-        derivePasswordWrappingKey('never log this password', params, deriveArgon2idBytesInWorker),
+        derivePasswordWrappingKey('never log this password', params),
         error => error instanceof Error
           && /parameters/i.test(error.message)
           && !error.message.includes('never log this password'),
@@ -93,18 +100,18 @@ describe('private Pro vault password derivation', () => {
   test('does not run Argon2id on a runtime without browser workers', async () => {
     await assert.rejects(
       derivePasswordWrappingKey('never log this password', KNOWN_ANSWER_PARAMS),
-      error => error instanceof VaultPasswordWorkerIncompatibilityError
+      error => error instanceof Error
+        && /browser.*worker/i.test(error.message)
         && !error.message.includes('never log this password'),
     );
   });
 
-  test('does not permit PBKDF2 fallback after an ordinary Argon2id failure', async () => {
+  test('does not activate PBKDF2 merely because the Worker API is missing', async () => {
     await assert.rejects(
       derivePasswordWrappingKeyWithCompatibility(
         'never log this password',
         KNOWN_ANSWER_PARAMS,
         { algorithm: 'pbkdf2-sha256', iterations: 600_000, saltBase64: KNOWN_ANSWER_PARAMS.saltBase64 },
-        async () => { throw new Error('argon failure with never log this password'); },
       ),
       error => error instanceof Error
         && /derivation failed/i.test(error.message)
@@ -112,13 +119,60 @@ describe('private Pro vault password derivation', () => {
     );
   });
 
+  test('does not expose or honor application-supplied Argon2id derivation controls', async () => {
+    assert.equal('VaultPasswordWorkerIncompatibilityError' in passwordModule, false);
+    assert.equal('deriveArgon2idBytesInWorker' in passwordWorkerModule, false);
+
+    await assert.rejects(
+      (derivePasswordWrappingKey as unknown as (...args: unknown[]) => Promise<CryptoKey>)(
+        'never log this password',
+        KNOWN_ANSWER_PARAMS,
+        async () => new Uint8Array(32),
+      ),
+      /browser.*worker/i,
+    );
+  });
+
+  test('ignores an application-supplied compatibility deriver and uses the real worker result', async () => {
+    const fallback = { algorithm: 'pbkdf2-sha256', iterations: 600_000, saltBase64: KNOWN_ANSWER_PARAMS.saltBase64 } as const;
+    const result = await withVaultPasswordWorker(
+      () => ({ protocolVersion: 1, kind: 'incompatible', reason: 'memory-limit' }),
+      () => (derivePasswordWrappingKeyWithCompatibility as unknown as (...args: unknown[]) => ReturnType<typeof derivePasswordWrappingKeyWithCompatibility>)(
+        'correct horse battery staple',
+        KNOWN_ANSWER_PARAMS,
+        fallback,
+        async () => new Uint8Array(32),
+      ),
+    );
+
+    assert.deepEqual(result.params, fallback);
+  });
+
+  test('does not permit PBKDF2 fallback after an ordinary Argon2id failure', async () => {
+    await withVaultPasswordWorker(
+      () => ({ protocolVersion: 1, kind: 'failure' }),
+      () => assert.rejects(
+        derivePasswordWrappingKeyWithCompatibility(
+          'never log this password',
+          KNOWN_ANSWER_PARAMS,
+          { algorithm: 'pbkdf2-sha256', iterations: 600_000, saltBase64: KNOWN_ANSWER_PARAMS.saltBase64 },
+        ),
+        error => error instanceof Error
+          && /derivation failed/i.test(error.message)
+          && !error.message.includes('never log this password'),
+      ),
+    );
+  });
+
   test('uses the versioned PBKDF2 fallback only after supported worker incompatibility', async () => {
     const fallback = { algorithm: 'pbkdf2-sha256', iterations: 600_000, saltBase64: KNOWN_ANSWER_PARAMS.saltBase64 } as const;
-    const result = await derivePasswordWrappingKeyWithCompatibility(
-      'correct horse battery staple',
-      KNOWN_ANSWER_PARAMS,
-      fallback,
-      async () => { throw new VaultPasswordWorkerIncompatibilityError(); },
+    const result = await withVaultPasswordWorker(
+      () => ({ protocolVersion: 1, kind: 'incompatible', reason: 'wasm-unavailable' }),
+      () => derivePasswordWrappingKeyWithCompatibility(
+        'correct horse battery staple',
+        KNOWN_ANSWER_PARAMS,
+        fallback,
+      ),
     );
 
     assert.deepEqual(result.params, fallback);

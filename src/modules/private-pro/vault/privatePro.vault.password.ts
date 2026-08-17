@@ -5,6 +5,7 @@ import {
   PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS,
   PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB,
   PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM,
+  PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
 } from './privatePro.vault.schemas';
 import type { VaultArgon2idWorkerRequest } from './privatePro.vault.password.worker';
 
@@ -23,19 +24,22 @@ export interface VaultPasswordPbkdf2V1CompatibilityParams {
   saltBase64: string;
 }
 
-export type VaultArgon2idDeriver = (request: VaultArgon2idWorkerRequest) => Promise<Uint8Array<ArrayBuffer>>;
-
-export const PRIVATE_PRO_VAULT_PBKDF2_SHA256_MIN_ITERATIONS = 600_000;
-
 const SALT_MIN_BYTES = 16;
 const SALT_MAX_BYTES = 64;
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 
-export class VaultPasswordWorkerIncompatibilityError extends Error {
+class VaultPasswordWorkerIncompatibilityError extends Error {
   constructor() {
     super('This browser cannot run the required vault password derivation worker.');
     this.name = 'VaultPasswordWorkerIncompatibilityError';
+  }
+}
+
+class VaultPasswordWorkerUnavailableError extends Error {
+  constructor() {
+    super('Vault password derivation failed because the browser worker is unavailable.');
+    this.name = 'VaultPasswordWorkerUnavailableError';
   }
 }
 
@@ -93,7 +97,7 @@ export function privateProVaultArgon2idWorkerUrl(): URL {
 
 function deriveArgon2idInBrowserWorker(request: VaultArgon2idWorkerRequest): Promise<Uint8Array<ArrayBuffer>> {
   if (typeof Worker === 'undefined')
-    return Promise.reject(new VaultPasswordWorkerIncompatibilityError());
+    return Promise.reject(new VaultPasswordWorkerUnavailableError());
 
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./privatePro.vault.password.worker.ts', import.meta.url), {
@@ -105,12 +109,16 @@ function deriveArgon2idInBrowserWorker(request: VaultArgon2idWorkerRequest): Pro
       action();
     };
     worker.addEventListener('message', event => {
-      const response = event.data as { kind?: string; keyBytes?: Uint8Array<ArrayBuffer> };
-      if (response.kind === 'success' && response.keyBytes instanceof Uint8Array) {
-        const keyBytes = response.keyBytes;
+      const response = event.data as Record<string, unknown> | null;
+      if (response?.protocolVersion === 1 && response.kind === 'success' && response.keyBytes instanceof Uint8Array) {
+        const keyBytes = Uint8Array.from(response.keyBytes);
         finish(() => resolve(keyBytes));
       }
-      else if (response.kind === 'incompatible')
+      else if (
+        response?.protocolVersion === 1
+        && response.kind === 'incompatible'
+        && (response.reason === 'wasm-unavailable' || response.reason === 'memory-limit')
+      )
         finish(() => reject(new VaultPasswordWorkerIncompatibilityError()));
       else
         finish(() => reject(new Error('Vault password derivation failed.')));
@@ -133,12 +141,11 @@ async function importWrappingKey(keyBytes: Uint8Array<ArrayBuffer>): Promise<Cry
 export async function derivePasswordWrappingKey(
   password: string,
   params: VaultPasswordKdfParams,
-  deriveArgon2id: VaultArgon2idDeriver = deriveArgon2idInBrowserWorker,
 ): Promise<CryptoKey> {
   const saltBytes = validateArgon2idParams(params);
   const passwordBytes = encodePassword(password);
   try {
-    const derivedBytes = await deriveArgon2id({
+    const derivedBytes = await deriveArgon2idInBrowserWorker({
       passwordBytes,
       saltBytes,
       memoryKiB: params.memoryKiB,
@@ -147,7 +154,7 @@ export async function derivePasswordWrappingKey(
     });
     return await importWrappingKey(derivedBytes);
   } catch (error) {
-    if (error instanceof VaultPasswordWorkerIncompatibilityError)
+    if (error instanceof VaultPasswordWorkerIncompatibilityError || error instanceof VaultPasswordWorkerUnavailableError)
       throw error;
     throw new Error('Vault password derivation failed.');
   } finally {
@@ -160,10 +167,9 @@ export async function derivePasswordWrappingKeyWithCompatibility(
   password: string,
   params: VaultPasswordKdfParams,
   fallback: VaultPasswordPbkdf2V1CompatibilityParams,
-  deriveArgon2id: VaultArgon2idDeriver = deriveArgon2idInBrowserWorker,
 ): Promise<{ key: CryptoKey; params: VaultPasswordKdfParams | VaultPasswordPbkdf2V1CompatibilityParams }> {
   try {
-    return { key: await derivePasswordWrappingKey(password, params, deriveArgon2id), params };
+    return { key: await derivePasswordWrappingKey(password, params), params };
   } catch (error) {
     if (!(error instanceof VaultPasswordWorkerIncompatibilityError))
       throw error;
@@ -173,7 +179,7 @@ export async function derivePasswordWrappingKeyWithCompatibility(
   if (
     fallback.algorithm !== 'pbkdf2-sha256'
     || !Number.isInteger(fallback.iterations)
-    || fallback.iterations < PRIVATE_PRO_VAULT_PBKDF2_SHA256_MIN_ITERATIONS
+    || fallback.iterations < PRIVATE_PRO_PBKDF2_MIN_ITERATIONS
     || fallback.iterations > 10_000_000
     || saltBytes.byteLength < SALT_MIN_BYTES
     || saltBytes.byteLength > SALT_MAX_BYTES

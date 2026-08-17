@@ -10,20 +10,30 @@ export interface VaultArgon2idWorkerRequest {
 }
 
 type VaultArgon2idWorkerResponse = {
+  protocolVersion: 1;
   kind: 'success';
   keyBytes: Uint8Array;
 } | {
-  kind: 'incompatible' | 'failure';
+  protocolVersion: 1;
+  kind: 'incompatible';
+  reason: 'wasm-unavailable' | 'memory-limit';
+} | {
+  protocolVersion: 1;
+  kind: 'failure';
 };
 
 
-function isSupportedIncompatibility(error: unknown): boolean {
-  if (typeof WebAssembly === 'undefined' || error instanceof RangeError)
-    return true;
-  return error instanceof Error && /(?:webassembly|wasm|memory|allocation|out of bounds)/i.test(error.message);
+function supportedIncompatibilityReason(error: unknown): 'wasm-unavailable' | 'memory-limit' | null {
+  if (typeof WebAssembly === 'undefined')
+    return 'wasm-unavailable';
+  if (error instanceof RangeError || error instanceof Error && /(?:memory|allocation|out of bounds)/i.test(error.message))
+    return 'memory-limit';
+  if (error instanceof Error && /(?:webassembly|wasm)/i.test(error.message))
+    return 'wasm-unavailable';
+  return null;
 }
 
-export async function deriveArgon2idBytesInWorker(request: VaultArgon2idWorkerRequest): Promise<Uint8Array<ArrayBuffer>> {
+async function deriveArgon2idBytesInWorker(request: VaultArgon2idWorkerRequest): Promise<Uint8Array<ArrayBuffer>> {
   try {
     const result = await argon2id({
       password: request.passwordBytes,
@@ -50,10 +60,13 @@ const workerScope = typeof self === 'undefined' ? null : self as unknown as Vaul
 workerScope?.addEventListener('message', event => {
   const request = event.data as VaultArgon2idWorkerRequest;
   void deriveArgon2idBytesInWorker(request).then(keyBytes => {
-    const response: VaultArgon2idWorkerResponse = { kind: 'success', keyBytes };
+    const response: VaultArgon2idWorkerResponse = { protocolVersion: 1, kind: 'success', keyBytes };
     workerScope.postMessage(response, [keyBytes.buffer]);
   }).catch(error => {
-    const response: VaultArgon2idWorkerResponse = { kind: isSupportedIncompatibility(error) ? 'incompatible' : 'failure' };
+    const incompatibilityReason = supportedIncompatibilityReason(error);
+    const response: VaultArgon2idWorkerResponse = incompatibilityReason
+      ? { protocolVersion: 1, kind: 'incompatible', reason: incompatibilityReason }
+      : { protocolVersion: 1, kind: 'failure' };
     workerScope.postMessage(response);
   });
 });

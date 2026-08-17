@@ -7,6 +7,7 @@ import {
   PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB,
   PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM,
   PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
+  PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
   PrivateProVaultEnvelopeSchema,
   PrivateProVaultPasswordEnvelopeSchema,
 } from './privatePro.vault.schemas';
@@ -37,6 +38,15 @@ const VALID_PASSWORD_ENVELOPE = {
   nonceBase64: 'AAECAwQFBgcICQoL',
   ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODw==',
   ciphertextBytes: 16,
+} as const;
+
+const VALID_PBKDF2_PASSWORD_ENVELOPE = {
+  ...VALID_PASSWORD_ENVELOPE,
+  kdf: {
+    algorithm: 'pbkdf2-sha256',
+    saltBase64: 'AAECAwQFBgcICQoLDA0ODw==',
+    iterations: PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
+  },
 } as const;
 
 
@@ -117,5 +127,16 @@ describe('private Pro vault schemas', () => {
       ...VALID_PASSWORD_ENVELOPE,
       kdf: { ...VALID_PASSWORD_ENVELOPE.kdf, parallelism: PRIVATE_PRO_VAULT_ARGON2ID_MAX_PARALLELISM + 1 },
     }).success, false);
+  });
+
+  test('rejects PBKDF2 iterations below the compatibility security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse({
+      ...VALID_PBKDF2_PASSWORD_ENVELOPE,
+      kdf: { ...VALID_PBKDF2_PASSWORD_ENVELOPE.kdf, iterations: PRIVATE_PRO_PBKDF2_MIN_ITERATIONS - 1 },
+    }).success, false);
+  });
+
+  test('accepts the PBKDF2 compatibility security floor', () => {
+    assert.equal(PrivateProVaultPasswordEnvelopeSchema.safeParse(VALID_PBKDF2_PASSWORD_ENVELOPE).success, true);
   });
 });

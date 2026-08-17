@@ -25,6 +25,7 @@ export const PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM = 1;
 export const PRIVATE_PRO_VAULT_ARGON2ID_MAX_MEMORY_KIB = 1024 * 1024;
 export const PRIVATE_PRO_VAULT_ARGON2ID_MAX_ITERATIONS = 100;
 export const PRIVATE_PRO_VAULT_ARGON2ID_MAX_PARALLELISM = 4;
+export const PRIVATE_PRO_PBKDF2_MIN_ITERATIONS = 600_000;
 
 const PRIVATE_PRO_VAULT_MAX_IDENTIFIER_LENGTH = 256;
 const PRIVATE_PRO_VAULT_MAX_CURSOR_LENGTH = 512;
@@ -135,7 +136,7 @@ const PrivateProVaultArgon2idSchema = z.object({
 const PrivateProVaultPbkdf2Schema = z.object({
   algorithm: z.literal('pbkdf2-sha256'),
   saltBase64: PrivateProVaultSaltSchema,
-  iterations: boundedPositiveInteger(10_000_000),
+  iterations: z.number().int().min(PRIVATE_PRO_PBKDF2_MIN_ITERATIONS).max(10_000_000),
 }).strict();
 
 export const PrivateProVaultPasswordEnvelopeSchema = z.object({
