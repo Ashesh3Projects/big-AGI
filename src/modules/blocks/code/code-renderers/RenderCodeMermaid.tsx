@@ -9,6 +9,7 @@ import { themeCodeFontFamilyCss, themeFontFamilyCss } from '~/common/app.theme';
 
 import { diagramErrorSx, diagramSx } from './RenderCodePlantUML';
 import { patchSvgString } from './RenderCodeSVG';
+import { sanitizeRenderedSvg } from './svgSanitize';
 
 
 /**
@@ -86,7 +87,8 @@ function _initializeMermaid(mermaidAPI: MermaidAPI): MermaidAPI {
     altFontFamily: themeFontFamilyCss,
 
     // style configuration
-    htmlLabels: true,
+    // Keep labels in SVG text nodes so the strict renderer can drop foreignObject entirely.
+    htmlLabels: false,
     securityLevel: 'loose',
     theme: 'forest',
 
@@ -146,7 +148,18 @@ export function RenderCodeMermaid(props: { mermaidCode: string, fitScreen: boole
   });
 
   // derived
-  const hasMermaidLoadError = !!mermaidLoadError;
+  let renderedSvg: string | null = null;
+  let renderError: string | null = mermaidLoadError;
+  if (data?.success === false)
+    renderError = data.error;
+  else if (data?.success) {
+    try {
+      const patchedSvg = patchSvgString(props.fitScreen, data.svg);
+      renderedSvg = patchedSvg ? sanitizeRenderedSvg(patchedSvg) : null;
+    } catch (error) {
+      renderError = error instanceof Error ? error.message : String(error);
+    }
+  }
 
   return (
     <Box component='div'>
@@ -158,13 +171,8 @@ export function RenderCodeMermaid(props: { mermaidCode: string, fitScreen: boole
       <Box
         component='div'
         ref={mermaidContainerRef}
-        dangerouslySetInnerHTML={{
-          __html:
-            hasMermaidLoadError ? mermaidLoadError
-              : data?.success === false ? data.error
-                : patchSvgString(props.fitScreen, data?.svg) || 'Loading Diagram...',
-        }}
-        sx={data?.success === false ? diagramErrorSx : diagramSx}
+        {...renderedSvg ? { dangerouslySetInnerHTML: { __html: renderedSvg } } : { children: renderError || 'Loading Diagram...' }}
+        sx={renderError ? diagramErrorSx : diagramSx}
       />
     </Box>
   );

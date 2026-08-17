@@ -7,6 +7,7 @@ import { frontendSideFetch } from '~/common/util/clientFetchers';
 
 import { encodeWithCompressionStream } from './plantuml.utils';
 import { patchSvgString } from './RenderCodeSVG';
+import { sanitizeRenderedSvg } from './svgSanitize';
 import * as React from 'react';
 
 
@@ -98,14 +99,24 @@ export function RenderCodePlantUML(props: {
       </Typography>
     );
 
+  const patchedSvg = patchSvgString(props.fitScreen, props.svgCode);
+  if (!patchedSvg)
+    return <Box component='div' className='code-container' sx={diagramErrorSx}>{props.error ? `PlantUML Error: ${props.error.message}` : 'No PlantUML code'}</Box>;
+
+  let sanitizedSvg: string;
+  try {
+    sanitizedSvg = sanitizeRenderedSvg(patchedSvg);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return <Box component='div' className='code-container' sx={diagramErrorSx}>{`Unable to display PlantUML: ${message}`}</Box>;
+  }
+
   return (
     <Box
       component='div'
       className='code-container'
-      dangerouslySetInnerHTML={{
-        __html: patchSvgString(props.fitScreen, props.svgCode) || (props.error ? `PlantUML Error: ${props.error.message}` : 'No PlantUML code'),
-      }}
-      sx={(!props.svgCode && props.error) ? undefined : diagramSx}
+      dangerouslySetInnerHTML={{ __html: sanitizedSvg }}
+      sx={diagramSx}
     />
   );
 }

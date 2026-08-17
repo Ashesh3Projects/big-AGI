@@ -16,6 +16,8 @@ import StopIcon from '@mui/icons-material/Stop';
 
 import { useShallow } from 'zustand/react/shallow';
 
+import { sanitizeRenderedSvg } from '~/modules/blocks/code/code-renderers/svgSanitize';
+
 import { PLACEHOLDER_INTERIM_TRANSCRIPT, type SpeechResult, useSpeechRecognition } from '~/common/components/speechrecognition/useSpeechRecognition';
 import { useLLM } from '~/common/stores/llms/llms.hooks';
 
@@ -391,6 +393,15 @@ export function LiveSvgAnimator(props: { isMobile: boolean }) {
 
   const showEmpty = status === 'idle' && timeline.length === 0;
   const latest: Frame | undefined = timeline[timeline.length - 1];
+  let latestSvg: string | null = null;
+  let latestSvgError: string | null = null;
+  if (latest) {
+    try {
+      latestSvg = sanitizeRenderedSvg(latest.svg);
+    } catch (svgError) {
+      latestSvgError = svgError instanceof Error ? svgError.message : String(svgError);
+    }
+  }
 
   // derived statistics
   const avgTps = totalGenMs > 0 ? totalTokensOut / (totalGenMs / 1000) : 0;
@@ -514,8 +525,10 @@ export function LiveSvgAnimator(props: { isMobile: boolean }) {
 
           {/* large current frame, with the centered recording control overlaid */}
           <Box sx={_styles.stage}>
-            {latest ? (
-              <Box sx={_styles.bigFrame} dangerouslySetInnerHTML={{ __html: latest.svg }} />
+            {latestSvg ? (
+              <Box sx={_styles.bigFrame} dangerouslySetInnerHTML={{ __html: latestSvg }} />
+            ) : latestSvgError ? (
+              <Typography level='body-sm' color='danger'>{`Unable to display SVG frame: ${latestSvgError}`}</Typography>
             ) : (
               <Box sx={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 1, color: 'text.tertiary' }}>
                 <CircularProgress />

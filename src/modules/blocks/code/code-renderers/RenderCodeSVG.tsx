@@ -3,6 +3,8 @@ import * as React from 'react';
 import type { SxProps } from '@mui/joy/styles/types';
 import { Box } from '@mui/joy';
 
+import { sanitizeRenderedSvg } from './svgSanitize';
+
 
 function _removePotentialComments(code: string): string {
   return code.replace(/^(<!--[^>]*-->)*\s*/i, '');
@@ -37,13 +39,23 @@ export function RenderCodeSVG(props: {
   svgCode: string;
   fitScreen: boolean;
 }) {
+  const patchedSvg = patchSvgString(props.fitScreen, props.svgCode);
+  if (!patchedSvg)
+    return <Box component='div' className='code-container' sx={svgSx}>No SVG code</Box>;
+
+  let sanitizedSvg: string;
+  try {
+    sanitizedSvg = sanitizeRenderedSvg(patchedSvg);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return <Box component='div' className='code-container' sx={svgSx}>{`Unable to display SVG: ${message}`}</Box>;
+  }
+
   return (
     <Box
       component='div'
       className='code-container'
-      dangerouslySetInnerHTML={{
-        __html: patchSvgString(props.fitScreen, props.svgCode) || 'No SVG code',
-      }}
+      dangerouslySetInnerHTML={{ __html: sanitizedSvg }}
       sx={svgSx}
     />
   );
