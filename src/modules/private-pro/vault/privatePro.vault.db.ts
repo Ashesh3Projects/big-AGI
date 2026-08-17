@@ -34,6 +34,7 @@ export interface PrivateProVaultOutboxRecord {
   operationId: string;
   operation: PrivateProVaultOperation;
   createdAtMs: number;
+  localSequence?: number;
 }
 
 export interface PrivateProVaultRevisionRecord {

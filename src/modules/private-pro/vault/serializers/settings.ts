@@ -169,6 +169,7 @@ function speechVaultSubscribe(listener: () => void): () => void {
 export const privateProVaultSettingsSerializer: PrivateProVaultLogicalSerializer<SettingsValue> = {
   recordType: 'settings',
   schemaVersion: 2,
+  conflictPolicy: 'replace',
   schema: SettingsSchema,
   logicalId: value => value.group,
   snapshot: () => {

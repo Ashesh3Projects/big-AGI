@@ -23,23 +23,30 @@ export type PrivateProPortableMutation = {
   schemaVersion: number;
 };
 
+export type PrivateProVaultConflictPolicy = 'replace' | 'conflict-copy' | 'manual';
+
 export interface PrivateProVaultSerializer<T> {
   recordType: PrivateProVaultRecordType;
   schemaVersion: number;
+  conflictPolicy: PrivateProVaultConflictPolicy;
   snapshot(): Promise<Array<{ recordId: string; value: T }>>;
+  validate(recordId: string, value: unknown): Promise<T>;
   apply(recordId: string, value: T): Promise<void>;
   remove(recordId: string): Promise<void>;
+  createConflictCopy?(value: T): Promise<{ recordId: string; value: T }>;
   subscribe(listener: (mutation: PrivateProPortableMutation) => void): () => void;
 }
 
 export interface PrivateProVaultLogicalSerializer<T> {
   recordType: PrivateProVaultRecordType;
   schemaVersion: number;
+  conflictPolicy?: PrivateProVaultConflictPolicy;
   schema: z.ZodType<T>;
   logicalId(value: T): string;
   snapshot(): Array<{ logicalId: string; value: T }>;
   apply(logicalId: string, value: T): void;
   remove(logicalId: string): void;
+  createConflictCopy?(value: T): T;
   subscribe(listener: () => void): () => void;
 }
 
@@ -59,14 +66,22 @@ function bindSerializer<T>(
     value: serializer.schema.parse(record.value),
   })));
 
+  const validate = async (recordId: string, input: unknown) => {
+    const value = serializer.schema.parse(input);
+    const logicalId = serializer.logicalId(value);
+    await assertPrivateProVaultRecordId(identifierKey, serializer.recordType, logicalId, recordId);
+    return value;
+  };
+
   return {
     recordType: serializer.recordType,
     schemaVersion: serializer.schemaVersion,
+    conflictPolicy: serializer.conflictPolicy ?? 'manual',
     snapshot,
+    validate,
     apply: async (recordId, input) => {
-      const value = serializer.schema.parse(input);
+      const value = await validate(recordId, input);
       const logicalId = serializer.logicalId(value);
-      await assertPrivateProVaultRecordId(identifierKey, serializer.recordType, logicalId, recordId);
       serializer.apply(logicalId, value);
     },
     remove: async recordId => {
@@ -77,6 +92,13 @@ function bindSerializer<T>(
         }
       }
     },
+    ...(serializer.createConflictCopy ? {
+      createConflictCopy: async (input: T) => {
+        const value = serializer.schema.parse(serializer.createConflictCopy!(serializer.schema.parse(input)));
+        const recordId = await opaqueId(serializer.logicalId(value));
+        return { recordId, value };
+      },
+    } : {}),
     subscribe: listener => {
       let stopped = false;
       let previousPromise = snapshot();

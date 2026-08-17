@@ -180,6 +180,7 @@ function projectModel(model: DLLM): DLLM {
 export const privateProVaultCredentialSerializer: PrivateProVaultLogicalSerializer<CredentialServiceValue> = {
   recordType: 'credential-service',
   schemaVersion: 5,
+  conflictPolicy: 'replace',
   schema: CredentialServiceSchema,
   logicalId: value => value.id,
   snapshot: () => modelsVaultSnapshot().map(({ service }) => ({

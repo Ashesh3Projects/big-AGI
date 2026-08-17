@@ -13,6 +13,7 @@ type ChatValue = z.infer<typeof ChatSchema>;
 export const privateProVaultChatSerializer: PrivateProVaultLogicalSerializer<ChatValue> = {
   recordType: 'chat',
   schemaVersion: 4,
+  conflictPolicy: 'conflict-copy',
   schema: ChatSchema,
   logicalId: value => value.conversation.id,
   snapshot: () => chatSyncSnapshot().flatMap(conversation => {
@@ -21,5 +22,14 @@ export const privateProVaultChatSerializer: PrivateProVaultLogicalSerializer<Cha
   }),
   apply: (_logicalId, value) => chatSyncUpsert(parseSyncConversation(value as SyncConversation)),
   remove: chatSyncDelete,
+  createConflictCopy: value => ({
+    ...structuredClone(value),
+    conversation: {
+      ...structuredClone(value.conversation),
+      id: `${value.conversation.id}-conflict-${crypto.randomUUID()}`,
+      userTitle: `${value.conversation.userTitle || value.conversation.autoTitle || 'Chat'} (conflict copy)`,
+      updated: Date.now(),
+    },
+  }),
   subscribe: chatSyncSubscribe,
 };
