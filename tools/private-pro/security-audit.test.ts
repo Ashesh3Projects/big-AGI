@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
   classifyAppCheck,
@@ -11,7 +14,8 @@ import {
   classifyHeaders,
   classifyIamRoles,
   classifyServiceAccountKeys,
-  auditCommand,
+  runCommand,
+  selectRuntimeIdentity,
   buildAuditReport,
   inspectAppCheck,
   inspectAuthorizedDomains,
@@ -30,12 +34,17 @@ function severities(findings: AuditFinding[]) {
 }
 
 describe('private Pro security audit classifiers', () => {
-  test('uses Windows command executables for CLI collectors', () => {
-    assert.deepEqual(auditCommand('gcloud', ['version'], 'win32', 'C:\\Windows\\System32\\cmd.exe'), {
-      file: 'C:\\Windows\\System32\\cmd.exe',
-      args: ['/d', '/s', '/c', 'gcloud.cmd', 'version'],
-    });
-    assert.deepEqual(auditCommand('gcloud', ['version'], 'linux'), { file: 'gcloud', args: ['version'] });
+  test('passes shell metacharacters as one argument without executing them', async () => {
+    const directory = await mkdtemp(join(tmpdir(), 'private-pro-audit-'));
+    const script = join(directory, 'echo-args.ps1');
+    const sideEffect = join(directory, 'injected.txt');
+    await writeFile(script, '$args | ConvertTo-Json -Compress\n', 'utf8');
+
+    const argument = `safe&Set-Content -LiteralPath '${sideEffect}' injected`;
+    const result = await runCommand(process.env.SystemRoot ? join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script, argument]);
+
+    assert.equal(JSON.parse(result.stdout), argument);
+    await assert.rejects(readFile(sideEffect, 'utf8'));
   });
 
   test('blocks wildcard CORS and missing CSP headers', () => {
@@ -71,15 +80,39 @@ describe('private Pro security audit classifiers', () => {
   });
 
   test('blocks an unrestricted browser API key', () => {
-    const findings = classifyBrowserApiKeys({ total: 1, unrestricted: 1, missingReferrerRestrictions: 1, missingApiTargets: 1 });
+    const findings = classifyBrowserApiKeys({ total: 1, unrestricted: 1, missingExpectedReferrers: 2, staleReferrers: 0, broadReferrers: 1, missingRequiredApiTargets: 2, unrelatedApiTargets: 0 });
 
-    assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'block']);
+    assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'pass', 'block', 'block', 'pass']);
+  });
+
+  test('requires exact browser referrers and only explicit API services', () => {
+    assert.deepEqual(inspectBrowserApiKeys([{ restrictions: {
+      browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://*.ashesh.dev/*', 'https://old.example.com/*'] },
+      apiTargets: [{ service: 'identitytoolkit.googleapis.com' }, { service: 'maps.googleapis.com' }],
+    } }], new Set(['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*']), new Set(['identitytoolkit.googleapis.com', 'securetoken.googleapis.com'])), {
+      total: 1,
+      unrestricted: 0,
+      missingExpectedReferrers: 1,
+      staleReferrers: 2,
+      broadReferrers: 1,
+      missingRequiredApiTargets: 1,
+      unrelatedApiTargets: 1,
+    });
   });
 
   test('blocks disabled App Check enforcement', () => {
-    const findings = classifyAppCheck({ total: 2, enforced: 0, unenforced: 2, unknown: 0 });
+    const findings = classifyAppCheck({ required: 3, enforced: 0, missing: 1, unenforced: 1, unknown: 1 });
 
-    assert.deepEqual(severities(findings), ['pass', 'block', 'pass']);
+    assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'block', 'block']);
+  });
+
+  test('passes App Check only when every required service is explicitly enforced', () => {
+    const required = new Set(['identitytoolkit.googleapis.com', 'firestore.googleapis.com']);
+    assert.deepEqual(inspectAppCheck({ services: [
+      { name: 'projects/1/services/identitytoolkit.googleapis.com', enforcementMode: 'ENFORCED' },
+      { name: 'projects/1/services/firestore.googleapis.com', enforcementMode: 'ENFORCED' },
+    ] }, required), { required: 2, enforced: 2, missing: 0, unenforced: 0, unknown: 0 });
+    assert.equal(classifyAppCheck({ required: 2, enforced: 2, missing: 0, unenforced: 0, unknown: 0 }).every(item => item.severity === 'pass'), true);
   });
 
   test('blocks broad Admin SDK roles and reports counts only', () => {
@@ -89,23 +122,38 @@ describe('private Pro security audit classifiers', () => {
   });
 
   test('blocks stale service-account keys without key IDs', () => {
-    const findings = classifyServiceAccountKeys({ total: 3, userManaged: 2, stale: 1, disabled: 0 });
+    const findings = classifyServiceAccountKeys({ collectorReady: true, identityCount: 1, total: 3, userManaged: 2, stale: 1, disabled: 0 });
 
-    assert.deepEqual(severities(findings), ['pass', 'warn', 'block', 'pass']);
+    assert.deepEqual(severities(findings), ['pass', 'pass', 'pass', 'warn', 'block', 'pass']);
+  });
+
+  test('blocks missing or ambiguous runtime identity and unreadable key data', () => {
+    assert.deepEqual(selectRuntimeIdentity([], undefined), { identityCount: 0 });
+    assert.deepEqual(selectRuntimeIdentity([{ email: 'firebase-adminsdk-a@example.iam.gserviceaccount.com' }, { email: 'firebase-adminsdk-b@example.iam.gserviceaccount.com' }], undefined), { identityCount: 2 });
+    assert.deepEqual(selectRuntimeIdentity([], 'runtime@sample-project.iam.gserviceaccount.com'), { identityCount: 1, email: 'runtime@sample-project.iam.gserviceaccount.com' });
+    assert.deepEqual(selectRuntimeIdentity([], 'runtime@sample-project.iam.gserviceaccount.com&whoami'), { identityCount: 0 });
+    assert.equal(classifyServiceAccountKeys({ collectorReady: false, identityCount: 1, total: 0, userManaged: 0, stale: 0, disabled: 0 })[0].severity, 'block');
   });
 
   test('blocks critical or high production dependency advisories', () => {
-    const findings = classifyDependencyAudit({ critical: 1, high: 2, moderate: 3, low: 4, total: 10 });
+    const findings = classifyDependencyAudit({ readable: true, critical: 1, high: 2, moderate: 3, low: 4, total: 10 });
 
-    assert.deepEqual(severities(findings), ['block', 'block', 'warn', 'warn', 'pass']);
+    assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'warn', 'warn', 'pass']);
+  });
+
+  test('blocks malformed and npm audit error payloads', () => {
+    assert.equal(inspectDependencyAudit({ error: { code: 'EAUDITNOLOCK' } }).readable, false);
+    assert.equal(inspectDependencyAudit({ metadata: {} }).readable, false);
+    assert.equal(inspectDependencyAudit('not-json').readable, false);
+    assert.equal(classifyDependencyAudit({ readable: false, critical: 0, high: 0, moderate: 0, low: 0, total: 0 })[0].severity, 'block');
   });
 
   test('blocks Firebase probes that permit anonymous reads or writes', () => {
     const findings = classifyFirebaseRuleProbes({
-      firestoreReadDenied: true,
-      firestoreWriteDenied: false,
-      storageReadDenied: false,
-      storageWriteDenied: true,
+      firestoreRead: 'denied',
+      firestoreWrite: 'allowed',
+      storageRead: 'unknown',
+      storageWrite: 'denied',
     });
 
     assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'pass']);
@@ -118,17 +166,21 @@ describe('private Pro security audit classifiers', () => {
       wildcard: 1,
       missing: 1,
     });
-    assert.deepEqual(inspectBrowserApiKeys([{ restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://example.com/*'] }, apiTargets: [{ service: 'identitytoolkit.googleapis.com' }] } }, {}]), {
+    assert.deepEqual(inspectBrowserApiKeys([{ restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://example.com/*'] }, apiTargets: [{ service: 'identitytoolkit.googleapis.com' }] } }, {}], new Set(['https://example.com/*']), new Set(['identitytoolkit.googleapis.com'])), {
       total: 2,
       unrestricted: 1,
-      missingReferrerRestrictions: 1,
-      missingApiTargets: 1,
+      missingExpectedReferrers: 1,
+      staleReferrers: 0,
+      broadReferrers: 0,
+      missingRequiredApiTargets: 1,
+      unrelatedApiTargets: 0,
     });
-    assert.deepEqual(inspectAppCheck({ services: [{ enforcementMode: 'ENFORCED' }, { enforcementMode: 'UNENFORCED' }, {}] }), {
-      total: 3,
+    assert.deepEqual(inspectAppCheck({ services: [{ name: 'projects/1/services/a', enforcementMode: 'ENFORCED' }, { name: 'projects/1/services/b', enforcementMode: 'UNENFORCED' }, { name: 'projects/1/services/c' }] }, new Set(['a', 'b', 'c', 'd'])), {
+      required: 4,
       enforced: 1,
+      missing: 2,
       unenforced: 1,
-      unknown: 1,
+      unknown: 0,
     });
     assert.deepEqual(inspectIamRoles({ bindings: [{ role: 'roles/firebase.admin' }, { role: 'roles/viewer' }] }), {
       bindings: 2,
@@ -150,8 +202,9 @@ describe('private Pro security audit classifiers', () => {
     assert.deepEqual(inspectServiceAccountKeys([
       { name: 'secret-key-id', keyType: 'USER_MANAGED', validAfterTime: '2025-01-01T00:00:00Z' },
       { name: 'system-key-id', keyType: 'SYSTEM_MANAGED', disabled: true },
-    ], Date.parse('2026-08-17T00:00:00Z')), { total: 2, userManaged: 1, stale: 1, disabled: 1 });
+    ], Date.parse('2026-08-17T00:00:00Z'), true, 1), { collectorReady: true, identityCount: 1, total: 2, userManaged: 1, stale: 1, disabled: 1 });
     assert.deepEqual(inspectDependencyAudit({ metadata: { vulnerabilities: { critical: 1, high: 2, moderate: 3, low: 4, total: 10 } } }), {
+      readable: true,
       critical: 1,
       high: 2,
       moderate: 3,
@@ -165,7 +218,7 @@ describe('private Pro security audit classifiers', () => {
       staleAliases: 1,
     });
 
-    const reportText = JSON.stringify(buildAuditReport(classifyServiceAccountKeys({ total: 2, userManaged: 1, stale: 1, disabled: 0 })));
+    const reportText = JSON.stringify(buildAuditReport(classifyServiceAccountKeys({ collectorReady: true, identityCount: 1, total: 2, userManaged: 1, stale: 1, disabled: 0 })));
     assert.doesNotMatch(reportText, /secret|key-id|example\.com|firebase\.admin/);
     const assertBooleanOrCountLeaves = (value: unknown): void => {
       if (typeof value === 'boolean' || typeof value === 'number') return;
@@ -173,6 +226,6 @@ describe('private Pro security audit classifiers', () => {
       assert.notEqual(value, null);
       for (const child of Object.values(value as Record<string, unknown>)) assertBooleanOrCountLeaves(child);
     };
-    assertBooleanOrCountLeaves(buildAuditReport(classifyServiceAccountKeys({ total: 2, userManaged: 1, stale: 1, disabled: 0 })));
+    assertBooleanOrCountLeaves(buildAuditReport(classifyServiceAccountKeys({ collectorReady: true, identityCount: 1, total: 2, userManaged: 1, stale: 1, disabled: 0 })));
   });
 });

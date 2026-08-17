@@ -59,3 +59,24 @@ The live report remains blocked before remediation as required. It records missi
 
 - The active Google credential cannot read Identity Platform authorized domains or App Check service enforcement, so those checks correctly block as unreadable.
 - Live Firebase write-rule verification is intentionally conservative. The audit does not attempt anonymous writes, even to probe paths.
+
+## Fix round 1
+
+Addressed all six review findings.
+
+- Replaced Windows `cmd.exe /c` execution with `execFile(..., { shell: false })`. Windows npm and gcloud shims are resolved to their underlying Node/Python entry points. Project, bucket, and configured service-account identifiers use strict validation.
+- Added an execution regression using an argument containing `&`; the argument remains intact and no injected side-effect file is created.
+- Browser API keys now require the exact production referrers, reject broad or stale referrers, require the explicit Firebase API service set, and block unrelated API targets.
+- App Check passes only when every required service is present with `ENFORCED`; missing, unenforced, and unknown modes block.
+- Malformed npm audit output, missing vulnerability metadata, and npm error payloads such as `EAUDITNOLOCK` block as unreadable.
+- Runtime identity uses validated `FIREBASE_CLIENT_EMAIL` when configured, otherwise requires exactly one Firebase Admin identity. Missing or ambiguous identity and unreadable key data block.
+- Firebase rule probes use `denied`, `allowed`, or `unknown`. Non-mutating live write probes remain explicitly `Unknown` blockers.
+
+Fix verification:
+
+- `npx tsx --test tools/private-pro/security-audit.test.ts` - 15 passed.
+- `npx eslint tools/private-pro/security-audit.ts tools/private-pro/security-audit.test.ts` - exit 0.
+- `npm run tscheck` - exit 0.
+- `npm run private-pro:security-audit -- --report-only` - exit 0, report remains blocked with booleans/counts only.
+- Default `npm.cmd run private-pro:security-audit` - exit 1.
+- `git diff --check` - exit 0.
