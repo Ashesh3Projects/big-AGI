@@ -74,6 +74,7 @@ async function fixture(): Promise<{
   source: PrivateProEncryptedBackupSource;
   record: PrivateProVaultEnvelope;
   recoveryKey: string;
+  masterKey: CryptoKey;
 }> {
   const masterKeyBytes = Uint8Array.from({ length: 32 }, (_, index) => index + 32);
   const masterKey = await importVaultMasterKey(masterKeyBytes);
@@ -138,13 +139,28 @@ async function fixture(): Promise<{
     source: {
       vaultId: VAULT_ID,
       keyset,
+      masterKey,
       createdAtMs: 1_765_000_000_000,
       records: async function* () { yield record; },
       assets: async function* () { yield asset; },
     },
     record,
     recoveryKey: recovery.display,
+    masterKey,
   };
+}
+
+async function encryptedRecord(masterKey: CryptoKey, recordId: string, apiKey: string): Promise<PrivateProVaultEnvelope> {
+  const recordKey = await deriveVaultSubkey(masterKey, 'record-encryption', `credential-service/${recordId}`, ['encrypt', 'decrypt']);
+  return encryptVaultRecord(recordKey, {
+    vaultId: VAULT_ID,
+    formatVersion: 1,
+    recordType: 'credential-service',
+    recordId,
+    schemaVersion: 1,
+    keyVersion: 1,
+    revision: 1,
+  }, new TextEncoder().encode(JSON.stringify({ serviceId: recordId, apiKey })));
 }
 
 async function collectStream(stream: ReadableStream<Uint8Array>): Promise<{ bytes: Uint8Array; chunks: number }> {
@@ -315,7 +331,111 @@ describe('private Pro encrypted backup', () => {
           async () => undefined,
           async () => { applyCalls++; },
         ),
-        /duplicate record|asset key version/i,
+        /duplicate record|transcript authentication|asset key version/i,
+      );
+    }
+    assert.equal(applyCalls, 0);
+  });
+
+  test('authenticates deletion even when an attacker rewrites end counts and byte totals', async () => {
+    const { source } = await fixture();
+    const output = await collectStream(createPrivateProEncryptedBackupStream(source));
+    const lines = new TextDecoder().decode(output.bytes).trimEnd().split('\n');
+    const asset = JSON.parse(lines[2]) as { ciphertextBytes: number };
+    const end = JSON.parse(lines[3]) as Record<string, unknown>;
+    end.recordCount = 0;
+    end.totalCiphertextBytes = asset.ciphertextBytes;
+    const tampered = new TextEncoder().encode(`${[lines[0], lines[2], JSON.stringify(end)].join('\n')}\n`);
+    let applyCalls = 0;
+
+    await assert.rejects(
+      importPrivateProEncryptedBackup(
+        streamFromBytes(tampered),
+        { kind: 'password', password: PASSWORD },
+        async () => undefined,
+        async () => { applyCalls++; },
+      ),
+      /transcript authentication/i,
+    );
+    assert.equal(applyCalls, 0);
+  });
+
+  test('authenticates the order of otherwise valid record lines', async () => {
+    const { source, masterKey } = await fixture();
+    const second = await encryptedRecord(masterKey, 'opaque-credential-record-2', 'second-secret');
+    const twoRecordSource: PrivateProEncryptedBackupSource = {
+      ...source,
+      records: async function* () {
+        for await (const record of source.records()) yield record;
+        yield second;
+      },
+    };
+    const output = await collectStream(createPrivateProEncryptedBackupStream(twoRecordSource));
+    const lines = new TextDecoder().decode(output.bytes).trimEnd().split('\n');
+    const reordered = new TextEncoder().encode(`${[lines[0], lines[2], lines[1], ...lines.slice(3)].join('\n')}\n`);
+    let applyCalls = 0;
+
+    await assert.rejects(
+      importPrivateProEncryptedBackup(
+        streamFromBytes(reordered),
+        { kind: 'password', password: PASSWORD },
+        async () => undefined,
+        async () => { applyCalls++; },
+      ),
+      /transcript authentication/i,
+    );
+    assert.equal(applyCalls, 0);
+  });
+
+  test('enforces record, asset, ciphertext-byte, and line limits before apply', async () => {
+    const { source } = await fixture();
+    const output = await collectStream(createPrivateProEncryptedBackupStream(source));
+    const limits = [
+      { maxRecords: 0 },
+      { maxAssetChunks: 0 },
+      { maxTotalCiphertextBytes: 1 },
+      { maxLineBytes: 32 },
+    ];
+    let applyCalls = 0;
+
+    for (const limit of limits) {
+      await assert.rejects(
+        importPrivateProEncryptedBackup(
+          streamFromBytes(output.bytes),
+          { kind: 'password', password: PASSWORD },
+          async () => undefined,
+          async () => { applyCalls++; },
+          limit,
+        ),
+        /limit|too many|oversized/i,
+      );
+    }
+    assert.equal(applyCalls, 0);
+  });
+
+  test('requires header, records, assets, end, and immediate EOF with no blank lines', async () => {
+    const { source } = await fixture();
+    const output = await collectStream(createPrivateProEncryptedBackupStream(source));
+    const lines = new TextDecoder().decode(output.bytes).trimEnd().split('\n');
+    const variants = [
+      `${lines[0]}\n\n${lines.slice(1).join('\n')}\n`,
+      `${lines.join('\n')}\n \n`,
+      `${lines.join('\n')}\n${lines.at(-1)}\n`,
+      `${lines.join('\n')}\n{"kind":"record"}\n`,
+      `${[lines[0], lines[2], lines[1], lines[3]].join('\n')}\n`,
+      lines.join('\n'),
+    ];
+    let applyCalls = 0;
+
+    for (const variant of variants) {
+      await assert.rejects(
+        importPrivateProEncryptedBackup(
+          streamFromBytes(new TextEncoder().encode(variant)),
+          { kind: 'password', password: PASSWORD },
+          async () => undefined,
+          async () => { applyCalls++; },
+        ),
+        /blank|after.*end|record.*asset|newline|order/i,
       );
     }
     assert.equal(applyCalls, 0);

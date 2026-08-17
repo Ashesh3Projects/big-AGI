@@ -18,8 +18,12 @@ const MAX_VAULT_ID_LENGTH = 512;
 const MAX_ASSET_ID_LENGTH = 512;
 const MAX_CHUNK_ID_LENGTH = 512;
 const MAX_ASSET_CIPHERTEXT_BYTES = 64 * 1024 * 1024;
-const MAX_BACKUP_LINES = 1_000_000;
-const MAX_BACKUP_LINE_BYTES = 96 * 1024 * 1024;
+const DEFAULT_MAX_RECORDS = 100_000;
+const DEFAULT_MAX_ASSET_CHUNKS = 100_000;
+const DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES = 2 * 1024 * 1024 * 1024;
+const DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024;
+const TRANSCRIPT_MAC_BYTES = 32;
+const TRANSCRIPT_INITIAL_STATE: Uint8Array<ArrayBufferLike> = new Uint8Array(TRANSCRIPT_MAC_BYTES);
 const CANONICAL_BASE64 = /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
 
@@ -68,6 +72,9 @@ const BackupEndSchema = z.object({
   kind: z.literal('end'),
   recordCount: z.number().int().nonnegative().safe(),
   assetCount: z.number().int().nonnegative().safe(),
+  totalCiphertextBytes: z.number().int().nonnegative().max(DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES).safe(),
+  transcriptMacBase64: canonicalBase64Schema(TRANSCRIPT_MAC_BYTES)
+    .refine(value => atob(value).length === TRANSCRIPT_MAC_BYTES, 'Encrypted backup transcript MACs must be 256 bits.'),
 }).strict();
 
 
@@ -77,9 +84,17 @@ export type PrivateProEncryptedBackupAsset = z.infer<typeof BackupAssetSchema>;
 export interface PrivateProEncryptedBackupSource {
   vaultId: string;
   keyset: PrivateProVaultKeyset;
+  masterKey: CryptoKey;
   createdAtMs?: number;
   records: () => AsyncIterable<PrivateProVaultEnvelope>;
   assets?: () => AsyncIterable<PrivateProEncryptedBackupAsset>;
+}
+
+export interface PrivateProEncryptedBackupLimits {
+  maxRecords: number;
+  maxAssetChunks: number;
+  maxTotalCiphertextBytes: number;
+  maxLineBytes: number;
 }
 
 export type PrivateProEncryptedBackupCredential = {
@@ -114,6 +129,41 @@ export type PrivateProEncryptedBackupApply = (
 
 function base64ToBytes(base64: string): Uint8Array<ArrayBuffer> {
   return Uint8Array.from(atob(base64), character => character.charCodeAt(0));
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (const byte of bytes)
+    binary += String.fromCharCode(byte);
+  return btoa(binary);
+}
+
+function limitsWithDefaults(input: Partial<PrivateProEncryptedBackupLimits> = {}): PrivateProEncryptedBackupLimits {
+  const limits = {
+    maxRecords: input.maxRecords ?? DEFAULT_MAX_RECORDS,
+    maxAssetChunks: input.maxAssetChunks ?? DEFAULT_MAX_ASSET_CHUNKS,
+    maxTotalCiphertextBytes: input.maxTotalCiphertextBytes ?? DEFAULT_MAX_TOTAL_CIPHERTEXT_BYTES,
+    maxLineBytes: input.maxLineBytes ?? DEFAULT_MAX_LINE_BYTES,
+  };
+  if (Object.values(limits).some(value => !Number.isSafeInteger(value) || value < 0))
+    throw new Error('Private Pro encrypted backup limits must be nonnegative safe integers.');
+  return limits;
+}
+
+async function transcriptMacKey(masterKey: CryptoKey, vaultId: string): Promise<CryptoKey> {
+  return deriveVaultSubkey(masterKey, 'backup-transcript/v1', vaultId, ['sign', 'verify']);
+}
+
+// Streaming construction: state[0] is 32 zero bytes and
+// state[n+1] = HMAC-SHA-256(backupMacKey, state[n] || exactCanonicalLineWithNewline).
+async function updateTranscriptMac(key: CryptoKey, state: Uint8Array, line: Uint8Array): Promise<{
+  input: Uint8Array<ArrayBuffer>;
+  mac: Uint8Array<ArrayBuffer>;
+}> {
+  const input = new Uint8Array(state.byteLength + line.byteLength);
+  input.set(state);
+  input.set(line, state.byteLength);
+  return { input, mac: new Uint8Array(await crypto.subtle.sign('HMAC', key, input)) };
 }
 
 async function derivePbkdf2WrappingKey(password: string, saltBase64: string, iterations: number): Promise<CryptoKey> {
@@ -185,7 +235,10 @@ function encodeLine(value: unknown): Uint8Array {
   return new TextEncoder().encode(`${JSON.stringify(value)}\n`);
 }
 
-async function* backupLines(source: PrivateProEncryptedBackupSource): AsyncGenerator<Uint8Array> {
+async function* backupLines(
+  source: PrivateProEncryptedBackupSource,
+  limits: PrivateProEncryptedBackupLimits,
+): AsyncGenerator<Uint8Array> {
   const header = BackupHeaderSchema.parse({
     schema: PRIVATE_PRO_ENCRYPTED_BACKUP_SCHEMA,
     schemaVersion: PRIVATE_PRO_ENCRYPTED_BACKUP_SCHEMA_VERSION,
@@ -194,27 +247,66 @@ async function* backupLines(source: PrivateProEncryptedBackupSource): AsyncGener
     createdAtMs: source.createdAtMs ?? Date.now(),
     keyset: source.keyset,
   });
-  yield encodeLine(header);
+  const macKey = await transcriptMacKey(source.masterKey, header.vaultId);
+  let transcriptMac = TRANSCRIPT_INITIAL_STATE;
+  const headerLine = encodeLine(header);
+  if (headerLine.byteLength > limits.maxLineBytes)
+    throw new Error('Private Pro encrypted backup contains an oversized line.');
+  transcriptMac = (await updateTranscriptMac(macKey, transcriptMac, headerLine)).mac;
+  yield headerLine;
 
   let recordCount = 0;
+  let totalCiphertextBytes = 0;
   for await (const envelope of source.records()) {
-    yield encodeLine(BackupRecordSchema.parse({ kind: 'record', envelope }));
+    const record = BackupRecordSchema.parse({ kind: 'record', envelope });
+    const line = encodeLine(record);
+    if (recordCount >= limits.maxRecords)
+      throw new Error('Private Pro encrypted backup contains too many records for the configured limit.');
+    if (totalCiphertextBytes + record.envelope.ciphertextBytes > limits.maxTotalCiphertextBytes)
+      throw new Error('Private Pro encrypted backup ciphertext exceeds the configured byte limit.');
+    if (line.byteLength > limits.maxLineBytes)
+      throw new Error('Private Pro encrypted backup contains an oversized line.');
+    transcriptMac = (await updateTranscriptMac(macKey, transcriptMac, line)).mac;
+    yield line;
     recordCount++;
+    totalCiphertextBytes += record.envelope.ciphertextBytes;
   }
 
   let assetCount = 0;
   if (source.assets) {
     for await (const asset of source.assets()) {
-      yield encodeLine(BackupAssetSchema.parse(asset));
+      const validatedAsset = BackupAssetSchema.parse(asset);
+      const line = encodeLine(validatedAsset);
+      if (assetCount >= limits.maxAssetChunks)
+        throw new Error('Private Pro encrypted backup contains too many asset chunks for the configured limit.');
+      if (totalCiphertextBytes + validatedAsset.ciphertextBytes > limits.maxTotalCiphertextBytes)
+        throw new Error('Private Pro encrypted backup ciphertext exceeds the configured byte limit.');
+      if (line.byteLength > limits.maxLineBytes)
+        throw new Error('Private Pro encrypted backup contains an oversized line.');
+      transcriptMac = (await updateTranscriptMac(macKey, transcriptMac, line)).mac;
+      yield line;
       assetCount++;
+      totalCiphertextBytes += validatedAsset.ciphertextBytes;
     }
   }
 
-  yield encodeLine(BackupEndSchema.parse({ kind: 'end', recordCount, assetCount }));
+  const endLine = encodeLine(BackupEndSchema.parse({
+    kind: 'end',
+    recordCount,
+    assetCount,
+    totalCiphertextBytes,
+    transcriptMacBase64: bytesToBase64(transcriptMac),
+  }));
+  if (endLine.byteLength > limits.maxLineBytes)
+    throw new Error('Private Pro encrypted backup contains an oversized line.');
+  yield endLine;
 }
 
-export function createPrivateProEncryptedBackupStream(source: PrivateProEncryptedBackupSource): ReadableStream<Uint8Array> {
-  const iterator = backupLines(source)[Symbol.asyncIterator]();
+export function createPrivateProEncryptedBackupStream(
+  source: PrivateProEncryptedBackupSource,
+  limitOverrides: Partial<PrivateProEncryptedBackupLimits> = {},
+): ReadableStream<Uint8Array> {
+  const iterator = backupLines(source, limitsWithDefaults(limitOverrides))[Symbol.asyncIterator]();
   return new ReadableStream({
     async pull(controller) {
       try {
@@ -231,19 +323,25 @@ export function createPrivateProEncryptedBackupStream(source: PrivateProEncrypte
   });
 }
 
-async function* readLines(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+async function* readLines(
+  stream: ReadableStream<Uint8Array>,
+  maximumLineBytes: number,
+): AsyncGenerator<{ text: string; bytes: Uint8Array }> {
   const reader = stream.getReader();
   const decoder = new TextDecoder('utf-8', { fatal: true });
   let buffered = '';
   let bufferedLineBytes = 0;
-  let lineCount = 0;
   try {
     while (true) {
       const result = await reader.read();
       if (result.done) break;
       for (const byte of result.value) {
-        if (byte === 0x0a) bufferedLineBytes = 0;
-        else if (++bufferedLineBytes > MAX_BACKUP_LINE_BYTES)
+        if (byte === 0x0a) {
+          if (++bufferedLineBytes > maximumLineBytes)
+            throw new Error('Private Pro encrypted backup contains an oversized line.');
+          bufferedLineBytes = 0;
+        }
+        else if (++bufferedLineBytes > maximumLineBytes)
           throw new Error('Private Pro encrypted backup contains an oversized line.');
       }
       buffered += decoder.decode(result.value, { stream: true });
@@ -251,15 +349,15 @@ async function* readLines(stream: ReadableStream<Uint8Array>): AsyncGenerator<st
       while (newlineIndex >= 0) {
         const line = buffered.slice(0, newlineIndex);
         buffered = buffered.slice(newlineIndex + 1);
-        lineCount++;
-        if (lineCount > MAX_BACKUP_LINES)
-          throw new Error('Private Pro encrypted backup contains too many lines.');
-        if (line.trim()) yield line;
+        if (!line.trim())
+          throw new Error('Private Pro encrypted backup cannot contain blank lines.');
+        yield { text: line, bytes: new TextEncoder().encode(`${line}\n`) };
         newlineIndex = buffered.indexOf('\n');
       }
     }
     buffered += decoder.decode();
-    if (buffered.trim()) yield buffered;
+    if (buffered.length)
+      throw new Error('Private Pro encrypted backup must end with a newline immediately after its end marker.');
   } finally {
     reader.releaseLock();
   }
@@ -278,41 +376,80 @@ export async function importPrivateProEncryptedBackup(
   credential: PrivateProEncryptedBackupCredential,
   validateRecord: PrivateProEncryptedBackupRecordValidator,
   apply: PrivateProEncryptedBackupApply,
+  limitOverrides: Partial<PrivateProEncryptedBackupLimits> = {},
 ): Promise<{ recordCount: number; assetCount: number; reloadRequired: true }> {
+  const limits = limitsWithDefaults(limitOverrides);
   let header: PrivateProEncryptedBackupHeader | null = null;
   let end: z.infer<typeof BackupEndSchema> | null = null;
+  let masterKey: CryptoKey | null = null;
+  let macKey: CryptoKey | null = null;
+  let transcriptMac = TRANSCRIPT_INITIAL_STATE;
+  let transcriptMacInput: Uint8Array<ArrayBuffer> | null = null;
+  let totalCiphertextBytes = 0;
+  let phase: 'header' | 'records' | 'assets' | 'ended' = 'header';
   const records: PrivateProVaultEnvelope[] = [];
   const assets: PrivateProEncryptedBackupAsset[] = [];
   const recordIds = new Set<string>();
   const assetChunkIds = new Set<string>();
 
-  for await (const line of readLines(stream)) {
-    const value = parseJsonLine(line);
+  for await (const line of readLines(stream, limits.maxLineBytes)) {
+    if (phase === 'ended')
+      throw new Error('Private Pro encrypted backup contains data after its end marker.');
+    const value = parseJsonLine(line.text);
     if (!header) {
       header = BackupHeaderSchema.parse(value);
+      if (line.text !== JSON.stringify(header))
+        throw new Error('Private Pro encrypted backup lines must use canonical JSON.');
+      masterKey = await unlockMasterKey(header.keyset, credential);
+      macKey = await transcriptMacKey(masterKey, header.vaultId);
+      ({ input: transcriptMacInput, mac: transcriptMac } = await updateTranscriptMac(macKey, transcriptMac, line.bytes));
+      phase = 'records';
       continue;
     }
-    if (end)
-      throw new Error('Private Pro encrypted backup contains data after its end marker.');
 
     const kind = typeof value === 'object' && value !== null && 'kind' in value ? value.kind : undefined;
     if (kind === 'record') {
+      if (phase !== 'records')
+        throw new Error('Private Pro encrypted backup cannot contain records after asset chunks.');
       const record = BackupRecordSchema.parse(value).envelope;
+      const canonical = JSON.stringify({ kind: 'record', envelope: record });
+      if (line.text !== canonical)
+        throw new Error('Private Pro encrypted backup lines must use canonical JSON.');
+      if (records.length >= limits.maxRecords)
+        throw new Error('Private Pro encrypted backup contains too many records for the configured limit.');
+      if (totalCiphertextBytes + record.ciphertextBytes > limits.maxTotalCiphertextBytes)
+        throw new Error('Private Pro encrypted backup ciphertext exceeds the configured byte limit.');
       const recordIdentity = `${record.recordType}\u0000${record.recordId}`;
       if (recordIds.has(recordIdentity))
         throw new Error('Private Pro encrypted backup contains a duplicate record.');
       recordIds.add(recordIdentity);
       records.push(record);
+      totalCiphertextBytes += record.ciphertextBytes;
+      ({ input: transcriptMacInput, mac: transcriptMac } = await updateTranscriptMac(macKey!, transcriptMac, line.bytes));
     }
     else if (kind === 'asset') {
+      phase = 'assets';
       const asset = BackupAssetSchema.parse(value);
+      if (line.text !== JSON.stringify(asset))
+        throw new Error('Private Pro encrypted backup lines must use canonical JSON.');
+      if (assets.length >= limits.maxAssetChunks)
+        throw new Error('Private Pro encrypted backup contains too many asset chunks for the configured limit.');
+      if (totalCiphertextBytes + asset.ciphertextBytes > limits.maxTotalCiphertextBytes)
+        throw new Error('Private Pro encrypted backup ciphertext exceeds the configured byte limit.');
       const assetChunkIdentity = `${asset.assetId}\u0000${asset.chunkId}`;
       if (assetChunkIds.has(assetChunkIdentity))
         throw new Error('Private Pro encrypted backup contains a duplicate asset chunk.');
       assetChunkIds.add(assetChunkIdentity);
       assets.push(asset);
+      totalCiphertextBytes += asset.ciphertextBytes;
+      ({ input: transcriptMacInput, mac: transcriptMac } = await updateTranscriptMac(macKey!, transcriptMac, line.bytes));
     }
-    else if (kind === 'end') end = BackupEndSchema.parse(value);
+    else if (kind === 'end') {
+      end = BackupEndSchema.parse(value);
+      if (line.text !== JSON.stringify(end))
+        throw new Error('Private Pro encrypted backup lines must use canonical JSON.');
+      phase = 'ended';
+    }
     else throw new Error('Private Pro encrypted backup contains an unknown line type.');
   }
 
@@ -320,8 +457,18 @@ export async function importPrivateProEncryptedBackup(
   if (!end) throw new Error('Private Pro encrypted backup end marker is missing.');
   if (end.recordCount !== records.length || end.assetCount !== assets.length)
     throw new Error('Private Pro encrypted backup item counts do not match its contents.');
+  if (end.totalCiphertextBytes !== totalCiphertextBytes)
+    throw new Error('Private Pro encrypted backup ciphertext byte total does not match its contents.');
+  if (!macKey || !transcriptMacInput || !await crypto.subtle.verify(
+    'HMAC',
+    macKey,
+    base64ToBytes(end.transcriptMacBase64),
+    transcriptMacInput,
+  ))
+    throw new Error('Private Pro encrypted backup transcript authentication failed.');
 
-  const masterKey = await unlockMasterKey(header.keyset, credential);
+  if (!masterKey)
+    throw new Error('Private Pro encrypted backup credentials are invalid.');
   for (const envelope of records) {
     if (envelope.keyVersion !== header.keyset.keyVersion)
       throw new Error('Private Pro encrypted backup record key version does not match its keyset.');
