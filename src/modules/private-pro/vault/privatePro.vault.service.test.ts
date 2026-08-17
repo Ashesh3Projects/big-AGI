@@ -446,6 +446,77 @@ describe('Private Pro encrypted vault service', () => {
     });
   });
 
+  test('rejects wrapping rotations that replace enrollment or recovery authority without changing stored state', async () => {
+    const attacks: Array<[string, (current: PrivateProVaultKeyset) => PrivateProVaultKeyset]> = [
+      ['master key version', current => ({
+        ...current,
+        keyVersion: 2,
+        enrollmentAuthority: { ...current.enrollmentAuthority, keyVersion: 2 },
+        passwordEnvelope: { ...current.passwordEnvelope, keyVersion: 2 },
+        recoveryEnvelope: { ...current.recoveryEnvelope, keyVersion: 2 },
+      })],
+      ['enrollment public key', current => ({
+        ...current,
+        enrollmentAuthority: {
+          ...current.enrollmentAuthority,
+          publicJwk: { ...current.enrollmentAuthority.publicJwk, x: 'EQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o' },
+        },
+      })],
+      ['recovery enrollment envelope', current => ({
+        ...current,
+        enrollmentAuthority: {
+          ...current.enrollmentAuthority,
+          recoveryEnvelope: { ...current.enrollmentAuthority.recoveryEnvelope, nonceBase64: 'AQAAAAAAAAAAAAAA' },
+        },
+      })],
+      ['recovery master envelope', current => ({
+        ...current,
+        recoveryEnvelope: { ...current.recoveryEnvelope, recoveryVersion: 2, nonceBase64: 'AQAAAAAAAAAAAAAA' },
+      })],
+    ];
+
+    for (const [name, mutate] of attacks) {
+      const { service } = serviceFixture();
+      const initial = keyset(1, 1);
+      await service.putKeyset(UID_A, { operationId: `initial-${name.replaceAll(' ', '-')}`, baseWrappingVersion: 0, keyset: initial });
+      const attack = mutate({ ...clone(initial), wrappingVersion: 2 });
+
+      await assert.rejects(
+        service.putKeyset(UID_A, { operationId: `attack-${name.replaceAll(' ', '-')}`, baseWrappingVersion: 1, keyset: attack }),
+        /cannot change during (?:password )?wrapping rotation/i,
+      );
+      assert.deepEqual(await service.getKeyset(UID_A), { keyset: initial, serverUpdatedAtMs: 1_000 });
+    }
+  });
+
+  test('accepts password and recovery-reset rewraps when recovery authority remains stable', async () => {
+    for (const operationId of ['password-rotation', 'recovery-password-reset']) {
+      const { service } = serviceFixture();
+      const initial = keyset(1, 1);
+      await service.putKeyset(UID_A, { operationId: `initial-${operationId}`, baseWrappingVersion: 0, keyset: initial });
+      const rotated: PrivateProVaultKeyset = {
+        ...clone(initial),
+        wrappingVersion: 2,
+        passwordEnvelope: {
+          ...initial.passwordEnvelope,
+          kdf: { ...initial.passwordEnvelope.kdf, saltBase64: 'AQAAAAAAAAAAAAAAAAAAAA==' },
+          nonceBase64: 'AQAAAAAAAAAAAAAA',
+        },
+        enrollmentAuthority: {
+          ...initial.enrollmentAuthority,
+          passwordEnvelope: { ...initial.enrollmentAuthority.passwordEnvelope, nonceBase64: 'AQAAAAAAAAAAAAAA' },
+        },
+      };
+
+      assert.deepEqual(await service.putKeyset(UID_A, {
+        operationId,
+        baseWrappingVersion: 1,
+        keyset: rotated,
+      }), { status: 'committed', wrappingVersion: 2, serverUpdatedAtMs: 1_001 });
+      assert.deepEqual((await service.getKeyset(UID_A))?.keyset, rotated);
+    }
+  });
+
   test('does not register an unknown device during bootstrap and preserves known revocation', async () => {
     const { service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';

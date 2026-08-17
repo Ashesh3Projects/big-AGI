@@ -111,6 +111,21 @@ function canonicalJson(value: unknown): string {
     .join(',')}}`;
 }
 
+function equalCanonical(left: unknown, right: unknown): boolean {
+  return canonicalJson(left) === canonicalJson(right);
+}
+
+function assertPasswordWrappingRotation(current: PrivateProVaultKeyset, next: PrivateProVaultKeyset): void {
+  if (current.keyVersion !== next.keyVersion)
+    throw new Error('Vault master key version cannot change during wrapping rotation.');
+  if (!equalCanonical(current.enrollmentAuthority.publicJwk, next.enrollmentAuthority.publicJwk))
+    throw new Error('Vault enrollment authority cannot change during password wrapping rotation.');
+  if (!equalCanonical(current.enrollmentAuthority.recoveryEnvelope, next.enrollmentAuthority.recoveryEnvelope))
+    throw new Error('Vault enrollment recovery envelope cannot change during password wrapping rotation.');
+  if (!equalCanonical(current.recoveryEnvelope, next.recoveryEnvelope))
+    throw new Error('Vault master recovery envelope cannot change during password wrapping rotation.');
+}
+
 function repeatOutcome(outcome: PrivateProVaultOperationOutcome) {
   switch (outcome.kind) {
     case 'record':
@@ -364,7 +379,7 @@ export function createPrivateProVaultService(
           await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
           return { status: 'conflict', currentWrappingVersion };
         }
-        if (current && current.keyVersion !== keyset.keyVersion) throw new Error('Vault master key version cannot change during wrapping rotation.');
+        if (current) assertPasswordWrappingRotation(current.keyset, keyset);
         const serverUpdatedAtMs = now();
         await transaction.setKeyset({ keyVersion: keyset.keyVersion, wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs, keyset: structuredClone(keyset) });
         const outcome = { kind: 'keyset', status: 'committed', wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs } as const;

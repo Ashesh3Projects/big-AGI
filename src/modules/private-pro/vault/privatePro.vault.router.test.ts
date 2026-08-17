@@ -20,6 +20,7 @@ const state: {
   appCheckEnforced: boolean;
   appCheckTokenValid: boolean;
   accountError: Error | null;
+  putKeysetError: Error | null;
   calls: Array<{ method: string; uid: string; input: unknown }>;
   devices: Map<string, { deviceId: string; keyVersion: number; revokedAtMs: number | null }>;
 } = {
@@ -27,6 +28,7 @@ const state: {
   appCheckEnforced: true,
   appCheckTokenValid: true,
   accountError: null,
+  putKeysetError: null,
   calls: [],
   devices: new Map(),
 };
@@ -73,6 +75,7 @@ const service = {
   },
   putKeyset: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'putKeyset', uid, input });
+    if (state.putKeysetError) throw state.putKeysetError;
     return { status: 'committed' as const, wrappingVersion: 1, serverUpdatedAtMs: 1 };
   },
   commitMigration: async (uid: string, input: unknown) => {
@@ -264,6 +267,24 @@ describe('private Pro vault router input bounds', () => {
       { method: 'beginDeviceRegistration', uid: UID, input: { deviceId: DEVICE_ID, keyVersion: 1 } },
       { method: 'completeDeviceRegistration', uid: UID, input: { operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' } },
     ]);
+  });
+
+  test('returns only the generic vault error when a wrapping rotation violates server invariants', async () => {
+    state.account = account();
+    state.devices.set(DEVICE_ID, { deviceId: DEVICE_ID, keyVersion: 1, revokedAtMs: null });
+    state.putKeysetError = new Error('Vault enrollment authority cannot change during password wrapping rotation.');
+    const caller = (await router()).createCaller(context(identity()));
+
+    try {
+      await assert.rejects(caller.putKeyset({ operationId: 'malicious-rotation', baseWrappingVersion: 1, keyset: { ...keyset(1), wrappingVersion: 2 } }), error => {
+        assert.equal((error as { code?: string }).code, 'INTERNAL_SERVER_ERROR');
+        assert.equal((error as Error).message, 'Encrypted vault operation failed.');
+        assert.doesNotMatch((error as Error).message, /enrollment authority/i);
+        return true;
+      });
+    } finally {
+      state.putKeysetError = null;
+    }
   });
 
   test('rejects registration when the header ID and input ID differ', async () => {

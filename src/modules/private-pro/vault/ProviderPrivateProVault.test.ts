@@ -15,6 +15,7 @@ import { PrivateProVaultStatus } from '../ui/PrivateProVaultStatus';
 import { PrivateProVaultUnlock } from '../ui/PrivateProVaultUnlock';
 import {
   rewrapPrivateProVaultPassword,
+  rewrapPrivateProVaultPasswordWithRecovery,
   unlockPrivateProVaultWithPassword,
   unlockPrivateProVaultWithRecovery,
 } from './privatePro.vault.keyset';
@@ -557,5 +558,21 @@ describe('private Pro vault keyset lifecycle', () => {
       () => unlockPrivateProVaultWithPassword(rotated, 'new vault password long'),
     )).algorithm.name, 'HKDF');
     assert.equal((await unlockPrivateProVaultWithRecovery(rotated, recoveryKey)).algorithm.name, 'HKDF');
+  });
+
+  test('recovery password reset preserves both recovery envelopes', async () => {
+    const { keyset, recoveryKey } = await keysetFixture('old vault password');
+
+    const rotated = await withVaultPasswordWorker(
+      realArgon2idWorkerResponse,
+      () => rewrapPrivateProVaultPasswordWithRecovery(keyset, recoveryKey, 'new vault password long', 'uid-test'),
+    );
+
+    assert.equal(rotated.keyVersion, 1);
+    assert.equal(rotated.wrappingVersion, 2);
+    assert.deepEqual(rotated.recoveryEnvelope, keyset.recoveryEnvelope);
+    assert.deepEqual(rotated.enrollmentAuthority.recoveryEnvelope, keyset.enrollmentAuthority.recoveryEnvelope);
+    assert.notDeepEqual(rotated.passwordEnvelope, keyset.passwordEnvelope);
+    assert.notDeepEqual(rotated.enrollmentAuthority.passwordEnvelope, keyset.enrollmentAuthority.passwordEnvelope);
   });
 });
