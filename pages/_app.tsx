@@ -31,16 +31,34 @@ import { hasGoogleAnalytics, OptionalGoogleAnalytics } from '~/common/components
 import { hasPostHogAnalytics, OptionalPostHogAnalytics } from '~/common/components/3rdparty/PostHogAnalytics';
 import { OptionalUrlTrackingCleaner } from '~/common/components/3rdparty/UrlTrackingCleaner';
 import { ProviderPrivatePro } from '~/modules/private-pro/auth/ProviderPrivatePro';
-import { ProviderPrivateProSync } from '~/modules/private-pro/sync/ProviderPrivateProSync';
+import { ProviderPrivateProVault } from '~/modules/private-pro/vault/ProviderPrivateProVault';
 
 
-const Big_AGI_App = ({ Component, emotionCache, pageProps }: MyAppProps) => {
+const ApplicationWithTRPC = apiQuery.withTRPC(({ Component, pageProps }: MyAppProps) => {
+
+  const getLayout = Component.getLayout ?? ((page: any) => page);
+
+  return (
+    <ProviderSingleTab>
+      <ProviderBackendCapabilities>
+        {/* ^ Backend capabilities & SSR boundary */}
+        <ErrorBoundary outer>
+          <ProviderBootstrapLogic>
+            <SnackbarInsert />
+            {getLayout(<Component {...pageProps} />)}
+            <OverlaysInsert />
+          </ProviderBootstrapLogic>
+        </ErrorBoundary>
+      </ProviderBackendCapabilities>
+    </ProviderSingleTab>
+  );
+}) as React.ComponentType<MyAppProps>;
+
+const Big_AGI_App = (props: MyAppProps) => {
 
   // We are using a nextjs per-page layout pattern to bring the (Optima) layout creation to a shared place
   // This reduces the flicker and the time switching between apps, and seems to not have impact on
   // the build. This is a good trade-off for now.
-  const getLayout = Component.getLayout ?? ((page: any) => page);
-
   return <>
 
     <Head>
@@ -48,22 +66,11 @@ const Big_AGI_App = ({ Component, emotionCache, pageProps }: MyAppProps) => {
       <meta name='viewport' content='minimum-scale=1, initial-scale=1, width=device-width, shrink-to-fit=no' />
     </Head>
 
-    <ProviderTheming emotionCache={emotionCache}>
+    <ProviderTheming emotionCache={props.emotionCache}>
       <ProviderPrivatePro>
-        <ProviderSingleTab>
-          <ProviderBackendCapabilities>
-            {/* ^ Backend capabilities & SSR boundary */}
-            <ErrorBoundary outer>
-              <ProviderBootstrapLogic>
-                <ProviderPrivateProSync>
-                  <SnackbarInsert />
-                  {getLayout(<Component {...pageProps} />)}
-                  <OverlaysInsert />
-                </ProviderPrivateProSync>
-              </ProviderBootstrapLogic>
-            </ErrorBoundary>
-          </ProviderBackendCapabilities>
-        </ProviderSingleTab>
+        <ProviderPrivateProVault>
+          <ApplicationWithTRPC {...props} />
+        </ProviderPrivateProVault>
       </ProviderPrivatePro>
     </ProviderTheming>
 
@@ -77,5 +84,4 @@ const Big_AGI_App = ({ Component, emotionCache, pageProps }: MyAppProps) => {
   </>;
 };
 
-// Initializes React Query and tRPC, and enables the tRPC React Query hooks (apiQuery).
-export default apiQuery.withTRPC(Big_AGI_App);
+export default Big_AGI_App;

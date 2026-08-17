@@ -85,6 +85,9 @@ export function ProviderPrivatePro(props: { children: React.ReactNode }) {
 
   const signOutCurrent = React.useCallback(async () => {
     deniedEmailRef.current = undefined;
+    setBootstrap(null);
+    setUser(null);
+    setState(privateProClientConfig.enabled ? 'signed-out' : 'signed-in');
     await privateProSignOut();
   }, []);
 
