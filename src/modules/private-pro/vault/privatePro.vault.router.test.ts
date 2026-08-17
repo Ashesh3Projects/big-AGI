@@ -48,6 +48,11 @@ const service = {
       ...device,
     }));
   },
+  registerDevice: async (uid: string, input: { deviceId: string; keyVersion: number }) => {
+    state.calls.push({ method: 'registerDevice', uid, input });
+    state.devices.set(input.deviceId, { deviceId: input.deviceId, keyVersion: input.keyVersion, revokedAtMs: null });
+    return { status: 'registered' as const, device: { formatVersion: 1 as const, createdAtMs: 1, lastSeenAtMs: 1, ...state.devices.get(input.deviceId)! } };
+  },
   getRecords: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'getRecords', uid, input });
     return [];
@@ -191,6 +196,7 @@ describe('private Pro vault router input bounds', () => {
 
     await caller.bootstrap({ deviceId: DEVICE_ID });
     await caller.listDevices();
+    await caller.registerDevice({ deviceId: DEVICE_ID, keyVersion: 1 });
     await caller.getIndex({ pageSize: 1 });
     await caller.getRecords({ opaqueRecordIds: [RECORD_ID] });
     await caller.putRecord({
@@ -237,17 +243,28 @@ describe('private Pro vault router input bounds', () => {
     }
   });
 
-  test('registers the request device after the initial keyset commit', async () => {
+  test('requires explicit matching device registration after the initial keyset commit', async () => {
     state.account = account();
     state.calls = [];
     const caller = (await router()).createCaller(context(identity()));
 
     await caller.putKeyset({ operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) });
+    await caller.registerDevice({ deviceId: DEVICE_ID, keyVersion: 1 });
 
     assert.deepEqual(state.calls, [
       { method: 'putKeyset', uid: UID, input: { operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) } },
-      { method: 'bootstrap', uid: UID, input: DEVICE_ID },
+      { method: 'registerDevice', uid: UID, input: { deviceId: DEVICE_ID, keyVersion: 1 } },
     ]);
+  });
+
+  test('rejects registration when the header ID and input ID differ', async () => {
+    state.account = account();
+    const caller = (await router()).createCaller(context(identity()));
+
+    await assert.rejects(caller.registerDevice({ deviceId: RECORD_ID, keyVersion: 1 }), error => {
+      assert.equal((error as { code?: string }).code, 'FORBIDDEN');
+      return true;
+    });
   });
 
   test('rejects UID injection, oversized pages/counts/ciphertext, and malformed operation IDs', async () => {

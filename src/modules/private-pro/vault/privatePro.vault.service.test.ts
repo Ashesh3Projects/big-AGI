@@ -414,13 +414,17 @@ describe('Private Pro encrypted vault service', () => {
     });
   });
 
-  test('bootstraps only opaque remembered-device metadata and preserves revocation', async () => {
+  test('does not register an unknown device during bootstrap and preserves known revocation', async () => {
     const { service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
     await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
 
     assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
       keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
+      device: null,
+    });
+    assert.deepEqual(await service.registerDevice(UID_A, { deviceId, keyVersion: 1 }), {
+      status: 'registered',
       device: {
         formatVersion: 1,
         deviceId,
@@ -434,7 +438,18 @@ describe('Private Pro encrypted vault service', () => {
       status: 'committed',
       revokedAtMs: 1_002,
     });
-    await assert.rejects(service.bootstrap(UID_A, deviceId), /revoked/i);
+    await assert.rejects(service.registerDevice(UID_A, { deviceId, keyVersion: 1 }), /revoked/i);
+    assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
+      keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
+      device: {
+        formatVersion: 1,
+        deviceId,
+        keyVersion: 1,
+        createdAtMs: 1_001,
+        lastSeenAtMs: 1_001,
+        revokedAtMs: 1_002,
+      },
+    });
     assert.deepEqual(await service.listDevices(UID_A), [{
       formatVersion: 1,
       deviceId,
@@ -449,7 +464,7 @@ describe('Private Pro encrypted vault service', () => {
     const { repository, service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
     await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
-    await service.bootstrap(UID_A, deviceId);
+    await service.registerDevice(UID_A, { deviceId, keyVersion: 1 });
     const input = { operationId: 'revoke-device-1', deviceId };
 
     assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'committed', revokedAtMs: 1_002 });

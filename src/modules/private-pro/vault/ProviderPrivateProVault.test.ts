@@ -23,12 +23,13 @@ import { PRIVATE_PRO_PBKDF2_MIN_ITERATIONS } from './privatePro.vault.schemas';
 import type { PrivateProVaultKeyset } from './privatePro.vault.types';
 import { realArgon2idWorkerResponse, withVaultPasswordWorker } from '../../../../tools/private-pro/test-helpers/privatePro.vault.password.test-helpers';
 import { privateProClientConfig } from '../config/privatePro.config';
-import { getPrivateProVaultDeviceId } from './privatePro.vault.device';
+import { getPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
 
 
 interface Harness {
   deps: PrivateProVaultLifecycleDependencies<string, string>;
   phases: PrivateProVaultLifecyclePhase[];
+  operationIds: string[];
   resolveApply?: () => void;
   runtimePhase(phase: 'ready' | 'reconnecting' | 'migrating' | 'error'): void;
   counts: {
@@ -37,7 +38,10 @@ interface Harness {
     logout: number;
     passwordUnlock: number;
     recoveryUnlock: number;
+    commitRecovery: number;
+    commitSetup: number;
     remember: number;
+    register: number;
     setup: number;
   };
 }
@@ -49,6 +53,7 @@ function createHarness(options: {
   passwordError?: Error;
   recoveryError?: Error;
   activationError?: Error;
+  commitError?: Error;
   deferApply?: boolean;
 } = {}): Harness {
   const counts = {
@@ -57,10 +62,14 @@ function createHarness(options: {
     logout: 0,
     passwordUnlock: 0,
     recoveryUnlock: 0,
+    commitRecovery: 0,
+    commitSetup: 0,
     remember: 0,
+    register: 0,
     setup: 0,
   };
   const phases: PrivateProVaultLifecyclePhase[] = [];
+  const operationIds: string[] = [];
   let runtimeListener: ((phase: 'ready' | 'reconnecting' | 'migrating' | 'error') => void) | undefined;
   let resolveApply: (() => void) | undefined;
 
@@ -81,11 +90,19 @@ function createHarness(options: {
       if (options.recoveryError) throw options.recoveryError;
       return { keyset: 'keyset-2', masterKey: 'recovery-master-key' };
     },
+    commitRecovery: async () => { counts.commitRecovery++; return 'committed'; },
     setup: async (_password) => {
       counts.setup++;
       return { keyset: 'keyset-1', masterKey: 'setup-master-key', recoveryKey: 'AAAA-BBBB-CCCC-DDDD' };
     },
+    commitSetup: async (_keyset, operationId) => {
+      counts.commitSetup++;
+      operationIds.push(operationId);
+      if (options.commitError) throw options.commitError;
+      return 'committed';
+    },
     remember: async () => { counts.remember++; },
+    register: async () => { counts.register++; },
     activate: async () => {
       counts.activate++;
       if (options.activationError) throw options.activationError;
@@ -97,11 +114,13 @@ function createHarness(options: {
     },
     logout: async () => { counts.logout++; },
     onState: state => phases.push(state.phase),
+    createOperationId: () => 'setup-operation-1',
   };
 
   return {
     deps,
     phases,
+    operationIds,
     counts,
     get resolveApply() { return resolveApply; },
     runtimePhase: phase => runtimeListener?.(phase),
@@ -176,44 +195,57 @@ describe('private Pro vault lifecycle', () => {
     await lifecycle.start();
     assert.equal(lifecycle.getState().phase, 'setup');
 
-    const setup = lifecycle.setup('correct horse battery staple');
-    await new Promise(resolve => setTimeout(resolve, 0));
-    assert.equal(lifecycle.getState().phase, 'hydrating');
+    await lifecycle.setup('correct horse battery staple');
+    assert.equal(lifecycle.getState().phase, 'setup');
     assert.equal(lifecycle.getState().recoveryKey, 'AAAA-BBBB-CCCC-DDDD');
-    assert.equal(harness.counts.remember, 1);
+    assert.equal(harness.counts.commitSetup, 0);
+    assert.equal(harness.counts.remember, 0);
+    assert.equal(harness.counts.register, 0);
+    assert.equal(harness.counts.activate, 0);
+    const setup = lifecycle.acknowledgeRecoveryKey();
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(lifecycle.getState().phase, 'setup');
+    assert.equal(lifecycle.getState().busy, true);
     harness.resolveApply?.();
     await setup;
 
-    assert.equal(lifecycle.getState().phase, 'setup');
-    lifecycle.acknowledgeRecoveryKey();
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.equal(lifecycle.getState().recoveryKey, null);
   });
 
-  test('setup confirmation cannot open the app while activation is pending or after activation fails', async () => {
-    const pending = createHarness({ keyset: null, deferApply: true });
-    const pendingLifecycle = createPrivateProVaultLifecycle(pending.deps);
-    await pendingLifecycle.start();
-    const setup = pendingLifecycle.setup('correct horse battery staple');
-    await new Promise(resolve => setTimeout(resolve, 0));
-
-    pendingLifecycle.acknowledgeRecoveryKey();
-    assert.equal(pendingLifecycle.getState().phase, 'hydrating');
-    pending.resolveApply?.();
-    await setup;
-    assert.equal(pendingLifecycle.getState().phase, 'setup');
-
-    const failing = createHarness({ keyset: null, activationError: new Error('remote failure') });
+  test('failed setup confirmation preserves the recovery key and retry succeeds', async () => {
+    const failing = createHarness({ keyset: null, commitError: new Error('remote failure') });
     const failingLifecycle = createPrivateProVaultLifecycle(failing.deps);
     await failingLifecycle.start();
     await failingLifecycle.setup('correct horse battery staple');
-    failingLifecycle.acknowledgeRecoveryKey();
+    await failingLifecycle.acknowledgeRecoveryKey();
     assert.deepEqual(failingLifecycle.getState(), {
       phase: 'setup',
       busy: false,
       error: 'The encrypted vault could not be created.',
-      recoveryKey: null,
+      recoveryKey: 'AAAA-BBBB-CCCC-DDDD',
     });
+
+    failing.deps.commitSetup = async () => { failing.counts.commitSetup++; return 'committed'; };
+    await failingLifecycle.acknowledgeRecoveryKey();
+    assert.equal(failingLifecycle.getState().phase, 'ready');
+    assert.equal(failingLifecycle.getState().recoveryKey, null);
+    assert.deepEqual(failing.operationIds, ['setup-operation-1']);
+  });
+
+  test('failed activation preserves the recovery key and retries the same setup commit', async () => {
+    const harness = createHarness({ keyset: null, activationError: new Error('apply failure') });
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+    await lifecycle.start();
+    await lifecycle.setup('correct horse battery staple');
+
+    await lifecycle.acknowledgeRecoveryKey();
+    assert.equal(lifecycle.getState().recoveryKey, 'AAAA-BBBB-CCCC-DDDD');
+    harness.deps.activate = async () => { harness.counts.activate++; };
+    await lifecycle.acknowledgeRecoveryKey();
+
+    assert.equal(lifecycle.getState().phase, 'ready');
+    assert.deepEqual(harness.operationIds, ['setup-operation-1', 'setup-operation-1']);
   });
 
   test('remembered devices auto-unlock before the application opens', async () => {
@@ -250,6 +282,8 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.equal(lifecycle.getState().recoveryKey, null);
     assert.equal(harness.counts.recoveryUnlock, 1);
+    assert.equal(harness.counts.register, 1);
+    assert.equal(harness.counts.commitRecovery, 1);
   });
 
   test('wrong passwords stay locked and return one secret-free failure', async () => {
@@ -361,14 +395,14 @@ describe('private Pro vault accessibility', () => {
       error: null,
       recoveryKey: null,
       onSetup: async () => {},
-      onRecoveryConfirmed: () => {},
+      onRecoveryConfirmed: async () => {},
     }));
     const recoveryMarkup = renderToStaticMarkup(React.createElement(PrivateProVaultSetup, {
       busy: false,
       error: null,
       recoveryKey: 'AAAA-BBBB-CCCC-DDDD',
       onSetup: async () => {},
-      onRecoveryConfirmed: () => {},
+      onRecoveryConfirmed: async () => {},
     }));
 
     assert.match(passwordMarkup, /<label[^>]*>Vault password<\/label>/);
@@ -422,6 +456,49 @@ describe('private Pro vault keyset lifecycle', () => {
     assert.notEqual(await getPrivateProVaultDeviceId('uid-b', storage), first);
     assert.match(first, /^[A-Za-z0-9_-]{43}$/);
     assert.equal([...values.values()].some(value => value.includes('CryptoKey')), false);
+  });
+
+  test('uses the durable remembered-device ID after localStorage is cleared', async () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    };
+    const rememberedId = 'rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr';
+    const db = { getDeviceUnlock: async () => ({ key: {} as CryptoKey, deviceId: rememberedId }) };
+    values.clear();
+
+    assert.equal(await resolvePrivateProVaultRequestDeviceId('uid-a', db, storage), rememberedId);
+    assert.equal(values.size, 0);
+  });
+
+  test('generates a proposed ID only when no remembered device key exists', async () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    };
+    const proposed = await resolvePrivateProVaultRequestDeviceId('uid-a', { getDeviceUnlock: async () => null }, storage);
+
+    assert.match(proposed, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal(values.size, 1);
+  });
+
+  test('does not fall back to localStorage when a remembered key lacks a valid device identity', async () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    };
+
+    await assert.rejects(
+      resolvePrivateProVaultRequestDeviceId('uid-a', { getDeviceUnlock: async () => ({ deviceId: '' }) }, storage),
+      /identity is invalid/i,
+    );
+    assert.equal(values.size, 0);
   });
 
   test('unlocks persisted PBKDF2 keysets without trying the Argon2 worker', async () => {

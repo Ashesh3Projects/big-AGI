@@ -30,7 +30,7 @@ import { privateProVaultSession } from './privatePro.vault.session';
 import { createPrivateProVaultStore, privateProVaultStore, type PrivateProVaultPhase } from './store-private-pro-vault';
 import { createPrivateProVaultTransport } from './privatePro.vault.transport';
 import type { PrivateProVaultDeviceMetadata, PrivateProVaultKeyset } from './privatePro.vault.types';
-import { clearPrivateProVaultDeviceId, getPrivateProVaultDeviceId } from './privatePro.vault.device';
+import { clearPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
 
 
 export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'migrating' | 'error';
@@ -49,12 +49,16 @@ export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey> {
   restoreRemembered(keyset: TKeyset): Promise<TMasterKey | null>;
   unlockPassword(keyset: TKeyset, password: string): Promise<TMasterKey>;
   unlockRecovery(keyset: TKeyset, recoveryKey: string, newPassword: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey }>;
+  commitRecovery(previousKeyset: TKeyset, rotatedKeyset: TKeyset): Promise<'committed' | 'conflict'>;
   setup(password: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; recoveryKey: string }>;
+  commitSetup(keyset: TKeyset, operationId: string): Promise<'committed' | 'conflict'>;
   remember(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
+  register(keyset: TKeyset): Promise<void>;
   activate(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
   subscribeRuntime(listener: (phase: 'ready' | 'reconnecting' | 'migrating' | 'error') => void): () => void;
   logout(): Promise<void>;
   onState?(state: PrivateProVaultPublicState): void;
+  createOperationId?(): string;
 }
 
 export interface PrivateProVaultLifecycle {
@@ -63,7 +67,7 @@ export interface PrivateProVaultLifecycle {
   start(): Promise<void>;
   retry(): Promise<void>;
   setup(password: string): Promise<void>;
-  acknowledgeRecoveryKey(): void;
+  acknowledgeRecoveryKey(): Promise<void>;
   unlockWithPassword(password: string): Promise<void>;
   unlockWithRecovery(recoveryKey: string, newPassword: string): Promise<void>;
   logout(): Promise<void>;
@@ -73,7 +77,7 @@ export interface PrivateProVaultLifecycle {
 export interface PrivateProVaultContextValue extends PrivateProVaultPublicState {
   retry(): Promise<void>;
   setup(password: string): Promise<void>;
-  acknowledgeRecoveryKey(): void;
+  acknowledgeRecoveryKey(): Promise<void>;
   unlockWithPassword(password: string): Promise<void>;
   unlockWithRecovery(recoveryKey: string, newPassword: string): Promise<void>;
   changePassword(currentPassword: string, newPassword: string): Promise<void>;
@@ -113,6 +117,8 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
   let keyset: TKeyset | null = null;
   let masterKey: TMasterKey | null = null;
   let activationReady = false;
+  let pendingSetup: { keyset: TKeyset; masterKey: TMasterKey; recoveryKey: string; operationId: string } | null = null;
+  let confirmation: Promise<void> | null = null;
   let destroyed = false;
   let unsubscribeRuntime: (() => void) | undefined;
   const listeners = new Set<(state: PrivateProVaultPublicState) => void>();
@@ -190,24 +196,44 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
       setState({ phase: 'setup', busy: true, error: null });
       try {
         const created = await deps.setup(password);
-        keyset = created.keyset;
-        masterKey = created.masterKey;
-        await deps.remember(created.masterKey, created.keyset);
-        setState({ phase: 'hydrating', busy: true, recoveryKey: created.recoveryKey });
-        await deps.activate(created.masterKey, created.keyset);
-        bindRuntime();
-        activationReady = true;
-        setState({ phase: 'setup', busy: false, error: null });
+        pendingSetup = { ...created, operationId: deps.createOperationId?.() ?? `setup-${crypto.randomUUID()}` };
+        setState({ phase: 'setup', busy: false, error: null, recoveryKey: created.recoveryKey });
       } catch {
-        activationReady = false;
-        masterKey = null;
-        keyset = null;
-        setState({ phase: 'setup', busy: false, error: 'The encrypted vault could not be created.', recoveryKey: null });
+        setState({ phase: 'setup', busy: false, error: 'The encrypted vault could not be created.' });
       }
     },
-    acknowledgeRecoveryKey() {
-      if (!activationReady || !masterKey || !keyset || !state.recoveryKey) return;
-      setState({ phase: 'ready', recoveryKey: null, error: null });
+    async acknowledgeRecoveryKey() {
+      if (confirmation) return confirmation;
+      if (!pendingSetup || !state.recoveryKey) return;
+      const pending = pendingSetup;
+      confirmation = (async () => {
+        setState({ phase: 'setup', busy: true, error: null });
+        try {
+          const result = await deps.commitSetup(pending.keyset, pending.operationId);
+          if (result === 'conflict') {
+            pendingSetup = null;
+            const bootstrap = await deps.bootstrap();
+            keyset = bootstrap.keyset;
+            masterKey = null;
+            setState({ phase: 'locked', busy: false, error: 'This vault already exists. Unlock it to continue.', recoveryKey: null });
+            return;
+          }
+          await deps.remember(pending.masterKey, pending.keyset);
+          await deps.register(pending.keyset);
+          await deps.activate(pending.masterKey, pending.keyset);
+          masterKey = pending.masterKey;
+          keyset = pending.keyset;
+          activationReady = true;
+          bindRuntime();
+          pendingSetup = null;
+          setState({ phase: 'ready', busy: false, error: null, recoveryKey: null });
+        } catch {
+          setState({ phase: 'setup', busy: false, error: 'The encrypted vault could not be created.', recoveryKey: pending.recoveryKey });
+        } finally {
+          confirmation = null;
+        }
+      })();
+      return confirmation;
     },
     async unlockWithPassword(password) {
       if (!keyset) return start();
@@ -215,6 +241,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
       try {
         const unlocked = await deps.unlockPassword(keyset, password);
         await deps.remember(unlocked, keyset);
+        await deps.register(keyset);
         await activate(unlocked, keyset);
       } catch {
         setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
@@ -229,8 +256,11 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
       setState({ phase: 'locked', busy: true, error: null });
       try {
         const unlocked = await deps.unlockRecovery(keyset, recoveryKey, newPassword);
+        const commit = await deps.commitRecovery(keyset, unlocked.keyset);
+        if (commit === 'conflict') throw new Error('Vault keyset changed.');
         keyset = unlocked.keyset;
         await deps.remember(unlocked.masterKey, unlocked.keyset);
+        await deps.register(unlocked.keyset);
         await activate(unlocked.masterKey, unlocked.keyset);
       } catch {
         setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
@@ -242,6 +272,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
       masterKey = null;
       keyset = null;
       activationReady = false;
+      pendingSetup = null;
       await deps.logout();
       setState({ phase: 'locked', busy: false, error: null, recoveryKey: null });
     },
@@ -251,6 +282,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
       listeners.clear();
       masterKey = null;
       keyset = null;
+      pendingSetup = null;
     },
   };
 }
@@ -264,7 +296,7 @@ function createProductionDependencies(
   return {
     isOnline: () => typeof navigator === 'undefined' || navigator.onLine,
     async bootstrap() {
-      deviceId = await getPrivateProVaultDeviceId(user.uid);
+      deviceId = await resolvePrivateProVaultRequestDeviceId(user.uid, privateProVaultDB);
       const result = await apiAsyncNode.privateProVault.bootstrap.mutate({ deviceId });
       runtime.devices = [];
       runtime.keyset = result.keyset?.keyset ?? null;
@@ -291,36 +323,42 @@ function createProductionDependencies(
     async unlockRecovery(keyset, recoveryKey, newPassword) {
       const masterKey = await unlockPrivateProVaultWithRecovery(keyset, recoveryKey);
       const rotated = await rewrapPrivateProVaultPasswordWithRecovery(keyset, recoveryKey, newPassword);
+      return { keyset: rotated, masterKey };
+    },
+    async commitRecovery(keyset, rotated) {
       const result = await apiAsyncNode.privateProVault.putKeyset.mutate({
         operationId: `recover-${crypto.randomUUID()}`,
         baseWrappingVersion: keyset.wrappingVersion,
         keyset: rotated,
       });
-      if (result.status === 'conflict') throw new Error('Vault keyset changed.');
-      runtime.keyset = rotated;
-      return { keyset: rotated, masterKey };
+      return result.status === 'conflict' ? 'conflict' : 'committed';
     },
     async setup(password) {
       const created = await createPrivateProVaultKeyset(password);
-      const result = await apiAsyncNode.privateProVault.putKeyset.mutate({
-        operationId: `setup-${crypto.randomUUID()}`,
-        baseWrappingVersion: 0,
-        keyset: created.keyset,
-      });
-      if (result.status === 'conflict') throw new Error('Vault already exists.');
       runtime.keyset = created.keyset;
       runtime.masterKey = created.masterKey;
       return created;
     },
+    async commitSetup(keyset, operationId) {
+      const result = await apiAsyncNode.privateProVault.putKeyset.mutate({
+        operationId,
+        baseWrappingVersion: 0,
+        keyset,
+      });
+      return result.status === 'conflict' ? 'conflict' : 'committed';
+    },
     async remember(masterKey, keyset) {
       const remembered = await createPrivateProRememberedUnlock(masterKey);
       await privateProVaultDB.transaction('rw', [privateProVaultDB.deviceKeys, privateProVaultDB.wrappedKeys], async () => {
-        await privateProVaultDB.storeDeviceKey(user.uid, remembered.deviceKey);
+        await privateProVaultDB.storeDeviceKey(user.uid, remembered.deviceKey, deviceId);
         await privateProVaultDB.wrappedKeys.put({ uid: user.uid, envelope: remembered.envelope });
       });
       privateProVaultSession.unlock(user.uid, masterKey);
       runtime.masterKey = masterKey;
       runtime.keyset = keyset;
+    },
+    async register(keyset) {
+      await apiAsyncNode.privateProVault.registerDevice.mutate({ deviceId, keyVersion: keyset.keyVersion });
     },
     async activate(masterKey, keyset) {
       await runtime.engine?.stopAndWait();
@@ -435,7 +473,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
 
   const revokeOtherDevices = React.useCallback(async () => {
     if (!auth.user) return;
-    const currentId = await getPrivateProVaultDeviceId(auth.user.uid);
+    const currentId = await resolvePrivateProVaultRequestDeviceId(auth.user.uid, privateProVaultDB);
     const devices = runtimeRef.current.devices.filter(device => device.deviceId !== currentId && device.revokedAtMs === null);
     await Promise.all(devices.map(device => apiAsyncNode.privateProVault.revokeDevice.mutate({
       operationId: `revoke-${crypto.randomUUID()}`,

@@ -55,6 +55,14 @@ export function createPrivateProVaultRouter(
 
   listDevices: deviceProcedure.query(({ ctx }) => vaultCall(() => service().listDevices(ctx.privateProIdentity.uid))),
 
+  registerDevice: procedure
+    .input(z.object({ deviceId: opaqueIdSchema, keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER) }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => {
+      if (ctx.privateProDeviceId !== input.deviceId)
+        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
+      return service().registerDevice(ctx.privateProIdentity.uid, input);
+    })),
+
   getIndex: deviceProcedure
     .input(z.object({
       pageSize: z.number().int().min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
@@ -92,16 +100,7 @@ export function createPrivateProVaultRouter(
       baseWrappingVersion: baseVersionSchema,
       keyset: PrivateProVaultKeysetSchema,
     }).strict())
-    .mutation(async ({ ctx, input }) => vaultCall(async () => {
-      const result = await service().putKeyset(ctx.privateProIdentity.uid, input);
-      if (input.baseWrappingVersion === 0) {
-        const deviceId = ctx.privateProDeviceId;
-        if (!deviceId || !/^[A-Za-z0-9_-]{43}$/.test(deviceId))
-          throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
-        await service().bootstrap(ctx.privateProIdentity.uid, deviceId);
-      }
-      return result;
-    })),
+    .mutation(({ ctx, input }) => vaultCall(() => service().putKeyset(ctx.privateProIdentity.uid, input))),
 
   commitMigration: deviceProcedure
     .input(z.object({

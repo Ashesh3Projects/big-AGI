@@ -9,11 +9,12 @@ import type {
 } from './privatePro.vault.types';
 
 
-export const PRIVATE_PRO_VAULT_DB_VERSION = 1;
+export const PRIVATE_PRO_VAULT_DB_VERSION = 2;
 
 export interface PrivateProVaultDeviceKeyRecord {
   uid: string;
   key: CryptoKey;
+  deviceId: string;
 }
 
 export interface PrivateProVaultWrappedKeyRecord {
@@ -104,13 +105,18 @@ export class PrivateProVaultDB extends Dexie {
     });
   }
 
-  async storeDeviceKey(uid: string, key: CryptoKey): Promise<void> {
+  async storeDeviceKey(uid: string, key: CryptoKey, deviceId: string): Promise<void> {
     assertRememberedDeviceKey(key);
-    await this.deviceKeys.put({ uid, key });
+    if (!/^[A-Za-z0-9_-]{43}$/.test(deviceId)) throw new Error('Remembered vault device ID is invalid.');
+    await this.deviceKeys.put({ uid, key, deviceId });
   }
 
   async getDeviceKey(uid: string): Promise<CryptoKey | null> {
     return (await this.deviceKeys.get(uid))?.key ?? null;
+  }
+
+  async getDeviceUnlock(uid: string): Promise<PrivateProVaultDeviceKeyRecord | null> {
+    return await this.deviceKeys.get(uid) ?? null;
   }
 
   async deleteDeviceUnlock(uid: string): Promise<void> {

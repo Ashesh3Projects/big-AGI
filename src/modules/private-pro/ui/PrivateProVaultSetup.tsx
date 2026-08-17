@@ -9,7 +9,7 @@ export interface PrivateProVaultSetupProps {
   error: string | null;
   recoveryKey: string | null;
   onSetup(password: string): Promise<void>;
-  onRecoveryConfirmed(): void;
+  onRecoveryConfirmed(): Promise<void>;
 }
 
 function recoveryGroups(value: string): string[] {
@@ -55,7 +55,7 @@ export function PrivateProVaultSetup(props: PrivateProVaultSetupProps) {
             <FormLabel>Recovery key groups</FormLabel>
             <Input autoComplete='off' value={recoveryConfirmation} onChange={event => setRecoveryConfirmation(event.target.value)} />
           </FormControl>
-          <Button disabled={enteredConfirmation !== expectedConfirmation} onClick={() => props.onRecoveryConfirmed()}>
+          <Button loading={props.busy} disabled={enteredConfirmation !== expectedConfirmation} onClick={() => void props.onRecoveryConfirmed()}>
             Save recovery key
           </Button>
         </>}

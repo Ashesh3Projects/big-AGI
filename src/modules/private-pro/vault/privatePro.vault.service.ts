@@ -61,6 +61,11 @@ export interface RevokeVaultDeviceInput {
   deviceId: string;
 }
 
+export interface RegisterVaultDeviceInput {
+  deviceId: string;
+  keyVersion: number;
+}
+
 export type CommitVaultMigrationResult =
   | { status: 'committed'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
   | { status: 'unchanged'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
@@ -136,22 +141,33 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
           transaction.getKeyset(),
           transaction.getDevice(deviceId),
         ]);
-        if (existingDevice?.revokedAtMs !== null && existingDevice?.revokedAtMs !== undefined)
-          throw new Error('Vault device is revoked.');
-        const timestamp = now();
-        const device = existingDevice || storedKeyset ? {
-          formatVersion: 1 as const,
-          deviceId,
-          keyVersion: storedKeyset?.keyVersion ?? existingDevice!.keyVersion,
-          createdAtMs: existingDevice?.createdAtMs ?? timestamp,
-          lastSeenAtMs: timestamp,
-          revokedAtMs: existingDevice?.revokedAtMs ?? null,
-        } : null;
-        if (device) await transaction.setDevice(device);
         return {
           keyset: storedKeyset ? { keyset: storedKeyset.keyset, serverUpdatedAtMs: storedKeyset.serverUpdatedAtMs } : null,
-          device,
+          device: existingDevice,
         };
+      });
+    },
+
+    async registerDevice(uid: string, input: RegisterVaultDeviceInput) {
+      assertUid(uid);
+      assertOpaqueRecordId(input.deviceId, 'device ID');
+      if (!Number.isSafeInteger(input.keyVersion) || input.keyVersion <= 0) throw new Error('Vault device key version is invalid.');
+      return repository.transaction(uid, async transaction => {
+        const [storedKeyset, existing] = await Promise.all([transaction.getKeyset(), transaction.getDevice(input.deviceId)]);
+        if (!storedKeyset || storedKeyset.keyVersion !== input.keyVersion) throw new Error('Vault device key version is stale.');
+        if (existing?.revokedAtMs !== null && existing?.revokedAtMs !== undefined) throw new Error('Vault device is revoked.');
+        if (existing) return { status: 'registered' as const, device: existing };
+        const timestamp = now();
+        const device = {
+          formatVersion: 1 as const,
+          deviceId: input.deviceId,
+          keyVersion: input.keyVersion,
+          createdAtMs: timestamp,
+          lastSeenAtMs: timestamp,
+          revokedAtMs: null,
+        };
+        await transaction.setDevice(device);
+        return { status: 'registered' as const, device };
       });
     },
 

@@ -35,6 +35,20 @@ export async function getPrivateProVaultDeviceId(
   )));
 }
 
+export async function resolvePrivateProVaultRequestDeviceId(
+  uid: string,
+  db: { getDeviceUnlock(uid: string): Promise<{ deviceId: string } | null> },
+  storage: PrivateProVaultDeviceStorage | null = browserStorage(),
+): Promise<string> {
+  const remembered = await db.getDeviceUnlock(uid);
+  if (remembered) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(remembered.deviceId))
+      throw new Error('Remembered vault device identity is invalid.');
+    return remembered.deviceId;
+  }
+  return getPrivateProVaultDeviceId(uid, storage);
+}
+
 export function clearPrivateProVaultDeviceId(
   uid: string,
   storage: PrivateProVaultDeviceStorage | null = browserStorage(),

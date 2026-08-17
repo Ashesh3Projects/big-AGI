@@ -12,6 +12,8 @@ import type { PrivateProVaultEnvelope, PrivateProVaultOperation, PrivateProVault
 
 const UID_A = 'uid-a';
 const UID_B = 'uid-b';
+const DEVICE_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
+const DEVICE_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 
 const ENVELOPE_A: PrivateProVaultEnvelope = {
   formatVersion: 1,
@@ -98,7 +100,7 @@ describe('private Pro encrypted vault database', () => {
 
     await db.open();
 
-    assert.equal(db.verno, 1);
+    assert.equal(db.verno, 2);
     assert.deepEqual(
       db.tables.map(table => table.name).sort(),
       ['deviceKeys', 'migration', 'outbox', 'quarantine', 'records', 'revisions', 'wrappedKeys'].sort(),
@@ -116,13 +118,14 @@ describe('private Pro encrypted vault database', () => {
     const iv = crypto.getRandomValues(new Uint8Array(12));
     const wrappedMasterKey = await crypto.subtle.wrapKey('raw', masterKey, deviceKey, { name: 'AES-GCM', iv });
 
-    await db.storeDeviceKey(UID_A, deviceKey);
+    await db.storeDeviceKey(UID_A, deviceKey, DEVICE_A);
     db.close();
     await db.open();
 
     const retrievedKey = await db.getDeviceKey(UID_A);
     if (!retrievedKey) assert.fail('Expected the remembered device key to persist.');
     assert.equal(retrievedKey.extractable, false);
+    assert.equal((await db.getDeviceUnlock(UID_A))?.deviceId, DEVICE_A);
     await assert.rejects(crypto.subtle.exportKey('raw', retrievedKey), /key is not extractable/i);
 
     const unwrappedMasterKey = await crypto.subtle.unwrapKey(
@@ -147,8 +150,8 @@ describe('private Pro encrypted vault database', () => {
     const deviceKeyA = await generateDeviceKey();
     const deviceKeyB = await generateDeviceKey();
 
-    await db.storeDeviceKey(UID_A, deviceKeyA);
-    await db.storeDeviceKey(UID_B, deviceKeyB);
+    await db.storeDeviceKey(UID_A, deviceKeyA, DEVICE_A);
+    await db.storeDeviceKey(UID_B, deviceKeyB, DEVICE_B);
     await db.putEncryptedRecord(UID_A, ENVELOPE_A);
     await db.putEncryptedRecord(UID_B, ENVELOPE_B);
 
@@ -161,7 +164,8 @@ describe('private Pro encrypted vault database', () => {
   test('rejects remembered device keys with extra usages', async (t) => {
     const db = createDB(t);
 
-    await assert.rejects(db.storeDeviceKey(UID_A, await generateDeviceKeyWithExtraUsage()), /exactly wrapKey and unwrapKey/i);
+    await assert.rejects(db.storeDeviceKey(UID_A, await generateDeviceKeyWithExtraUsage(), DEVICE_A), /exactly wrapKey and unwrapKey/i);
+    await assert.rejects(db.storeDeviceKey(UID_A, await generateDeviceKey(), 'not-opaque'), /device ID/i);
     assert.equal(await db.getDeviceKey(UID_A), null);
   });
 
@@ -181,8 +185,8 @@ describe('private Pro encrypted vault database', () => {
     const session = new PrivateProVaultSession(db);
     const masterKey = await importMasterKey();
 
-    await db.storeDeviceKey(UID_A, await generateDeviceKey());
-    await db.storeDeviceKey(UID_B, await generateDeviceKey());
+    await db.storeDeviceKey(UID_A, await generateDeviceKey(), DEVICE_A);
+    await db.storeDeviceKey(UID_B, await generateDeviceKey(), DEVICE_B);
     await db.wrappedKeys.put({ uid: UID_A, envelope: WRAPPED_KEY_A });
     await db.wrappedKeys.put({ uid: UID_B, envelope: WRAPPED_KEY_B });
     session.unlock(UID_A, masterKey);
@@ -203,7 +207,7 @@ describe('private Pro encrypted vault database', () => {
     const db = createDB(t);
     const session = new PrivateProVaultSession(db);
     const masterKey = await importMasterKey();
-    await db.storeDeviceKey(UID_B, await generateDeviceKey());
+    await db.storeDeviceKey(UID_B, await generateDeviceKey(), DEVICE_B);
     await db.wrappedKeys.put({ uid: UID_B, envelope: WRAPPED_KEY_B });
     session.unlock(UID_A, masterKey);
 
@@ -226,7 +230,7 @@ describe('private Pro encrypted vault database', () => {
     const db = createDB(t);
     const session = new PrivateProVaultSession(db);
     const masterKey = await importMasterKey();
-    await db.storeDeviceKey(UID_A, await generateDeviceKey());
+    await db.storeDeviceKey(UID_A, await generateDeviceKey(), DEVICE_A);
     session.unlock(UID_A, masterKey);
 
     session.lock();
