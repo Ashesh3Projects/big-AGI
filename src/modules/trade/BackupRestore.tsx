@@ -1043,6 +1043,9 @@ export function FlashBackup(props: {
       </Typography>
     )}
     {!errorMessage && <>
+      <Typography level='body-xs' color='danger' ml={2} endDecorator={<WarningRoundedIcon />}>
+        Unencrypted export. This file contains API keys when Models &amp; Settings are included.
+      </Typography>
       <FormControl orientation='horizontal' sx={{ justifyContent: 'space-between', alignItems: 'center', ml: 2, mr: 1.25, mt: 0.25 }}>
         <FormLabel sx={{ fontWeight: 'md' }}>Include Models & Settings</FormLabel>
         <Switch size='sm' checked={includeSettings} onChange={(event) => setIncludeSettings(event.target.checked)} />
