@@ -106,6 +106,29 @@ Fix verification:
 - `npm run tscheck` - passed.
 - `git diff --check` - passed with Git line-ending notices only.
 
+## Fix round 3
+
+Restored the agreed synchronous stop interface while preserving the commit barrier.
+
+- `stop()` again returns `void`. It synchronously invalidates the run and unsubscribes, starts the shared stopping barrier, and consumes any rejection so fire-and-forget callers cannot create an unhandled rejection.
+- Added `stopAndWait(): Promise<void>` for callers that must await the full serialized tail, including a started acknowledgement transaction.
+- Repeated `stop()` and `stopAndWait()` calls share the same barrier and do not invalidate twice.
+- `logoutAndClear()` awaits `stopAndWait()`.
+- `hydrateBeforeOpen()` and `start()` continue to await the existing stopping barrier before opening a new run.
+
+Fix TDD RED:
+
+```text
+stop returned a pending Promise instead of undefined
+```
+
+Fix verification:
+
+- Engine, database, and serializer suites - 27 passed, 0 failed.
+- Focused affected-file ESLint - passed.
+- `npm run tscheck` - passed.
+- `git diff --check` - passed with Git line-ending notices only.
+
 ## Fix round 2
 
 Closed the remaining acknowledgement commit race.

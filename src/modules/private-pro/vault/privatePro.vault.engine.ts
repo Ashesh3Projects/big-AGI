@@ -62,7 +62,8 @@ interface PrivateProVaultEngineDependencies {
 export interface PrivateProVaultEngine {
   hydrateBeforeOpen(): Promise<void>;
   start(): Promise<void>;
-  stop(): Promise<void>;
+  stop(): void;
+  stopAndWait(): Promise<void>;
   whenCurrent(): Promise<void>;
   logoutAndClear(): Promise<void>;
 }
@@ -115,6 +116,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
   let nextLocalSequence: number | undefined;
   let runEpoch = 0;
   let stopping = Promise.resolve();
+  let stoppingActive = false;
 
   const assertCurrent = (epoch: number) => {
     if (epoch !== runEpoch) throw new PrivateProVaultRunCancelledError();
@@ -535,6 +537,25 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
     unsubscribeSerializers = [];
   };
 
+  const beginStop = () => {
+    if (stoppingActive) return stopping;
+    invalidateRun();
+    stoppingActive = true;
+    const barrier = (async () => {
+      try {
+        while (true) {
+          const current = work;
+          await current;
+          if (current === work) return;
+        }
+      } finally {
+        stoppingActive = false;
+      }
+    })();
+    stopping = barrier.catch(() => {});
+    return barrier;
+  };
+
   return {
     async hydrateBeforeOpen() {
       await stopping;
@@ -565,11 +586,12 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
       }
     },
 
-    async stop() {
-      invalidateRun();
-      const barrier = this.whenCurrent();
-      stopping = barrier.catch(() => {});
-      await barrier;
+    stop() {
+      void beginStop().catch(() => {});
+    },
+
+    stopAndWait() {
+      return beginStop();
     },
 
     async whenCurrent() {
@@ -581,7 +603,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
     },
 
     async logoutAndClear() {
-      await this.stop();
+      await this.stopAndWait();
       await (deps.clearSession ? deps.clearSession() : privateProVaultSession.logoutAndClear(deps.uid));
       await deps.db.transaction('rw', [
         deps.db.deviceKeys,

@@ -496,8 +496,10 @@ describe('private Pro blocking multi-device vault engine', () => {
 
     await serializer(client, 'settings').mutate(THEME_ID, { id: 'theme', value: 'dark' });
     while (server.operations.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    const stopResult = client.engine.stop();
+    assert.equal(stopResult, undefined);
     let stopSettled = false;
-    const stopping = client.engine.stop().then(() => stopSettled = true);
+    const stopping = client.engine.stopAndWait().then(() => stopSettled = true);
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal(stopSettled, false);
     releaseWrite();
@@ -527,8 +529,10 @@ describe('private Pro blocking multi-device vault engine', () => {
     while (server.operations.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal(acknowledgeStarted, true);
+    const stopResult = client.engine.stop();
+    assert.equal(stopResult, undefined);
     let stopSettled = false;
-    const stopping = client.engine.stop().then(() => stopSettled = true);
+    const stopping = client.engine.stopAndWait().then(() => stopSettled = true);
     await new Promise(resolve => setTimeout(resolve, 0));
     assert.equal(stopSettled, false);
 
