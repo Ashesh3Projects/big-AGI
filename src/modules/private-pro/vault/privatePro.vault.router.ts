@@ -3,7 +3,7 @@ import * as z from 'zod/v4';
 
 import { createTRPCRouter } from '~/server/trpc/trpc.server';
 
-import { privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
+import { createPrivateProVaultProcedure, createPrivateProVaultPutKeysetProcedure, privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
   PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE,
@@ -40,25 +40,35 @@ export function createPrivateProVaultRouter(
   serviceFactory: () => PrivateProVaultService = getFirebasePrivateProVaultService,
 ) {
   const service = () => serviceFactory();
+  const accessDependencies = {
+    async getVaultAccess(uid, deviceId) {
+      const [keyset, devices] = await Promise.all([service().getKeyset(uid), service().listDevices(uid)]);
+      return { keyset: keyset?.keyset ?? null, device: devices.find(device => device.deviceId === deviceId) ?? null };
+    },
+  } satisfies Parameters<typeof createPrivateProVaultProcedure>[1];
+  const deviceProcedure = createPrivateProVaultProcedure(procedure, accessDependencies);
+  const putKeysetProcedure = createPrivateProVaultPutKeysetProcedure(procedure, accessDependencies);
   return createTRPCRouter({
   bootstrap: procedure
     .input(z.object({ deviceId: opaqueIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().bootstrap(ctx.privateProIdentity.uid, input.deviceId))),
 
-  getIndex: procedure
+  listDevices: deviceProcedure.query(({ ctx }) => vaultCall(() => service().listDevices(ctx.privateProIdentity.uid))),
+
+  getIndex: deviceProcedure
     .input(z.object({
       pageSize: z.number().int().min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
       cursor: opaqueIdSchema.nullish(),
     }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getIndex(ctx.privateProIdentity.uid, input))),
 
-  getRecords: procedure
+  getRecords: deviceProcedure
     .input(z.object({
       opaqueRecordIds: z.array(opaqueIdSchema).min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
     }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getRecords(ctx.privateProIdentity.uid, input.opaqueRecordIds))),
 
-  putRecord: procedure
+  putRecord: deviceProcedure
     .input(z.object({
       operationId: operationIdSchema,
       opaqueRecordId: opaqueIdSchema,
@@ -67,7 +77,7 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().putRecord(ctx.privateProIdentity.uid, input))),
 
-  deleteRecord: procedure
+  deleteRecord: deviceProcedure
     .input(z.object({
       operationId: operationIdSchema,
       opaqueRecordId: opaqueIdSchema,
@@ -76,15 +86,24 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().deleteRecord(ctx.privateProIdentity.uid, input))),
 
-  putKeyset: procedure
+  putKeyset: putKeysetProcedure
     .input(z.object({
       operationId: operationIdSchema,
-      baseKeyVersion: baseVersionSchema,
+      baseWrappingVersion: baseVersionSchema,
       keyset: PrivateProVaultKeysetSchema,
     }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => service().putKeyset(ctx.privateProIdentity.uid, input))),
+    .mutation(async ({ ctx, input }) => vaultCall(async () => {
+      const result = await service().putKeyset(ctx.privateProIdentity.uid, input);
+      if (input.baseWrappingVersion === 0) {
+        const deviceId = ctx.privateProDeviceId;
+        if (!deviceId || !/^[A-Za-z0-9_-]{43}$/.test(deviceId))
+          throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
+        await service().bootstrap(ctx.privateProIdentity.uid, deviceId);
+      }
+      return result;
+    })),
 
-  commitMigration: procedure
+  commitMigration: deviceProcedure
     .input(z.object({
       operationId: operationIdSchema,
       migrationId: migrationValueSchema,
@@ -93,7 +112,7 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().commitMigration(ctx.privateProIdentity.uid, input))),
 
-  revokeDevice: procedure
+  revokeDevice: deviceProcedure
     .input(z.object({ operationId: operationIdSchema, deviceId: opaqueIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().revokeDevice(ctx.privateProIdentity.uid, input))),
 });

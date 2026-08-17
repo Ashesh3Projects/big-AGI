@@ -12,6 +12,7 @@ import {
 
 import { privateProClientConfig } from '../config/privatePro.config';
 import { getPrivateProFirebaseAuth, privateProGetAppCheckToken } from '../firebase/firebase.client';
+import { getPrivateProVaultDeviceId } from '../vault/privatePro.vault.device';
 
 
 export function privateProOnAuthStateChanged(callback: (user: User | null) => void): () => void {
@@ -56,6 +57,7 @@ export async function privateProGetRequestHeaders(): Promise<Record<string, stri
   const appCheckToken = await privateProGetAppCheckToken();
   return {
     authorization: `Bearer ${await user.getIdToken()}`,
+    'x-private-pro-device-id': await getPrivateProVaultDeviceId(user.uid),
     ...(appCheckToken && { 'x-firebase-appcheck': appCheckToken }),
   };
 }

@@ -88,6 +88,11 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
     this.transaction.set(this.db.doc(`${vaultRoot(this.uid)}/devices/${device.deviceId}`), device);
   }
 
+  async listDevices() {
+    const snapshot = await this.transaction.get(this.db.collection(`${vaultRoot(this.uid)}/devices`));
+    return snapshot.docs.map(document => document.data() as PrivateProVaultStoredDevice);
+  }
+
   async getMigration(migrationId: string) {
     const snapshot = await this.transaction.get(this.db.doc(`${vaultRoot(this.uid)}/migrations/${migrationId}`));
     return snapshot.exists ? snapshot.data() as PrivateProVaultMigrationState : null;

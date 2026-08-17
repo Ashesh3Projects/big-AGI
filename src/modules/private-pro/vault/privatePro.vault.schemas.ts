@@ -162,6 +162,7 @@ export const PrivateProVaultRecoveryEnvelopeSchema = z.object({
 export const PrivateProVaultKeysetSchema = z.object({
   formatVersion: z.literal(1),
   keyVersion: boundedPositiveInteger(),
+  wrappingVersion: boundedPositiveInteger(),
   passwordEnvelope: PrivateProVaultPasswordEnvelopeSchema,
   recoveryEnvelope: PrivateProVaultRecoveryEnvelopeSchema,
 }).strict().refine(value =>

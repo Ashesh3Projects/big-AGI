@@ -51,6 +51,7 @@ export interface PrivateProVaultRecoveryEnvelope extends PrivateProVaultWrappedK
 export interface PrivateProVaultKeyset {
   formatVersion: 1;
   keyVersion: number;
+  wrappingVersion: number;
   passwordEnvelope: PrivateProVaultPasswordEnvelope;
   recoveryEnvelope: PrivateProVaultRecoveryEnvelope;
 }

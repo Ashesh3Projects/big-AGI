@@ -6,10 +6,12 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { deriveVaultSubkey, decryptVaultRecord, encryptVaultRecord, importVaultMasterKey } from '../private-pro/vault/privatePro.vault.crypto';
 import { generateRecoveryKey } from '../private-pro/vault/privatePro.vault.recovery';
+import { rewrapPrivateProVaultPassword } from '../private-pro/vault/privatePro.vault.keyset';
 import {
   PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
 } from '../private-pro/vault/privatePro.vault.schemas';
 import type { PrivateProVaultEnvelope, PrivateProVaultKeyset } from '../private-pro/vault/privatePro.vault.types';
+import { realArgon2idWorkerResponse, withVaultPasswordWorker } from '../../../tools/private-pro/test-helpers/privatePro.vault.password.test-helpers';
 import { FlashBackup } from './BackupRestore';
 import {
   createPrivateProEncryptedBackupStream,
@@ -116,6 +118,7 @@ async function fixture(): Promise<{
   const keyset: PrivateProVaultKeyset = {
     formatVersion: 1,
     keyVersion: 1,
+    wrappingVersion: 1,
     passwordEnvelope: {
       formatVersion: 1,
       keyVersion: 1,
@@ -241,6 +244,27 @@ describe('private Pro encrypted backup', () => {
 
     assert.equal(JSON.parse(decrypted).apiKey, SENTINEL_API_KEY);
     assert.deepEqual(result, { recordCount: 1, assetCount: 1, reloadRequired: true });
+  });
+
+  test('exports and imports keyVersion-1 records after password wrappingVersion advances', async () => {
+    const { source } = await fixture();
+    source.keyset = await withVaultPasswordWorker(
+      realArgon2idWorkerResponse,
+      () => rewrapPrivateProVaultPassword(source.keyset, PASSWORD, 'new correct horse battery staple'),
+    );
+    assert.equal(source.keyset.keyVersion, 1);
+    assert.equal(source.keyset.wrappingVersion, 2);
+    const output = await collectStream(createPrivateProEncryptedBackupStream(source));
+    let appliedKeyVersion = 0;
+
+    await withVaultPasswordWorker(realArgon2idWorkerResponse, () => importPrivateProEncryptedBackup(
+      streamFromBytes(output.bytes),
+      { kind: 'password', password: 'new correct horse battery staple' },
+      ({ envelope }) => { appliedKeyVersion = envelope.keyVersion; },
+      async () => {},
+    ));
+
+    assert.equal(appliedKeyVersion, 1);
   });
 
   test('unlocks, validates, and applies with the correct recovery key', async () => {

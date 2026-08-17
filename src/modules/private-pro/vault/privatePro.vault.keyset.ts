@@ -146,6 +146,7 @@ export async function createPrivateProVaultKeyset(password: string): Promise<{
     const keyset = PrivateProVaultKeysetSchema.parse({
       formatVersion: 1,
       keyVersion,
+      wrappingVersion: 1,
       passwordEnvelope: await createPasswordEnvelope(masterKeyBytes, password, keyVersion),
       recoveryEnvelope: await createRecoveryEnvelope(masterKeyBytes, recovery.display, keyVersion, 1),
     });
@@ -202,7 +203,7 @@ async function rewrapPrivateProVaultPasswordWithKey(
   currentEnvelope: PrivateProVaultWrappedKeyEnvelope,
   newPassword: string,
 ): Promise<PrivateProVaultKeyset> {
-  const keyVersion = keyset.keyVersion + 1;
+  const wrappingVersion = keyset.wrappingVersion + 1;
   const passwordKdf = {
     algorithm: 'argon2id' as const,
     memoryKiB: PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB,
@@ -233,16 +234,17 @@ async function rewrapPrivateProVaultPasswordWithKey(
     }));
     return PrivateProVaultKeysetSchema.parse({
       formatVersion: 1,
-      keyVersion,
+      keyVersion: keyset.keyVersion,
+      wrappingVersion,
       passwordEnvelope: {
         formatVersion: 1,
-        keyVersion,
+        keyVersion: keyset.keyVersion,
         kdf: passwordWrapping.params,
         nonceBase64: bytesToBase64(nonce),
         ciphertextBase64: bytesToBase64(passwordCiphertext),
         ciphertextBytes: passwordCiphertext.byteLength,
       },
-      recoveryEnvelope: { ...keyset.recoveryEnvelope, keyVersion },
+      recoveryEnvelope: keyset.recoveryEnvelope,
     });
   } catch {
     throw new Error('Vault password or recovery key is incorrect.');

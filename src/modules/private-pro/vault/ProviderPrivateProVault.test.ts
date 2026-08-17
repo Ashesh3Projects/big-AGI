@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import {
   createPrivateProVaultLifecycle,
+  ProviderPrivateProVault,
   privateProVaultPasswordStrength,
   type PrivateProVaultLifecycleDependencies,
   type PrivateProVaultLifecyclePhase,
@@ -21,6 +22,8 @@ import { generateRecoveryKey } from './privatePro.vault.recovery';
 import { PRIVATE_PRO_PBKDF2_MIN_ITERATIONS } from './privatePro.vault.schemas';
 import type { PrivateProVaultKeyset } from './privatePro.vault.types';
 import { realArgon2idWorkerResponse, withVaultPasswordWorker } from '../../../../tools/private-pro/test-helpers/privatePro.vault.password.test-helpers';
+import { privateProClientConfig } from '../config/privatePro.config';
+import { getPrivateProVaultDeviceId } from './privatePro.vault.device';
 
 
 interface Harness {
@@ -143,6 +146,7 @@ async function keysetFixture(password: string): Promise<{ keyset: PrivateProVaul
     keyset: {
       formatVersion: 1,
       keyVersion: 1,
+      wrappingVersion: 1,
       passwordEnvelope: {
         formatVersion: 1,
         keyVersion: 1,
@@ -184,6 +188,32 @@ describe('private Pro vault lifecycle', () => {
     lifecycle.acknowledgeRecoveryKey();
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.equal(lifecycle.getState().recoveryKey, null);
+  });
+
+  test('setup confirmation cannot open the app while activation is pending or after activation fails', async () => {
+    const pending = createHarness({ keyset: null, deferApply: true });
+    const pendingLifecycle = createPrivateProVaultLifecycle(pending.deps);
+    await pendingLifecycle.start();
+    const setup = pendingLifecycle.setup('correct horse battery staple');
+    await new Promise(resolve => setTimeout(resolve, 0));
+
+    pendingLifecycle.acknowledgeRecoveryKey();
+    assert.equal(pendingLifecycle.getState().phase, 'hydrating');
+    pending.resolveApply?.();
+    await setup;
+    assert.equal(pendingLifecycle.getState().phase, 'setup');
+
+    const failing = createHarness({ keyset: null, activationError: new Error('remote failure') });
+    const failingLifecycle = createPrivateProVaultLifecycle(failing.deps);
+    await failingLifecycle.start();
+    await failingLifecycle.setup('correct horse battery staple');
+    failingLifecycle.acknowledgeRecoveryKey();
+    assert.deepEqual(failingLifecycle.getState(), {
+      phase: 'setup',
+      busy: false,
+      error: 'The encrypted vault could not be created.',
+      recoveryKey: null,
+    });
   });
 
   test('remembered devices auto-unlock before the application opens', async () => {
@@ -314,6 +344,17 @@ describe('private Pro vault lifecycle', () => {
 
 
 describe('private Pro vault accessibility', () => {
+  test('disabled private Pro renders the open application without vault context', () => {
+    const enabled = privateProClientConfig.enabled;
+    Object.defineProperty(privateProClientConfig, 'enabled', { configurable: true, value: false });
+    try {
+      const markup = renderToStaticMarkup(React.createElement(ProviderPrivateProVault, null, React.createElement('main', null, 'Open build')));
+      assert.match(markup, /<main>Open build<\/main>/);
+      assert.doesNotMatch(markup, /Opening encrypted vault/);
+    } finally {
+      Object.defineProperty(privateProClientConfig, 'enabled', { configurable: true, value: enabled });
+    }
+  });
   test('setup exposes labelled password confirmation and recovery confirmation controls', () => {
     const passwordMarkup = renderToStaticMarkup(React.createElement(PrivateProVaultSetup, {
       busy: false,
@@ -368,6 +409,21 @@ describe('private Pro vault accessibility', () => {
 
 
 describe('private Pro vault keyset lifecycle', () => {
+  test('persists one opaque device ID per authenticated UID without exposing a device key', async () => {
+    const values = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => values.get(key) ?? null,
+      setItem: (key: string, value: string) => { values.set(key, value); },
+      removeItem: (key: string) => { values.delete(key); },
+    };
+
+    const first = await getPrivateProVaultDeviceId('uid-a', storage);
+    assert.equal(await getPrivateProVaultDeviceId('uid-a', storage), first);
+    assert.notEqual(await getPrivateProVaultDeviceId('uid-b', storage), first);
+    assert.match(first, /^[A-Za-z0-9_-]{43}$/);
+    assert.equal([...values.values()].some(value => value.includes('CryptoKey')), false);
+  });
+
   test('unlocks persisted PBKDF2 keysets without trying the Argon2 worker', async () => {
     const { keyset } = await keysetFixture('old vault password');
 
@@ -386,7 +442,10 @@ describe('private Pro vault keyset lifecycle', () => {
       () => rewrapPrivateProVaultPassword(keyset, 'old vault password', 'new vault password long'),
     );
 
-    assert.equal(rotated.keyVersion, 2);
+    assert.equal(rotated.keyVersion, 1);
+    assert.equal(rotated.wrappingVersion, 2);
+    assert.equal(rotated.passwordEnvelope.keyVersion, 1);
+    assert.equal(rotated.recoveryEnvelope.keyVersion, 1);
     await assert.rejects(unlockPrivateProVaultWithPassword(rotated, 'old vault password'));
     assert.equal((await withVaultPasswordWorker(
       realArgon2idWorkerResponse,

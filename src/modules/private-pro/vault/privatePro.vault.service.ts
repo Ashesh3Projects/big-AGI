@@ -40,14 +40,14 @@ export interface DeleteVaultRecordInput {
 
 export interface PutVaultKeysetInput {
   operationId: string;
-  baseKeyVersion: number;
+  baseWrappingVersion: number;
   keyset: PrivateProVaultKeyset;
 }
 
 export type PutVaultKeysetResult =
-  | { status: 'committed'; keyVersion: number; serverUpdatedAtMs: number }
-  | { status: 'unchanged'; keyVersion: number; serverUpdatedAtMs: number }
-  | { status: 'conflict'; currentKeyVersion: number };
+  | { status: 'committed'; wrappingVersion: number; serverUpdatedAtMs: number }
+  | { status: 'unchanged'; wrappingVersion: number; serverUpdatedAtMs: number }
+  | { status: 'conflict'; currentWrappingVersion: number };
 
 export interface CommitVaultMigrationInput {
   operationId: string;
@@ -103,8 +103,8 @@ function repeatOutcome(outcome: PrivateProVaultOperationOutcome) {
         : { status: 'conflict' as const, currentRevision: outcome.currentRevision };
     case 'keyset':
       return outcome.status === 'committed'
-        ? { status: 'unchanged' as const, keyVersion: outcome.keyVersion, serverUpdatedAtMs: outcome.serverUpdatedAtMs }
-        : { status: 'conflict' as const, currentKeyVersion: outcome.currentKeyVersion };
+        ? { status: 'unchanged' as const, wrappingVersion: outcome.wrappingVersion, serverUpdatedAtMs: outcome.serverUpdatedAtMs }
+        : { status: 'conflict' as const, currentWrappingVersion: outcome.currentWrappingVersion };
     case 'migration':
       return outcome.status === 'committed'
         ? { status: 'unchanged' as const, phase: outcome.phase, serverUpdatedAtMs: outcome.serverUpdatedAtMs }
@@ -136,6 +136,8 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
           transaction.getKeyset(),
           transaction.getDevice(deviceId),
         ]);
+        if (existingDevice?.revokedAtMs !== null && existingDevice?.revokedAtMs !== undefined)
+          throw new Error('Vault device is revoked.');
         const timestamp = now();
         const device = existingDevice || storedKeyset ? {
           formatVersion: 1 as const,
@@ -151,6 +153,11 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
           device,
         };
       });
+    },
+
+    async listDevices(uid: string) {
+      assertUid(uid);
+      return repository.transaction(uid, transaction => transaction.listDevices());
     },
 
     async putRecord(uid: string, input: PutVaultRecordInput): Promise<PutVaultRecordResult> {
@@ -252,26 +259,27 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
     async putKeyset(uid: string, input: PutVaultKeysetInput): Promise<PutVaultKeysetResult> {
       assertUid(uid);
       assertOperationId(input.operationId);
-      if (!Number.isSafeInteger(input.baseKeyVersion) || input.baseKeyVersion < 0) throw new Error('Vault base key version is invalid.');
+      if (!Number.isSafeInteger(input.baseWrappingVersion) || input.baseWrappingVersion < 0) throw new Error('Vault base wrapping version is invalid.');
       const keyset = PrivateProVaultKeysetSchema.parse(input.keyset);
-      if (keyset.keyVersion !== input.baseKeyVersion + 1) throw new Error('Vault keyset version must follow the base key version.');
+      if (keyset.wrappingVersion !== input.baseWrappingVersion + 1) throw new Error('Vault wrapping version must follow the base wrapping version.');
       const requestFingerprint = fingerprint({ kind: 'put-keyset', ...input, keyset });
 
       return repository.transaction(uid, async transaction => {
         const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
         if (repeated) return repeated as PutVaultKeysetResult;
         const current = await transaction.getKeyset();
-        const currentKeyVersion = current?.keyVersion ?? 0;
-        if (currentKeyVersion !== input.baseKeyVersion) {
-          const outcome = { kind: 'keyset', status: 'conflict', currentKeyVersion } as const;
+        const currentWrappingVersion = current?.wrappingVersion ?? 0;
+        if (currentWrappingVersion !== input.baseWrappingVersion) {
+          const outcome = { kind: 'keyset', status: 'conflict', currentWrappingVersion } as const;
           await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
-          return { status: 'conflict', currentKeyVersion };
+          return { status: 'conflict', currentWrappingVersion };
         }
+        if (current && current.keyVersion !== keyset.keyVersion) throw new Error('Vault master key version cannot change during wrapping rotation.');
         const serverUpdatedAtMs = now();
-        await transaction.setKeyset({ keyVersion: keyset.keyVersion, serverUpdatedAtMs, keyset: structuredClone(keyset) });
-        const outcome = { kind: 'keyset', status: 'committed', keyVersion: keyset.keyVersion, serverUpdatedAtMs } as const;
+        await transaction.setKeyset({ keyVersion: keyset.keyVersion, wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs, keyset: structuredClone(keyset) });
+        const outcome = { kind: 'keyset', status: 'committed', wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs } as const;
         await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
-        return { status: 'committed', keyVersion: keyset.keyVersion, serverUpdatedAtMs };
+        return { status: 'committed', wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs };
       });
     },
 

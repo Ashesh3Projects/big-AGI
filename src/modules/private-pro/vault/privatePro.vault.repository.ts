@@ -26,6 +26,7 @@ export interface PrivateProVaultStoredTombstone {
 
 export interface PrivateProVaultStoredKeyset {
   keyVersion: number;
+  wrappingVersion: number;
   serverUpdatedAtMs: number;
   keyset: PrivateProVaultKeyset;
 }
@@ -43,8 +44,8 @@ export interface PrivateProVaultMigrationState {
 export type PrivateProVaultOperationOutcome =
   | { kind: 'record'; status: 'committed'; revision: number; serverUpdatedAtMs: number }
   | { kind: 'record'; status: 'conflict'; currentRevision: number }
-  | { kind: 'keyset'; status: 'committed'; keyVersion: number; serverUpdatedAtMs: number }
-  | { kind: 'keyset'; status: 'conflict'; currentKeyVersion: number }
+  | { kind: 'keyset'; status: 'committed'; wrappingVersion: number; serverUpdatedAtMs: number }
+  | { kind: 'keyset'; status: 'conflict'; currentWrappingVersion: number }
   | { kind: 'migration'; status: 'committed'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
   | { kind: 'migration'; status: 'conflict'; currentPhase: PrivateProVaultMigrationPhase | null }
   | { kind: 'device'; status: 'committed'; revokedAtMs: number };
@@ -81,6 +82,7 @@ export interface PrivateProVaultRepositoryTransaction {
   setKeyset(keyset: PrivateProVaultStoredKeyset): Promise<void>;
   getDevice(deviceId: string): Promise<PrivateProVaultStoredDevice | null>;
   setDevice(device: PrivateProVaultStoredDevice): Promise<void>;
+  listDevices(): Promise<PrivateProVaultStoredDevice[]>;
   getMigration(migrationId: string): Promise<PrivateProVaultMigrationState | null>;
   setMigration(migration: PrivateProVaultMigrationState): Promise<void>;
 }

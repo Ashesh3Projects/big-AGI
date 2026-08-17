@@ -57,10 +57,11 @@ function envelope(
   };
 }
 
-function keyset(keyVersion: number): PrivateProVaultKeyset {
+function keyset(keyVersion: number, wrappingVersion = keyVersion): PrivateProVaultKeyset {
   return {
     formatVersion: 1,
     keyVersion,
+    wrappingVersion,
     passwordEnvelope: {
       formatVersion: 1,
       keyVersion,
@@ -142,6 +143,7 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
       setKeyset: async value => { vault.keyset = clone(value); },
       getDevice: async deviceId => clone(vault.devices.get(deviceId) ?? null),
       setDevice: async device => { vault.devices.set(device.deviceId, clone(device)); },
+      listDevices: async () => clone([...vault.devices.values()]),
       getMigration: async migrationId => clone(vault.migrations.get(migrationId) ?? null),
       setMigration: async migration => { vault.migrations.set(migration.migrationId, clone(migration)); },
     };
@@ -389,25 +391,25 @@ describe('Private Pro encrypted vault service', () => {
     assert.deepEqual(mergePrivateProVaultIndexEntries([record], [deleted], 1).map(entry => entry.opaqueRecordId), [deletedId]);
   });
 
-  test('compare-and-swaps the wrapped keyset', async () => {
+  test('compare-and-swaps wrapping revisions without changing the master key version', async () => {
     const { service } = serviceFixture();
     assert.deepEqual(await service.putKeyset(UID_A, {
       operationId: 'keyset-1',
-      baseKeyVersion: 0,
-      keyset: keyset(1),
-    }), { status: 'committed', keyVersion: 1, serverUpdatedAtMs: 1_000 });
+      baseWrappingVersion: 0,
+      keyset: keyset(1, 1),
+    }), { status: 'committed', wrappingVersion: 1, serverUpdatedAtMs: 1_000 });
     assert.deepEqual(await service.putKeyset(UID_A, {
       operationId: 'keyset-stale',
-      baseKeyVersion: 0,
-      keyset: keyset(1),
-    }), { status: 'conflict', currentKeyVersion: 1 });
+      baseWrappingVersion: 0,
+      keyset: keyset(1, 1),
+    }), { status: 'conflict', currentWrappingVersion: 1 });
     assert.deepEqual(await service.putKeyset(UID_A, {
       operationId: 'keyset-2',
-      baseKeyVersion: 1,
-      keyset: keyset(2),
-    }), { status: 'committed', keyVersion: 2, serverUpdatedAtMs: 1_001 });
+      baseWrappingVersion: 1,
+      keyset: keyset(1, 2),
+    }), { status: 'committed', wrappingVersion: 2, serverUpdatedAtMs: 1_001 });
     assert.deepEqual(await service.getKeyset(UID_A), {
-      keyset: keyset(2),
+      keyset: keyset(1, 2),
       serverUpdatedAtMs: 1_001,
     });
   });
@@ -415,7 +417,7 @@ describe('Private Pro encrypted vault service', () => {
   test('bootstraps only opaque remembered-device metadata and preserves revocation', async () => {
     const { service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseKeyVersion: 0, keyset: keyset(1) });
+    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
 
     assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
       keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
@@ -432,23 +434,21 @@ describe('Private Pro encrypted vault service', () => {
       status: 'committed',
       revokedAtMs: 1_002,
     });
-    assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
-      keyset: { keyset: keyset(1), serverUpdatedAtMs: 1_000 },
-      device: {
-        formatVersion: 1,
-        deviceId,
-        keyVersion: 1,
-        createdAtMs: 1_001,
-        lastSeenAtMs: 1_003,
-        revokedAtMs: 1_002,
-      },
-    });
+    await assert.rejects(service.bootstrap(UID_A, deviceId), /revoked/i);
+    assert.deepEqual(await service.listDevices(UID_A), [{
+      formatVersion: 1,
+      deviceId,
+      keyVersion: 1,
+      createdAtMs: 1_001,
+      lastSeenAtMs: 1_001,
+      revokedAtMs: 1_002,
+    }]);
   });
 
   test('makes device revocation idempotent without accepting device key material', async () => {
     const { repository, service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseKeyVersion: 0, keyset: keyset(1) });
+    await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
     await service.bootstrap(UID_A, deviceId);
     const input = { operationId: 'revoke-device-1', deviceId };
 
@@ -512,7 +512,7 @@ describe('Private Pro encrypted vault service', () => {
     };
     await service.putRecord(UID_A, input);
     await service.putRecord(UID_B, input);
-    await service.putKeyset(UID_A, { operationId: 'same-keyset-op', baseKeyVersion: 0, keyset: keyset(1) });
+    await service.putKeyset(UID_A, { operationId: 'same-keyset-op', baseWrappingVersion: 0, keyset: keyset(1) });
     await service.commitMigration(UID_A, {
       operationId: 'same-migration-op', migrationId: 'legacy-v1', basePhase: null, phase: 'encrypting',
     });

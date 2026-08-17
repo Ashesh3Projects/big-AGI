@@ -19,15 +19,18 @@ const state: {
   appCheckTokenValid: boolean;
   accountError: Error | null;
   calls: Array<{ method: string; uid: string; input: unknown }>;
+  devices: Map<string, { deviceId: string; keyVersion: number; revokedAtMs: number | null }>;
 } = {
   account: null,
   appCheckEnforced: true,
   appCheckTokenValid: true,
   accountError: null,
   calls: [],
+  devices: new Map(),
 };
 
 const service = {
+  getKeyset: async () => ({ keyset: keyset(1), serverUpdatedAtMs: 1 }),
   bootstrap: async (uid: string, deviceId: string) => {
     state.calls.push({ method: 'bootstrap', uid, input: deviceId });
     return { keyset: null, device: null };
@@ -35,6 +38,15 @@ const service = {
   getIndex: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'getIndex', uid, input });
     return { entries: [], nextCursor: null };
+  },
+  listDevices: async (uid: string) => {
+    state.calls.push({ method: 'listDevices', uid, input: undefined });
+    return [...state.devices.values()].map(device => ({
+      formatVersion: 1 as const,
+      createdAtMs: 1,
+      lastSeenAtMs: 1,
+      ...device,
+    }));
   },
   getRecords: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'getRecords', uid, input });
@@ -50,7 +62,7 @@ const service = {
   },
   putKeyset: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'putKeyset', uid, input });
-    return { status: 'committed' as const, keyVersion: 1, serverUpdatedAtMs: 1 };
+    return { status: 'committed' as const, wrappingVersion: 1, serverUpdatedAtMs: 1 };
   },
   commitMigration: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'commitMigration', uid, input });
@@ -123,6 +135,7 @@ function context(privateProIdentity: PrivateProIdentity | null, appCheckToken: s
     privateProIdentity,
     privateProAuthError: null,
     privateProAppCheckToken: appCheckToken,
+    privateProDeviceId: DEVICE_ID,
   };
 }
 
@@ -146,12 +159,16 @@ describe('private Pro vault router authorization', () => {
 
   test('allows the current entitled caller and derives UID only from context', async () => {
     state.account = account();
+    state.devices.set(DEVICE_ID, { deviceId: DEVICE_ID, keyVersion: 1, revokedAtMs: null });
     state.calls = [];
     const privateProVaultRouter = await router();
 
     await privateProVaultRouter.createCaller(context(identity())).getIndex({ pageSize: 1 });
 
-    assert.deepEqual(state.calls, [{ method: 'getIndex', uid: UID, input: { pageSize: 1 } }]);
+    assert.deepEqual(state.calls.slice(-2), [
+      { method: 'listDevices', uid: UID, input: undefined },
+      { method: 'getIndex', uid: UID, input: { pageSize: 1 } },
+    ]);
   });
 
   test('does not expose authorization storage errors', async () => {
@@ -173,6 +190,7 @@ describe('private Pro vault router input bounds', () => {
     const caller = (await router()).createCaller(context(identity()));
 
     await caller.bootstrap({ deviceId: DEVICE_ID });
+    await caller.listDevices();
     await caller.getIndex({ pageSize: 1 });
     await caller.getRecords({ opaqueRecordIds: [RECORD_ID] });
     await caller.putRecord({
@@ -195,9 +213,41 @@ describe('private Pro vault router input bounds', () => {
         deletedAtMs: 1,
       },
     });
-    await caller.putKeyset({ operationId: 'put-keyset-1', baseKeyVersion: 0, keyset: keyset(1) });
+    await caller.putKeyset({ operationId: 'put-keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
     await caller.commitMigration({ operationId: 'migration-1', migrationId: 'legacy-v1', basePhase: null, phase: 'complete' });
     await caller.revokeDevice({ operationId: 'revoke-device-1', deviceId: DEVICE_ID });
+  });
+
+  test('rejects missing, revoked, and stale-key devices from protected vault operations', async () => {
+    state.account = account();
+    const privateProVaultRouter = await router();
+
+    for (const device of [
+      null,
+      { deviceId: DEVICE_ID, keyVersion: 1, revokedAtMs: 5 },
+      { deviceId: DEVICE_ID, keyVersion: 2, revokedAtMs: null },
+    ]) {
+      state.devices.clear();
+      if (device) state.devices.set(DEVICE_ID, device);
+      const caller = privateProVaultRouter.createCaller(context(identity()));
+      await assert.rejects(caller.getIndex({ pageSize: 1 }), error => {
+        assert.equal((error as { code?: string }).code, 'FORBIDDEN');
+        return true;
+      });
+    }
+  });
+
+  test('registers the request device after the initial keyset commit', async () => {
+    state.account = account();
+    state.calls = [];
+    const caller = (await router()).createCaller(context(identity()));
+
+    await caller.putKeyset({ operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) });
+
+    assert.deepEqual(state.calls, [
+      { method: 'putKeyset', uid: UID, input: { operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) } },
+      { method: 'bootstrap', uid: UID, input: DEVICE_ID },
+    ]);
   });
 
   test('rejects UID injection, oversized pages/counts/ciphertext, and malformed operation IDs', async () => {
@@ -235,6 +285,7 @@ function keyset(keyVersion: number) {
   return {
     formatVersion: 1 as const,
     keyVersion,
+    wrappingVersion: 1,
     passwordEnvelope: {
       formatVersion: 1 as const,
       keyVersion,
