@@ -126,3 +126,26 @@ export function useScratchClipVisibility() {
   const isVisible = useScratchClipStore((state) => state.isVisible);
   return { isVisible, toggleVisibility: useScratchClipStore.getState().toggleVisibility };
 }
+
+
+/// Private vault adapters
+
+export interface ScratchClipVaultState {
+  history: ClipboardHistoryItem[];
+}
+
+export function scratchClipVaultSnapshot(): ScratchClipVaultState {
+  return { history: structuredClone(useScratchClipStore.getState().history) };
+}
+
+export function scratchClipVaultApply(value: ScratchClipVaultState): void {
+  useScratchClipStore.setState({ history: structuredClone(value.history) });
+}
+
+export function scratchClipVaultReset(): void {
+  useScratchClipStore.setState({ history: [] });
+}
+
+export function scratchClipVaultSubscribe(listener: () => void): () => void {
+  return useScratchClipStore.subscribe(listener);
+}

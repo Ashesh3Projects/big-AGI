@@ -11,13 +11,15 @@ import {
 
 
 function serializeMessage(message: DMessage) {
+  const generator = message.generator ? structuredClone(message.generator) : undefined;
+  if (generator) delete generator.metrics;
   return {
     id: message.id,
     role: message.role,
     fragments: structuredClone(message.fragments),
     ...(message.purposeId !== undefined && { purposeId: message.purposeId }),
     ...(message.metadata !== undefined && { metadata: structuredClone(message.metadata) }),
-    ...(message.generator !== undefined && { generator: structuredClone(message.generator) }),
+    ...(generator !== undefined && { generator }),
     ...(message.userFlags !== undefined && { userFlags: [...message.userFlags] }),
     tokenCount: message.tokenCount,
     created: message.created,

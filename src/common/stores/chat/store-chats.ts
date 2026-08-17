@@ -556,6 +556,7 @@ export function chatSyncSnapshot(): DConversation[] {
 }
 
 export function chatSyncUpsert(conversation: DConversation): void {
+  if (!_chatSyncEligible(conversation)) return;
   const synced = structuredClone(conversation);
   V4ToHeadConverters.inMemHeadCleanDConversations([synced]);
   useChatStore.setState(state => ({

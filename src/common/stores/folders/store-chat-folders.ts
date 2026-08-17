@@ -157,3 +157,29 @@ export function getRotatingFolderColor(): string {
   const randomIndex = Math.floor(Math.random() * (FOLDERS_COLOR_PALETTE.length / 3));
   return FOLDERS_COLOR_PALETTE[randomIndex];
 }
+
+
+/// Private vault adapters
+
+export function folderVaultSnapshot(): DFolder[] {
+  return structuredClone(useFolderStore.getState().folders);
+}
+
+export function folderVaultApply(folder: DFolder): void {
+  const synced = structuredClone(folder);
+  useFolderStore.setState(state => ({
+    folders: [...state.folders.filter(existing => existing.id !== synced.id), synced],
+  }));
+}
+
+export function folderVaultRemove(folderId: string): void {
+  useFolderStore.setState(state => ({ folders: state.folders.filter(folder => folder.id !== folderId) }));
+}
+
+export function folderVaultResetAll(): void {
+  useFolderStore.setState({ folders: [] });
+}
+
+export function folderVaultSubscribe(listener: () => void): () => void {
+  return useFolderStore.subscribe(listener);
+}

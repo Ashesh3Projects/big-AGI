@@ -304,3 +304,28 @@ export function asrxAreCredentialsValid(credentials: DASRxCredentialsAny): boole
       return !!vendor.csfAvailable?.(llmService.setup);
   }
 }
+
+
+/// Private vault adapters
+
+export interface ASRxVaultState {
+  engines: Record<DASRxEngineId, DASRxEngineAny>;
+  activeEngineId: DASRxEngineId | null;
+}
+
+export function asrxVaultSnapshot(): ASRxVaultState {
+  const { engines, activeEngineId } = useASRxStore.getState();
+  return structuredClone({ engines, activeEngineId });
+}
+
+export function asrxVaultApply(value: ASRxVaultState): void {
+  useASRxStore.setState({ ...structuredClone(value), hasInitializedLlms: true });
+}
+
+export function asrxVaultReset(): void {
+  useASRxStore.setState({ engines: {}, activeEngineId: null, hasInitializedLlms: true });
+}
+
+export function asrxVaultSubscribe(listener: () => void): () => void {
+  return useASRxStore.subscribe(listener);
+}

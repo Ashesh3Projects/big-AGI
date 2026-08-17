@@ -37,3 +37,29 @@ export const useGoogleSearchStore = create<ModuleGoogleSearchStore>()(
       name: 'app-module-google-search',
     }),
 );
+
+
+/// Private vault adapters
+
+export interface GoogleVaultState {
+  googleCloudApiKey: string;
+  googleCSEId: string;
+  restrictToDomain: string;
+}
+
+export function googleVaultSnapshot(): GoogleVaultState {
+  const { googleCloudApiKey, googleCSEId, restrictToDomain } = useGoogleSearchStore.getState();
+  return { googleCloudApiKey, googleCSEId, restrictToDomain };
+}
+
+export function googleVaultApply(value: GoogleVaultState): void {
+  useGoogleSearchStore.setState(structuredClone(value));
+}
+
+export function googleVaultReset(): void {
+  useGoogleSearchStore.setState({ googleCloudApiKey: '', googleCSEId: '', restrictToDomain: '' });
+}
+
+export function googleVaultSubscribe(listener: () => void): () => void {
+  return useGoogleSearchStore.subscribe(listener);
+}

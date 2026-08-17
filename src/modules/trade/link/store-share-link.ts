@@ -67,3 +67,26 @@ export const useLinkStorageOwnerId = () => useShareLinkStore(useShallow(state =>
 export function hasNoChatLinkItems() {
   return !useShareLinkStore.getState().chatLinkItems.length;
 }
+
+
+/// Private vault adapters
+
+export interface ShareVaultState {
+  chatLinkItems: SharedChatLinkItem[];
+}
+
+export function shareVaultSnapshot(): ShareVaultState {
+  return { chatLinkItems: structuredClone(useShareLinkStore.getState().chatLinkItems) };
+}
+
+export function shareVaultApply(value: ShareVaultState): void {
+  useShareLinkStore.setState({ chatLinkItems: structuredClone(value.chatLinkItems) });
+}
+
+export function shareVaultReset(): void {
+  useShareLinkStore.setState({ chatLinkItems: [] });
+}
+
+export function shareVaultSubscribe(listener: () => void): () => void {
+  return useShareLinkStore.subscribe(listener);
+}

@@ -375,3 +375,29 @@ export function speexAreCredentialsValid(credentials: DSpeexCredentialsAny): boo
   }
 }
 
+
+/// Private vault adapters
+
+export interface SpeexVaultState {
+  engines: Record<SpeexEngineId, DSpeexEngineAny>;
+  activeEngineId: SpeexEngineId | null;
+  ttsCharLimit: number | null;
+}
+
+export function speexVaultSnapshot(): SpeexVaultState {
+  const { engines, activeEngineId, ttsCharLimit } = useSpeexStore.getState();
+  return structuredClone({ engines, activeEngineId, ttsCharLimit });
+}
+
+export function speexVaultApply(value: SpeexVaultState): void {
+  useSpeexStore.setState({ ...structuredClone(value), hasInitializedLlms: true });
+}
+
+export function speexVaultReset(): void {
+  useSpeexStore.setState({ engines: {}, activeEngineId: null, ttsCharLimit: 4096, hasInitializedLlms: true });
+}
+
+export function speexVaultSubscribe(listener: () => void): () => void {
+  return useSpeexStore.subscribe(listener);
+}
+

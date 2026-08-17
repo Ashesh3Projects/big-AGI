@@ -287,3 +287,34 @@ export function useUICounter(key: KnownKeys, novelty: number = 1) {
 export function resetUICounter(key: KnownKeys) {
   useUIPreferencesStore.getState().resetActionCounter(key);
 }
+
+
+/// Private vault theme adapter
+
+export type ThemeVaultMode = 'light' | 'dark' | 'system';
+
+export function themeVaultSnapshot(): ThemeVaultMode {
+  if (typeof localStorage === 'undefined') return 'light';
+  const value = localStorage.getItem('joy-mode');
+  return value === 'light' || value === 'dark' || value === 'system' ? value : 'light';
+}
+
+export function themeVaultApply(mode: ThemeVaultMode): void {
+  if (typeof localStorage === 'undefined') return;
+  localStorage.setItem('joy-mode', mode);
+  if (typeof window !== 'undefined')
+    window.dispatchEvent(new StorageEvent('storage', { key: 'joy-mode', newValue: mode }));
+}
+
+export function themeVaultReset(): void {
+  themeVaultApply('light');
+}
+
+export function themeVaultSubscribe(listener: () => void): () => void {
+  if (typeof window === 'undefined') return () => undefined;
+  const handleStorage = (event: StorageEvent) => {
+    if (event.key === 'joy-mode') listener();
+  };
+  window.addEventListener('storage', handleStorage);
+  return () => window.removeEventListener('storage', handleStorage);
+}
