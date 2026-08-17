@@ -4,6 +4,7 @@ import { getPrivateProFirestore } from '../firebase/firebase.admin';
 import type {
   PrivateProVaultMigrationState,
   PrivateProVaultOperationReceipt,
+  PrivateProVaultRegistrationChallenge,
   PrivateProVaultRepository,
   PrivateProVaultRepositoryTransaction,
   PrivateProVaultStoredKeyset,
@@ -91,6 +92,19 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
   async listDevices() {
     const snapshot = await this.transaction.get(this.db.collection(`${vaultRoot(this.uid)}/devices`));
     return snapshot.docs.map(document => document.data() as PrivateProVaultStoredDevice);
+  }
+
+  async getRegistrationChallenge(challengeId: string) {
+    const snapshot = await this.transaction.get(this.db.doc(`${vaultRoot(this.uid)}/registrationChallenges/${challengeId}`));
+    return snapshot.exists ? snapshot.data() as PrivateProVaultRegistrationChallenge : null;
+  }
+
+  async createRegistrationChallenge(challenge: PrivateProVaultRegistrationChallenge) {
+    this.transaction.create(this.db.doc(`${vaultRoot(this.uid)}/registrationChallenges/${challenge.challengeId}`), challenge);
+  }
+
+  async deleteRegistrationChallenge(challengeId: string) {
+    this.transaction.delete(this.db.doc(`${vaultRoot(this.uid)}/registrationChallenges/${challengeId}`));
   }
 
   async getMigration(migrationId: string) {

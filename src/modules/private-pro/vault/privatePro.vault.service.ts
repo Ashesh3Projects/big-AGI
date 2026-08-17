@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
@@ -62,10 +62,18 @@ export interface RevokeVaultDeviceInput {
   deviceId: string;
 }
 
-export interface RegisterVaultDeviceInput {
+export interface BeginVaultDeviceRegistrationInput {
   deviceId: string;
   keyVersion: number;
+}
+
+export interface CompleteVaultDeviceRegistrationInput {
   operationId: string;
+  deviceId: string;
+  keyVersion: number;
+  challengeId: string;
+  challengeBase64: string;
+  expiresAtMs: number;
   signatureBase64: string;
 }
 
@@ -136,7 +144,11 @@ async function existingOperation(
   return repeatOutcome(existing.outcome);
 }
 
-export function createPrivateProVaultService(repository: PrivateProVaultRepository, now: () => number = Date.now) {
+export function createPrivateProVaultService(
+  repository: PrivateProVaultRepository,
+  now: () => number = Date.now,
+  random: (byteLength: number) => Uint8Array = byteLength => randomBytes(byteLength),
+) {
   return {
     async bootstrap(uid: string, deviceId: string) {
       assertUid(uid);
@@ -153,23 +165,70 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
       });
     },
 
-    async registerDevice(uid: string, input: RegisterVaultDeviceInput) {
+    async beginDeviceRegistration(uid: string, input: BeginVaultDeviceRegistrationInput) {
       assertUid(uid);
       assertOpaqueRecordId(input.deviceId, 'device ID');
-      assertOperationId(input.operationId);
       if (!Number.isSafeInteger(input.keyVersion) || input.keyVersion <= 0) throw new Error('Vault device key version is invalid.');
       return repository.transaction(uid, async transaction => {
         const storedKeyset = await transaction.getKeyset();
         if (!storedKeyset || storedKeyset.keyVersion !== input.keyVersion) throw new Error('Vault device key version is stale.');
         const existing = await transaction.getDevice(input.deviceId);
         if (existing?.revokedAtMs !== null && existing?.revokedAtMs !== undefined) throw new Error('Vault device is revoked.');
+        if (existing) throw new Error('Vault device is already registered.');
+        const challengeBytes = random(32);
+        if (challengeBytes.byteLength !== 32) throw new Error('Vault registration challenge generation failed.');
+        const challenge = {
+          formatVersion: 1 as const,
+          challengeId: Buffer.from(random(32)).toString('base64url'),
+          challengeBase64: Buffer.from(challengeBytes).toString('base64'),
+          deviceId: input.deviceId,
+          keyVersion: input.keyVersion,
+          expiresAtMs: now() + 5 * 60 * 1_000,
+        };
+        assertOpaqueRecordId(challenge.challengeId, 'registration challenge ID');
+        await transaction.createRegistrationChallenge(challenge);
+        return challenge;
+      });
+    },
+
+    async completeDeviceRegistration(uid: string, input: CompleteVaultDeviceRegistrationInput) {
+      assertUid(uid);
+      assertOpaqueRecordId(input.deviceId, 'device ID');
+      assertOpaqueRecordId(input.challengeId, 'registration challenge ID');
+      assertOperationId(input.operationId);
+      if (!Number.isSafeInteger(input.keyVersion) || input.keyVersion <= 0) throw new Error('Vault device key version is invalid.');
+      if (!Number.isSafeInteger(input.expiresAtMs) || input.expiresAtMs <= 0) throw new Error('Vault registration challenge expiry is invalid.');
+      if (!/^(?:[A-Za-z0-9+/]{4}){10}[A-Za-z0-9+/]{3}=$/.test(input.challengeBase64)
+        || Buffer.from(input.challengeBase64, 'base64').byteLength !== 32)
+        throw new Error('Vault registration challenge is invalid.');
+      return repository.transaction(uid, async transaction => {
         const requestFingerprint = fingerprint({ kind: 'register-device', ...input });
         const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
         if (repeated) return repeated as { status: 'unchanged'; device: Awaited<ReturnType<typeof transaction.getDevice>> & object };
-        if (!await verifyPrivateProVaultDeviceRegistration(storedKeyset.keyset.deviceRegistration.publicJwk, {
-          formatVersion: 1, uid, deviceId: input.deviceId, keyVersion: input.keyVersion, operationId: input.operationId,
+        const [storedKeyset, challenge, existing] = await Promise.all([
+          transaction.getKeyset(),
+          transaction.getRegistrationChallenge(input.challengeId),
+          transaction.getDevice(input.deviceId),
+        ]);
+        if (!storedKeyset || storedKeyset.keyVersion !== input.keyVersion) throw new Error('Vault device key version is stale.');
+        if (existing?.revokedAtMs !== null && existing?.revokedAtMs !== undefined) throw new Error('Vault device is revoked.');
+        if (!challenge
+          || challenge.deviceId !== input.deviceId
+          || challenge.keyVersion !== input.keyVersion
+          || challenge.challengeBase64 !== input.challengeBase64
+          || challenge.expiresAtMs !== input.expiresAtMs)
+          throw new Error('Vault registration challenge is invalid.');
+        if (challenge.expiresAtMs <= now()) throw new Error('Vault registration challenge expired.');
+        if (!await verifyPrivateProVaultDeviceRegistration(storedKeyset.keyset.enrollmentAuthority.publicJwk, {
+          formatVersion: 1,
+          uid,
+          deviceId: input.deviceId,
+          keyVersion: input.keyVersion,
+          challengeId: input.challengeId,
+          challengeBase64: input.challengeBase64,
+          expiresAtMs: input.expiresAtMs,
         }, input.signatureBase64)) throw new Error('Vault device registration proof is invalid.');
-        if (existing) return { status: 'registered' as const, device: existing };
+        if (existing) throw new Error('Vault device is already registered.');
         const timestamp = now();
         const device = {
           formatVersion: 1 as const,
@@ -180,6 +239,7 @@ export function createPrivateProVaultService(repository: PrivateProVaultReposito
           revokedAtMs: null,
         };
         await transaction.setDevice(device);
+        await transaction.deleteRegistrationChallenge(input.challengeId);
         await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome: { kind: 'device-registration', status: 'committed', device } });
         return { status: 'registered' as const, device };
       });

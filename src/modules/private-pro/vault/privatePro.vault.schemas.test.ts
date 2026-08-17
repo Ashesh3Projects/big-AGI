@@ -9,7 +9,7 @@ import {
   PRIVATE_PRO_VAULT_MAX_RECORD_CIPHERTEXT_BYTES,
   PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
   PrivateProVaultEnvelopeSchema,
-  PrivateProVaultDeviceRegistrationSchema,
+  PrivateProVaultEnrollmentAuthoritySchema,
   PrivateProVaultPasswordEnvelopeSchema,
 } from './privatePro.vault.schemas';
 
@@ -150,16 +150,21 @@ describe('private Pro vault schemas', () => {
         x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
         y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
       },
-      privateKeyEnvelope: { nonceBase64: 'AAECAwQFBgcICQoL', ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODw==', ciphertextBytes: 16 },
+      passwordEnvelope: { nonceBase64: 'AAECAwQFBgcICQoL', ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODw==', ciphertextBytes: 16 },
+      recoveryEnvelope: { nonceBase64: 'AAECAwQFBgcICQoL', ciphertextBase64: 'AAECAwQFBgcICQoLDA0ODw==', ciphertextBytes: 16 },
     };
-    assert.equal(PrivateProVaultDeviceRegistrationSchema.safeParse(valid).success, true);
-    assert.equal(PrivateProVaultDeviceRegistrationSchema.safeParse({
+    assert.equal(PrivateProVaultEnrollmentAuthoritySchema.safeParse(valid).success, true);
+    assert.equal(PrivateProVaultEnrollmentAuthoritySchema.safeParse({
       ...valid,
       publicJwk: { ...valid.publicJwk, d: 'private-material' },
     }).success, false);
-    assert.equal(PrivateProVaultDeviceRegistrationSchema.safeParse({
+    assert.equal(PrivateProVaultEnrollmentAuthoritySchema.safeParse({
       ...valid,
       publicJwk: { ...valid.publicJwk, crv: 'P-384' },
+    }).success, false);
+    assert.equal(PrivateProVaultEnrollmentAuthoritySchema.safeParse({
+      ...valid,
+      privateKeyEnvelope: valid.passwordEnvelope,
     }).success, false);
   });
 });

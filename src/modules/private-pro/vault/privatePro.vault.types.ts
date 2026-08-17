@@ -48,7 +48,7 @@ export interface PrivateProVaultRecoveryEnvelope extends PrivateProVaultWrappedK
   recoveryVersion: number;
 }
 
-export interface PrivateProVaultDeviceRegistration {
+export interface PrivateProVaultEnrollmentAuthority {
   algorithm: 'ECDSA-P256-SHA256';
   keyVersion: number;
   publicJwk: {
@@ -57,14 +57,15 @@ export interface PrivateProVaultDeviceRegistration {
     x: string;
     y: string;
   };
-  privateKeyEnvelope: PrivateProVaultWrappedKeyEnvelope;
+  passwordEnvelope: PrivateProVaultWrappedKeyEnvelope;
+  recoveryEnvelope: PrivateProVaultWrappedKeyEnvelope;
 }
 
 export interface PrivateProVaultKeyset {
   formatVersion: 1;
   keyVersion: number;
   wrappingVersion: number;
-  deviceRegistration: PrivateProVaultDeviceRegistration;
+  enrollmentAuthority: PrivateProVaultEnrollmentAuthority;
   passwordEnvelope: PrivateProVaultPasswordEnvelope;
   recoveryEnvelope: PrivateProVaultRecoveryEnvelope;
 }

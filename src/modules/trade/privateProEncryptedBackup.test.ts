@@ -7,6 +7,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { deriveVaultSubkey, decryptVaultRecord, encryptVaultRecord, importVaultMasterKey } from '../private-pro/vault/privatePro.vault.crypto';
 import { generateRecoveryKey } from '../private-pro/vault/privatePro.vault.recovery';
 import { rewrapPrivateProVaultPassword } from '../private-pro/vault/privatePro.vault.keyset';
+import { createPrivateProVaultEnrollmentAuthority } from '../private-pro/vault/privatePro.vault.registration';
 import {
   PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
 } from '../private-pro/vault/privatePro.vault.schemas';
@@ -104,6 +105,7 @@ async function fixture(): Promise<{
   }, new TextEncoder().encode(JSON.stringify({ serviceId: 'openai', apiKey: SENTINEL_API_KEY })));
 
   const passwordEnvelope = await wrapMasterKey(masterKeyBytes, await passwordWrappingKey(PASSWORD), 1);
+  const passwordWrapping = await passwordWrappingKey(PASSWORD);
   const recovery = generateRecoveryKey();
   const recoveryWrappingKey = await crypto.subtle.importKey(
     'raw',
@@ -113,22 +115,14 @@ async function fixture(): Promise<{
     ['wrapKey', 'unwrapKey'],
   );
   const recoveryEnvelope = await wrapMasterKey(masterKeyBytes, recoveryWrappingKey, 2);
+  const enrollmentAuthority = (await createPrivateProVaultEnrollmentAuthority(passwordWrapping, recoveryWrappingKey, VAULT_ID, 1)).authority;
   recovery.bytes.fill(0);
 
   const keyset: PrivateProVaultKeyset = {
     formatVersion: 1,
     keyVersion: 1,
     wrappingVersion: 1,
-    deviceRegistration: {
-      algorithm: 'ECDSA-P256-SHA256',
-      keyVersion: 1,
-      publicJwk: {
-        kty: 'EC', crv: 'P-256',
-        x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
-        y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
-      },
-      privateKeyEnvelope: { nonceBase64: bytesToBase64(new Uint8Array(12)), ciphertextBase64: bytesToBase64(new Uint8Array(16)), ciphertextBytes: 16 },
-    },
+    enrollmentAuthority,
     passwordEnvelope: {
       formatVersion: 1,
       keyVersion: 1,
@@ -260,7 +254,7 @@ describe('private Pro encrypted backup', () => {
     const { source } = await fixture();
     source.keyset = await withVaultPasswordWorker(
       realArgon2idWorkerResponse,
-      () => rewrapPrivateProVaultPassword(source.keyset, PASSWORD, 'new correct horse battery staple'),
+      () => rewrapPrivateProVaultPassword(source.keyset, PASSWORD, 'new correct horse battery staple', VAULT_ID),
     );
     assert.equal(source.keyset.keyVersion, 1);
     assert.equal(source.keyset.wrappingVersion, 2);

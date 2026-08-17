@@ -55,17 +55,31 @@ export function createPrivateProVaultRouter(
 
   listDevices: deviceProcedure.query(({ ctx }) => vaultCall(() => service().listDevices(ctx.privateProIdentity.uid))),
 
-  registerDevice: procedure
+  beginDeviceRegistration: procedure
+    .input(z.object({
+      deviceId: opaqueIdSchema,
+      keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+    }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => {
+      if (ctx.privateProDeviceId !== input.deviceId)
+        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
+      return service().beginDeviceRegistration(ctx.privateProIdentity.uid, input);
+    })),
+
+  completeDeviceRegistration: procedure
     .input(z.object({
       operationId: operationIdSchema,
       deviceId: opaqueIdSchema,
       keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
+      challengeId: opaqueIdSchema,
+      challengeBase64: z.string().min(44).max(44),
+      expiresAtMs: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       signatureBase64: z.string().min(1).max(256),
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => {
       if (ctx.privateProDeviceId !== input.deviceId)
         throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
-      return service().registerDevice(ctx.privateProIdentity.uid, input);
+      return service().completeDeviceRegistration(ctx.privateProIdentity.uid, input);
     })),
 
   getIndex: deviceProcedure

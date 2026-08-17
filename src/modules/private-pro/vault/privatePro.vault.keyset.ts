@@ -17,7 +17,11 @@ import type {
   PrivateProVaultRecoveryEnvelope,
   PrivateProVaultWrappedKeyEnvelope,
 } from './privatePro.vault.types';
-import { createPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
+import {
+  createPrivateProVaultEnrollmentAuthority,
+  rewrapPrivateProVaultEnrollmentPassword,
+  unlockPrivateProVaultEnrollmentKey,
+} from './privatePro.vault.registration';
 
 
 const WRAP_ALGORITHM = 'AES-GCM';
@@ -69,10 +73,10 @@ async function unwrapMasterKey(
   );
 }
 
-async function recoveryWrappingKey(recoveryKey: string, usage: 'wrapKey' | 'unwrapKey'): Promise<CryptoKey> {
+async function recoveryWrappingKey(recoveryKey: string, usages: KeyUsage[]): Promise<CryptoKey> {
   const bytes = parseRecoveryKey(recoveryKey);
   try {
-    return await crypto.subtle.importKey('raw', new Uint8Array(bytes), { name: WRAP_ALGORITHM, length: 256 }, false, [usage]);
+    return await crypto.subtle.importKey('raw', new Uint8Array(bytes), { name: WRAP_ALGORITHM, length: 256 }, false, usages);
   } finally {
     bytes.fill(0);
   }
@@ -89,17 +93,13 @@ async function passwordWrappingKey(password: string, keyset: PrivateProVaultKeys
       hash: 'SHA-256',
       salt: base64ToBytes(params.saltBase64),
       iterations: params.iterations,
-    }, passwordKey, { name: WRAP_ALGORITHM, length: 256 }, false, ['unwrapKey']);
+    }, passwordKey, { name: WRAP_ALGORITHM, length: 256 }, false, ['wrapKey', 'unwrapKey']);
   } finally {
     passwordBytes.fill(0);
   }
 }
 
-async function createPasswordEnvelope(
-  masterKeyBytes: Uint8Array<ArrayBuffer>,
-  password: string,
-  keyVersion: number,
-): Promise<PrivateProVaultPasswordEnvelope> {
+async function newPasswordWrapping(password: string) {
   const argon2 = {
     algorithm: 'argon2id' as const,
     memoryKiB: PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB,
@@ -112,7 +112,14 @@ async function createPasswordEnvelope(
     iterations: PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
     saltBase64: argon2.saltBase64,
   };
-  const wrapping = await derivePasswordWrappingKeyWithCompatibility(password, argon2, fallback);
+  return derivePasswordWrappingKeyWithCompatibility(password, argon2, fallback);
+}
+
+async function createPasswordEnvelope(
+  masterKeyBytes: Uint8Array<ArrayBuffer>,
+  wrapping: Awaited<ReturnType<typeof newPasswordWrapping>>,
+  keyVersion: number,
+): Promise<PrivateProVaultPasswordEnvelope> {
   return {
     formatVersion: 1,
     keyVersion,
@@ -131,13 +138,14 @@ async function createRecoveryEnvelope(
     formatVersion: 1,
     keyVersion,
     recoveryVersion,
-    ...await wrapMasterKeyBytes(masterKeyBytes, await recoveryWrappingKey(recoveryKey, 'wrapKey')),
+    ...await wrapMasterKeyBytes(masterKeyBytes, await recoveryWrappingKey(recoveryKey, ['wrapKey'])),
   };
 }
 
 export async function createPrivateProVaultKeyset(password: string, uid: string): Promise<{
   keyset: PrivateProVaultKeyset;
   masterKey: CryptoKey;
+  enrollmentKey: CryptoKey;
   recoveryKey: string;
 }> {
   const masterKeyBytes = new Uint8Array(generateVaultMasterKeyBytes());
@@ -145,15 +153,18 @@ export async function createPrivateProVaultKeyset(password: string, uid: string)
   try {
     const keyVersion = 1;
     const masterKey = await importVaultMasterKey(masterKeyBytes);
+    const passwordWrapping = await newPasswordWrapping(password);
+    const recoveryWrapping = await recoveryWrappingKey(recovery.display, ['wrapKey']);
+    const enrollment = await createPrivateProVaultEnrollmentAuthority(passwordWrapping.key, recoveryWrapping, uid, keyVersion);
     const keyset = PrivateProVaultKeysetSchema.parse({
       formatVersion: 1,
       keyVersion,
       wrappingVersion: 1,
-      deviceRegistration: await createPrivateProVaultDeviceRegistration(masterKey, uid, keyVersion),
-      passwordEnvelope: await createPasswordEnvelope(masterKeyBytes, password, keyVersion),
+      enrollmentAuthority: enrollment.authority,
+      passwordEnvelope: await createPasswordEnvelope(masterKeyBytes, passwordWrapping, keyVersion),
       recoveryEnvelope: await createRecoveryEnvelope(masterKeyBytes, recovery.display, keyVersion, 1),
     });
-    return { keyset, masterKey, recoveryKey: recovery.display };
+    return { keyset, masterKey, enrollmentKey: enrollment.privateKey, recoveryKey: recovery.display };
   } finally {
     masterKeyBytes.fill(0);
     recovery.bytes.fill(0);
@@ -171,12 +182,44 @@ export async function unlockPrivateProVaultWithPassword(
   }
 }
 
+export async function unlockPrivateProVaultCredentialsWithPassword(
+  keyset: PrivateProVaultKeyset,
+  password: string,
+  uid: string,
+): Promise<{ masterKey: CryptoKey; enrollmentKey: CryptoKey }> {
+  try {
+    const wrappingKey = await passwordWrappingKey(password, keyset);
+    return {
+      masterKey: await unwrapMasterKey(keyset.passwordEnvelope, wrappingKey),
+      enrollmentKey: await unlockPrivateProVaultEnrollmentKey(keyset.enrollmentAuthority, 'password', wrappingKey, uid, keyset.keyVersion),
+    };
+  } catch {
+    throw new Error('Vault password or recovery key is incorrect.');
+  }
+}
+
 export async function unlockPrivateProVaultWithRecovery(
   keyset: PrivateProVaultKeyset,
   recoveryKey: string,
 ): Promise<CryptoKey> {
   try {
-    return await unwrapMasterKey(keyset.recoveryEnvelope, await recoveryWrappingKey(recoveryKey, 'unwrapKey'));
+    return await unwrapMasterKey(keyset.recoveryEnvelope, await recoveryWrappingKey(recoveryKey, ['unwrapKey']));
+  } catch {
+    throw new Error('Vault password or recovery key is incorrect.');
+  }
+}
+
+export async function unlockPrivateProVaultCredentialsWithRecovery(
+  keyset: PrivateProVaultKeyset,
+  recoveryKey: string,
+  uid: string,
+): Promise<{ masterKey: CryptoKey; enrollmentKey: CryptoKey }> {
+  try {
+    const wrappingKey = await recoveryWrappingKey(recoveryKey, ['unwrapKey']);
+    return {
+      masterKey: await unwrapMasterKey(keyset.recoveryEnvelope, wrappingKey),
+      enrollmentKey: await unlockPrivateProVaultEnrollmentKey(keyset.enrollmentAuthority, 'recovery', wrappingKey, uid, keyset.keyVersion),
+    };
   } catch {
     throw new Error('Vault password or recovery key is incorrect.');
   }
@@ -186,18 +229,20 @@ export async function rewrapPrivateProVaultPassword(
   keyset: PrivateProVaultKeyset,
   currentPassword: string,
   newPassword: string,
+  uid: string,
 ): Promise<PrivateProVaultKeyset> {
   const currentWrappingKey = await passwordWrappingKey(currentPassword, keyset);
-  return rewrapPrivateProVaultPasswordWithKey(keyset, currentWrappingKey, keyset.passwordEnvelope, newPassword);
+  return rewrapPrivateProVaultPasswordWithKey(keyset, currentWrappingKey, keyset.passwordEnvelope, newPassword, uid, 'password');
 }
 
 export async function rewrapPrivateProVaultPasswordWithRecovery(
   keyset: PrivateProVaultKeyset,
   recoveryKey: string,
   newPassword: string,
+  uid: string,
 ): Promise<PrivateProVaultKeyset> {
-  const currentWrappingKey = await recoveryWrappingKey(recoveryKey, 'unwrapKey');
-  return rewrapPrivateProVaultPasswordWithKey(keyset, currentWrappingKey, keyset.recoveryEnvelope, newPassword);
+  const currentWrappingKey = await recoveryWrappingKey(recoveryKey, ['unwrapKey']);
+  return rewrapPrivateProVaultPasswordWithKey(keyset, currentWrappingKey, keyset.recoveryEnvelope, newPassword, uid, 'recovery');
 }
 
 async function rewrapPrivateProVaultPasswordWithKey(
@@ -205,21 +250,11 @@ async function rewrapPrivateProVaultPasswordWithKey(
   currentWrappingKey: CryptoKey,
   currentEnvelope: PrivateProVaultWrappedKeyEnvelope,
   newPassword: string,
+  uid: string,
+  currentCredential: 'password' | 'recovery',
 ): Promise<PrivateProVaultKeyset> {
   const wrappingVersion = keyset.wrappingVersion + 1;
-  const passwordKdf = {
-    algorithm: 'argon2id' as const,
-    memoryKiB: PRIVATE_PRO_VAULT_ARGON2ID_MIN_MEMORY_KIB,
-    iterations: PRIVATE_PRO_VAULT_ARGON2ID_MIN_ITERATIONS,
-    parallelism: PRIVATE_PRO_VAULT_ARGON2ID_MIN_PARALLELISM,
-    saltBase64: randomBase64(16),
-  };
-  const fallback = {
-    algorithm: 'pbkdf2-sha256' as const,
-    iterations: PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
-    saltBase64: passwordKdf.saltBase64,
-  };
-  const passwordWrapping = await derivePasswordWrappingKeyWithCompatibility(newPassword, passwordKdf, fallback);
+  const passwordWrapping = await newPasswordWrapping(newPassword);
   try {
     const transientMasterKey = await crypto.subtle.unwrapKey(
       'raw',
@@ -248,7 +283,14 @@ async function rewrapPrivateProVaultPasswordWithKey(
         ciphertextBytes: passwordCiphertext.byteLength,
       },
       recoveryEnvelope: keyset.recoveryEnvelope,
-      deviceRegistration: keyset.deviceRegistration,
+      enrollmentAuthority: await rewrapPrivateProVaultEnrollmentPassword(
+        keyset.enrollmentAuthority,
+        currentWrappingKey,
+        passwordWrapping.key,
+        uid,
+        keyset.keyVersion,
+        currentCredential,
+      ),
     });
   } catch {
     throw new Error('Vault password or recovery key is incorrect.');

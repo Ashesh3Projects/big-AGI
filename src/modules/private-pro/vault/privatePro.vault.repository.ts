@@ -33,6 +33,15 @@ export interface PrivateProVaultStoredKeyset {
 
 export type PrivateProVaultStoredDevice = PrivateProVaultDeviceMetadata;
 
+export interface PrivateProVaultRegistrationChallenge {
+  formatVersion: 1;
+  challengeId: string;
+  challengeBase64: string;
+  deviceId: string;
+  keyVersion: number;
+  expiresAtMs: number;
+}
+
 export type PrivateProVaultMigrationPhase = string;
 
 export interface PrivateProVaultMigrationState {
@@ -84,6 +93,9 @@ export interface PrivateProVaultRepositoryTransaction {
   getDevice(deviceId: string): Promise<PrivateProVaultStoredDevice | null>;
   setDevice(device: PrivateProVaultStoredDevice): Promise<void>;
   listDevices(): Promise<PrivateProVaultStoredDevice[]>;
+  getRegistrationChallenge(challengeId: string): Promise<PrivateProVaultRegistrationChallenge | null>;
+  createRegistrationChallenge(challenge: PrivateProVaultRegistrationChallenge): Promise<void>;
+  deleteRegistrationChallenge(challengeId: string): Promise<void>;
   getMigration(migrationId: string): Promise<PrivateProVaultMigrationState | null>;
   setMigration(migration: PrivateProVaultMigrationState): Promise<void>;
 }

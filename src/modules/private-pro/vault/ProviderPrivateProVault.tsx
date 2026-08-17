@@ -22,8 +22,8 @@ import {
   restorePrivateProRememberedUnlock,
   rewrapPrivateProVaultPassword,
   rewrapPrivateProVaultPasswordWithRecovery,
-  unlockPrivateProVaultWithPassword,
-  unlockPrivateProVaultWithRecovery,
+  unlockPrivateProVaultCredentialsWithPassword,
+  unlockPrivateProVaultCredentialsWithRecovery,
 } from './privatePro.vault.keyset';
 import { createPrivateProVaultSerializers } from './privatePro.vault.serializers';
 import { privateProVaultSession } from './privatePro.vault.session';
@@ -31,7 +31,7 @@ import { createPrivateProVaultStore, privateProVaultStore, type PrivateProVaultP
 import { createPrivateProVaultTransport } from './privatePro.vault.transport';
 import type { PrivateProVaultDeviceMetadata, PrivateProVaultKeyset } from './privatePro.vault.types';
 import { clearPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
-import { signPrivateProVaultDeviceRegistration, unlockPrivateProVaultDeviceRegistrationKey } from './privatePro.vault.registration';
+import { signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 
 
 export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'migrating' | 'error';
@@ -44,17 +44,17 @@ export interface PrivateProVaultPublicState {
   recoveryKey: string | null;
 }
 
-export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey> {
+export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnrollmentKey = unknown> {
   isOnline(): boolean;
-  bootstrap(): Promise<{ keyset: TKeyset | null }>;
+  bootstrap(): Promise<{ keyset: TKeyset | null; rememberedDeviceKnown: boolean }>;
   restoreRemembered(keyset: TKeyset): Promise<TMasterKey | null>;
-  unlockPassword(keyset: TKeyset, password: string): Promise<TMasterKey>;
-  unlockRecovery(keyset: TKeyset, recoveryKey: string, newPassword: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey }>;
+  unlockPassword(keyset: TKeyset, password: string): Promise<{ masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
+  unlockRecovery(keyset: TKeyset, recoveryKey: string, newPassword: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
   commitRecovery(previousKeyset: TKeyset, rotatedKeyset: TKeyset): Promise<'committed' | 'conflict'>;
-  setup(password: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; recoveryKey: string }>;
+  setup(password: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; recoveryKey: string }>;
   commitSetup(keyset: TKeyset, operationId: string): Promise<'committed' | 'conflict'>;
   remember(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
-  register(keyset: TKeyset): Promise<void>;
+  register(keyset: TKeyset, enrollmentKey: TEnrollmentKey): Promise<void>;
   activate(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
   subscribeRuntime(listener: (phase: 'ready' | 'reconnecting' | 'migrating' | 'error') => void): () => void;
   logout(): Promise<void>;
@@ -111,14 +111,14 @@ function errorForPhase(phase: PrivateProVaultPublicPhase): string {
   return 'The encrypted vault could not be opened.';
 }
 
-export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
-  deps: PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey>,
+export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentKey>(
+  deps: PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnrollmentKey>,
 ): PrivateProVaultLifecycle {
   let state = INITIAL_STATE;
   let keyset: TKeyset | null = null;
   let masterKey: TMasterKey | null = null;
   let activationReady = false;
-  let pendingSetup: { keyset: TKeyset; masterKey: TMasterKey; recoveryKey: string; operationId: string } | null = null;
+  let pendingSetup: { keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; recoveryKey: string; operationId: string } | null = null;
   let confirmation: Promise<void> | null = null;
   let destroyed = false;
   let unsubscribeRuntime: (() => void) | undefined;
@@ -168,6 +168,10 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
       keyset = bootstrap.keyset;
       if (!keyset) {
         setState({ phase: 'setup', busy: false, error: null });
+        return;
+      }
+      if (!bootstrap.rememberedDeviceKnown) {
+        setState({ phase: 'locked', busy: false, error: null });
         return;
       }
       const remembered = await deps.restoreRemembered(keyset);
@@ -220,7 +224,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
             return;
           }
           await deps.remember(pending.masterKey, pending.keyset);
-          await deps.register(pending.keyset);
+          await deps.register(pending.keyset, pending.enrollmentKey);
           await deps.activate(pending.masterKey, pending.keyset);
           masterKey = pending.masterKey;
           keyset = pending.keyset;
@@ -241,9 +245,9 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
       setState({ phase: 'locked', busy: true, error: null });
       try {
         const unlocked = await deps.unlockPassword(keyset, password);
-        await deps.remember(unlocked, keyset);
-        await deps.register(keyset);
-        await activate(unlocked, keyset);
+        await deps.remember(unlocked.masterKey, keyset);
+        await deps.register(keyset, unlocked.enrollmentKey);
+        await activate(unlocked.masterKey, keyset);
       } catch {
         setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
       }
@@ -261,7 +265,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey>(
         if (commit === 'conflict') throw new Error('Vault keyset changed.');
         keyset = unlocked.keyset;
         await deps.remember(unlocked.masterKey, unlocked.keyset);
-        await deps.register(unlocked.keyset);
+        await deps.register(unlocked.keyset, unlocked.enrollmentKey);
         await activate(unlocked.masterKey, unlocked.keyset);
       } catch {
         setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
@@ -292,7 +296,7 @@ function createProductionDependencies(
   user: User,
   signOut: () => Promise<void>,
   runtime: { engine: PrivateProVaultEngine | null; keyset: PrivateProVaultKeyset | null; masterKey: CryptoKey | null; devices: PrivateProVaultDeviceMetadata[] },
-): PrivateProVaultLifecycleDependencies<PrivateProVaultKeyset, CryptoKey> {
+): PrivateProVaultLifecycleDependencies<PrivateProVaultKeyset, CryptoKey, CryptoKey> {
   let deviceId = '';
   return {
     isOnline: () => typeof navigator === 'undefined' || navigator.onLine,
@@ -301,7 +305,10 @@ function createProductionDependencies(
       const result = await apiAsyncNode.privateProVault.bootstrap.mutate({ deviceId });
       runtime.devices = [];
       runtime.keyset = result.keyset?.keyset ?? null;
-      return { keyset: runtime.keyset };
+      return {
+        keyset: runtime.keyset,
+        rememberedDeviceKnown: !!result.device && result.device.revokedAtMs === null && result.device.keyVersion === result.keyset?.keyset.keyVersion,
+      };
     },
     async restoreRemembered(keyset) {
       const [deviceKey, wrapped] = await Promise.all([
@@ -320,11 +327,11 @@ function createProductionDependencies(
         return null;
       }
     },
-    unlockPassword: unlockPrivateProVaultWithPassword,
+    unlockPassword: (keyset, password) => unlockPrivateProVaultCredentialsWithPassword(keyset, password, user.uid),
     async unlockRecovery(keyset, recoveryKey, newPassword) {
-      const masterKey = await unlockPrivateProVaultWithRecovery(keyset, recoveryKey);
-      const rotated = await rewrapPrivateProVaultPasswordWithRecovery(keyset, recoveryKey, newPassword);
-      return { keyset: rotated, masterKey };
+      const credentials = await unlockPrivateProVaultCredentialsWithRecovery(keyset, recoveryKey, user.uid);
+      const rotated = await rewrapPrivateProVaultPasswordWithRecovery(keyset, recoveryKey, newPassword, user.uid);
+      return { keyset: rotated, ...credentials };
     },
     async commitRecovery(keyset, rotated) {
       const result = await apiAsyncNode.privateProVault.putKeyset.mutate({
@@ -358,16 +365,15 @@ function createProductionDependencies(
       runtime.masterKey = masterKey;
       runtime.keyset = keyset;
     },
-    async register(keyset) {
+    async register(keyset, enrollmentKey) {
       const existing = await apiAsyncNode.privateProVault.bootstrap.mutate({ deviceId });
       if (existing.device && existing.device.revokedAtMs === null && existing.device.keyVersion === keyset.keyVersion) return;
-      if (!runtime.masterKey) throw new Error('Vault master key is unavailable.');
       const operationId = `register-${crypto.randomUUID()}`;
-      const privateKey = await unlockPrivateProVaultDeviceRegistrationKey(runtime.masterKey, user.uid, keyset.deviceRegistration, keyset.keyVersion);
-      const signatureBase64 = await signPrivateProVaultDeviceRegistration(privateKey, {
-        formatVersion: 1, uid: user.uid, deviceId, keyVersion: keyset.keyVersion, operationId,
+      const challenge = await apiAsyncNode.privateProVault.beginDeviceRegistration.mutate({ deviceId, keyVersion: keyset.keyVersion });
+      const signatureBase64 = await signPrivateProVaultDeviceRegistration(enrollmentKey, {
+        uid: user.uid, ...challenge,
       });
-      await apiAsyncNode.privateProVault.registerDevice.mutate({ operationId, deviceId, keyVersion: keyset.keyVersion, signatureBase64 });
+      await apiAsyncNode.privateProVault.completeDeviceRegistration.mutate({ operationId, ...challenge, signatureBase64 });
     },
     async activate(masterKey, keyset) {
       await runtime.engine?.stopAndWait();
@@ -454,7 +460,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     const runtime = runtimeRef.current;
     if (!runtime.masterKey || !runtime.keyset || !privateProVaultPasswordStrength(newPassword).acceptable)
       throw new Error('Use at least 14 characters.');
-    const rotated = await rewrapPrivateProVaultPassword(runtime.keyset, currentPassword, newPassword);
+    const rotated = await rewrapPrivateProVaultPassword(runtime.keyset, currentPassword, newPassword, auth.user!.uid);
     const result = await apiAsyncNode.privateProVault.putKeyset.mutate({
       operationId: `password-${crypto.randomUUID()}`,
       baseWrappingVersion: runtime.keyset.wrappingVersion,
@@ -462,7 +468,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     });
     if (result.status === 'conflict') throw new Error('The vault changed on another device. Reconnect and try again.');
     runtime.keyset = rotated;
-  }, []);
+  }, [auth.user]);
 
   const createEncryptedExport = React.useCallback(async () => {
     const runtime = runtimeRef.current;

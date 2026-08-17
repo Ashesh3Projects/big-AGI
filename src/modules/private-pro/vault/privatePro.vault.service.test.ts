@@ -7,6 +7,7 @@ import {
   mergePrivateProVaultIndexEntries,
   type PrivateProVaultMigrationState,
   type PrivateProVaultOperationReceipt,
+  type PrivateProVaultRegistrationChallenge,
   type PrivateProVaultRepository,
   type PrivateProVaultRepositoryTransaction,
   type PrivateProVaultStoredKeyset,
@@ -15,8 +16,7 @@ import {
   type PrivateProVaultStoredTombstone,
 } from './privatePro.vault.repository';
 import { createPrivateProVaultService } from './privatePro.vault.service';
-import { importVaultMasterKey } from './privatePro.vault.crypto';
-import { createPrivateProVaultDeviceRegistration, signPrivateProVaultDeviceRegistration, unlockPrivateProVaultDeviceRegistrationKey } from './privatePro.vault.registration';
+import { createPrivateProVaultEnrollmentAuthority, signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 import type {
   PrivateProVaultEnvelope,
   PrivateProVaultKeyset,
@@ -64,7 +64,7 @@ function keyset(keyVersion: number, wrappingVersion = keyVersion): PrivateProVau
     formatVersion: 1,
     keyVersion,
     wrappingVersion,
-    deviceRegistration: {
+    enrollmentAuthority: {
       algorithm: 'ECDSA-P256-SHA256',
       keyVersion,
       publicJwk: {
@@ -72,7 +72,8 @@ function keyset(keyVersion: number, wrappingVersion = keyVersion): PrivateProVau
         x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
         y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
       },
-      privateKeyEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
+      passwordEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
+      recoveryEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
     },
     passwordEnvelope: {
       formatVersion: 1,
@@ -115,6 +116,7 @@ interface MemoryVault {
   operations: Map<string, PrivateProVaultOperationReceipt>;
   keyset: PrivateProVaultStoredKeyset | null;
   devices: Map<string, PrivateProVaultStoredDevice>;
+  registrationChallenges: Map<string, PrivateProVaultRegistrationChallenge>;
   migrations: Map<string, PrivateProVaultMigrationState>;
 }
 
@@ -130,6 +132,7 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         operations: new Map(),
         keyset: null,
         devices: new Map(),
+        registrationChallenges: new Map(),
         migrations: new Map(),
       };
       this.vaults.set(uid, vault);
@@ -156,6 +159,12 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
       getDevice: async deviceId => clone(vault.devices.get(deviceId) ?? null),
       setDevice: async device => { vault.devices.set(device.deviceId, clone(device)); },
       listDevices: async () => clone([...vault.devices.values()]),
+      getRegistrationChallenge: async challengeId => clone(vault.registrationChallenges.get(challengeId) ?? null),
+      createRegistrationChallenge: async challenge => {
+        if (vault.registrationChallenges.has(challenge.challengeId)) throw new Error('Registration challenge already exists.');
+        vault.registrationChallenges.set(challenge.challengeId, clone(challenge));
+      },
+      deleteRegistrationChallenge: async challengeId => { vault.registrationChallenges.delete(challengeId); },
       getMigration: async migrationId => clone(vault.migrations.get(migrationId) ?? null),
       setMigration: async migration => { vault.migrations.set(migration.migrationId, clone(migration)); },
     };
@@ -199,24 +208,18 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
 function serviceFixture() {
   const repository = new MemoryVaultRepository();
   let now = 1_000;
-  const service = createPrivateProVaultService(repository, () => now++);
-  return { repository, service };
+  let randomFill = 1;
+  const service = createPrivateProVaultService(repository, () => now++, byteLength => new Uint8Array(byteLength).fill(randomFill++));
+  return { repository, service, setNow: (value: number) => { now = value; } };
 }
 
-async function registrationFixture(deviceId: string, operationId: string) {
-  const masterKey = await importVaultMasterKey(new Uint8Array(32).fill(0x42));
-  const deviceRegistration = await createPrivateProVaultDeviceRegistration(masterKey, UID_A, 1);
-  const privateKey = await unlockPrivateProVaultDeviceRegistrationKey(masterKey, UID_A, deviceRegistration, 1);
+async function registrationFixture() {
+  const passwordWrapping = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0x11), 'AES-GCM', false, ['wrapKey', 'unwrapKey']);
+  const recoveryWrapping = await crypto.subtle.importKey('raw', new Uint8Array(32).fill(0x22), 'AES-GCM', false, ['wrapKey', 'unwrapKey']);
+  const enrollment = await createPrivateProVaultEnrollmentAuthority(passwordWrapping, recoveryWrapping, UID_A, 1);
   return {
-    keyset: { ...keyset(1), deviceRegistration },
-    input: {
-      deviceId,
-      keyVersion: 1,
-      operationId,
-      signatureBase64: await signPrivateProVaultDeviceRegistration(privateKey, {
-        formatVersion: 1, uid: UID_A, deviceId, keyVersion: 1, operationId,
-      }),
-    },
+    keyset: { ...keyset(1), enrollmentAuthority: enrollment.authority },
+    privateKey: enrollment.privateKey,
   };
 }
 
@@ -446,73 +449,108 @@ describe('Private Pro encrypted vault service', () => {
   test('does not register an unknown device during bootstrap and preserves known revocation', async () => {
     const { service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-    const registration = await registrationFixture(deviceId, 'register-device-1');
+    const registration = await registrationFixture();
     await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: registration.keyset });
 
     assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
       keyset: { keyset: registration.keyset, serverUpdatedAtMs: 1_000 },
       device: null,
     });
-    assert.deepEqual(await service.registerDevice(UID_A, registration.input), {
+    const challenge = await service.beginDeviceRegistration(UID_A, { deviceId, keyVersion: 1 });
+    const input = {
+      operationId: 'register-device-1',
+      ...challenge,
+      signatureBase64: await signPrivateProVaultDeviceRegistration(registration.privateKey, { uid: UID_A, ...challenge }),
+    };
+    assert.deepEqual(await service.completeDeviceRegistration(UID_A, input), {
       status: 'registered',
       device: {
         formatVersion: 1,
         deviceId,
         keyVersion: 1,
-        createdAtMs: 1_001,
-        lastSeenAtMs: 1_001,
+        createdAtMs: 1_003,
+        lastSeenAtMs: 1_003,
         revokedAtMs: null,
       },
     });
     assert.deepEqual(await service.revokeDevice(UID_A, { operationId: 'revoke-device-1', deviceId }), {
       status: 'committed',
-      revokedAtMs: 1_002,
+      revokedAtMs: 1_004,
     });
-    await assert.rejects(service.registerDevice(UID_A, registration.input), /revoked/i);
+    await assert.rejects(service.beginDeviceRegistration(UID_A, { deviceId, keyVersion: 1 }), /revoked/i);
     assert.deepEqual(await service.bootstrap(UID_A, deviceId), {
       keyset: { keyset: registration.keyset, serverUpdatedAtMs: 1_000 },
       device: {
         formatVersion: 1,
         deviceId,
         keyVersion: 1,
-        createdAtMs: 1_001,
-        lastSeenAtMs: 1_001,
-        revokedAtMs: 1_002,
+        createdAtMs: 1_003,
+        lastSeenAtMs: 1_003,
+        revokedAtMs: 1_004,
       },
     });
     assert.deepEqual(await service.listDevices(UID_A), [{
       formatVersion: 1,
       deviceId,
       keyVersion: 1,
-      createdAtMs: 1_001,
-      lastSeenAtMs: 1_001,
-      revokedAtMs: 1_002,
+      createdAtMs: 1_003,
+      lastSeenAtMs: 1_003,
+      revokedAtMs: 1_004,
     }]);
   });
 
-  test('rejects unsigned, tampered, and operation-collision device registration', async () => {
-    const { service } = serviceFixture();
+  test('rejects challenge tampering, expiry, replay, and operation collisions', async () => {
+    const { service, setNow } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-    const registration = await registrationFixture(deviceId, 'register-device-proof');
+    const registration = await registrationFixture();
     await service.putKeyset(UID_A, { operationId: 'keyset-proof', baseWrappingVersion: 0, keyset: registration.keyset });
+    const challenge = await service.beginDeviceRegistration(UID_A, { deviceId, keyVersion: 1 });
+    const valid = {
+      operationId: 'register-device-proof',
+      ...challenge,
+      signatureBase64: await signPrivateProVaultDeviceRegistration(registration.privateKey, { uid: UID_A, ...challenge }),
+    };
 
-    await assert.rejects(service.registerDevice(UID_A, { ...registration.input, signatureBase64: '' }), /proof/i);
-    await assert.rejects(service.registerDevice(UID_A, { ...registration.input, deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }), /proof/i);
-    assert.equal((await service.registerDevice(UID_A, registration.input)).status, 'registered');
-    assert.equal((await service.registerDevice(UID_A, registration.input)).status, 'unchanged');
-    await assert.rejects(service.registerDevice(UID_A, { ...registration.input, deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }), /operation ID/i);
+    for (const tampered of [
+      { ...valid, deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' },
+      { ...valid, keyVersion: 2 },
+      { ...valid, challengeId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' },
+      { ...valid, challengeBase64: Buffer.alloc(32, 9).toString('base64') },
+      { ...valid, expiresAtMs: valid.expiresAtMs + 1 },
+      { ...valid, signatureBase64: '' },
+    ]) await assert.rejects(service.completeDeviceRegistration(UID_A, tampered), /challenge|proof|version/i);
+
+    const expiredChallenge = await service.beginDeviceRegistration(UID_A, { deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee', keyVersion: 1 });
+    const expired = {
+      operationId: 'register-device-expired',
+      ...expiredChallenge,
+      signatureBase64: await signPrivateProVaultDeviceRegistration(registration.privateKey, { uid: UID_A, ...expiredChallenge }),
+    };
+    setNow(expired.expiresAtMs);
+    await assert.rejects(service.completeDeviceRegistration(UID_A, expired), /expired/i);
+    setNow(2_000);
+
+    assert.equal((await service.completeDeviceRegistration(UID_A, valid)).status, 'registered');
+    assert.equal((await service.completeDeviceRegistration(UID_A, valid)).status, 'unchanged');
+    await assert.rejects(service.completeDeviceRegistration(UID_A, { ...valid, operationId: 'register-device-replay' }), /challenge/i);
+    await assert.rejects(service.completeDeviceRegistration(UID_A, { ...valid, deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' }), /operation ID/i);
   });
 
   test('makes device revocation idempotent without accepting device key material', async () => {
     const { repository, service } = serviceFixture();
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-    const registration = await registrationFixture(deviceId, 'register-device-idempotent');
+    const registration = await registrationFixture();
     await service.putKeyset(UID_A, { operationId: 'keyset-1', baseWrappingVersion: 0, keyset: registration.keyset });
-    await service.registerDevice(UID_A, registration.input);
+    const challenge = await service.beginDeviceRegistration(UID_A, { deviceId, keyVersion: 1 });
+    await service.completeDeviceRegistration(UID_A, {
+      operationId: 'register-device-idempotent',
+      ...challenge,
+      signatureBase64: await signPrivateProVaultDeviceRegistration(registration.privateKey, { uid: UID_A, ...challenge }),
+    });
     const input = { operationId: 'revoke-device-1', deviceId };
 
-    assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'committed', revokedAtMs: 1_002 });
-    assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'unchanged', revokedAtMs: 1_002 });
+    assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'committed', revokedAtMs: 1_004 });
+    assert.deepEqual(await service.revokeDevice(UID_A, input), { status: 'unchanged', revokedAtMs: 1_004 });
     const stored = await repository.transaction(UID_A, transaction => transaction.getDevice(deviceId));
     assert.ok(stored);
     assert.deepEqual(Object.keys(stored).sort(), ['createdAtMs', 'deviceId', 'formatVersion', 'keyVersion', 'lastSeenAtMs', 'revokedAtMs']);

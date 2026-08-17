@@ -12,6 +12,8 @@ const DEVICE_ID = 'ddddddddddddddddddddddddddddddddddddddddddd';
 const RECORD_ID = 'rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr';
 const NONCE_BASE64 = 'AAAAAAAAAAAAAAAA';
 const CIPHERTEXT_BASE64 = 'AAAAAAAAAAAAAAAAAAAAAA==';
+const CHALLENGE_ID = 'ccccccccccccccccccccccccccccccccccccccccccc';
+const CHALLENGE_BASE64 = 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=';
 
 const state: {
   account: PrivateProAccountRecord | null;
@@ -48,8 +50,12 @@ const service = {
       ...device,
     }));
   },
-  registerDevice: async (uid: string, input: { deviceId: string; keyVersion: number; operationId: string; signatureBase64: string }) => {
-    state.calls.push({ method: 'registerDevice', uid, input });
+  beginDeviceRegistration: async (uid: string, input: { deviceId: string; keyVersion: number }) => {
+    state.calls.push({ method: 'beginDeviceRegistration', uid, input });
+    return { formatVersion: 1 as const, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, ...input };
+  },
+  completeDeviceRegistration: async (uid: string, input: { deviceId: string; keyVersion: number; operationId: string; signatureBase64: string }) => {
+    state.calls.push({ method: 'completeDeviceRegistration', uid, input });
     state.devices.set(input.deviceId, { deviceId: input.deviceId, keyVersion: input.keyVersion, revokedAtMs: null });
     return { status: 'registered' as const, device: { formatVersion: 1 as const, createdAtMs: 1, lastSeenAtMs: 1, ...state.devices.get(input.deviceId)! } };
   },
@@ -196,7 +202,8 @@ describe('private Pro vault router input bounds', () => {
 
     await caller.bootstrap({ deviceId: DEVICE_ID });
     await caller.listDevices();
-    await caller.registerDevice({ operationId: 'register-device-1', deviceId: DEVICE_ID, keyVersion: 1, signatureBase64: 'AA==' });
+    await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
+    await caller.completeDeviceRegistration({ operationId: 'register-device-1', deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' });
     await caller.getIndex({ pageSize: 1 });
     await caller.getRecords({ opaqueRecordIds: [RECORD_ID] });
     await caller.putRecord({
@@ -249,11 +256,13 @@ describe('private Pro vault router input bounds', () => {
     const caller = (await router()).createCaller(context(identity()));
 
     await caller.putKeyset({ operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) });
-    await caller.registerDevice({ operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, signatureBase64: 'AA==' });
+    await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
+    await caller.completeDeviceRegistration({ operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' });
 
     assert.deepEqual(state.calls, [
       { method: 'putKeyset', uid: UID, input: { operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) } },
-      { method: 'registerDevice', uid: UID, input: { operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, signatureBase64: 'AA==' } },
+      { method: 'beginDeviceRegistration', uid: UID, input: { deviceId: DEVICE_ID, keyVersion: 1 } },
+      { method: 'completeDeviceRegistration', uid: UID, input: { operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' } },
     ]);
   });
 
@@ -261,7 +270,7 @@ describe('private Pro vault router input bounds', () => {
     state.account = account();
     const caller = (await router()).createCaller(context(identity()));
 
-    await assert.rejects(caller.registerDevice({ operationId: 'register-device-mismatch', deviceId: RECORD_ID, keyVersion: 1, signatureBase64: 'AA==' }), error => {
+    await assert.rejects(caller.beginDeviceRegistration({ deviceId: RECORD_ID, keyVersion: 1 }), error => {
       assert.equal((error as { code?: string }).code, 'FORBIDDEN');
       return true;
     });
@@ -303,7 +312,7 @@ function keyset(keyVersion: number) {
     formatVersion: 1 as const,
     keyVersion,
     wrappingVersion: 1,
-    deviceRegistration: {
+    enrollmentAuthority: {
       algorithm: 'ECDSA-P256-SHA256' as const,
       keyVersion,
       publicJwk: {
@@ -311,7 +320,8 @@ function keyset(keyVersion: number) {
         x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
         y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
       },
-      privateKeyEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
+      passwordEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
+      recoveryEnvelope: { nonceBase64: NONCE_BASE64, ciphertextBase64: CIPHERTEXT_BASE64, ciphertextBytes: 16 },
     },
     passwordEnvelope: {
       formatVersion: 1 as const,

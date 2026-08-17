@@ -20,16 +20,18 @@ import {
 } from './privatePro.vault.keyset';
 import { generateRecoveryKey } from './privatePro.vault.recovery';
 import { PRIVATE_PRO_PBKDF2_MIN_ITERATIONS } from './privatePro.vault.schemas';
-import type { PrivateProVaultKeyset } from './privatePro.vault.types';
+import type { PrivateProVaultEnrollmentAuthority, PrivateProVaultKeyset } from './privatePro.vault.types';
+import { createPrivateProVaultEnrollmentAuthority } from './privatePro.vault.registration';
 import { realArgon2idWorkerResponse, withVaultPasswordWorker } from '../../../../tools/private-pro/test-helpers/privatePro.vault.password.test-helpers';
 import { privateProClientConfig } from '../config/privatePro.config';
 import { getPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
 
 
 interface Harness {
-  deps: PrivateProVaultLifecycleDependencies<string, string>;
+  deps: PrivateProVaultLifecycleDependencies<string, string, string>;
   phases: PrivateProVaultLifecyclePhase[];
   operationIds: string[];
+  registrationKeys: string[];
   resolveApply?: () => void;
   runtimePhase(phase: 'ready' | 'reconnecting' | 'migrating' | 'error'): void;
   counts: {
@@ -49,6 +51,7 @@ interface Harness {
 function createHarness(options: {
   keyset?: string | null;
   rememberedKey?: string | null;
+  rememberedDeviceKnown?: boolean;
   online?: boolean;
   passwordError?: Error;
   recoveryError?: Error;
@@ -70,30 +73,34 @@ function createHarness(options: {
   };
   const phases: PrivateProVaultLifecyclePhase[] = [];
   const operationIds: string[] = [];
+  const registrationKeys: string[] = [];
   let runtimeListener: ((phase: 'ready' | 'reconnecting' | 'migrating' | 'error') => void) | undefined;
   let resolveApply: (() => void) | undefined;
 
-  const deps: PrivateProVaultLifecycleDependencies<string, string> = {
+  const deps: PrivateProVaultLifecycleDependencies<string, string, string> = {
     isOnline: () => options.online ?? true,
     bootstrap: async () => {
       counts.bootstrap++;
-      return { keyset: options.keyset === undefined ? 'keyset-1' : options.keyset };
+      return {
+        keyset: options.keyset === undefined ? 'keyset-1' : options.keyset,
+        rememberedDeviceKnown: options.rememberedDeviceKnown ?? true,
+      };
     },
     restoreRemembered: async () => options.rememberedKey === undefined ? null : options.rememberedKey,
     unlockPassword: async (_keyset, _password) => {
       counts.passwordUnlock++;
       if (options.passwordError) throw options.passwordError;
-      return 'password-master-key';
+      return { masterKey: 'password-master-key', enrollmentKey: 'password-enrollment-key' };
     },
     unlockRecovery: async (_keyset, _recoveryKey, _newPassword) => {
       counts.recoveryUnlock++;
       if (options.recoveryError) throw options.recoveryError;
-      return { keyset: 'keyset-2', masterKey: 'recovery-master-key' };
+      return { keyset: 'keyset-2', masterKey: 'recovery-master-key', enrollmentKey: 'recovery-enrollment-key' };
     },
     commitRecovery: async () => { counts.commitRecovery++; return 'committed'; },
     setup: async (_password) => {
       counts.setup++;
-      return { keyset: 'keyset-1', masterKey: 'setup-master-key', recoveryKey: 'AAAA-BBBB-CCCC-DDDD' };
+      return { keyset: 'keyset-1', masterKey: 'setup-master-key', enrollmentKey: 'setup-enrollment-key', recoveryKey: 'AAAA-BBBB-CCCC-DDDD' };
     },
     commitSetup: async (_keyset, operationId) => {
       counts.commitSetup++;
@@ -102,7 +109,7 @@ function createHarness(options: {
       return 'committed';
     },
     remember: async () => { counts.remember++; },
-    register: async () => { counts.register++; },
+    register: async (_keyset, enrollmentKey) => { counts.register++; registrationKeys.push(enrollmentKey); },
     activate: async () => {
       counts.activate++;
       if (options.activationError) throw options.activationError;
@@ -121,6 +128,7 @@ function createHarness(options: {
     deps,
     phases,
     operationIds,
+    registrationKeys,
     counts,
     get resolveApply() { return resolveApply; },
     runtimePhase: phase => runtimeListener?.(phase),
@@ -133,14 +141,14 @@ function bytesToBase64(bytes: Uint8Array): string {
   return btoa(binary);
 }
 
-async function pbkdf2WrappingKey(password: string, salt: Uint8Array<ArrayBuffer>, usage: 'wrapKey' | 'unwrapKey'): Promise<CryptoKey> {
+async function pbkdf2WrappingKey(password: string, salt: Uint8Array<ArrayBuffer>, usages: KeyUsage[]): Promise<CryptoKey> {
   const passwordKey = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
   return crypto.subtle.deriveKey({
     name: 'PBKDF2',
     hash: 'SHA-256',
     salt,
     iterations: PRIVATE_PRO_PBKDF2_MIN_ITERATIONS,
-  }, passwordKey, { name: 'AES-GCM', length: 256 }, false, [usage]);
+  }, passwordKey, { name: 'AES-GCM', length: 256 }, false, usages);
 }
 
 async function keysetFixture(password: string): Promise<{ keyset: PrivateProVaultKeyset; recoveryKey: string }> {
@@ -151,9 +159,11 @@ async function keysetFixture(password: string): Promise<{ keyset: PrivateProVaul
   const recovery = generateRecoveryKey();
   const passwordNonce = new Uint8Array(12).fill(0x22);
   const recoveryNonce = new Uint8Array(12).fill(0x33);
-  const recoveryWrapping = await crypto.subtle.importKey('raw', new Uint8Array(recovery.bytes), { name: 'AES-GCM', length: 256 }, false, ['wrapKey']);
+  const recoveryWrapping = await crypto.subtle.importKey('raw', new Uint8Array(recovery.bytes), { name: 'AES-GCM', length: 256 }, false, ['wrapKey', 'unwrapKey']);
+  const passwordWrapping = await pbkdf2WrappingKey(password, salt, ['wrapKey', 'unwrapKey']);
+  const enrollmentAuthority = (await createPrivateProVaultEnrollmentAuthority(passwordWrapping, recoveryWrapping, 'uid-test', 1)).authority;
   const passwordCiphertext = new Uint8Array(await crypto.subtle.wrapKey(
-    'raw', masterKey, await pbkdf2WrappingKey(password, salt, 'wrapKey'), { name: 'AES-GCM', iv: passwordNonce },
+    'raw', masterKey, passwordWrapping, { name: 'AES-GCM', iv: passwordNonce },
   ));
   const recoveryCiphertext = new Uint8Array(await crypto.subtle.wrapKey(
     'raw', masterKey, recoveryWrapping, { name: 'AES-GCM', iv: recoveryNonce },
@@ -166,16 +176,7 @@ async function keysetFixture(password: string): Promise<{ keyset: PrivateProVaul
       formatVersion: 1,
       keyVersion: 1,
       wrappingVersion: 1,
-      deviceRegistration: {
-        algorithm: 'ECDSA-P256-SHA256',
-        keyVersion: 1,
-        publicJwk: {
-          kty: 'EC', crv: 'P-256',
-          x: 'DQ9dV0Ox8qzTjqhmlAAmBQJuobtsfi7yGJmudlgj88o',
-          y: 'tFuyoZPxIC7Zy05p9pXoCDacjIlJlBNblHjZrDksE1c',
-        },
-        privateKeyEnvelope: { nonceBase64: bytesToBase64(new Uint8Array(12)), ciphertextBase64: bytesToBase64(new Uint8Array(16)), ciphertextBytes: 16 },
-      },
+      enrollmentAuthority,
       passwordEnvelope: {
         formatVersion: 1,
         keyVersion: 1,
@@ -221,6 +222,7 @@ describe('private Pro vault lifecycle', () => {
 
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.equal(lifecycle.getState().recoveryKey, null);
+    assert.deepEqual(harness.registrationKeys, ['setup-enrollment-key']);
   });
 
   test('failed setup confirmation preserves the recovery key and retry succeeds', async () => {
@@ -268,6 +270,18 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(harness.counts.passwordUnlock, 0);
     assert.equal(harness.counts.activate, 1);
     assert.equal(harness.counts.register, 0);
+    assert.deepEqual(harness.registrationKeys, []);
+  });
+
+  test('remembered unlock stays locked when bootstrap does not recognize the durable device ID', async () => {
+    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: 'remembered-master-key', rememberedDeviceKnown: false });
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+
+    assert.equal(lifecycle.getState().phase, 'locked');
+    assert.equal(harness.counts.activate, 0);
+    assert.equal(harness.counts.register, 0);
   });
 
   test('new devices unlock with the password and remember the device', async () => {
@@ -282,6 +296,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(harness.counts.passwordUnlock, 1);
     assert.equal(harness.counts.remember, 1);
     assert.equal(harness.counts.register, 1);
+    assert.deepEqual(harness.registrationKeys, ['password-enrollment-key']);
   });
 
   test('recovery keys unlock and expose no recovery secret in state', async () => {
@@ -296,6 +311,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(harness.counts.recoveryUnlock, 1);
     assert.equal(harness.counts.register, 1);
     assert.equal(harness.counts.commitRecovery, 1);
+    assert.deepEqual(harness.registrationKeys, ['recovery-enrollment-key']);
   });
 
   test('wrong passwords stay locked and return one secret-free failure', async () => {
@@ -525,10 +541,10 @@ describe('private Pro vault keyset lifecycle', () => {
   test('password rotation requires the current password and preserves recovery unlock', async () => {
     const { keyset, recoveryKey } = await keysetFixture('old vault password');
 
-    await assert.rejects(rewrapPrivateProVaultPassword(keyset, 'wrong vault password', 'new vault password long'));
+    await assert.rejects(rewrapPrivateProVaultPassword(keyset, 'wrong vault password', 'new vault password long', 'uid-test'));
     const rotated = await withVaultPasswordWorker(
       realArgon2idWorkerResponse,
-      () => rewrapPrivateProVaultPassword(keyset, 'old vault password', 'new vault password long'),
+      () => rewrapPrivateProVaultPassword(keyset, 'old vault password', 'new vault password long', 'uid-test'),
     );
 
     assert.equal(rotated.keyVersion, 1);
