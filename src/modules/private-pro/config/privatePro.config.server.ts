@@ -36,9 +36,10 @@ export interface PrivateProServerConfig {
   allowedEmails: ReadonlySet<string>;
   firebase: {
     projectId: string;
-    clientEmail: string;
-    privateKey: string;
+    clientEmail?: string;
+    privateKey?: string;
     storageBucket: string;
+    credentialSource: PrivateProFirebaseCredentialSource;
   };
   attachmentQuotaBytes: number;
   maxFileBytes: number;
@@ -49,6 +50,8 @@ export interface PrivateProServerConfig {
   };
   appCheckEnforced: boolean;
 }
+
+export type PrivateProFirebaseCredentialSource = 'application-default' | 'static-key-fallback';
 
 export interface PrivateProServerConfigInput {
   enabled: boolean;
@@ -61,6 +64,17 @@ export interface PrivateProServerConfigInput {
   appCheckSiteKey: string | undefined;
 }
 
+export function classifyPrivateProFirebaseCredentialSource(
+  clientEmail: string | undefined,
+  privateKey: string | undefined,
+): PrivateProFirebaseCredentialSource {
+  const hasClientEmail = !!clientEmail;
+  const hasPrivateKey = !!privateKey;
+  if (hasClientEmail !== hasPrivateKey)
+    throw new Error('FIREBASE_CLIENT_EMAIL and FIREBASE_PRIVATE_KEY must be provided together.');
+  return hasClientEmail ? 'static-key-fallback' : 'application-default';
+}
+
 export function parsePrivateProServerConfig(input: PrivateProServerConfigInput): PrivateProServerConfig {
   const allowedEmails = parsePrivateProAllowlist(input.allowedEmails);
   if (input.enabled && allowedEmails.size === 0)
@@ -70,14 +84,20 @@ export function parsePrivateProServerConfig(input: PrivateProServerConfigInput):
   if (input.enabled && input.nodeEnv === 'production' && !appCheckSiteKey)
     throw new Error('Firebase App Check is required when private Pro is enabled in production.');
 
+  const clientEmail = input.firebaseClientEmail?.trim() || undefined;
+  const expandedPrivateKey = (input.firebasePrivateKey ?? '').replaceAll('\\n', '\n');
+  const privateKey = expandedPrivateKey.trim() ? expandedPrivateKey : undefined;
+  const credentialSource = classifyPrivateProFirebaseCredentialSource(clientEmail, privateKey);
+
   return {
     enabled: input.enabled,
     allowedEmails,
     firebase: {
       projectId: input.firebaseProjectId ?? '',
-      clientEmail: input.firebaseClientEmail ?? '',
-      privateKey: (input.firebasePrivateKey ?? '').replaceAll('\\n', '\n'),
+      clientEmail,
+      privateKey,
       storageBucket: input.firebaseStorageBucket ?? '',
+      credentialSource,
     },
     attachmentQuotaBytes: PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
     maxFileBytes: PRIVATE_PRO_MAX_FILE_BYTES,

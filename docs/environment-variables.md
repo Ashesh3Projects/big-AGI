@@ -73,6 +73,9 @@ PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS=60000
 PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS=30
 PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES=268435456
 CRON_SECRET=
+# Optional audit identity hint for ADC/WIF. Not a credential.
+PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL=
+# Optional static-key fallback. Set both variables or neither.
 FIREBASE_CLIENT_EMAIL=
 FIREBASE_PRIVATE_KEY=
 
@@ -176,8 +179,9 @@ See [Private Pro Firebase deployment](deploy-private-pro-firebase.md) for the co
 | `PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS` | Maximum reservation requests per UID and window. Defaults to 30.                                 |
 | `PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES`  | Maximum requested upload bytes per UID and window. Defaults to 268435456 bytes.                    |
 | `CRON_SECRET`                        | Secret Vercel sends to the scheduled expired-reservation cleanup endpoint. Server-only.             |
-| `FIREBASE_CLIENT_EMAIL`              | Firebase Admin service-account email. Server-only.                                                  |
-| `FIREBASE_PRIVATE_KEY`               | Firebase Admin private key. Server-only. Supports escaped `\n` line breaks.                        |
+| `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL` | Optional dedicated runtime service-account email used by the security audit to identify ADC/WIF. Not a credential. |
+| `FIREBASE_CLIENT_EMAIL`              | Optional static-key fallback service-account email. Server-only. Must be paired with `FIREBASE_PRIVATE_KEY`. |
+| `FIREBASE_PRIVATE_KEY`               | Optional static-key fallback private key. Server-only. Must be paired with `FIREBASE_CLIENT_EMAIL`; supports escaped `\n`. |
 
 ### Frontend Variables
 

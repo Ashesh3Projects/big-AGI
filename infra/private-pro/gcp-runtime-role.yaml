@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "runtimeRole": {
+    "roleId": "privateProRuntime",
+    "title": "Private Pro Firebase runtime",
+    "description": "Mounted Private Pro Auth, Firestore, and Storage object calls only.",
+    "stage": "GA",
+    "includedPermissions": [
+      "datastore.databases.get",
+      "datastore.entities.create",
+      "datastore.entities.delete",
+      "datastore.entities.get",
+      "datastore.entities.list",
+      "datastore.entities.update",
+      "firebaseauth.users.get",
+      "firebaseauth.users.update",
+      "storage.objects.create",
+      "storage.objects.delete",
+      "storage.objects.get"
+    ]
+  },
+  "localVerification": [
+    {
+      "operation": "firebase-id-token",
+      "requiredIamPermissions": []
+    },
+    {
+      "operation": "firebase-app-check-token",
+      "requiredIamPermissions": []
+    }
+  ],
+  "signingBinding": {
+    "permission": "iam.serviceAccounts.signBlob",
+    "role": "roles/iam.serviceAccountTokenCreator",
+    "serviceAccount": "${RUNTIME_SERVICE_ACCOUNT_EMAIL}",
+    "member": "serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}",
+    "scope": "runtime-service-account-only"
+  },
+  "validation": {
+    "status": "unverified",
+    "requiredTask": 21,
+    "notes": "Provisioning and protected staging probes require explicit approval. Do not mutate IAM from this manifest automatically."
+  }
+}

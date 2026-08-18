@@ -13,6 +13,8 @@ import {
   classifyFirebaseRuleProbes,
   classifyHeaders,
   classifyIamRoles,
+  classifyRuntimeIdentity,
+  classifyRuntimeRoleManifest,
   classifyServiceAccountKeys,
   runCommand,
   selectRuntimeIdentity,
@@ -23,6 +25,8 @@ import {
   inspectDependencyAudit,
   inspectDeployment,
   inspectIamRoles,
+  inspectRuntimeIdentity,
+  inspectRuntimeRoleManifest,
   inspectServiceAccountKeys,
   inspectServiceAccountIamRoles,
   type AuditFinding,
@@ -116,9 +120,11 @@ describe('private Pro security audit classifiers', () => {
   });
 
   test('blocks broad Admin SDK roles and reports counts only', () => {
-    const findings = classifyIamRoles({ bindings: 3, broadAdmin: 1, owner: 0, editor: 0, serviceAccountUser: 1 });
+    const findings = classifyIamRoles({ bindings: 3, broadAdmin: 1, owner: 0, editor: 0, serviceAccountUser: 1, runtimeRole: 1, identityAttributed: true });
 
-    assert.deepEqual(severities(findings), ['pass', 'block', 'pass', 'pass', 'warn']);
+    assert.deepEqual(severities(findings), ['pass', 'pass', 'pass', 'block', 'pass', 'pass', 'block']);
+    assert.equal(inspectIamRoles({ bindings: [{ role: 'roles/firebase.sdkAdminServiceAgent' }] }).broadAdmin, 1);
+    assert.equal(inspectIamRoles({ bindings: [{ role: 'projects/sample-project/roles/privateProRuntime' }] }).broadAdmin, 0);
   });
 
   test('blocks stale service-account keys without key IDs', () => {
@@ -133,6 +139,89 @@ describe('private Pro security audit classifiers', () => {
     assert.deepEqual(selectRuntimeIdentity([], 'runtime@sample-project.iam.gserviceaccount.com'), { identityCount: 1, email: 'runtime@sample-project.iam.gserviceaccount.com' });
     assert.deepEqual(selectRuntimeIdentity([], 'runtime@sample-project.iam.gserviceaccount.com&whoami'), { identityCount: 0 });
     assert.equal(classifyServiceAccountKeys({ collectorReady: false, identityCount: 1, total: 0, userManaged: 0, stale: 0, disabled: 0 })[0].severity, 'block');
+  });
+
+  test('selects an explicit ADC runtime identity without requiring FIREBASE_CLIENT_EMAIL', () => {
+    assert.deepEqual(selectRuntimeIdentity([], {
+      runtimeServiceAccountEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+    }), {
+      credentialSource: 'application-default',
+      identityCount: 1,
+      email: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+      staticKeyFallback: false,
+      partialStaticCredentials: false,
+      identityExplicit: true,
+    });
+  });
+
+  test('warns for a complete static key fallback and blocks a partial pair', () => {
+    const fallback = inspectRuntimeIdentity([], {
+      staticClientEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+      staticPrivateKey: 'private-key-sentinel',
+    });
+    const partial = inspectRuntimeIdentity([], {
+      staticPrivateKey: 'private-key-sentinel',
+    });
+
+    assert.deepEqual(fallback, {
+      credentialSource: 'static-key-fallback',
+      identityCount: 1,
+      staticKeyFallback: true,
+      partialStaticCredentials: false,
+      identityExplicit: true,
+    });
+    assert.deepEqual(severities(classifyRuntimeIdentity(fallback)), ['pass', 'warn', 'pass']);
+    assert.deepEqual(severities(classifyRuntimeIdentity(partial)), ['block', 'pass', 'block']);
+    assert.doesNotMatch(JSON.stringify(buildAuditReport(classifyRuntimeIdentity(fallback))), /private-key-sentinel|sample-project|iam\.gserviceaccount/);
+  });
+
+  test('warns when ADC is selected but the runtime service account cannot be attributed', () => {
+    const facts = inspectRuntimeIdentity([], {});
+
+    assert.deepEqual(facts, {
+      credentialSource: 'application-default',
+      identityCount: 0,
+      staticKeyFallback: false,
+      partialStaticCredentials: false,
+      identityExplicit: false,
+    });
+    assert.deepEqual(severities(classifyRuntimeIdentity(facts)), ['warn', 'pass', 'pass']);
+    assert.deepEqual(severities(classifyIamRoles({
+      bindings: 0,
+      broadAdmin: 0,
+      owner: 0,
+      editor: 0,
+      serviceAccountUser: 0,
+      runtimeRole: 0,
+      identityAttributed: false,
+      credentialSource: 'application-default',
+    })), ['warn', 'warn', 'warn', 'pass', 'pass', 'pass', 'pass']);
+    assert.deepEqual(severities(classifyServiceAccountKeys({
+      collectorReady: false,
+      identityCount: 0,
+      total: 0,
+      userManaged: 0,
+      stale: 0,
+      disabled: 0,
+      credentialSource: 'application-default',
+      identityExplicit: false,
+    })), ['warn', 'warn', 'warn', 'pass', 'pass', 'pass']);
+  });
+
+  test('validates the exact runtime permission allowlist and separate signBlob binding', async () => {
+    const manifest = JSON.parse(await readFile('infra/private-pro/gcp-runtime-role.yaml', 'utf8')) as unknown;
+    const facts = inspectRuntimeRoleManifest(manifest);
+
+    assert.deepEqual(facts, {
+      readable: true,
+      missingRuntimePermissions: 0,
+      unexpectedRuntimePermissions: 0,
+      forbiddenRuntimePermissions: 0,
+      signBlobInRuntimeRole: 0,
+      signingBindingValid: true,
+      projectSpecificPrincipals: 0,
+    });
+    assert.equal(classifyRuntimeRoleManifest(facts).every(finding => finding.severity === 'pass'), true);
   });
 
   test('blocks critical or high production dependency advisories', () => {
@@ -188,6 +277,7 @@ describe('private Pro security audit classifiers', () => {
       owner: 0,
       editor: 0,
       serviceAccountUser: 0,
+      runtimeRole: 0,
     });
     assert.deepEqual(inspectServiceAccountIamRoles({ bindings: [
       { role: 'roles/firebase.admin', members: ['serviceAccount:runtime@example.iam.gserviceaccount.com'] },
@@ -198,6 +288,7 @@ describe('private Pro security audit classifiers', () => {
       owner: 0,
       editor: 0,
       serviceAccountUser: 0,
+      runtimeRole: 0,
     });
     assert.deepEqual(inspectServiceAccountKeys([
       { name: 'secret-key-id', keyType: 'USER_MANAGED', validAfterTime: '2025-01-01T00:00:00Z' },

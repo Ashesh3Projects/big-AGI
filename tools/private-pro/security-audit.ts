@@ -1,5 +1,5 @@
 import { execFile as execFileCallback } from 'node:child_process';
-import { access } from 'node:fs/promises';
+import { access, readFile } from 'node:fs/promises';
 import { delimiter, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -23,14 +23,44 @@ const BROAD_ADMIN_ROLES = new Set([
   'roles/owner',
   'roles/editor',
   'roles/firebase.admin',
+  'roles/firebase.sdkAdminServiceAgent',
   'roles/firebaseauth.admin',
   'roles/datastore.owner',
   'roles/storage.admin',
 ]);
 const SERVICE_ACCOUNT_USER_ROLES = new Set([
   'roles/iam.serviceAccountAdmin',
-  'roles/iam.serviceAccountTokenCreator',
   'roles/iam.serviceAccountUser',
+]);
+const RUNTIME_ROLE_ID = 'privateProRuntime';
+const RUNTIME_ROLE_MANIFEST_PATH = 'infra/private-pro/gcp-runtime-role.yaml';
+const PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS = new Set([
+  'datastore.databases.get',
+  'datastore.entities.create',
+  'datastore.entities.delete',
+  'datastore.entities.get',
+  'datastore.entities.list',
+  'datastore.entities.update',
+  'firebaseauth.users.get',
+  'firebaseauth.users.update',
+  'storage.objects.create',
+  'storage.objects.delete',
+  'storage.objects.get',
+]);
+const FORBIDDEN_RUNTIME_PERMISSIONS = new Set([
+  'apikeys.keys.create',
+  'apikeys.keys.delete',
+  'apikeys.keys.update',
+  'firebase.projects.update',
+  'firebaseauth.configs.update',
+  'firebaserules.releases.create',
+  'firebaserules.releases.delete',
+  'firebaserules.rulesets.create',
+  'firebaserules.rulesets.delete',
+  'resourcemanager.projects.setIamPolicy',
+  'storage.buckets.create',
+  'storage.buckets.delete',
+  'storage.buckets.setIamPolicy',
 ]);
 
 export type AuditSeverity = 'pass' | 'warn' | 'block';
@@ -107,6 +137,9 @@ interface IamRoleFacts {
   owner: number;
   editor: number;
   serviceAccountUser: number;
+  runtimeRole: number;
+  identityAttributed?: boolean;
+  credentialSource?: RuntimeIdentityFacts['credentialSource'];
 }
 
 interface ServiceAccountKeyFacts {
@@ -116,6 +149,30 @@ interface ServiceAccountKeyFacts {
   userManaged: number;
   stale: number;
   disabled: number;
+  credentialSource?: RuntimeIdentityFacts['credentialSource'];
+  identityExplicit?: boolean;
+}
+
+export interface RuntimeIdentityFacts {
+  credentialSource: 'application-default' | 'static-key-fallback' | 'invalid';
+  identityCount: number;
+  staticKeyFallback: boolean;
+  partialStaticCredentials: boolean;
+  identityExplicit: boolean;
+}
+
+interface RuntimeIdentitySelection extends RuntimeIdentityFacts {
+  email?: string;
+}
+
+export interface RuntimeRoleManifestFacts {
+  readable: boolean;
+  missingRuntimePermissions: number;
+  unexpectedRuntimePermissions: number;
+  forbiddenRuntimePermissions: number;
+  signBlobInRuntimeRole: number;
+  signingBindingValid: boolean;
+  projectSpecificPrincipals: number;
 }
 
 interface DependencyAuditFacts {
@@ -202,20 +259,47 @@ export function classifyAppCheck(facts: AppCheckFacts): AuditFinding[] {
 }
 
 export function classifyIamRoles(facts: IamRoleFacts): AuditFinding[] {
+  const adcUnattributed = facts.credentialSource === 'application-default' && facts.identityAttributed === false;
   return [
+    finding('iam', 'identityAttributed', facts.identityAttributed === false ? (adcUnattributed ? 'warn' : 'block') : 'pass', facts.identityAttributed === false ? 1 : 0),
     finding('iam', 'bindings', facts.bindings > 0 ? 'pass' : 'warn', facts.bindings),
+    finding('iam', 'runtimeRole', facts.runtimeRole === 1 ? 'pass' : adcUnattributed ? 'warn' : 'block', facts.runtimeRole),
     finding('iam', 'broadAdmin', facts.broadAdmin === 0 ? 'pass' : 'block', facts.broadAdmin),
     finding('iam', 'owner', facts.owner === 0 ? 'pass' : 'block', facts.owner),
     finding('iam', 'editor', facts.editor === 0 ? 'pass' : 'block', facts.editor),
-    finding('iam', 'serviceAccountUser', facts.serviceAccountUser === 0 ? 'pass' : 'warn', facts.serviceAccountUser),
+    finding('iam', 'serviceAccountUser', facts.serviceAccountUser === 0 ? 'pass' : 'block', facts.serviceAccountUser),
+  ];
+}
+
+export function classifyRuntimeIdentity(facts: RuntimeIdentityFacts): AuditFinding[] {
+  const identitySeverity: AuditSeverity = facts.identityExplicit && facts.identityCount === 1
+    ? 'pass'
+    : facts.credentialSource === 'application-default' && !facts.partialStaticCredentials ? 'warn' : 'block';
+  return [
+    finding('runtimeIdentity', 'selected', identitySeverity, facts.identityCount),
+    finding('runtimeIdentity', 'staticKeyFallback', facts.staticKeyFallback ? 'warn' : 'pass', facts.staticKeyFallback ? 1 : 0),
+    finding('runtimeIdentity', 'partialStaticCredentials', facts.partialStaticCredentials ? 'block' : 'pass', facts.partialStaticCredentials ? 1 : 0),
+  ];
+}
+
+export function classifyRuntimeRoleManifest(facts: RuntimeRoleManifestFacts): AuditFinding[] {
+  return [
+    booleanFinding('runtimeRoleManifest', 'readable', facts.readable),
+    finding('runtimeRoleManifest', 'missingRuntimePermissions', facts.missingRuntimePermissions === 0 ? 'pass' : 'block', facts.missingRuntimePermissions),
+    finding('runtimeRoleManifest', 'unexpectedRuntimePermissions', facts.unexpectedRuntimePermissions === 0 ? 'pass' : 'block', facts.unexpectedRuntimePermissions),
+    finding('runtimeRoleManifest', 'forbiddenRuntimePermissions', facts.forbiddenRuntimePermissions === 0 ? 'pass' : 'block', facts.forbiddenRuntimePermissions),
+    finding('runtimeRoleManifest', 'signBlobSeparated', facts.signBlobInRuntimeRole === 0 ? 'pass' : 'block', facts.signBlobInRuntimeRole),
+    booleanFinding('runtimeRoleManifest', 'signingBindingValid', facts.signingBindingValid),
+    finding('runtimeRoleManifest', 'projectSpecificPrincipals', facts.projectSpecificPrincipals === 0 ? 'pass' : 'block', facts.projectSpecificPrincipals),
   ];
 }
 
 export function classifyServiceAccountKeys(facts: ServiceAccountKeyFacts): AuditFinding[] {
+  const adcUnattributed = facts.credentialSource === 'application-default' && facts.identityExplicit === false;
   return [
-    booleanFinding('serviceAccountKeys', 'collectorReady', facts.collectorReady),
-    finding('serviceAccountKeys', 'identity', facts.identityCount === 1 ? 'pass' : 'block', facts.identityCount),
-    finding('serviceAccountKeys', 'total', facts.collectorReady && facts.identityCount === 1 ? 'pass' : 'block', facts.total),
+    finding('serviceAccountKeys', 'collectorReady', facts.collectorReady ? 'pass' : adcUnattributed ? 'warn' : 'block', facts.collectorReady ? 0 : 1),
+    finding('serviceAccountKeys', 'identity', facts.identityCount === 1 ? 'pass' : adcUnattributed ? 'warn' : 'block', facts.identityCount),
+    finding('serviceAccountKeys', 'total', facts.collectorReady && facts.identityCount === 1 ? 'pass' : adcUnattributed ? 'warn' : 'block', facts.total),
     finding('serviceAccountKeys', 'userManaged', facts.userManaged === 0 ? 'pass' : 'warn', facts.userManaged),
     finding('serviceAccountKeys', 'stale', facts.stale === 0 ? 'pass' : 'block', facts.stale),
     finding('serviceAccountKeys', 'disabled', facts.disabled === 0 ? 'pass' : 'warn', facts.disabled),
@@ -375,7 +459,91 @@ export function inspectIamRoles(value: unknown): IamRoleFacts {
     owner: roles.filter(role => role === 'roles/owner').length,
     editor: roles.filter(role => role === 'roles/editor').length,
     serviceAccountUser: roles.filter(role => SERVICE_ACCOUNT_USER_ROLES.has(role)).length,
+    runtimeRole: roles.filter(role => role.endsWith(`/roles/${RUNTIME_ROLE_ID}`)).length,
   };
+}
+
+function isServiceAccountEmail(value: string): boolean {
+  return /^[a-z0-9][a-z0-9-]{2,62}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/.test(value);
+}
+
+function selectRuntimeIdentityForInput(accountsValue: unknown, input: {
+  runtimeServiceAccountEmail?: string;
+  staticClientEmail?: string;
+  staticPrivateKey?: string;
+}): RuntimeIdentitySelection {
+  const runtimeServiceAccountEmail = input.runtimeServiceAccountEmail?.trim() ?? '';
+  const staticClientEmail = input.staticClientEmail?.trim() ?? '';
+  const staticPrivateKey = input.staticPrivateKey ?? '';
+  const hasStaticClientEmail = !!staticClientEmail;
+  const hasStaticPrivateKey = !!staticPrivateKey.trim();
+  if (hasStaticClientEmail !== hasStaticPrivateKey) {
+    return {
+      credentialSource: 'invalid',
+      identityCount: 0,
+      staticKeyFallback: false,
+      partialStaticCredentials: true,
+      identityExplicit: false,
+    };
+  }
+  if (hasStaticClientEmail) {
+    return isServiceAccountEmail(staticClientEmail) ? {
+      credentialSource: 'static-key-fallback',
+      identityCount: 1,
+      email: staticClientEmail,
+      staticKeyFallback: true,
+      partialStaticCredentials: false,
+      identityExplicit: true,
+    } : {
+      credentialSource: 'invalid',
+      identityCount: 0,
+      staticKeyFallback: true,
+      partialStaticCredentials: false,
+      identityExplicit: true,
+    };
+  }
+  if (runtimeServiceAccountEmail) {
+    return isServiceAccountEmail(runtimeServiceAccountEmail) ? {
+      credentialSource: 'application-default',
+      identityCount: 1,
+      email: runtimeServiceAccountEmail,
+      staticKeyFallback: false,
+      partialStaticCredentials: false,
+      identityExplicit: true,
+    } : {
+      credentialSource: 'invalid',
+      identityCount: 0,
+      staticKeyFallback: false,
+      partialStaticCredentials: false,
+      identityExplicit: true,
+    };
+  }
+  const plausible = asRecords(accountsValue)
+    .map(account => typeof account.email === 'string' ? account.email : '')
+    .filter(email => email.startsWith('private-pro-runtime@') && isServiceAccountEmail(email));
+  return plausible.length === 1 ? {
+    credentialSource: 'application-default',
+    identityCount: 1,
+    email: plausible[0],
+    staticKeyFallback: false,
+    partialStaticCredentials: false,
+    identityExplicit: false,
+  } : {
+    credentialSource: 'application-default',
+    identityCount: plausible.length,
+    staticKeyFallback: false,
+    partialStaticCredentials: false,
+    identityExplicit: false,
+  };
+}
+
+export function inspectRuntimeIdentity(accountsValue: unknown, input: {
+  runtimeServiceAccountEmail?: string;
+  staticClientEmail?: string;
+  staticPrivateKey?: string;
+}): RuntimeIdentityFacts {
+  const { email: _email, ...facts } = selectRuntimeIdentityForInput(accountsValue, input);
+  return facts;
 }
 
 export function inspectServiceAccountIamRoles(value: unknown, serviceAccountEmail: string): IamRoleFacts {
@@ -383,17 +551,70 @@ export function inspectServiceAccountIamRoles(value: unknown, serviceAccountEmai
   return inspectIamRoles({ bindings });
 }
 
-export function selectRuntimeIdentity(accountsValue: unknown, configuredEmail: string | undefined): { identityCount: number; email?: string } {
-  if (configuredEmail) return /^[a-z0-9][a-z0-9-]{2,62}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/.test(configuredEmail)
-    ? { identityCount: 1, email: configuredEmail }
-    : { identityCount: 0 };
+export function selectRuntimeIdentity(accountsValue: unknown, configuredEmail: string | undefined): { identityCount: number; email?: string };
+export function selectRuntimeIdentity(accountsValue: unknown, input: {
+  runtimeServiceAccountEmail?: string;
+  staticClientEmail?: string;
+  staticPrivateKey?: string;
+}): RuntimeIdentitySelection;
+export function selectRuntimeIdentity(accountsValue: unknown, input: string | undefined | {
+  runtimeServiceAccountEmail?: string;
+  staticClientEmail?: string;
+  staticPrivateKey?: string;
+}): { identityCount: number; email?: string } | RuntimeIdentitySelection {
+  if (typeof input === 'object') return selectRuntimeIdentityForInput(accountsValue, input);
+  const configuredEmail = input;
+  if (configuredEmail) return isServiceAccountEmail(configuredEmail) ? { identityCount: 1, email: configuredEmail } : { identityCount: 0 };
   const plausible = asRecords(accountsValue)
     .map(account => typeof account.email === 'string' ? account.email : '')
     .filter(email => email.startsWith('firebase-adminsdk-'));
   return plausible.length === 1 ? { identityCount: 1, email: plausible[0] } : { identityCount: plausible.length };
 }
 
-export function inspectServiceAccountKeys(value: unknown, nowMs: number, collectorReady = true, identityCount = 1, staleAfterDays = 90): ServiceAccountKeyFacts {
+function countProjectSpecificPrincipals(value: unknown): number {
+  if (typeof value === 'string') {
+    if (value.includes('${')) return 0;
+    return /@[^\s]+\.iam\.gserviceaccount\.com$/.test(value) || /principal(?:Set)?:\/\/iam\.googleapis\.com\/projects\/\d+/.test(value) ? 1 : 0;
+  }
+  if (Array.isArray(value)) return value.reduce((count, item) => count + countProjectSpecificPrincipals(item), 0);
+  if (typeof value === 'object' && value !== null)
+    return Object.values(value).reduce((count, item) => count + countProjectSpecificPrincipals(item), 0);
+  return 0;
+}
+
+export function inspectRuntimeRoleManifest(value: unknown): RuntimeRoleManifestFacts {
+  const root = asRecord(value);
+  const role = asRecord(root.runtimeRole);
+  const signing = asRecord(root.signingBinding);
+  const localVerification = asRecords(root.localVerification);
+  const permissions = asStrings(role.includedPermissions);
+  const permissionSet = new Set(permissions);
+  const localVerificationValid = ['firebase-id-token', 'firebase-app-check-token'].every(operation => localVerification.some(item => (
+    item.operation === operation && asStrings(item.requiredIamPermissions).length === 0
+  )));
+  const readable = root.schemaVersion === 1 && role.roleId === 'privateProRuntime' && permissions.length > 0 && localVerificationValid;
+  return {
+    readable,
+    missingRuntimePermissions: [...PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS].filter(permission => !permissionSet.has(permission)).length,
+    unexpectedRuntimePermissions: permissions.filter(permission => !PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS.has(permission)).length,
+    forbiddenRuntimePermissions: permissions.filter(permission => FORBIDDEN_RUNTIME_PERMISSIONS.has(permission)).length,
+    signBlobInRuntimeRole: permissions.filter(permission => permission === 'iam.serviceAccounts.signBlob').length,
+    signingBindingValid: signing.permission === 'iam.serviceAccounts.signBlob'
+      && signing.role === 'roles/iam.serviceAccountTokenCreator'
+      && signing.serviceAccount === '${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
+      && signing.member === 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}',
+    projectSpecificPrincipals: countProjectSpecificPrincipals(value),
+  };
+}
+
+export function inspectServiceAccountKeys(
+  value: unknown,
+  nowMs: number,
+  collectorReady = true,
+  identityCount = 1,
+  staleAfterDays = 90,
+  identity?: Pick<RuntimeIdentityFacts, 'credentialSource' | 'identityExplicit'>,
+): ServiceAccountKeyFacts {
   const keys = asRecords(value);
   const userManaged = keys.filter(key => key.keyType === 'USER_MANAGED');
   const cutoff = nowMs - staleAfterDays * 24 * 60 * 60 * 1000;
@@ -408,6 +629,10 @@ export function inspectServiceAccountKeys(value: unknown, nowMs: number, collect
     userManaged: userManaged.length,
     stale,
     disabled: keys.filter(key => key.disabled === true).length,
+    ...(identity ? {
+      credentialSource: identity.credentialSource,
+      identityExplicit: identity.identityExplicit,
+    } : {}),
   };
 }
 
@@ -510,19 +735,53 @@ async function collectAppCheck(projectId: string): Promise<AppCheckFacts> {
 
 async function collectIamRoles(projectId: string): Promise<IamRoleFacts> {
   const accounts = asRecords(await runJson('gcloud', ['iam', 'service-accounts', 'list', `--project=${projectId}`, '--format=json']));
-  const identity = selectRuntimeIdentity(accounts, process.env.FIREBASE_CLIENT_EMAIL?.trim());
-  if (identity.identityCount !== 1 || !identity.email) throw new Error('Runtime identity is missing or ambiguous.');
+  const identity = selectRuntimeIdentity(accounts, {
+    runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
+    staticClientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    staticPrivateKey: process.env.FIREBASE_PRIVATE_KEY,
+  });
+  if (identity.identityCount !== 1 || !identity.email) return {
+    bindings: 0,
+    broadAdmin: 0,
+    owner: 0,
+    editor: 0,
+    serviceAccountUser: 0,
+    runtimeRole: 0,
+    identityAttributed: false,
+    credentialSource: identity.credentialSource,
+  };
   const policy = await runJson('gcloud', ['projects', 'get-iam-policy', projectId, '--format=json']);
-  return inspectServiceAccountIamRoles(policy, identity.email);
+  return {
+    ...inspectServiceAccountIamRoles(policy, identity.email),
+    identityAttributed: true,
+    credentialSource: identity.credentialSource,
+  };
 }
 
 async function collectServiceAccountKeys(projectId: string): Promise<ServiceAccountKeyFacts> {
   const accounts = asRecords(await runJson('gcloud', ['iam', 'service-accounts', 'list', `--project=${projectId}`, '--format=json']));
-  const identity = selectRuntimeIdentity(accounts, process.env.FIREBASE_CLIENT_EMAIL?.trim());
+  const identity = selectRuntimeIdentity(accounts, {
+    runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
+    staticClientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    staticPrivateKey: process.env.FIREBASE_PRIVATE_KEY,
+  });
   if (identity.identityCount !== 1 || !identity.email)
-    return inspectServiceAccountKeys([], Date.now(), false, identity.identityCount);
+    return inspectServiceAccountKeys([], Date.now(), false, identity.identityCount, 90, identity);
   const keys = await runJson('gcloud', ['iam', 'service-accounts', 'keys', 'list', `--iam-account=${identity.email}`, `--project=${projectId}`, '--format=json']);
-  return inspectServiceAccountKeys(keys, Date.now(), true, 1);
+  return inspectServiceAccountKeys(keys, Date.now(), true, 1, 90, identity);
+}
+
+async function collectRuntimeIdentity(projectId: string): Promise<RuntimeIdentityFacts> {
+  const accounts = asRecords(await runJson('gcloud', ['iam', 'service-accounts', 'list', `--project=${projectId}`, '--format=json']));
+  return inspectRuntimeIdentity(accounts, {
+    runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
+    staticClientEmail: process.env.FIREBASE_CLIENT_EMAIL,
+    staticPrivateKey: process.env.FIREBASE_PRIVATE_KEY,
+  });
+}
+
+async function collectRuntimeRoleManifest(): Promise<RuntimeRoleManifestFacts> {
+  return inspectRuntimeRoleManifest(JSON.parse(await readFile(RUNTIME_ROLE_MANIFEST_PATH, 'utf8')) as unknown);
 }
 
 async function collectDependencyAudit(): Promise<DependencyAuditFacts> {
@@ -571,11 +830,13 @@ async function collectReport(): Promise<AuditReport> {
     collectBrowserApiKeys(projectId).then(classifyBrowserApiKeys),
     collectAppCheck(projectId).then(classifyAppCheck),
     collectIamRoles(projectId).then(classifyIamRoles),
+    collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
+    collectRuntimeRoleManifest().then(classifyRuntimeRoleManifest),
     collectServiceAccountKeys(projectId).then(classifyServiceAccountKeys),
     collectDependencyAudit().then(classifyDependencyAudit),
     collectFirebaseRuleProbes(projectId, storageBucket).then(classifyFirebaseRuleProbes),
   ];
-  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'appCheck', 'iam', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
+  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'appCheck', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
   const results = await Promise.allSettled(tasks);
   const findings = results.flatMap((result, index) => result.status === 'fulfilled'
     ? result.value

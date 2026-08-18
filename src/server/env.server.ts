@@ -134,6 +134,7 @@ export const env = createEnv({
     PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS: z.string().regex(/^\d+$/).optional(),
     PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS: z.string().regex(/^\d+$/).optional(),
     PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES: z.string().regex(/^\d+$/).optional(),
+    PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL: z.string().optional(),
     FIREBASE_CLIENT_EMAIL: z.string().optional(),
     FIREBASE_PRIVATE_KEY: z.string().optional(),
     CRON_SECRET: z.string().optional(),

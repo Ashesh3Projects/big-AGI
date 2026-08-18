@@ -1,0 +1,76 @@
+# Task 20 report
+
+## Status
+
+Complete for code, tests, documentation, manifest, and local/static audit.
+
+Cloud IAM provisioning, staging deployment, protected live probes, credential disablement, and key deletion were not performed. Those actions remain approval-gated for Tasks 21 and 24.
+
+## Changes
+
+- Firebase Admin now uses Application Default Credentials when static credentials are absent.
+- A complete `FIREBASE_CLIENT_EMAIL` plus `FIREBASE_PRIVATE_KEY` pair remains supported and is classified as `static-key-fallback`.
+- A partial static pair is rejected. Credential-construction errors do not expose private-key material.
+- The pure `selectPrivateProFirebaseCredential()` helper selects and constructs credentials through injectable factories without initializing a global Admin app.
+- `createPrivateProAdminAppOptions()` builds deterministic project ID, bucket, and credential initialization options.
+- Server config exposes the safe credential source and makes static credential fields optional.
+- App Check support is unchanged. Firebase ID-token and App Check verification use Google public keys and require no project IAM permission.
+- The security audit accepts ADC/WIF without `FIREBASE_CLIENT_EMAIL`, warns when an ADC identity cannot be attributed, warns on static fallback, blocks partial static credentials, blocks broad roles, and validates the checked-in permission manifest.
+- Deployment documentation prefers Vercel OIDC plus Google WIF without claiming it is configured. It documents static fallback rotation/removal and the approval gates.
+- Browser Firestore and Storage documentation now matches Task 19's catch-all browser denial.
+
+## Runtime permission manifest
+
+`infra/private-pro/gcp-runtime-role.yaml` contains this exact custom project-role allowlist:
+
+- `datastore.databases.get`
+- `datastore.entities.create`
+- `datastore.entities.delete`
+- `datastore.entities.get`
+- `datastore.entities.list`
+- `datastore.entities.update`
+- `firebaseauth.users.get`
+- `firebaseauth.users.update`
+- `storage.objects.create`
+- `storage.objects.delete`
+- `storage.objects.get`
+
+The list covers the mounted Auth user/claim/token-revocation calls, Firestore document/query/batch/transaction operations, encrypted vault records and assets, and the still-mounted plaintext sync/asset server paths found in Task 19.
+
+`iam.serviceAccounts.signBlob` is not in the custom project role. Signed URL generation uses a separate `roles/iam.serviceAccountTokenCreator` binding scoped to the dedicated runtime service account, with the service account as its own member. The external WIF principal receives only `roles/iam.workloadIdentityUser` on that service account.
+
+The manifest excludes project update, bucket create/delete, ruleset/release mutation, API-key administration, IAM policy mutation, and unrelated Firebase product administration.
+
+## TDD
+
+Initial focused RED: 29 tests, 22 passed, 7 failed.
+
+The failures covered missing ADC selection, missing static fallback classification, missing partial-pair rejection, missing deterministic Admin options, missing ADC-aware audit identity selection, missing static-fallback audit classification, and the absent permission manifest.
+
+Additional RED covered certificate-factory errors that could echo a private-key sentinel and incorrect WIF signer-binding scope.
+
+Final focused config, Firebase Admin, App Check, audit, manifest, and docs/config contract run: 36 passed, 0 failed.
+
+## Verification
+
+- Focused config/Firebase/audit/manifest/docs tests: 36 passed, 0 failed.
+- Security-audit unit tests: 19 passed, 0 failed in the final audit-only run before the combined focused run.
+- All Private Pro source/tool/encrypted-backup tests: 305 passed, 4 failed. The four failures are the existing duplicate-React invalid-hook-call failures in three vault accessibility renders and one legacy backup warning render. No Task 20 test failed.
+- Focused changed-file TypeScript project: passed. The temporary project file was deleted and is not committed.
+- `npm run tscheck`: blocked by the existing cross-worktree React type collision. The tools leg reported 5 ReactNode/JSX errors; the root leg reported 351 errors in 153 unrelated files.
+- `npm run build`: compilation passed, then type validation failed at `pages/_app.tsx` with the same duplicate-React `bigint is not assignable to ReactNode` collision.
+- ESLint: blocked before file analysis by the existing `@rushstack/eslint-patch` caller-recognition error.
+- `npm run private-pro:security-audit -- --report-only`: exited 0 and validated every local runtime-role manifest check. The report remained non-passing because of existing live deployment, API-key, dependency, rules-probe, and unattributed-current-identity findings. No live state was changed.
+- `git diff --check`: passed.
+
+## Unverified live work
+
+- Confirm the Vercel OIDC issuer and deployed runtime support the intended WIF token exchange.
+- Provision the workload identity pool/provider, dedicated runtime service account, custom project role, project binding, WIF impersonation binding, and service-account-scoped signing binding.
+- Validate every manifest permission with a staging identity across Auth bootstrap/claim/revocation, App Check, Firestore reads/queries/transactions/writes/deletes, Storage metadata/delete, and signed upload/download paths.
+- Confirm the still-mounted plaintext sync and asset procedures and scheduled sweep operate with the same role until their later removal.
+- Promote only after protected staging probes pass. Do not disable or delete the working static key before the replacement is verified and rollback time has elapsed.
+
+## Commit
+
+Subject: `Security: use least-privilege Firebase identity`
