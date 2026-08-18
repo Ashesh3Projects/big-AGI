@@ -751,7 +751,7 @@ describe('private Pro security audit classifiers', () => {
     await assert.rejects(readFile(sideEffect, 'utf8'));
   });
 
-  test('isolates restore evidence before GoogleAuth and child collectors while passing captured input explicitly', async () => {
+  test('consumes restore evidence once before GoogleAuth and verifies explicitly reinjected input deterministically', async () => {
     const audit = securityAuditModule as unknown as {
       runSecurityAuditWithCollector<T>(collector: (input: {
         readonly evidenceBase64?: string;
@@ -846,6 +846,10 @@ describe('private Pro security audit classifiers', () => {
       Object.assign(process.env, auditEnvironment);
       const first = await runOnce();
       for (const name of evidenceEnvironmentNames) assert.equal(process.env[name], undefined, name);
+
+      const consumed = await audit.runSecurityAuditWithCollector(async input => input);
+      assert.equal(Object.isFrozen(consumed), true);
+      assert.deepEqual(consumed, {});
 
       Object.assign(process.env, auditEnvironment);
       const second = await runOnce();
