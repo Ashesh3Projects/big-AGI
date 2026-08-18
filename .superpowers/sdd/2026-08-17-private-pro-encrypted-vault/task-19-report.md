@@ -22,8 +22,7 @@ Firestore and Storage therefore use one catch-all browser denial. Firebase Admin
 - Replaced the former legacy asset Storage read with one catch-all read/write denial.
 - Added emulator coverage for account metadata, every encrypted vault family, former migration and plaintext sync paths, unknown nested paths, collection and collection-group queries, the current encrypted chunk object path, old Storage paths, and Storage list operations.
 - Seeded all emulator fixtures through a rules-disabled context and verified both Firestore and Storage seeds.
-- Removed the obsolete legacy `assets` and `quotaReservations` indexes.
-- Retained only the two Task 17 `assetReservations` composite indexes:
+- Retained the two Task 17 `assetReservations` composite indexes:
   - UID-local `opaqueAssetId ==` plus `status ==` reservation lookup.
   - Collection-group `status ==` plus `expiresAtMs <=` expiration sweep.
 - Task 13 record/tombstone index paging orders by document ID and requires no composite index.
@@ -65,3 +64,51 @@ Mutation check:
 ## Cloud boundary
 
 No Firebase rules, indexes, Storage configuration, or application build was deployed. No cloud resource was mutated.
+
+## Fix round 1
+
+Status: complete.
+
+### Finding
+
+The first report incorrectly classified the plaintext `assets` and `quotaReservations` indexes as obsolete based only on browser provider call sites. The plaintext asset client is not mounted by the production provider tree, but the authenticated cloud router still exposes `reserveUpload`, `finalizeUpload`, `getDownload`, `releaseExpired`, and `releaseReservation`. Those procedures call `getFirebasePrivateProAssetsService()` directly.
+
+The production cron route also still calls `getFirebasePrivateProAssetsService().sweepExpiredReservations()`. Removing only that call would leave reservations created through the still-mounted plaintext server procedures without scheduled cleanup. Removing the plaintext procedures and modules is outside Task 19 scope.
+
+### Changes
+
+- Restored the `assets(contentHash, status)` collection index required by the mounted plaintext `reserveUpload` procedure.
+- Restored the `quotaReservations(status, expiresAtMs)` collection-group index required by the live scheduled plaintext reservation sweep.
+- Added a deployment contract against the real cloud router, cron route, and `firestore.indexes.json`. Each legacy index is required only while its production consumer remains mounted, so a later cleanup can remove the procedures, cron call, and indexes together.
+- Left the cron route and legacy modules unchanged.
+- Browser Firestore and Storage access remains fully denied.
+
+### TDD
+
+RED:
+
+```text
+1 test: 0 passed, 1 failed
+reserveUpload requires the assets contentHash/status index
+```
+
+GREEN after restoring both reachable server-path indexes:
+
+```text
+1 test: 1 passed, 0 failed
+```
+
+Mutation check:
+
+- Removed only the restored `quotaReservations` index.
+- The deployment contract failed with `the scheduled plaintext reservation sweep requires the quotaReservations status/expiresAtMs index`.
+- Restored the index and the focused contract passed again.
+
+### Verification
+
+- `npx eslint src/modules/private-pro/assets/privatePro.assets.deployment.test.ts app/api/private-pro/sweep-expired/route.ts test/firebase` - passed with zero warnings.
+- `npx cross-env NODE_ENV=development tsx --test src/modules/private-pro/assets/privatePro.assets.deployment.test.ts` - 1 passed, 0 failed.
+- Firebase Emulator Suite with Microsoft JDK 21 - 35 passed, 0 failed.
+- All Private Pro source/tool/encrypted-backup tests, including the deployment contract - 296 passed, 0 failed.
+- `npm run tscheck` - passed application and tools TypeScript projects.
+- `git diff --check` - passed.
