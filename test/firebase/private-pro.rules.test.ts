@@ -32,6 +32,8 @@ const ENCRYPTED_FIRESTORE_DOCUMENTS = [
   ['device', 'users/uid-a/vault/data/devices/device-1', 'users/uid-a/vault/data/devices/device-new'],
   ['operation', 'users/uid-a/vault/data/operations/operation-1', 'users/uid-a/vault/data/operations/operation-new'],
   ['backup merge', 'users/uid-a/vault/data/backupMerges/merge-1', 'users/uid-a/vault/data/backupMerges/merge-new'],
+  ['restore session', 'users/uid-a/vault/data/restoreSessions/active', 'users/uid-a/vault/data/restoreSessions/new'],
+  ['restore completion', 'users/uid-a/vault/data/restoreCompletions/restore-1', 'users/uid-a/vault/data/restoreCompletions/restore-new'],
   ['registration challenge', 'users/uid-a/vault/data/registrationChallenges/challenge-1', 'users/uid-a/vault/data/registrationChallenges/challenge-new'],
   ['asset metadata', 'users/uid-a/vault/data/assets/asset-1', 'users/uid-a/vault/data/assets/asset-new'],
   ['asset reservation', 'users/uid-a/vault/data/assetReservations/reservation-1', 'users/uid-a/vault/data/assetReservations/reservation-new'],

@@ -123,6 +123,8 @@ interface MemoryVault {
   registrationChallenges: Map<string, PrivateProVaultRegistrationChallenge>;
   securityEvents: Map<string, import('./privatePro.vault.repository').PrivateProVaultSecurityEvent>;
   backupMerges: Map<string, PrivateProVaultBackupMergeReceipt>;
+  restoreSession: import('./privatePro.vault.repository').PrivateProVaultRestoreSession | null;
+  restoreCompletions: Map<string, import('./privatePro.vault.repository').PrivateProVaultRestoreCompletion>;
 }
 
 class MemoryVaultRepository implements PrivateProVaultRepository {
@@ -140,6 +142,8 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         registrationChallenges: new Map(),
         securityEvents: new Map(),
         backupMerges: new Map(),
+        restoreSession: null,
+        restoreCompletions: new Map(),
       };
       this.vaults.set(uid, vault);
     }
@@ -180,6 +184,13 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         if (vault.backupMerges.has(receipt.operationId)) throw new Error('Backup merge already exists.');
         vault.backupMerges.set(receipt.operationId, clone(receipt));
       },
+      getRestoreSession: async () => clone(vault.restoreSession),
+      setRestoreSession: async session => { vault.restoreSession = clone(session); },
+      deleteRestoreSession: async () => { vault.restoreSession = null; },
+      getRestoreCompletion: async restoreId => clone(vault.restoreCompletions.get(restoreId) ?? null),
+      createRestoreCompletion: async completion => { vault.restoreCompletions.set(completion.restoreId, clone(completion)); },
+      listIndexEntries: async (afterOpaqueRecordId, limit) => this.listIndexEntries(uid, afterOpaqueRecordId, limit),
+      getRecords: async opaqueRecordIds => this.getRecords(uid, opaqueRecordIds),
     };
     return callback(transaction);
   }
@@ -749,6 +760,57 @@ describe('Private Pro encrypted vault service', () => {
         return { opaqueRecordId: id, baseRevision: 0, envelope: envelope(id, 1, 'settings', 700 * 1024) };
       }),
     }), /byte limit/i);
+  });
+
+  test('restores more than 500 records in resumable atomic chunks and blocks normal access until finalization', async () => {
+    const { service } = serviceFixture();
+    const restoreId = 'restore-session-large';
+    const records = Array.from({ length: 1_001 }, (_, index) => {
+      const id = Buffer.alloc(32);
+      id.writeUInt32BE(index, 28);
+      const opaqueRecordId = id.toString('base64url');
+      return { opaqueRecordId, baseRevision: 0, envelope: envelope(opaqueRecordId, 1) };
+    });
+
+    await service.beginBackupRestore(UID_A, { restoreId, backupFingerprint: 'f'.repeat(43), chunkCount: 6, recordCount: records.length });
+    await assert.rejects(service.getIndex(UID_A, { pageSize: 10 }), /restore.*progress/i);
+    await assert.rejects(service.putRecord(UID_A, {
+      operationId: 'normal-write-during-restore', opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1),
+    }), /restore.*progress/i);
+
+    for (let chunkIndex = 0; chunkIndex < 6; chunkIndex++) {
+      const chunk = records.slice(chunkIndex * 200, (chunkIndex + 1) * 200);
+      const result = await service.mergeBackupRestoreChunk(UID_A, {
+        restoreId, operationId: `${restoreId}:${chunkIndex}`, chunkIndex, chunkCount: 6, records: chunk,
+      });
+      assert.equal(result.nextChunkIndex, chunkIndex + 1);
+    }
+    const status = await service.getBackupRestoreStatus(UID_A, restoreId);
+    assert.equal(status?.nextChunkIndex, 6);
+    await service.finalizeBackupRestore(UID_A, { restoreId, operationId: `${restoreId}:finalize` });
+    assert.equal((await service.getIndex(UID_A, { pageSize: 500 })).entries.length, 500);
+  });
+
+  test('keeps the restore marker after a middle chunk conflict and resumes the same chunk idempotently', async () => {
+    const { service } = serviceFixture();
+    await service.putRecord(UID_A, {
+      operationId: 'seed-middle-conflict', opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1),
+    });
+    await service.beginBackupRestore(UID_A, { restoreId: 'restore-resume', backupFingerprint: 'f'.repeat(43), chunkCount: 2, recordCount: 2 });
+    const firstInput = {
+      restoreId: 'restore-resume', operationId: 'restore-resume:0', chunkIndex: 0, chunkCount: 2,
+      records: [{ opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) }],
+    };
+    const committed = await service.mergeBackupRestoreChunk(UID_A, firstInput);
+    assert.deepEqual(await service.mergeBackupRestoreChunk(UID_A, firstInput), { ...committed, status: 'unchanged' });
+
+    const conflict = await service.mergeBackupRestoreChunk(UID_A, {
+      restoreId: 'restore-resume', operationId: 'restore-resume:1', chunkIndex: 1, chunkCount: 2,
+      records: [{ opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1) }],
+    });
+    assert.deepEqual(conflict, { status: 'conflict', conflicts: [{ opaqueRecordId: RECORD_B, currentRevision: 1 }], nextChunkIndex: 1 });
+    assert.equal((await service.getBackupRestoreStatus(UID_A, 'restore-resume'))?.nextChunkIndex, 1);
+    await assert.rejects(service.finalizeBackupRestore(UID_A, { restoreId: 'restore-resume', operationId: 'restore-resume:finalize' }), /incomplete/i);
   });
 
   test('records a bounded security event after recovery without accepting sensitive metadata', async () => {

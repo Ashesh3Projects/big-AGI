@@ -73,6 +73,30 @@ const service = {
     state.calls.push({ method: 'mergeBackup', uid, input });
     return { status: 'committed' as const, records: [] };
   },
+  beginBackupRestore: async (uid: string, input: unknown) => {
+    state.calls.push({ method: 'beginBackupRestore', uid, input });
+    return { status: 'started' as const };
+  },
+  getBackupRestoreStatus: async (uid: string, restoreId: string) => {
+    state.calls.push({ method: 'getBackupRestoreStatus', uid, input: restoreId });
+    return { nextChunkIndex: 0 };
+  },
+  mergeBackupRestoreChunk: async (uid: string, input: unknown) => {
+    state.calls.push({ method: 'mergeBackupRestoreChunk', uid, input });
+    return { status: 'committed' as const, records: [], nextChunkIndex: 1 };
+  },
+  getBackupRestoreIndex: async (uid: string, restoreId: string, input: unknown) => {
+    state.calls.push({ method: 'getBackupRestoreIndex', uid, input: { restoreId, input } });
+    return { entries: [], nextCursor: null };
+  },
+  getBackupRestoreRecords: async (uid: string, restoreId: string, input: unknown) => {
+    state.calls.push({ method: 'getBackupRestoreRecords', uid, input: { restoreId, input } });
+    return [];
+  },
+  finalizeBackupRestore: async (uid: string, input: unknown) => {
+    state.calls.push({ method: 'finalizeBackupRestore', uid, input });
+    return { status: 'completed' as const };
+  },
   deleteRecord: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'deleteRecord', uid, input });
     return { status: 'committed' as const, revision: 1, serverUpdatedAtMs: 1 };
@@ -225,6 +249,15 @@ describe('private Pro vault router input bounds', () => {
       operationId: 'merge-backup-1',
       records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
     });
+    await caller.beginBackupRestore({ restoreId: 'restore-1', backupFingerprint: 'f'.repeat(43), chunkCount: 1, recordCount: 1 });
+    await caller.getBackupRestoreStatus({ restoreId: 'restore-1' });
+    await caller.mergeBackupRestoreChunk({
+      restoreId: 'restore-1', operationId: 'restore-1:0', chunkIndex: 0, chunkCount: 1,
+      records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
+    });
+    await caller.getBackupRestoreIndex({ restoreId: 'restore-1', pageSize: 1 });
+    await caller.getBackupRestoreRecords({ restoreId: 'restore-1', opaqueRecordIds: [RECORD_ID] });
+    await caller.finalizeBackupRestore({ restoreId: 'restore-1', operationId: 'restore-1:finalize' });
     await caller.deleteRecord({
       operationId: 'delete-record-1',
       opaqueRecordId: RECORD_ID,

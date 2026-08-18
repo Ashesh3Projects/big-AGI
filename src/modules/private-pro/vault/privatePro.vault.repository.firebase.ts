@@ -12,6 +12,8 @@ import type {
   PrivateProVaultStoredRecord,
   PrivateProVaultStoredTombstone,
   PrivateProVaultSecurityEvent,
+  PrivateProVaultRestoreCompletion,
+  PrivateProVaultRestoreSession,
 } from './privatePro.vault.repository';
 import { mergePrivateProVaultIndexEntries } from './privatePro.vault.repository';
 import { createPrivateProVaultService } from './privatePro.vault.service';
@@ -80,6 +82,50 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
 
   async createBackupMerge(receipt: PrivateProVaultBackupMergeReceipt) {
     this.transaction.create(this.db.doc(`${vaultRoot(this.uid)}/backupMerges/${receipt.operationId}`), receipt);
+  }
+
+  async getRestoreSession() {
+    const snapshot = await this.transaction.get(this.db.doc(`${vaultRoot(this.uid)}/restoreSessions/active`));
+    return snapshot.exists ? snapshot.data() as PrivateProVaultRestoreSession : null;
+  }
+
+  async setRestoreSession(session: PrivateProVaultRestoreSession) {
+    this.transaction.set(this.db.doc(`${vaultRoot(this.uid)}/restoreSessions/active`), session);
+  }
+
+  async deleteRestoreSession() {
+    this.transaction.delete(this.db.doc(`${vaultRoot(this.uid)}/restoreSessions/active`));
+  }
+
+  async getRestoreCompletion(restoreId: string) {
+    const snapshot = await this.transaction.get(this.db.doc(`${vaultRoot(this.uid)}/restoreCompletions/${restoreId}`));
+    return snapshot.exists ? snapshot.data() as PrivateProVaultRestoreCompletion : null;
+  }
+
+  async createRestoreCompletion(completion: PrivateProVaultRestoreCompletion) {
+    this.transaction.create(this.db.doc(`${vaultRoot(this.uid)}/restoreCompletions/${completion.restoreId}`), completion);
+  }
+
+  async listIndexEntries(afterOpaqueRecordId: string | null, limit: number) {
+    const createQuery = (collection: CollectionReference<DocumentData>) => {
+      const ordered = collection.orderBy(FieldPath.documentId()).limit(limit);
+      return afterOpaqueRecordId === null ? ordered : ordered.startAfter(afterOpaqueRecordId);
+    };
+    const [records, tombstones] = await Promise.all([
+      this.transaction.get(createQuery(recordCollection(this.db, this.uid))),
+      this.transaction.get(createQuery(tombstoneCollection(this.db, this.uid))),
+    ]);
+    return mergePrivateProVaultIndexEntries(
+      records.docs.map(document => document.data() as PrivateProVaultStoredRecord),
+      tombstones.docs.map(document => document.data() as PrivateProVaultStoredTombstone),
+      limit,
+    );
+  }
+
+  async getRecords(opaqueRecordIds: readonly string[]) {
+    if (opaqueRecordIds.length === 0) return [];
+    const snapshots = await this.transaction.getAll(...opaqueRecordIds.map(opaqueRecordId => recordCollection(this.db, this.uid).doc(opaqueRecordId)));
+    return snapshots.flatMap(snapshot => snapshot.exists ? [snapshot.data() as PrivateProVaultStoredRecord] : []);
   }
 
   async getKeyset() {

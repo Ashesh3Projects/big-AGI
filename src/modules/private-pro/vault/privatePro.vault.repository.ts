@@ -83,6 +83,28 @@ export interface PrivateProVaultBackupMergeReceipt {
   outcome: PrivateProVaultBackupMergeOutcome;
 }
 
+export interface PrivateProVaultRestoreSession {
+  formatVersion: 1;
+  restoreId: string;
+  backupFingerprint: string;
+  chunkCount: number;
+  recordCount: number;
+  nextChunkIndex: number;
+  committedRecordCount: number;
+  startedAtMs: number;
+}
+
+export interface PrivateProVaultRestoreCompletion {
+  formatVersion: 1;
+  restoreId: string;
+  operationId: string;
+  requestFingerprint: string;
+  backupFingerprint: string;
+  chunkCount: number;
+  recordCount: number;
+  completedAtMs: number;
+}
+
 export type PrivateProVaultIndexEntry = {
   opaqueRecordId: string;
   recordType: PrivateProVaultRecordType;
@@ -107,6 +129,13 @@ export interface PrivateProVaultRepositoryTransaction {
   createOperation(operation: PrivateProVaultOperationReceipt): Promise<void>;
   getBackupMerge(operationId: string): Promise<PrivateProVaultBackupMergeReceipt | null>;
   createBackupMerge(receipt: PrivateProVaultBackupMergeReceipt): Promise<void>;
+  getRestoreSession(): Promise<PrivateProVaultRestoreSession | null>;
+  setRestoreSession(session: PrivateProVaultRestoreSession): Promise<void>;
+  deleteRestoreSession(): Promise<void>;
+  getRestoreCompletion(restoreId: string): Promise<PrivateProVaultRestoreCompletion | null>;
+  createRestoreCompletion(completion: PrivateProVaultRestoreCompletion): Promise<void>;
+  listIndexEntries(afterOpaqueRecordId: string | null, limit: number): Promise<PrivateProVaultIndexEntry[]>;
+  getRecords(opaqueRecordIds: readonly string[]): Promise<PrivateProVaultStoredRecord[]>;
   getKeyset(): Promise<PrivateProVaultStoredKeyset | null>;
   setKeyset(keyset: PrivateProVaultStoredKeyset): Promise<void>;
   getDevice(deviceId: string): Promise<PrivateProVaultStoredDevice | null>;

@@ -115,6 +115,52 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().mergeBackup(ctx.privateProIdentity.uid, input))),
 
+  beginBackupRestore: deviceProcedure
+    .input(z.object({
+      restoreId: operationIdSchema,
+      backupFingerprint: opaqueIdSchema,
+      chunkCount: z.number().int().min(1).max(100_000),
+      recordCount: z.number().int().min(1).max(100_000),
+    }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => service().beginBackupRestore(ctx.privateProIdentity.uid, input))),
+
+  getBackupRestoreStatus: deviceProcedure
+    .input(z.object({ restoreId: operationIdSchema }).strict())
+    .query(({ ctx, input }) => vaultCall(() => service().getBackupRestoreStatus(ctx.privateProIdentity.uid, input.restoreId))),
+
+  mergeBackupRestoreChunk: deviceProcedure
+    .input(z.object({
+      restoreId: operationIdSchema,
+      operationId: operationIdSchema,
+      chunkIndex: z.number().int().min(0).max(99_999),
+      chunkCount: z.number().int().min(1).max(100_000),
+      records: z.array(z.object({
+        opaqueRecordId: opaqueIdSchema,
+        baseRevision: baseVersionSchema,
+        envelope: firestoreEnvelopeSchema,
+      }).strict()).min(1).max(PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS),
+    }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => service().mergeBackupRestoreChunk(ctx.privateProIdentity.uid, input))),
+
+  getBackupRestoreIndex: deviceProcedure
+    .input(z.object({
+      restoreId: operationIdSchema,
+      pageSize: z.number().int().min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
+      cursor: opaqueIdSchema.nullish(),
+    }).strict())
+    .query(({ ctx, input }) => vaultCall(() => service().getBackupRestoreIndex(ctx.privateProIdentity.uid, input.restoreId, input))),
+
+  getBackupRestoreRecords: deviceProcedure
+    .input(z.object({
+      restoreId: operationIdSchema,
+      opaqueRecordIds: z.array(opaqueIdSchema).min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
+    }).strict())
+    .query(({ ctx, input }) => vaultCall(() => service().getBackupRestoreRecords(ctx.privateProIdentity.uid, input.restoreId, input.opaqueRecordIds))),
+
+  finalizeBackupRestore: deviceProcedure
+    .input(z.object({ restoreId: operationIdSchema, operationId: operationIdSchema }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => service().finalizeBackupRestore(ctx.privateProIdentity.uid, input))),
+
   deleteRecord: deviceProcedure
     .input(z.object({
       operationId: operationIdSchema,

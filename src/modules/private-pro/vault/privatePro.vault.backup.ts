@@ -3,8 +3,9 @@ import type { PrivateProVaultAssetClient } from './privatePro.vault.assets.clien
 import type { PrivateProVaultDB } from './privatePro.vault.db';
 import type { PrivateProVaultSerializer } from './privatePro.vault.serializers';
 import type { PrivateProVaultEnvelope, PrivateProVaultKeyset } from './privatePro.vault.types';
-import type { PrivateProVaultTransport } from './privatePro.vault.transport';
+import { PrivateProVaultAmbiguousTransportError, type PrivateProVaultTransport } from './privatePro.vault.transport';
 import { collectPrivateProVaultAssetIds } from './privatePro.vault.assets.client';
+import { PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES } from './privatePro.vault.repository';
 import {
   createPrivateProEncryptedBackupStream,
   importPrivateProEncryptedBackup,
@@ -15,6 +16,8 @@ import {
 
 const textDecoder = new TextDecoder('utf-8', { fatal: true });
 const textEncoder = new TextEncoder();
+const RESTORE_CHUNK_MAX_RECORDS = 200;
+const RESTORE_CHUNK_MAX_CIPHERTEXT_BYTES = 4 * 1024 * 1024;
 
 export class PrivateProVaultBackupCommittedError extends Error {
   constructor(message: string, options?: ErrorOptions) {
@@ -49,6 +52,36 @@ function canonicalJson(value: unknown): string {
     .sort(([left], [right]) => left.localeCompare(right))
     .map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJson(nested)}`)
     .join(',')}}`;
+}
+
+function restoreChunks<T>(records: readonly T[], ciphertextBytes: (record: T) => number): T[][] {
+  const chunks: T[][] = [];
+  let current: T[] = [];
+  let currentBytes = 0;
+  for (const record of records) {
+    const recordBytes = ciphertextBytes(record);
+    if (current.length && (current.length >= RESTORE_CHUNK_MAX_RECORDS
+      || currentBytes + recordBytes > RESTORE_CHUNK_MAX_CIPHERTEXT_BYTES)) {
+      chunks.push(current);
+      current = [];
+      currentBytes = 0;
+    }
+    if (recordBytes > RESTORE_CHUNK_MAX_CIPHERTEXT_BYTES)
+      throw new Error('Encrypted backup record exceeds the cloud restore chunk limit.');
+    current.push(record);
+    currentBytes += recordBytes;
+  }
+  if (current.length) chunks.push(current);
+  return chunks;
+}
+
+async function retryAmbiguous<T>(transport: PrivateProVaultTransport, operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (!(error instanceof PrivateProVaultAmbiguousTransportError) || !transport.isOnline()) throw error;
+    return operation();
+  }
 }
 
 async function decryptAndValidate(
@@ -146,6 +179,10 @@ export async function importPrivateProVaultBackup(
         const activeMasterKey = deps.activeMasterKey;
         const activeKeyVersion = deps.activeKeyVersion;
         if (!deps.transport.isOnline()) throw new Error('Reconnect before merging an encrypted backup.');
+        if (!deps.transport.beginBackupRestore || !deps.transport.getBackupRestoreStatus
+          || !deps.transport.mergeBackupRestoreChunk || !deps.transport.getBackupRestoreIndex
+          || !deps.transport.getBackupRestoreRecords || !deps.transport.finalizeBackupRestore)
+          throw new Error('Encrypted backup restore sessions are unavailable.');
         const backupAssets = (deps.createBackupAssetClient ?? deps.createAssetClient)?.(
           input.masterKey, input.header.keyset.keyVersion, input.header.vaultId,
         );
@@ -153,74 +190,103 @@ export async function importPrivateProVaultBackup(
         const staged = await Promise.all(input.records.map(async envelope => {
           const serializer = serializers.get(envelope.recordType)!;
           const value = await decryptAndNormalize(input.header.vaultId, input.masterKey, serializer, envelope);
-          return { serializer, value, recordId: await serializer.recordIdFor(value) };
+          const plaintext = textEncoder.encode(JSON.stringify(value));
+          const projectedCiphertextBytes = plaintext.byteLength + 16;
+          if (projectedCiphertextBytes > PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES)
+            throw new Error('Encrypted backup record exceeds the cloud record limit.');
+          return { serializer, value, recordId: await serializer.recordIdFor(value), plaintext, projectedCiphertextBytes };
         }));
+        const backupFingerprint = input.transcriptMacBase64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+        const restoreId = deps.createOperationId?.() ?? `restore-${backupFingerprint}`;
+        const restoreStatus = await deps.transport.getBackupRestoreStatus(restoreId);
+        const chunks = restoreChunks(staged, record => record.projectedCiphertextBytes);
         const assetIds = [...new Set(staged.flatMap(record => collectPrivateProVaultAssetIds(record.serializer.recordType, record.value)))];
         const materializedAssetIds = await backupAssets.importAssetChunks(input.assets);
         let cloudCommitted = false;
         try {
           await deps.activeAssets.prepareForUpload(assetIds);
-          const index = await deps.transport.getIndex();
+          const index = restoreStatus
+            ? await deps.transport.getBackupRestoreIndex(restoreId)
+            : await deps.transport.getIndex();
           const revisions = new Map(index.map(entry => [`${entry.recordType}:${entry.opaqueRecordId}`, entry.revision]));
-          const mergeRecords = await Promise.all(staged.map(async record => {
-            const baseRevision = revisions.get(`${record.serializer.recordType}:${record.recordId}`) ?? 0;
-            const key = await deriveVaultSubkey(
-              activeMasterKey, 'record-encryption', `${record.serializer.recordType}:${record.recordId}`, ['encrypt'],
-            );
-            const envelope = await encryptVaultRecord(key, {
-              vaultId: deps.uid,
-              formatVersion: 1,
-              recordType: record.serializer.recordType,
-              recordId: record.recordId,
-              schemaVersion: record.serializer.schemaVersion,
-              keyVersion: activeKeyVersion,
-              revision: baseRevision + 1,
-            }, textEncoder.encode(JSON.stringify(record.value)));
-            return { ...record, baseRevision, envelope };
-          }));
-          const operationId = deps.createOperationId?.() ?? `restore-${crypto.randomUUID()}`;
-          const mergeInput = {
-            operationId,
-            records: mergeRecords.map(record => ({
-              opaqueRecordId: record.recordId,
-              baseRevision: record.baseRevision,
-              envelope: record.envelope,
-            })),
-          };
-          let result;
-          try {
-            result = await deps.transport.mergeBackup(mergeInput);
-          } catch (error) {
-            if (!(error instanceof TypeError) || !deps.transport.isOnline()) throw error;
-            result = await deps.transport.mergeBackup(mergeInput);
+          const expectedRevisions = new Map<string, number>();
+          if (restoreStatus && restoreStatus.nextChunkIndex > 0) {
+            for (const record of chunks.slice(0, restoreStatus.nextChunkIndex).flat()) {
+              const revision = revisions.get(`${record.serializer.recordType}:${record.recordId}`);
+              if (!revision)
+                throw new PrivateProVaultBackupCommittedError('Cloud backup restore progress is incomplete. Restart to reconcile.');
+              expectedRevisions.set(record.recordId, revision);
+            }
           }
-          if (result.status === 'conflict') throw new Error('The cloud vault changed during backup merge. Retry the merge.');
+          try {
+            await retryAmbiguous(deps.transport, () => deps.transport!.beginBackupRestore!({
+              restoreId, backupFingerprint, chunkCount: chunks.length, recordCount: staged.length,
+            }));
+          } catch (error) {
+            if (error instanceof PrivateProVaultAmbiguousTransportError) {
+              cloudCommitted = true;
+              throw new PrivateProVaultBackupCommittedError('Cloud backup restore status is ambiguous. Restart to reconcile.', { cause: error });
+            }
+            throw error;
+          }
           cloudCommitted = true;
-          const committedById = new Map(result.records.map(record => [record.opaqueRecordId, record]));
-          if (committedById.size !== mergeRecords.length)
-            throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification is incomplete. Restart to reconcile.');
-          const verifiedIndex = await deps.transport.getIndex();
-          const restoredIds = new Set(mergeRecords.map(record => `${record.serializer.recordType}:${record.recordId}`));
+          const status = await deps.transport.getBackupRestoreStatus(restoreId);
+          let nextChunkIndex = status?.nextChunkIndex ?? 0;
+          for (let chunkIndex = nextChunkIndex; chunkIndex < chunks.length; chunkIndex++) {
+            const chunk = await Promise.all(chunks[chunkIndex].map(async record => {
+              const baseRevision = revisions.get(`${record.serializer.recordType}:${record.recordId}`) ?? 0;
+              const key = await deriveVaultSubkey(
+                activeMasterKey, 'record-encryption', `${record.serializer.recordType}:${record.recordId}`, ['encrypt'],
+              );
+              const envelope = await encryptVaultRecord(key, {
+                vaultId: deps.uid,
+                formatVersion: 1,
+                recordType: record.serializer.recordType,
+                recordId: record.recordId,
+                schemaVersion: record.serializer.schemaVersion,
+                keyVersion: activeKeyVersion,
+                revision: baseRevision + 1,
+              }, record.plaintext);
+              return { ...record, baseRevision, envelope };
+            }));
+            const result = await retryAmbiguous(deps.transport, () => deps.transport!.mergeBackupRestoreChunk!({
+              restoreId,
+              operationId: `restore-chunk-${backupFingerprint}:${chunkIndex}`,
+              chunkIndex,
+              chunkCount: chunks.length,
+              records: chunk.map(record => ({ opaqueRecordId: record.recordId, baseRevision: record.baseRevision, envelope: record.envelope })),
+            }));
+            if (result.status === 'conflict') throw new Error('The cloud vault changed during backup merge. Retry the merge.');
+            for (const record of chunk) expectedRevisions.set(record.recordId, record.envelope.revision);
+            nextChunkIndex = result.nextChunkIndex;
+          }
+          if (nextChunkIndex !== chunks.length)
+            throw new PrivateProVaultBackupCommittedError('Cloud backup restore is incomplete. Restart to reconcile.');
+          await retryAmbiguous(deps.transport, () => deps.transport!.finalizeBackupRestore!({
+            restoreId,
+            operationId: `restore-finalize-${backupFingerprint}`,
+          }));
+          const verifiedIndex = await deps.transport.getBackupRestoreIndex(restoreId);
+          const restoredIds = new Set(staged.map(record => `${record.serializer.recordType}:${record.recordId}`));
           const relevantIndex = verifiedIndex
             .filter(entry => restoredIds.has(`${entry.recordType}:${entry.opaqueRecordId}`))
             .sort((left, right) => left.opaqueRecordId.localeCompare(right.opaqueRecordId));
-          const verifiedEnvelopes = await deps.transport.getRecords(relevantIndex.map(entry => entry.opaqueRecordId));
+          const verifiedEnvelopes = await deps.transport.getBackupRestoreRecords(restoreId, relevantIndex.map(entry => entry.opaqueRecordId));
           const verifiedById = new Map(verifiedEnvelopes.map(envelope => [envelope.recordId, envelope]));
-          for (const record of mergeRecords) {
-            const receipt = committedById.get(record.recordId);
+          for (const record of staged) {
             const entry = relevantIndex.find(candidate => candidate.opaqueRecordId === record.recordId);
             const envelope = verifiedById.get(record.recordId);
+            const expectedRevision = expectedRevisions.get(record.recordId);
             if (
-              !receipt || !entry || !envelope
-              || receipt.revision !== record.envelope.revision
+              !entry || !envelope || !expectedRevision
               || entry.recordType !== record.serializer.recordType
-              || entry.revision !== record.envelope.revision
+              || entry.revision !== expectedRevision
               || entry.keyVersion !== activeKeyVersion
               || envelope.recordType !== record.serializer.recordType
               || envelope.recordId !== record.recordId
               || envelope.schemaVersion !== record.serializer.schemaVersion
               || envelope.keyVersion !== activeKeyVersion
-              || envelope.revision !== record.envelope.revision
+              || envelope.revision !== expectedRevision
             ) throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification metadata mismatched. Restart to reconcile.');
             const verifiedValue = await decryptAndValidate(
               { uid: deps.uid, masterKey: activeMasterKey, serializers: deps.serializers }, envelope,
@@ -228,7 +294,7 @@ export async function importPrivateProVaultBackup(
             if (canonicalJson(verifiedValue) !== canonicalJson(record.value))
               throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification mismatch was detected. Restart to reconcile.');
           }
-          if (verifiedEnvelopes.length !== mergeRecords.length)
+          if (verifiedEnvelopes.length !== staged.length)
             throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification is incomplete. Restart to reconcile.');
           return;
         } catch (error) {

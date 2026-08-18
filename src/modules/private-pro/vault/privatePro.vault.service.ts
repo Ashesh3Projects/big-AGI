@@ -59,6 +59,24 @@ export interface MergeVaultBackupInput {
   }>;
 }
 
+export interface BeginVaultBackupRestoreInput {
+  restoreId: string;
+  backupFingerprint: string;
+  chunkCount: number;
+  recordCount: number;
+}
+
+export interface MergeVaultBackupRestoreChunkInput extends MergeVaultBackupInput {
+  restoreId: string;
+  chunkIndex: number;
+  chunkCount: number;
+}
+
+export interface FinalizeVaultBackupRestoreInput {
+  restoreId: string;
+  operationId: string;
+}
+
 export type MergeVaultBackupResult =
   | { status: 'committed' | 'unchanged'; records: Array<{ opaqueRecordId: string; revision: number; serverUpdatedAtMs: number }> }
   | { status: 'conflict'; conflicts: Array<{ opaqueRecordId: string; currentRevision: number }> };
@@ -280,6 +298,7 @@ export function createPrivateProVaultService(
       const requestFingerprint = fingerprint({ kind: 'put-record', ...input, envelope });
 
       return repository.transaction(uid, async transaction => {
+        if (await transaction.getRestoreSession()) throw new Error('An encrypted backup restore is in progress.');
         const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
         if (repeated) return repeated as PutVaultRecordResult;
         const [record, tombstone] = await Promise.all([
@@ -318,6 +337,7 @@ export function createPrivateProVaultService(
       const requestFingerprint = fingerprint({ kind: 'delete-record', ...input, tombstone });
 
       return repository.transaction(uid, async transaction => {
+        if (await transaction.getRestoreSession()) throw new Error('An encrypted backup restore is in progress.');
         const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
         if (repeated) return repeated as PutVaultRecordResult;
         const [record, existingTombstone] = await Promise.all([
@@ -350,17 +370,23 @@ export function createPrivateProVaultService(
         throw new Error('Vault index page size must be between 1 and 500.');
       const cursor = input.cursor ?? null;
       if (cursor !== null) assertOpaqueRecordId(cursor, 'cursor');
-      const entries = await repository.listIndexEntries(uid, cursor, input.pageSize + 1);
-      const hasMore = entries.length > input.pageSize;
-      const page = entries.slice(0, input.pageSize);
-      return { entries: page, nextCursor: hasMore ? page.at(-1)?.opaqueRecordId ?? null : null };
+      return repository.transaction(uid, async transaction => {
+        if (await transaction.getRestoreSession()) throw new Error('An encrypted backup restore is in progress.');
+        const entries = await transaction.listIndexEntries(cursor, input.pageSize + 1);
+        const hasMore = entries.length > input.pageSize;
+        const page = entries.slice(0, input.pageSize);
+        return { entries: page, nextCursor: hasMore ? page.at(-1)?.opaqueRecordId ?? null : null };
+      });
     },
 
     async getRecords(uid: string, opaqueRecordIds: readonly string[]) {
       assertUid(uid);
       if (opaqueRecordIds.length > PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE) throw new Error('Too many vault records requested.');
       opaqueRecordIds.forEach(recordId => assertOpaqueRecordId(recordId));
-      return repository.getRecords(uid, opaqueRecordIds);
+      return repository.transaction(uid, async transaction => {
+        if (await transaction.getRestoreSession()) throw new Error('An encrypted backup restore is in progress.');
+        return transaction.getRecords(opaqueRecordIds);
+      });
     },
 
     async putKeyset(uid: string, input: PutVaultKeysetInput): Promise<PutVaultKeysetResult> {
@@ -376,6 +402,7 @@ export function createPrivateProVaultService(
       const requestFingerprint = fingerprint({ kind: 'put-keyset', ...input, keyset });
 
       return repository.transaction(uid, async transaction => {
+        if (await transaction.getRestoreSession()) throw new Error('An encrypted backup restore is in progress.');
         const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
         if (repeated) return repeated as PutVaultKeysetResult;
         const current = await transaction.getKeyset();
@@ -448,6 +475,7 @@ export function createPrivateProVaultService(
       const requestFingerprint = fingerprint({ kind: 'merge-backup', operationId: input.operationId, records });
 
       return repository.transaction(uid, async transaction => {
+        if (await transaction.getRestoreSession()) throw new Error('An encrypted backup restore is in progress.');
         const repeated = await transaction.getBackupMerge(input.operationId);
         if (repeated) {
           if (repeated.requestFingerprint !== requestFingerprint)
@@ -488,7 +516,193 @@ export function createPrivateProVaultService(
       });
     },
 
+    async beginBackupRestore(uid: string, input: BeginVaultBackupRestoreInput) {
+      assertUid(uid);
+      assertRestoreId(input.restoreId);
+      assertRestoreCounts(input.chunkCount, input.recordCount);
+      if (!OPAQUE_RECORD_ID.test(input.backupFingerprint)) throw new Error('Vault restore fingerprint is invalid.');
+      return repository.transaction(uid, async transaction => {
+        const [active, completion] = await Promise.all([
+          transaction.getRestoreSession(),
+          transaction.getRestoreCompletion(input.restoreId),
+        ]);
+        if (completion) {
+          if (completion.backupFingerprint !== input.backupFingerprint
+            || completion.chunkCount !== input.chunkCount
+            || completion.recordCount !== input.recordCount)
+            throw new Error('Vault restore ID is already used by different content.');
+          return { status: 'completed' as const, completion };
+        }
+        if (active) {
+          if (active.restoreId !== input.restoreId
+            || active.backupFingerprint !== input.backupFingerprint
+            || active.chunkCount !== input.chunkCount
+            || active.recordCount !== input.recordCount)
+            throw new Error('Another encrypted backup restore is already in progress.');
+          return { status: 'unchanged' as const, session: active };
+        }
+        const session = {
+          formatVersion: 1 as const,
+          restoreId: input.restoreId,
+          backupFingerprint: input.backupFingerprint,
+          chunkCount: input.chunkCount,
+          recordCount: input.recordCount,
+          nextChunkIndex: 0,
+          committedRecordCount: 0,
+          startedAtMs: now(),
+        };
+        await transaction.setRestoreSession(session);
+        return { status: 'started' as const, session };
+      });
+    },
+
+    async getBackupRestoreStatus(uid: string, restoreId: string) {
+      assertUid(uid);
+      assertRestoreId(restoreId);
+      return repository.transaction(uid, async transaction => {
+        const active = await transaction.getRestoreSession();
+        if (active?.restoreId === restoreId) return active;
+        const completion = await transaction.getRestoreCompletion(restoreId);
+        return completion ? { ...completion, nextChunkIndex: completion.chunkCount } : null;
+      });
+    },
+
+    async mergeBackupRestoreChunk(uid: string, input: MergeVaultBackupRestoreChunkInput) {
+      assertUid(uid);
+      assertRestoreId(input.restoreId);
+      assertOperationId(input.operationId);
+      if (!Number.isSafeInteger(input.chunkCount) || input.chunkCount < 1 || input.chunkCount > 100_000)
+        throw new Error('Vault restore chunk count is invalid.');
+      if (!Number.isSafeInteger(input.chunkIndex) || input.chunkIndex < 0 || input.chunkIndex >= input.chunkCount)
+        throw new Error('Vault restore chunk index is invalid.');
+      if (input.records.length < 1 || input.records.length > PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS)
+        throw new Error('Vault backup merge contains too many records.');
+      const seen = new Set<string>();
+      let totalCiphertextBytes = 0;
+      const records = input.records.map(record => {
+        assertOpaqueRecordId(record.opaqueRecordId);
+        assertBaseRevision(record.baseRevision);
+        const envelope = PrivateProVaultEnvelopeSchema.parse(record.envelope);
+        if (seen.has(record.opaqueRecordId)) throw new Error('Vault backup merge contains duplicate records.');
+        seen.add(record.opaqueRecordId);
+        if (envelope.recordId !== record.opaqueRecordId) throw new Error('Vault envelope record ID disagrees with the route.');
+        if (envelope.revision !== record.baseRevision + 1) throw new Error('Vault envelope revision must follow the base revision.');
+        if (envelope.ciphertextBytes > PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES)
+          throw new Error('Vault record ciphertext exceeds the 700 KiB server limit.');
+        totalCiphertextBytes += envelope.ciphertextBytes;
+        return { ...record, envelope };
+      });
+      if (totalCiphertextBytes > PRIVATE_PRO_VAULT_BACKUP_MAX_TOTAL_CIPHERTEXT_BYTES)
+        throw new Error('Vault backup merge exceeds the total ciphertext byte limit.');
+      const requestFingerprint = fingerprint({ kind: 'restore-chunk', ...input, records });
+      return repository.transaction(uid, async transaction => {
+        const session = await transaction.getRestoreSession();
+        if (!session || session.restoreId !== input.restoreId) throw new Error('Encrypted backup restore session is unavailable.');
+        if (session.chunkCount !== input.chunkCount) throw new Error('Encrypted backup restore chunk count changed.');
+        const repeated = await transaction.getBackupMerge(input.operationId);
+        if (repeated) {
+          if (repeated.requestFingerprint !== requestFingerprint) throw new Error('Vault operation ID is already used by different content.');
+          return { status: 'unchanged' as const, records: repeated.outcome.records, nextChunkIndex: session.nextChunkIndex };
+        }
+        if (input.chunkIndex !== session.nextChunkIndex) throw new Error('Encrypted backup restore chunk is out of sequence.');
+        const current = await Promise.all(records.map(async record => {
+          const [stored, tombstone] = await Promise.all([transaction.getRecord(record.opaqueRecordId), transaction.getTombstone(record.opaqueRecordId)]);
+          return { record, currentRevision: Math.max(stored?.revision ?? 0, tombstone?.revision ?? 0) };
+        }));
+        const conflicts = current.filter(entry => entry.currentRevision !== entry.record.baseRevision)
+          .map(entry => ({ opaqueRecordId: entry.record.opaqueRecordId, currentRevision: entry.currentRevision }));
+        if (conflicts.length) return { status: 'conflict' as const, conflicts, nextChunkIndex: session.nextChunkIndex };
+        const serverUpdatedAtMs = now();
+        const outcomes = records.map(record => ({ opaqueRecordId: record.opaqueRecordId, revision: record.envelope.revision, serverUpdatedAtMs }));
+        for (const record of records) {
+          await transaction.setRecord({ opaqueRecordId: record.opaqueRecordId, revision: record.envelope.revision, serverUpdatedAtMs, envelope: structuredClone(record.envelope) });
+          await transaction.deleteTombstone(record.opaqueRecordId);
+        }
+        await transaction.createBackupMerge({ operationId: input.operationId, requestFingerprint, outcome: { status: 'committed', records: outcomes } });
+        await transaction.setRestoreSession({
+          ...session,
+          nextChunkIndex: session.nextChunkIndex + 1,
+          committedRecordCount: session.committedRecordCount + records.length,
+        });
+        return { status: 'committed' as const, records: outcomes, nextChunkIndex: session.nextChunkIndex + 1 };
+      });
+    },
+
+    async getBackupRestoreIndex(uid: string, restoreId: string, input: { pageSize: number; cursor?: string | null }) {
+      assertUid(uid);
+      assertRestoreId(restoreId);
+      if (!Number.isInteger(input.pageSize) || input.pageSize < 1 || input.pageSize > PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE)
+        throw new Error('Vault index page size must be between 1 and 500.');
+      const cursor = input.cursor ?? null;
+      if (cursor !== null) assertOpaqueRecordId(cursor, 'cursor');
+      return repository.transaction(uid, async transaction => {
+        const active = await transaction.getRestoreSession();
+        const completion = await transaction.getRestoreCompletion(restoreId);
+        if (active?.restoreId !== restoreId && !completion) throw new Error('Encrypted backup restore session is unavailable.');
+        const entries = await transaction.listIndexEntries(cursor, input.pageSize + 1);
+        const hasMore = entries.length > input.pageSize;
+        const page = entries.slice(0, input.pageSize);
+        return { entries: page, nextCursor: hasMore ? page.at(-1)?.opaqueRecordId ?? null : null };
+      });
+    },
+
+    async getBackupRestoreRecords(uid: string, restoreId: string, opaqueRecordIds: readonly string[]) {
+      assertUid(uid);
+      assertRestoreId(restoreId);
+      if (opaqueRecordIds.length > PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE) throw new Error('Too many vault records requested.');
+      opaqueRecordIds.forEach(recordId => assertOpaqueRecordId(recordId));
+      return repository.transaction(uid, async transaction => {
+        const active = await transaction.getRestoreSession();
+        const completion = await transaction.getRestoreCompletion(restoreId);
+        if (active?.restoreId !== restoreId && !completion) throw new Error('Encrypted backup restore session is unavailable.');
+        return transaction.getRecords(opaqueRecordIds);
+      });
+    },
+
+    async finalizeBackupRestore(uid: string, input: FinalizeVaultBackupRestoreInput) {
+      assertUid(uid);
+      assertRestoreId(input.restoreId);
+      assertOperationId(input.operationId);
+      const requestFingerprint = fingerprint({ kind: 'finalize-restore', ...input });
+      return repository.transaction(uid, async transaction => {
+        const existing = await transaction.getRestoreCompletion(input.restoreId);
+        if (existing) {
+          if (existing.operationId !== input.operationId || existing.requestFingerprint !== requestFingerprint)
+            throw new Error('Vault operation ID is already used by different content.');
+          return { status: 'unchanged' as const, completion: existing };
+        }
+        const session = await transaction.getRestoreSession();
+        if (!session || session.restoreId !== input.restoreId) throw new Error('Encrypted backup restore session is unavailable.');
+        if (session.nextChunkIndex !== session.chunkCount) throw new Error('Encrypted backup restore is incomplete.');
+        if (session.committedRecordCount !== session.recordCount) throw new Error('Encrypted backup restore record count is incomplete.');
+        const completion = {
+          formatVersion: 1 as const,
+          restoreId: input.restoreId,
+          operationId: input.operationId,
+          requestFingerprint,
+          backupFingerprint: session.backupFingerprint,
+          chunkCount: session.chunkCount,
+          recordCount: session.recordCount,
+          completedAtMs: now(),
+        };
+        await transaction.createRestoreCompletion(completion);
+        await transaction.deleteRestoreSession();
+        return { status: 'completed' as const, completion };
+      });
+    },
+
   };
+}
+
+function assertRestoreId(restoreId: string): void {
+  if (!OPERATION_ID.test(restoreId)) throw new Error('Vault restore ID is invalid.');
+}
+
+function assertRestoreCounts(chunkCount: number, recordCount: number): void {
+  if (!Number.isSafeInteger(chunkCount) || chunkCount < 1 || chunkCount > 100_000)
+    throw new Error('Vault restore chunk count is invalid.');
+  if (!Number.isSafeInteger(recordCount) || recordCount < 1 || recordCount > 100_000)
+    throw new Error('Vault restore record count is invalid.');
 }
 
 export type PrivateProVaultService = ReturnType<typeof createPrivateProVaultService>;

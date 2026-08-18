@@ -1,4 +1,5 @@
 import { apiAsyncNode } from '~/common/util/trpc.client';
+import { TRPCClientError } from '@trpc/client';
 
 import { PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES } from './privatePro.vault.repository';
 import type { PrivateProVaultIndexEntry } from './privatePro.vault.repository';
@@ -16,6 +17,12 @@ export interface PrivateProVaultTransport {
   getIndex(): Promise<PrivateProVaultIndexEntry[]>;
   getRecords(recordIds: readonly string[]): Promise<PrivateProVaultEnvelope[]>;
   mergeBackup(input: MergeVaultBackupInput): Promise<MergeVaultBackupResult>;
+  beginBackupRestore?(input: { restoreId: string; backupFingerprint: string; chunkCount: number; recordCount: number }): Promise<unknown>;
+  getBackupRestoreStatus?(restoreId: string): Promise<{ nextChunkIndex: number } | null>;
+  mergeBackupRestoreChunk?(input: MergeVaultBackupInput & { restoreId: string; chunkIndex: number; chunkCount: number }): Promise<MergeVaultBackupResult & { nextChunkIndex: number }>;
+  getBackupRestoreIndex?(restoreId: string): Promise<PrivateProVaultIndexEntry[]>;
+  getBackupRestoreRecords?(restoreId: string, recordIds: readonly string[]): Promise<PrivateProVaultEnvelope[]>;
+  finalizeBackupRestore?(input: { restoreId: string; operationId: string }): Promise<unknown>;
   write(operation: PrivateProVaultOperation): Promise<PrivateProVaultWriteResult>;
 }
 
@@ -23,6 +30,40 @@ export class PrivateProVaultChunkRequiredError extends Error {
   constructor() {
     super('Encrypted vault record requires chunked transport support.');
     this.name = 'PrivateProVaultChunkRequiredError';
+  }
+}
+
+export class PrivateProVaultAmbiguousTransportError extends Error {
+  constructor(cause: unknown) {
+    super('Encrypted vault transport response was ambiguous.', { cause });
+    this.name = 'PrivateProVaultAmbiguousTransportError';
+  }
+}
+
+export function isPrivateProVaultAmbiguousTRPCError(error: unknown): boolean {
+  if (!(error instanceof TRPCClientError)) return false;
+  if (error.data?.httpStatus !== undefined || error.data?.code !== undefined) return false;
+  const cause = error.cause;
+  return cause instanceof TypeError
+    || cause instanceof DOMException && cause.name !== 'AbortError'
+    || cause instanceof Error && /(?:failed to fetch|fetch failed|network|socket|terminated|connection|stream closed)/i.test(cause.message);
+}
+
+async function mergeBackup(input: MergeVaultBackupInput): Promise<MergeVaultBackupResult> {
+  try {
+    return await apiAsyncNode.privateProVault.mergeBackup.mutate(input);
+  } catch (error) {
+    if (isPrivateProVaultAmbiguousTRPCError(error)) throw new PrivateProVaultAmbiguousTransportError(error);
+    throw error;
+  }
+}
+
+async function ambiguousMutation<T>(operation: () => Promise<T>): Promise<T> {
+  try {
+    return await operation();
+  } catch (error) {
+    if (isPrivateProVaultAmbiguousTRPCError(error)) throw new PrivateProVaultAmbiguousTransportError(error);
+    throw error;
   }
 }
 
@@ -63,7 +104,35 @@ export function createPrivateProVaultTransport(): PrivateProVaultTransport {
       return envelopes;
     },
 
-    mergeBackup: input => apiAsyncNode.privateProVault.mergeBackup.mutate(input),
+    mergeBackup,
+
+    beginBackupRestore: input => ambiguousMutation(() => apiAsyncNode.privateProVault.beginBackupRestore.mutate(input)),
+
+    getBackupRestoreStatus: restoreId => apiAsyncNode.privateProVault.getBackupRestoreStatus.query({ restoreId }),
+
+    mergeBackupRestoreChunk: input => ambiguousMutation(() => apiAsyncNode.privateProVault.mergeBackupRestoreChunk.mutate(input)),
+
+    async getBackupRestoreIndex(restoreId) {
+      const entries: PrivateProVaultIndexEntry[] = [];
+      let cursor: string | null = null;
+      do {
+        const page = await apiAsyncNode.privateProVault.getBackupRestoreIndex.query({ restoreId, pageSize: 500, cursor });
+        entries.push(...page.entries);
+        cursor = page.nextCursor;
+      } while (cursor !== null);
+      return entries;
+    },
+
+    async getBackupRestoreRecords(restoreId, recordIds) {
+      const envelopes: PrivateProVaultEnvelope[] = [];
+      for (let offset = 0; offset < recordIds.length; offset += 500) {
+        const records = await apiAsyncNode.privateProVault.getBackupRestoreRecords.query({ restoreId, opaqueRecordIds: recordIds.slice(offset, offset + 500) });
+        envelopes.push(...records.map(record => structuredClone(record.envelope)));
+      }
+      return envelopes;
+    },
+
+    finalizeBackupRestore: input => ambiguousMutation(() => apiAsyncNode.privateProVault.finalizeBackupRestore.mutate(input)),
 
     async write(operation) {
       if (operation.kind === 'put') {
