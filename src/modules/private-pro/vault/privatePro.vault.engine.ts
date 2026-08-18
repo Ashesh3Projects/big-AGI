@@ -52,6 +52,11 @@ interface PrivateProVaultEngineDependencies {
   createOperationId?: () => string;
   clearSession?: () => Promise<void>;
   beforeAcknowledgeCommit?: () => Promise<void>;
+  assets?: {
+    referencedAssetIds(recordType: PrivateProVaultRecordType, value: unknown): readonly string[];
+    prepareForUpload(assetIds: readonly string[]): Promise<void>;
+    prepareForHydrate(assetIds: readonly string[]): Promise<void>;
+  };
   persistCurrent?: (
     index: readonly PrivateProVaultIndexEntry[],
     envelopes: readonly PrivateProVaultEnvelope[],
@@ -263,6 +268,10 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
 
   const replaceRuntime = async (epoch: number, records: readonly StagedRecord[], before: ReadonlyMap<PrivateProVaultRecordType, Array<{ recordId: string; value: unknown }>>) => {
     try {
+      if (deps.assets) {
+        const assetIds = [...new Set(records.flatMap(record => deps.assets!.referencedAssetIds(record.serializer.recordType, record.value)))];
+        if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForHydrate(assetIds));
+      }
       await withSuppressedEvents(async () => {
         for (const serializer of deps.serializers) {
           for (const current of await waitCurrent(epoch, serializer.snapshot()))
@@ -436,6 +445,11 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
         break;
       }
       try {
+        if (next.operation.kind === 'put' && deps.assets) {
+          const local = await decryptAndValidate(epoch, next.operation.envelope);
+          const assetIds = [...new Set(deps.assets.referencedAssetIds(local.serializer.recordType, local.value))];
+          if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForUpload(assetIds));
+        }
         const result = await waitCurrent(epoch, deps.transport.write(next.operation));
         if (result.status === 'conflict') {
           if (!await resolveConflict(epoch, next, result.currentRevision)) break;

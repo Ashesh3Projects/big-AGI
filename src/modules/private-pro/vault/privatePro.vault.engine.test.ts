@@ -225,6 +225,11 @@ async function createClient(
     rejectThemeApplyValue?: string;
     clearSession?: () => Promise<void>;
     beforeAcknowledgeCommit?: () => Promise<void>;
+    assets?: {
+      referencedAssetIds(recordType: PrivateProVaultRecordType, value: unknown): readonly string[];
+      prepareForUpload(assetIds: readonly string[]): Promise<void>;
+      prepareForHydrate(assetIds: readonly string[]): Promise<void>;
+    };
     persistCurrent?: (
       index: readonly PrivateProVaultIndexEntry[],
       envelopes: readonly PrivateProVaultEnvelope[],
@@ -265,6 +270,7 @@ async function createClient(
     clearSession: options.clearSession,
     beforeAcknowledgeCommit: options.beforeAcknowledgeCommit,
     persistCurrent: options.persistCurrent,
+    assets: options.assets,
   });
   return { db, engine, serializers, store, transport };
 }
@@ -303,6 +309,67 @@ async function encryptedEnvelope(
 
 
 describe('private Pro blocking multi-device vault engine', () => {
+  test('hydrates referenced assets before applying a remote chat', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    const order: string[] = [];
+    let releaseAssets = () => {};
+    const assetGate = new Promise<void>(resolve => releaseAssets = resolve);
+    const client = await createClient(t, server, masterKey, 'asset-hydrate', {
+      assets: {
+        referencedAssetIds: recordType => recordType === 'chat' ? ['asset-private'] : [],
+        async prepareForHydrate(assetIds) {
+          order.push(`hydrate:${assetIds.join(',')}`);
+          await assetGate;
+        },
+        async prepareForUpload() {},
+      },
+    });
+    const chatSerializer = serializer(client, 'chat');
+    const originalApply = chatSerializer.apply.bind(chatSerializer);
+    chatSerializer.apply = async (recordId, value) => {
+      order.push('apply:chat');
+      await originalApply(recordId, value);
+    };
+    server.records.set(CHAT_ID, {
+      envelope: await encryptedEnvelope(masterKey, 'chat', CHAT_ID, 1, { id: 'chat', value: 'remote' }),
+      serverUpdatedAtMs: 1,
+    });
+
+    const hydration = client.engine.hydrateBeforeOpen();
+    while (order.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
+    assert.deepEqual(order, ['hydrate:asset-private']);
+    assert.equal(chatSerializer.values.size, 0);
+    releaseAssets();
+    await hydration;
+
+    assert.deepEqual(order, ['hydrate:asset-private', 'apply:chat']);
+  });
+
+  test('uploads referenced assets before writing a local encrypted chat record', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    const order: string[] = [];
+    const originalWrite = server.write.bind(server);
+    server.write = async operation => {
+      order.push('write:chat');
+      return originalWrite(operation);
+    };
+    const client = await createClient(t, server, masterKey, 'asset-upload', {
+      assets: {
+        referencedAssetIds: recordType => recordType === 'chat' ? ['asset-private'] : [],
+        async prepareForHydrate() {},
+        async prepareForUpload(assetIds) { order.push(`upload:${assetIds.join(',')}`); },
+      },
+    });
+    await openClient(client);
+
+    await serializer(client, 'chat').mutate(CHAT_ID, { id: 'chat', value: 'local' });
+    await client.engine.whenCurrent();
+
+    assert.deepEqual(order, ['upload:asset-private', 'write:chat']);
+  });
+
   test('PC B downloads and applies PC A credentials before ready, then changes theme independently', async (t) => {
     const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
     const server = new TestVaultServer();

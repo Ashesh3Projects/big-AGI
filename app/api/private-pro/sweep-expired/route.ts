@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 
 import { getFirebasePrivateProAssetsService } from '~/modules/private-pro/assets/privatePro.assets.firebase';
+import { getFirebasePrivateProVaultAssetsService } from '~/modules/private-pro/vault/privatePro.vault.assets.firebase';
 import { getPrivateProServerConfig } from '~/modules/private-pro/config/privatePro.config.server';
 import { env } from '~/server/env.server';
 
@@ -15,5 +16,9 @@ export async function GET(request: NextRequest) {
   if (!secret || request.headers.get('authorization') !== `Bearer ${secret}`)
     return NextResponse.json({ error: 'Unauthorized.' }, { status: 401 });
 
-  return NextResponse.json(await getFirebasePrivateProAssetsService().sweepExpiredReservations());
+  const [legacy, encrypted] = await Promise.all([
+    getFirebasePrivateProAssetsService().sweepExpiredReservations(),
+    getFirebasePrivateProVaultAssetsService().sweepExpiredReservations(),
+  ]);
+  return NextResponse.json({ released: legacy.released + encrypted.released });
 }

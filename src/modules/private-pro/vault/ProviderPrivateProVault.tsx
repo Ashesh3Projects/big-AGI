@@ -25,7 +25,8 @@ import {
   unlockPrivateProVaultCredentialsWithPassword,
   unlockPrivateProVaultCredentialsWithRecovery,
 } from './privatePro.vault.keyset';
-import { createPrivateProVaultSerializers } from './privatePro.vault.serializers';
+import { createPrivateProVaultSerializers, privateProVaultSerializers } from './privatePro.vault.serializers';
+import { collectPrivateProVaultAssetIds, createPrivateProVaultAssetClient, type PrivateProVaultAssetClient } from './privatePro.vault.assets.client';
 import { privateProVaultSession } from './privatePro.vault.session';
 import { createPrivateProVaultStore, privateProVaultStore, type PrivateProVaultPhase } from './store-private-pro-vault';
 import { createPrivateProVaultTransport } from './privatePro.vault.transport';
@@ -295,7 +296,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
 function createProductionDependencies(
   user: User,
   signOut: () => Promise<void>,
-  runtime: { engine: PrivateProVaultEngine | null; keyset: PrivateProVaultKeyset | null; masterKey: CryptoKey | null; devices: PrivateProVaultDeviceMetadata[] },
+  runtime: { engine: PrivateProVaultEngine | null; keyset: PrivateProVaultKeyset | null; masterKey: CryptoKey | null; devices: PrivateProVaultDeviceMetadata[]; assets: PrivateProVaultAssetClient | null },
 ): PrivateProVaultLifecycleDependencies<PrivateProVaultKeyset, CryptoKey, CryptoKey> {
   let deviceId = '';
   return {
@@ -378,6 +379,7 @@ function createProductionDependencies(
     async activate(masterKey, keyset) {
       await runtime.engine?.stopAndWait();
       const identifierKey = await deriveVaultSubkey(masterKey, 'record-identifiers', 'portable-state', ['sign']);
+      const assets = createPrivateProVaultAssetClient({ vaultId: user.uid, masterKey, keyVersion: keyset.keyVersion });
       const engine = createPrivateProVaultEngine({
         uid: user.uid,
         keyVersion: keyset.keyVersion,
@@ -387,8 +389,14 @@ function createProductionDependencies(
         serializers: createPrivateProVaultSerializers(identifierKey),
         transport: createPrivateProVaultTransport(),
         store: privateProVaultStore,
+        assets: {
+          referencedAssetIds: collectPrivateProVaultAssetIds,
+          prepareForUpload: assetIds => assets.prepareForUpload(assetIds),
+          prepareForHydrate: assetIds => assets.prepareForHydrate(assetIds),
+        },
       });
       runtime.engine = engine;
+      runtime.assets = assets;
       await engine.hydrateBeforeOpen();
       await engine.start();
       const current = privateProVaultStore.getState();
@@ -410,6 +418,7 @@ function createProductionDependencies(
       runtime.engine = null;
       runtime.masterKey = null;
       runtime.keyset = null;
+      runtime.assets = null;
       clearPrivateProVaultDeviceId(user.uid);
       await signOut();
     },
@@ -432,7 +441,8 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     keyset: PrivateProVaultKeyset | null;
     masterKey: CryptoKey | null;
     devices: PrivateProVaultDeviceMetadata[];
-  }>({ engine: null, keyset: null, masterKey: null, devices: [] });
+    assets: PrivateProVaultAssetClient | null;
+  }>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null });
 
   React.useEffect(() => {
     if (!auth.user) return;
@@ -480,6 +490,18 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
       records: async function* () {
         for (const envelope of await privateProVaultDB.listEncryptedRecords(auth.user!.uid)) yield envelope;
       },
+      ...(runtime.assets ? {
+        assets: async function* () {
+          const assetIds = new Set<string>();
+          for (const serializer of privateProVaultSerializers) {
+            if (serializer.recordType !== 'chat') continue;
+            for (const record of await serializer.snapshot())
+              for (const assetId of collectPrivateProVaultAssetIds(serializer.recordType, record.value)) assetIds.add(assetId);
+          }
+          await runtime.assets!.prepareForUpload([...assetIds]);
+          yield* runtime.assets!.exportAssetChunks([...assetIds]);
+        },
+      } : {}),
     };
     const response = new Response(createPrivateProEncryptedBackupStream(source));
     const blob = await response.blob();
