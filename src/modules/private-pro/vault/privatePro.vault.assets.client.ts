@@ -533,13 +533,6 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
   };
 
   return {
-    async verifyCloud(assetIds: readonly DBlobAssetId[], signal?: AbortSignal) {
-      for (const assetId of [...new Set(assetIds)]) {
-        throwIfAborted(signal);
-        await decryptAsset(assetId, await downloadChunks(assetId, signal));
-      }
-    },
-
     async prepareForUpload(assetIds: readonly DBlobAssetId[], signal?: AbortSignal) {
       for (const assetId of [...new Set(assetIds)]) {
         throwIfAborted(signal);

@@ -224,35 +224,4 @@ export class FirebasePrivateProSyncRepository implements PrivateProSyncRepositor
       return { status: 'committed', revision };
     });
   }
-
-  async cleanupMigratedEntity(input: { uid: string; entityType: PrivateProEntityType; entityId: string; sourceVersion: string }) {
-    const [revisionText, contentHash] = input.sourceVersion.split(':');
-    const expectedRevision = Number(revisionText);
-    const canonical = input.entityType === 'chat'
-      ? chatRef(this.db, input.uid, input.entityId)
-      : personaRef(this.db, input.uid, input.entityId);
-    const revisionRoot = input.entityType === 'chat' ? canonical.collection('revisions') : null;
-    const cleanup = await this.db.runTransaction(async transaction => {
-      const snapshot = await transaction.get(canonical);
-      if (!snapshot.exists) return { status: 'already-deleted' as const, revisionPath: null as string | null };
-      const value = snapshot.data();
-      if (personaRevision(value) !== expectedRevision || currentHash(value) !== contentHash)
-        return { status: 'conflict' as const, revisionPath: null as string | null };
-      const operationId = typeof value?.operationId === 'string' ? value.operationId : null;
-      transaction.delete(canonical);
-      return {
-        status: 'deleted' as const,
-        revisionPath: revisionRoot && operationId ? revisionRoot.doc(`${expectedRevision}-${operationId}`).path : null,
-      };
-    });
-    if (cleanup.status === 'deleted' && cleanup.revisionPath) {
-      const revision = this.db.doc(cleanup.revisionPath);
-      const chunks = await revision.collection('chunks').get();
-      const batch = this.db.batch();
-      for (const chunk of chunks.docs) batch.delete(chunk.ref);
-      batch.delete(revision);
-      await batch.commit();
-    }
-    return cleanup.status;
-  }
 }

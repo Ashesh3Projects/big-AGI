@@ -87,10 +87,4 @@ export interface PrivateProSyncRepository {
     operationId: string,
   ): Promise<PrivateProDeleteResult>;
   putPersona(uid: string, request: PrivateProPutPersonaRequest): Promise<PrivateProPutEntityResult>;
-  cleanupMigratedEntity(input: {
-    uid: string;
-    entityType: PrivateProEntityType;
-    entityId: string;
-    sourceVersion: string;
-  }): Promise<'deleted' | 'already-deleted' | 'conflict'>;
 }

@@ -424,27 +424,6 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(lifecycle.getState().phase, 'ready');
   });
 
-  test('retry resumes an unlocked migration without returning to password unlock', async () => {
-    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: 'remembered-master-key' });
-    let first = true;
-    harness.deps.activate = async () => {
-      harness.counts.activate++;
-      if (first) {
-        first = false;
-        throw new Error('migration needs export confirmation');
-      }
-    };
-    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
-
-    await lifecycle.start();
-    assert.equal(lifecycle.getState().phase, 'error');
-    await lifecycle.retry();
-
-    assert.equal(lifecycle.getState().phase, 'ready');
-    assert.equal(harness.counts.bootstrap, 1);
-    assert.equal(harness.counts.activate, 2);
-  });
-
   test('logout destroys remembered and in-memory unlock state before returning to auth', async () => {
     const harness = createHarness({ keyset: 'keyset-1', rememberedKey: 'remembered-master-key' });
     const lifecycle = createPrivateProVaultLifecycle(harness.deps);

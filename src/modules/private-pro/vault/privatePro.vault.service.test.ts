@@ -633,30 +633,30 @@ describe('Private Pro encrypted vault service', () => {
       operationId: 'migration-start',
       migrationId: 'legacy-v1',
       basePhase: null,
-      phase: 'commit',
+      phase: 'encrypting',
     };
     assert.deepEqual(await service.commitMigration(UID_A, start), {
       status: 'committed',
-      phase: 'commit',
+      phase: 'encrypting',
       serverUpdatedAtMs: 1_000,
     });
     assert.deepEqual(await service.commitMigration(UID_A, start), {
       status: 'unchanged',
-      phase: 'commit',
+      phase: 'encrypting',
       serverUpdatedAtMs: 1_000,
     });
     assert.deepEqual(await service.commitMigration(UID_A, {
       operationId: 'migration-stale',
       migrationId: 'legacy-v1',
       basePhase: null,
-      phase: 'complete',
-    }), { status: 'conflict', currentPhase: 'commit' });
+      phase: 'committed',
+    }), { status: 'conflict', currentPhase: 'encrypting' });
     assert.deepEqual(await service.commitMigration(UID_A, {
       operationId: 'migration-finish',
       migrationId: 'legacy-v1',
-      basePhase: 'commit',
-      phase: 'complete',
-    }), { status: 'committed', phase: 'complete', serverUpdatedAtMs: 1_001 });
+      basePhase: 'encrypting',
+      phase: 'committed',
+    }), { status: 'committed', phase: 'committed', serverUpdatedAtMs: 1_001 });
   });
 
   test('rejects records above the Firestore-safe ciphertext bound', async () => {
@@ -682,7 +682,7 @@ describe('Private Pro encrypted vault service', () => {
     await service.putRecord(UID_B, input);
     await service.putKeyset(UID_A, { operationId: 'same-keyset-op', baseWrappingVersion: 0, keyset: keyset(1) });
     await service.commitMigration(UID_A, {
-      operationId: 'same-migration-op', migrationId: 'legacy-v1', basePhase: null, phase: 'commit',
+      operationId: 'same-migration-op', migrationId: 'legacy-v1', basePhase: null, phase: 'encrypting',
     });
 
     assert.equal((await service.getIndex(UID_A, { pageSize: 10 })).entries.length, 1);
