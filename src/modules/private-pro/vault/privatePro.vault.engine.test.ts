@@ -652,27 +652,32 @@ describe('private Pro blocking multi-device vault engine', () => {
   test('stop waits for a started acknowledgement transaction to commit atomically', async (t) => {
     const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
     const server = new TestVaultServer();
-    let acknowledgeStarted = false;
+    let signalAcknowledgeStarted = () => {};
+    const acknowledgeStarted = new Promise<void>(resolve => signalAcknowledgeStarted = resolve);
+    let signalStopRequested = () => {};
+    const stopRequested = new Promise<void>(resolve => signalStopRequested = resolve);
+    let signalStopBlocked = (_blocked: boolean) => {};
+    const stopBlocked = new Promise<boolean>(resolve => signalStopBlocked = resolve);
     let releaseAcknowledge = () => {};
     const acknowledgeGate = new Promise<void>(resolve => releaseAcknowledge = resolve);
+    let stopSettled = false;
     const client = await createClient(t, server, masterKey, 'stop-acknowledge', {
       beforeAcknowledgeCommit: async () => {
-        acknowledgeStarted = true;
+        signalAcknowledgeStarted();
+        await stopRequested;
+        signalStopBlocked(!stopSettled);
         await acknowledgeGate;
       },
     });
     await openClient(client);
 
     await serializer(client, 'settings').mutate(THEME_ID, { id: 'theme', value: 'dark' });
-    while (server.operations.length === 0) await new Promise(resolve => setTimeout(resolve, 0));
-    await new Promise(resolve => setTimeout(resolve, 0));
-    assert.equal(acknowledgeStarted, true);
+    await acknowledgeStarted;
     const stopResult = client.engine.stop();
     assert.equal(stopResult, undefined);
-    let stopSettled = false;
     const stopping = client.engine.stopAndWait().then(() => stopSettled = true);
-    await new Promise(resolve => setTimeout(resolve, 0));
-    assert.equal(stopSettled, false);
+    signalStopRequested();
+    assert.equal(await stopBlocked, true);
 
     releaseAcknowledge();
     await stopping;
