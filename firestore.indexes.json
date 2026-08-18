@@ -36,7 +36,7 @@
   "fieldOverrides": [
     {
       "collectionGroup": "legacyCleanupReceipts",
-      "fieldPath": "expiresAtMs",
+      "fieldPath": "expiresAt",
       "ttl": true,
       "indexes": []
     }

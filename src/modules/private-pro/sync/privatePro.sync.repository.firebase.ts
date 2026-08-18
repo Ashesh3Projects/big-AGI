@@ -1,4 +1,4 @@
-import { FieldValue, type DocumentData, type DocumentReference, type Firestore } from 'firebase-admin/firestore';
+import { Timestamp, type DocumentData, type DocumentReference, type Firestore } from 'firebase-admin/firestore';
 
 import { getPrivateProFirestore } from '../firebase/firebase.admin';
 import {
@@ -233,13 +233,43 @@ export class FirebasePrivateProSyncRepository implements PrivateProSyncRepositor
     });
   }
 
-  async cleanupMigratedEntity(input: { uid: string; operationId: string; entityType: PrivateProEntityType; entityId: string; sourceVersion: string; frozenRevisionPath: string | null; frozenChunkIds: string[]; expiresAtMs: number }) {
+  async cleanupMigratedEntity(input: { uid: string; operationId: string; entityType: PrivateProEntityType; entityId: string; sourceVersion: string; expiresAtMs: number }) {
     return resumePrivateProLegacyMigrationCleanup(new FirebasePrivateProLegacyCleanupPort(this.db), input);
   }
 }
 
+export function createFirebasePrivateProLegacyCleanupPortForTest(db: Firestore): PrivateProLegacyCleanupPort {
+  return new FirebasePrivateProLegacyCleanupPort(db);
+}
+
 function cleanupReceiptRef(db: Firestore, uid: string, operationId: string) {
   return db.doc(`users/${uid}/legacyCleanupReceipts/${operationId}`);
+}
+
+function cleanupLocatorRef(db: Firestore, uid: string, entityType: PrivateProEntityType, entityId: string, revision: number) {
+  return db.doc(`users/${uid}/legacyCleanupLocators/${entityType}:${entityId}:${revision}`);
+}
+
+interface StoredLegacyCleanupLocator {
+  entityType: PrivateProEntityType;
+  entityId: string;
+  revision: number;
+  contentHash: string;
+  revisionId: string | null;
+  chunkIds: string[];
+}
+
+type StoredLegacyCleanupReceipt = Omit<PrivateProLegacyCleanupReceipt, 'expiresAtMs'> & { expiresAt: Timestamp };
+type StoredLegacyCleanupTombstone = Omit<PrivateProLegacyCleanupTombstone, 'expiresAtMs'> & { expiresAt: Timestamp };
+
+export function serializePrivateProLegacyCleanupState(state: PrivateProLegacyCleanupReceipt | PrivateProLegacyCleanupTombstone): StoredLegacyCleanupReceipt | StoredLegacyCleanupTombstone {
+  const { expiresAtMs, ...rest } = state;
+  return { ...rest, expiresAt: Timestamp.fromMillis(expiresAtMs) };
+}
+
+function parseCleanupState(state: StoredLegacyCleanupReceipt | StoredLegacyCleanupTombstone): PrivateProLegacyCleanupReceipt | PrivateProLegacyCleanupTombstone {
+  const { expiresAt, ...rest } = state;
+  return { ...rest, expiresAtMs: expiresAt.toMillis() } as PrivateProLegacyCleanupReceipt | PrivateProLegacyCleanupTombstone;
 }
 
 class FirebasePrivateProLegacyCleanupPort implements PrivateProLegacyCleanupPort {
@@ -250,10 +280,13 @@ class FirebasePrivateProLegacyCleanupPort implements PrivateProLegacyCleanupPort
     const expectedRevision = Number(revisionText);
     const canonical = input.entityType === 'chat' ? chatRef(this.db, input.uid, input.entityId) : personaRef(this.db, input.uid, input.entityId);
     const receiptRef = cleanupReceiptRef(this.db, input.uid, input.operationId);
+    const locatorRef = cleanupLocatorRef(this.db, input.uid, input.entityType, input.entityId, expectedRevision);
     return this.db.runTransaction(async transaction => {
-      const [receiptSnapshot, canonicalSnapshot] = await Promise.all([transaction.get(receiptRef), transaction.get(canonical)]);
+      const [receiptSnapshot, canonicalSnapshot, locatorSnapshot] = await Promise.all([
+        transaction.get(receiptRef), transaction.get(canonical), transaction.get(locatorRef),
+      ]);
       if (receiptSnapshot.exists) {
-        const stored = receiptSnapshot.data() as PrivateProLegacyCleanupReceipt | PrivateProLegacyCleanupTombstone;
+        const stored = parseCleanupState(receiptSnapshot.data() as StoredLegacyCleanupReceipt | StoredLegacyCleanupTombstone);
         if (stored.status === 'complete') {
           if (stored.uid !== input.uid || stored.operationId !== input.operationId)
             throw new Error('Legacy cleanup operation ID is already used by different content.');
@@ -262,27 +295,68 @@ class FirebasePrivateProLegacyCleanupPort implements PrivateProLegacyCleanupPort
         const receipt = stored;
         if (receipt.uid !== input.uid || receipt.entityType !== input.entityType || receipt.entityId !== input.entityId || receipt.sourceVersion !== input.sourceVersion)
           throw new Error('Legacy cleanup operation ID is already used by different content.');
-        return { status: 'ready' as const, receipt };
+        const refreshed = receipt.expiresAtMs >= input.expiresAtMs ? receipt : { ...receipt, expiresAtMs: input.expiresAtMs };
+        if (refreshed !== receipt) transaction.set(receiptRef, serializePrivateProLegacyCleanupState(refreshed));
+        return { status: 'ready' as const, receipt: refreshed };
       }
+      const existingLocator = locatorSnapshot.exists ? locatorSnapshot.data() as StoredLegacyCleanupLocator : null;
       if (!canonicalSnapshot.exists) {
         if (input.entityType === 'persona') return { status: 'already-deleted' as const };
-        const expectedPrefix = `users/${input.uid}/chats/${input.entityId}/revisions/`;
-        if (!input.frozenRevisionPath?.startsWith(expectedPrefix)) return { status: 'conflict' as const };
-        const receipt = createPrivateProLegacyCleanupReceipt(input, input.frozenRevisionPath, input.frozenChunkIds);
-        transaction.create(receiptRef, receipt);
+        if (!existingLocator || existingLocator.entityType !== 'chat' || existingLocator.entityId !== input.entityId
+          || existingLocator.revision !== expectedRevision || existingLocator.contentHash !== contentHash || !existingLocator.revisionId)
+          return { status: 'conflict' as const };
+        const revisionPath = canonical.collection('revisions').doc(existingLocator.revisionId).path;
+        const revisionSnapshot = await transaction.get(this.db.doc(revisionPath));
+        if (!revisionSnapshot.exists) return { status: 'already-deleted' as const };
+        const revision = revisionSnapshot.data();
+        const receipt = createPrivateProLegacyCleanupReceipt(input, {
+          revisionPath,
+          revision: personaRevision(revision),
+          contentHash: currentHash(revision) ?? '',
+          chunkIds: Array.isArray(revision?.chunkIds) ? revision.chunkIds.filter((chunkId): chunkId is string => typeof chunkId === 'string') : [],
+        });
+        if (JSON.stringify(receipt.chunkIds) !== JSON.stringify(existingLocator.chunkIds)) return { status: 'conflict' as const };
+        transaction.create(receiptRef, serializePrivateProLegacyCleanupState(receipt));
         return { status: 'ready' as const, receipt };
       }
       const value = canonicalSnapshot.data();
       if (personaRevision(value) !== expectedRevision || currentHash(value) !== contentHash) return { status: 'conflict' as const };
       const canonicalOperationId = typeof value?.operationId === 'string' ? value.operationId : null;
-      const revisionPath = input.entityType === 'chat' && canonicalOperationId
-        ? canonical.collection('revisions').doc(`${expectedRevision}-${canonicalOperationId}`).path
-        : null;
-      const chunkIds = input.entityType === 'chat' && Array.isArray(value?.chunkIds)
+      const revisionId = input.entityType === 'chat' && canonicalOperationId ? `${expectedRevision}-${canonicalOperationId}` : null;
+      const revisionPath = revisionId ? canonical.collection('revisions').doc(revisionId).path : null;
+      const canonicalChunkIds = input.entityType === 'chat' && Array.isArray(value?.chunkIds)
         ? value.chunkIds.filter((chunkId): chunkId is string => typeof chunkId === 'string')
         : [];
-      const receipt = createPrivateProLegacyCleanupReceipt(input, revisionPath, chunkIds);
-      transaction.create(receiptRef, receipt);
+      let chunkIds = canonicalChunkIds;
+      if (revisionPath) {
+        const revisionSnapshot = await transaction.get(this.db.doc(revisionPath));
+        if (!revisionSnapshot.exists) return { status: 'conflict' as const };
+        const revision = revisionSnapshot.data();
+        const revisionChunkIds = Array.isArray(revision?.chunkIds)
+          ? revision.chunkIds.filter((chunkId): chunkId is string => typeof chunkId === 'string')
+          : [];
+        if (personaRevision(revision) !== expectedRevision || currentHash(revision) !== contentHash
+          || typeof revision?.operationId !== 'string' || revision.operationId !== canonicalOperationId
+          || JSON.stringify(revisionChunkIds) !== JSON.stringify(canonicalChunkIds)) return { status: 'conflict' as const };
+        chunkIds = revisionChunkIds;
+      }
+      const locator: StoredLegacyCleanupLocator = {
+        entityType: input.entityType,
+        entityId: input.entityId,
+        revision: expectedRevision,
+        contentHash,
+        revisionId,
+        chunkIds,
+      };
+      if (existingLocator && JSON.stringify(existingLocator) !== JSON.stringify(locator)) return { status: 'conflict' as const };
+      const receipt = createPrivateProLegacyCleanupReceipt(input, revisionPath ? {
+        revisionPath,
+        revision: expectedRevision,
+        contentHash,
+        chunkIds,
+      } : null);
+      transaction.create(receiptRef, serializePrivateProLegacyCleanupState(receipt));
+      if (!existingLocator) transaction.create(locatorRef, locator);
       transaction.delete(canonical);
       return { status: 'ready' as const, receipt };
     });
@@ -293,14 +367,14 @@ class FirebasePrivateProLegacyCleanupPort implements PrivateProLegacyCleanupPort
     return this.db.runTransaction(async transaction => {
       const snapshot = await transaction.get(receiptRef);
       if (!snapshot.exists) throw new Error('Legacy cleanup receipt was not found.');
-      const receipt = snapshot.data() as PrivateProLegacyCleanupReceipt | PrivateProLegacyCleanupTombstone;
+      const receipt = parseCleanupState(snapshot.data() as StoredLegacyCleanupReceipt | StoredLegacyCleanupTombstone);
       if (receipt.status === 'complete') throw new Error('Legacy cleanup is already complete.');
       if (receipt.chunkCursor > input.expectedCursor) return receipt;
       if (receipt.chunkCursor !== input.expectedCursor || receipt.chunkIds[input.expectedCursor] !== input.chunkId)
         throw new Error('Legacy cleanup cursor conflicts with this retry.');
       if (receipt.revisionPath) transaction.delete(this.db.doc(receipt.revisionPath).collection('chunks').doc(input.chunkId));
       const next = { ...receipt, chunkCursor: receipt.chunkCursor + 1 };
-      transaction.set(receiptRef, next);
+      transaction.set(receiptRef, serializePrivateProLegacyCleanupState(next));
       return next;
     });
   }
@@ -316,13 +390,19 @@ class FirebasePrivateProLegacyCleanupPort implements PrivateProLegacyCleanupPort
     return this.db.runTransaction(async transaction => {
       const snapshot = await transaction.get(receiptRef);
       if (!snapshot.exists) throw new Error('Legacy cleanup receipt was not found.');
-      const stored = snapshot.data() as PrivateProLegacyCleanupReceipt | PrivateProLegacyCleanupTombstone;
+      const stored = parseCleanupState(snapshot.data() as StoredLegacyCleanupReceipt | StoredLegacyCleanupTombstone);
       if (stored.status === 'complete') return stored;
       const receipt = stored;
       if (receipt.chunkCursor !== receipt.chunkIds.length) throw new Error('Legacy cleanup children are incomplete.');
-      if (receipt.revisionPath) transaction.delete(this.db.doc(receipt.revisionPath));
+      if (receipt.revisionPath) {
+        const revisionRef = this.db.doc(receipt.revisionPath);
+        const remainingChunks = await transaction.get(revisionRef.collection('chunks'));
+        if (!remainingChunks.empty) throw new Error('Legacy cleanup children changed before finalization.');
+        transaction.delete(revisionRef);
+      }
+      transaction.delete(cleanupLocatorRef(this.db, receipt.uid, receipt.entityType, receipt.entityId, Number(receipt.sourceVersion.split(':')[0])));
       const complete = completePrivateProLegacyCleanupReceipt(receipt);
-      transaction.set(receiptRef, complete);
+      transaction.set(receiptRef, serializePrivateProLegacyCleanupState(complete));
       return complete;
     });
   }

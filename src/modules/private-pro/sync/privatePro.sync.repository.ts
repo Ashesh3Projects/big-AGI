@@ -93,8 +93,6 @@ export interface PrivateProSyncRepository {
     entityType: PrivateProEntityType;
     entityId: string;
     sourceVersion: string;
-    frozenRevisionPath: string | null;
-    frozenChunkIds: string[];
     expiresAtMs: number;
   }): Promise<'deleted' | 'already-deleted' | 'conflict'>;
 }
@@ -126,8 +124,6 @@ export interface PrivateProLegacyCleanupPort {
     entityType: PrivateProEntityType;
     entityId: string;
     sourceVersion: string;
-    frozenRevisionPath: string | null;
-    frozenChunkIds: string[];
     expiresAtMs: number;
   }): Promise<
     | { status: 'ready'; receipt: PrivateProLegacyCleanupReceipt }
@@ -146,15 +142,18 @@ export interface PrivateProLegacyCleanupPort {
 
 export function createPrivateProLegacyCleanupReceipt(
   input: Parameters<PrivateProLegacyCleanupPort['prepare']>[0],
-  revisionPath: string | null,
-  chunkIds: readonly string[],
+  revision: { revisionPath: string; revision: number; contentHash: string; chunkIds: readonly string[] } | null,
 ): PrivateProLegacyCleanupReceipt {
   if (!Number.isSafeInteger(input.expiresAtMs) || input.expiresAtMs <= 0)
     throw new Error('Legacy cleanup expiry is invalid.');
   if (input.entityType === 'chat') {
-    const expectedPrefix = `users/${input.uid}/chats/${input.entityId}/revisions/`;
-    if (!revisionPath?.startsWith(expectedPrefix)) throw new Error('Legacy cleanup revision path is invalid.');
-  } else if (revisionPath !== null || chunkIds.length) {
+    const [revisionText, contentHash] = input.sourceVersion.split(':');
+    const expectedRevision = Number(revisionText);
+    const expectedPrefix = `users/${input.uid}/chats/${input.entityId}/revisions/${expectedRevision}-`;
+    if (!revision || !revision.revisionPath.startsWith(expectedPrefix) || revision.revisionPath.slice(expectedPrefix.length).includes('/')
+      || revision.revision !== expectedRevision || revision.contentHash !== contentHash)
+      throw new Error('Legacy cleanup revision identity is invalid.');
+  } else if (revision !== null) {
     throw new Error('Persona cleanup cannot carry chat revision children.');
   }
   return {
@@ -163,8 +162,8 @@ export function createPrivateProLegacyCleanupReceipt(
     entityType: input.entityType,
     entityId: input.entityId,
     sourceVersion: input.sourceVersion,
-    revisionPath,
-    chunkIds: [...chunkIds],
+    revisionPath: revision?.revisionPath ?? null,
+    chunkIds: [...(revision?.chunkIds ?? [])],
     chunkCursor: 0,
     status: 'children',
     expiresAtMs: input.expiresAtMs,

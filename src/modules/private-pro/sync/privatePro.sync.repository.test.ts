@@ -8,6 +8,8 @@ import {
   type PrivateProLegacyCleanupPort,
   type PrivateProLegacyCleanupReceipt,
 } from './privatePro.sync.repository';
+import { serializePrivateProLegacyCleanupState } from './privatePro.sync.repository.firebase';
+import { Timestamp } from 'firebase-admin/firestore';
 
 
 class MemoryCleanupPort implements PrivateProLegacyCleanupPort {
@@ -26,10 +28,10 @@ class MemoryCleanupPort implements PrivateProLegacyCleanupPort {
       return { status: 'complete' as const, tombstone: structuredClone(this.completedTombstone) };
     if (this.receipt) return { status: 'ready' as const, receipt: structuredClone(this.receipt) };
     if (!this.canonical) {
-      if (!input.frozenRevisionPath || !input.frozenChunkIds) return { status: 'conflict' as const };
+      const revisionPath = `users/${input.uid}/chats/${input.entityId}/revisions/${input.sourceVersion.split(':')[0]}-op`;
       this.receipt = {
         uid: input.uid, operationId: input.operationId, entityType: input.entityType, entityId: input.entityId,
-        sourceVersion: input.sourceVersion, revisionPath: input.frozenRevisionPath, chunkIds: [...input.frozenChunkIds],
+        sourceVersion: input.sourceVersion, revisionPath, chunkIds: [...this.chunks],
         chunkCursor: 0, status: 'children', expiresAtMs: input.expiresAtMs,
       };
       return { status: 'ready' as const, receipt: structuredClone(this.receipt) };
@@ -58,7 +60,7 @@ class MemoryCleanupPort implements PrivateProLegacyCleanupPort {
     return structuredClone(this.receipt!);
   }
 
-  async listUnexpectedChunks() { return [...this.chunks].filter(chunk => !this.receipt!.chunkIds.includes(chunk)); }
+  async listUnexpectedChunks(receipt: PrivateProLegacyCleanupReceipt) { return [...this.chunks].filter(chunk => !receipt.chunkIds.includes(chunk)); }
 
   async finalize(input: Parameters<PrivateProLegacyCleanupPort['finalize']>[0]) {
     this.revisionExists = false;
@@ -75,12 +77,19 @@ class MemoryCleanupPort implements PrivateProLegacyCleanupPort {
 
 const INPUT = {
   uid: 'uid-owner', operationId: 'migration-cleanup-op', entityType: 'chat' as const, entityId: 'chat-1', sourceVersion: `3:${'a'.repeat(64)}`,
-  frozenRevisionPath: 'users/uid-owner/chats/chat-1/revisions/3-op', frozenChunkIds: ['a', 'b', 'c'], expiresAtMs: 86_401_000,
+  expiresAtMs: 86_401_000,
 };
+
+const REVISION = {
+  revisionPath: 'users/uid-owner/chats/chat-1/revisions/3-op',
+  revision: 3,
+  contentHash: 'a'.repeat(64),
+  chunkIds: ['a', 'b', 'c'],
+} as const;
 
 describe('private Pro legacy cleanup receipt', () => {
   test('production receipt state helpers recover a frozen orphan and minimize completion metadata', () => {
-    const receipt = createPrivateProLegacyCleanupReceipt(INPUT, INPUT.frozenRevisionPath, INPUT.frozenChunkIds);
+    const receipt = createPrivateProLegacyCleanupReceipt(INPUT, REVISION);
     const complete = completePrivateProLegacyCleanupReceipt({ ...receipt, chunkCursor: receipt.chunkIds.length });
 
     assert.deepEqual(complete, {
@@ -89,6 +98,9 @@ describe('private Pro legacy cleanup receipt', () => {
     const serialized = JSON.stringify(complete);
     for (const forbidden of ['chat-1', '3-op', 'a'.repeat(64), 'chunkIds', 'revisionPath', 'sourceVersion'])
       assert.equal(serialized.includes(forbidden), false, forbidden);
+    const stored = serializePrivateProLegacyCleanupState(complete);
+    assert.equal(stored.expiresAt instanceof Timestamp, true);
+    assert.equal('expiresAtMs' in stored, false);
   });
 
   test('resumes exact revision cleanup after a crash following canonical deletion', async () => {
@@ -129,6 +141,20 @@ describe('private Pro legacy cleanup receipt', () => {
     assert.equal(port.revisionExists, true);
   });
 
+  test('rechecks for concurrently inserted children immediately before deleting the revision', async () => {
+    const port = new MemoryCleanupPort();
+    const originalFinalize = port.finalize.bind(port);
+    port.finalize = async input => {
+      port.chunks.add('concurrent-child');
+      if ((await port.listUnexpectedChunks(input.receipt)).length) throw new Error('unexpected concurrent child');
+      return originalFinalize(input);
+    };
+
+    await assert.rejects(resumePrivateProLegacyMigrationCleanup(port, INPUT), /concurrent child/i);
+    assert.equal(port.revisionExists, true);
+    assert.equal(port.chunks.has('concurrent-child'), true);
+  });
+
   test('recreates an active receipt from frozen revision identity when canonical and receipt are absent', async () => {
     const port = new MemoryCleanupPort();
     port.canonical = null as never;
@@ -146,5 +172,17 @@ describe('private Pro legacy cleanup receipt', () => {
     const serialized = JSON.stringify(port.completedTombstone);
     for (const forbidden of ['chat-1', '3-op', 'a'.repeat(64), 'chunkIds', 'revisionPath', 'sourceVersion'])
       assert.equal(serialized.includes(forbidden), false, forbidden);
+  });
+
+  test('rejects forged revision identities, path-prefix tricks, and stale hashes', () => {
+    assert.throws(() => createPrivateProLegacyCleanupReceipt(INPUT, {
+      ...REVISION, revisionPath: 'users/uid-owner/chats/chat-1/revisions/4-newer', revision: 4,
+    }), /revision|identity/i);
+    assert.throws(() => createPrivateProLegacyCleanupReceipt(INPUT, {
+      ...REVISION, revisionPath: 'users/uid-owner/chats/chat-1/revisions/3-op/../../other',
+    }), /revision|identity/i);
+    assert.throws(() => createPrivateProLegacyCleanupReceipt(INPUT, {
+      ...REVISION, contentHash: 'b'.repeat(64),
+    }), /revision|hash|identity/i);
   });
 });

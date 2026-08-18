@@ -215,6 +215,19 @@ export function createPrivateProVaultAssetsService(
           if (existing.status === 'ready')
             return { status: 'already-uploaded' as const, opaqueAssetId: existing.opaqueAssetId, ciphertextBytes: existing.ciphertextBytes };
           if (existing.status === 'reserved') return existing;
+          if (existing.status === 'released') {
+            if (activeReservation && activeReservation.operationId !== existing.operationId)
+              throw new Error('Encrypted asset already has an active reservation.');
+            const reactivated = {
+              ...existing,
+              status: 'reserved' as const,
+              createdAtMs: now(),
+              expiresAtMs: now() + RESERVATION_TTL_MS,
+            };
+            await transaction.saveAccount({ ...account, reservedBytes: account.reservedBytes + existing.ciphertextBytes });
+            await transaction.saveReservation(reactivated);
+            return reactivated;
+          }
           throw new Error('Encrypted asset operation ID is no longer active.');
         }
         if (activeReservation)

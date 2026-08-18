@@ -52,6 +52,27 @@ export interface PrivateProVaultLogicalSerializer<T> {
 }
 
 
+const serializerLocks = new Map<PrivateProVaultRecordType, { tail: Promise<void> }>();
+
+function withSerializerLock<T>(recordType: PrivateProVaultRecordType, operation: () => Promise<T> | T): Promise<T> {
+  const state = serializerLocks.get(recordType) ?? { tail: Promise.resolve() };
+  serializerLocks.set(recordType, state);
+  const previous = state.tail;
+  let release!: () => void;
+  const current = new Promise<void>(resolve => { release = resolve; });
+  state.tail = previous.then(() => current);
+  return previous.then(operation).finally(() => {
+    release();
+    if (state.tail === current) serializerLocks.delete(recordType);
+  });
+}
+
+async function valueVersion(value: unknown): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(canonicalJson(value))));
+  return [...digest].map(byte => byte.toString(16).padStart(2, '0')).join('');
+}
+
+
 function canonicalJson(value: unknown): string {
   return JSON.stringify(value);
 }
@@ -62,10 +83,11 @@ function bindSerializer<T>(
 ): PrivateProVaultSerializer<T> {
   const opaqueId = (logicalId: string) => privateProVaultRecordId(identifierKey, serializer.recordType, logicalId);
 
-  const snapshot = async () => Promise.all(serializer.snapshot().map(async record => ({
+  const snapshotUnlocked = async () => Promise.all(serializer.snapshot().map(async record => ({
     recordId: await opaqueId(record.logicalId),
     value: serializer.schema.parse(record.value),
   })));
+  const snapshot = () => withSerializerLock(serializer.recordType, snapshotUnlocked);
 
   const validate = async (recordId: string, input: unknown) => {
     const value = serializer.schema.parse(input);
@@ -80,19 +102,29 @@ function bindSerializer<T>(
     conflictPolicy: serializer.conflictPolicy ?? 'manual',
     snapshot,
     validate,
-    apply: async (recordId, input) => {
+    apply: (recordId, input) => withSerializerLock(serializer.recordType, async () => {
       const value = await validate(recordId, input);
       const logicalId = serializer.logicalId(value);
       serializer.apply(logicalId, value);
-    },
-    remove: async recordId => {
+    }),
+    remove: recordId => withSerializerLock(serializer.recordType, async () => {
       for (const record of serializer.snapshot()) {
         if (await opaqueId(record.logicalId) === recordId) {
           serializer.remove(record.logicalId);
           return;
         }
       }
-    },
+    }),
+    removeIfVersion: (recordId, expectedVersion) => withSerializerLock(serializer.recordType, async () => {
+      for (const record of serializer.snapshot()) {
+        if (await opaqueId(record.logicalId) !== recordId) continue;
+        const value = serializer.schema.parse(record.value);
+        if (await valueVersion(value) !== expectedVersion) return false;
+        serializer.remove(record.logicalId);
+        return true;
+      }
+      return false;
+    }),
     ...(serializer.createConflictCopy ? {
       createConflictCopy: async (input: T) => {
         const value = serializer.schema.parse(serializer.createConflictCopy!(serializer.schema.parse(input)));
