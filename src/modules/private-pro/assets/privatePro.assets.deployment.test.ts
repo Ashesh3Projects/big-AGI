@@ -4,6 +4,9 @@ import { test } from 'node:test';
 
 import { NextRequest } from 'next/server';
 
+import { getFirebasePrivateProAssetsService } from './privatePro.assets.firebase';
+import { getFirebasePrivateProVaultAssetsService } from '../vault/privatePro.vault.assets.firebase';
+
 
 interface FirestoreIndex {
   collectionGroup: string;
@@ -54,7 +57,10 @@ test('production sweep route invokes legacy and encrypted reservation services',
     import('../../../../app/api/private-pro/sweep-expired/privatePro.sweep-expired'),
   ]);
   const calls = { legacy: 0, encrypted: 0 };
-  const dependencies = sweep.createPrivateProReservationSweepDependencies({
+  assert.equal(sweep.privateProReservationSweepProductionFactories.legacy, getFirebasePrivateProAssetsService);
+  assert.equal(sweep.privateProReservationSweepProductionFactories.encrypted, getFirebasePrivateProVaultAssetsService);
+
+  const testFactories = {
     legacy() {
       return {
         async sweepExpiredReservations() {
@@ -71,21 +77,24 @@ test('production sweep route invokes legacy and encrypted reservation services',
         },
       };
     },
-  });
+  };
+  const production = sweep.privateProSweepExpiredProductionDependencies;
+  const previous = { ...production };
+  try {
+    production.enabled = true;
+    production.cronSecret = 'cron-secret';
+    production.factories = testFactories;
+    const response = await route.GET(new NextRequest('https://example.test/api/private-pro/sweep-expired', {
+      headers: { authorization: 'Bearer cron-secret' },
+    }));
 
-  const handler = sweep.createPrivateProSweepExpiredGET({
-    enabled: true,
-    cronSecret: 'cron-secret',
-    sweep: () => sweep.sweepExpiredPrivateProReservations(dependencies),
-  });
-  const response = await handler(new NextRequest('https://example.test/api/private-pro/sweep-expired', {
-    headers: { authorization: 'Bearer cron-secret' },
-  }));
-
-  assert.equal(route.GET, sweep.privateProSweepExpiredGET);
-  assert.equal(response.status, 200);
-  assert.deepEqual(await response.json(), { released: 5 });
-  assert.deepEqual(calls, { legacy: 1, encrypted: 1 });
+    assert.equal(route.GET, sweep.privateProSweepExpiredGET);
+    assert.equal(response.status, 200);
+    assert.deepEqual(await response.json(), { released: 5 });
+    assert.deepEqual(calls, { legacy: 1, encrypted: 1 });
+  } finally {
+    Object.assign(production, previous);
+  }
 });
 
 test('schedules the reservation sweep route with its legacy cleanup index', async () => {

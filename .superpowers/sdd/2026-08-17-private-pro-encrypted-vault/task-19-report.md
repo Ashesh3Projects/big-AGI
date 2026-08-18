@@ -111,6 +111,48 @@ Final focused GREEN:
 - `git diff --check` - passed.
 - One intermediate Private Pro run hit the existing one-tick timing assertion in `privatePro.vault.engine.test.ts`. Repeated focused runs on the untouched parent commit alternated between the same pass and failure, proving baseline timing variance. The final full candidate run passed 298/298; no unrelated engine code was changed.
 - A later ESLint rerun after an indentation-only cleanup was blocked before file analysis by the local `@rushstack/eslint-patch` caller-recognition error. The focused ESLint run on the same implementation had already passed, and no lint configuration or semantic code changed afterward.
+
+## Fix round 3
+
+Status: complete.
+
+### Finding
+
+The fix-round-2 test proved that injected dual sweep factories work and that the route binds the exported handler, but it did not prove that the production handler itself uses the legacy and encrypted Firebase factories. Production could have changed to an encrypted-only or no-op composition while the injected behavior test remained green.
+
+### Changes
+
+- Exported `privateProReservationSweepProductionFactories` with the exact legacy and encrypted Firebase service factory identities.
+- Made `createPrivateProReservationSweepDependencies()` default to that exported descriptor.
+- Exported one production handler dependency object containing enablement, cron secret, and the production factory descriptor.
+- Bound the production `GET` handler directly to that dependency object.
+- Strengthened the test to:
+  - Assert the production legacy factory is exactly `getFirebasePrivateProAssetsService`.
+  - Assert the production encrypted factory is exactly `getFirebasePrivateProVaultAssetsService`.
+  - Substitute controlled factories into the same production dependency object and invoke the actual `route.GET` handler.
+  - Prove both sweeps run exactly once and their release counts are summed.
+
+### TDD
+
+RED:
+
+```text
+3 tests: 2 passed, 1 failed
+Cannot read properties of undefined (reading 'legacy')
+```
+
+GREEN:
+
+```text
+3 tests: 3 passed, 0 failed
+```
+
+### Verification
+
+- Focused deployment/route tests - 3 passed, 0 failed.
+- `git diff --check` - passed.
+- ESLint was blocked before file analysis by the existing local `@rushstack/eslint-patch` caller-recognition error.
+- `npm run tscheck` was blocked by 351 cross-workspace React type conflicts in 153 unrelated files. The errors resolve React types from both `F:\Projects\big-agi\node_modules` and the task worktree, including `bigint is not assignable to ReactNode`. The untouched parent commit reproduced the same failure under the same shared `.next` and `node_modules` environment. No React, Next configuration, generated type, or unrelated application file was changed.
 - Main checkout `F:\Projects\big-agi` remained clean on branch `pro`.
 
 ## Cloud boundary

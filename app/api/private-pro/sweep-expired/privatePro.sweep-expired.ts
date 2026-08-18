@@ -10,7 +10,7 @@ interface PrivateProReservationSweepService {
   sweepExpiredReservations(): Promise<{ released: number }>;
 }
 
-interface PrivateProReservationSweepFactories {
+export interface PrivateProReservationSweepFactories {
   legacy(): PrivateProReservationSweepService;
   encrypted(): PrivateProReservationSweepService;
 }
@@ -20,11 +20,13 @@ export interface PrivateProReservationSweepDependencies {
   encrypted: PrivateProReservationSweepService;
 }
 
+export const privateProReservationSweepProductionFactories: PrivateProReservationSweepFactories = {
+  legacy: getFirebasePrivateProAssetsService,
+  encrypted: getFirebasePrivateProVaultAssetsService,
+};
+
 export function createPrivateProReservationSweepDependencies(
-  factories: PrivateProReservationSweepFactories = {
-    legacy: getFirebasePrivateProAssetsService,
-    encrypted: getFirebasePrivateProVaultAssetsService,
-  },
+  factories: PrivateProReservationSweepFactories = privateProReservationSweepProductionFactories,
 ): PrivateProReservationSweepDependencies {
   return {
     legacy: factories.legacy(),
@@ -45,7 +47,7 @@ export async function sweepExpiredPrivateProReservations(
 export function createPrivateProSweepExpiredGET(dependencies: {
   enabled: boolean;
   cronSecret: string | undefined;
-  sweep(): Promise<{ released: number }>;
+  factories: PrivateProReservationSweepFactories;
 }) {
   return async function privateProSweepExpiredHandler(request: NextRequest) {
     if (!dependencies.enabled)
@@ -55,12 +57,18 @@ export function createPrivateProSweepExpiredGET(dependencies: {
     if (!secret || request.headers.get('authorization') !== `Bearer ${secret}`)
       return NextResponse.json({ error: 'Unauthorized.' }, { status: 401 });
 
-    return NextResponse.json(await dependencies.sweep());
+    return NextResponse.json(await sweepExpiredPrivateProReservations(
+      createPrivateProReservationSweepDependencies(dependencies.factories),
+    ));
   };
 }
 
-export const privateProSweepExpiredGET = createPrivateProSweepExpiredGET({
+export const privateProSweepExpiredProductionDependencies = {
   enabled: getPrivateProServerConfig().enabled,
   cronSecret: env.CRON_SECRET,
-  sweep: sweepExpiredPrivateProReservations,
-});
+  factories: privateProReservationSweepProductionFactories,
+};
+
+export const privateProSweepExpiredGET = createPrivateProSweepExpiredGET(
+  privateProSweepExpiredProductionDependencies,
+);
