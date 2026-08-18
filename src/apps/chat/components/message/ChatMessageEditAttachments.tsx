@@ -11,7 +11,6 @@ import { AttachmentDraftsList } from '~/common/attachment-drafts/attachment-draf
 import { AttachmentSourcesMemo } from '~/common/attachment-drafts/attachment-sources/AttachmentSources';
 import { useAttachHandler_CameraOpen, useAttachHandler_Files, useAttachHandler_ScreenCapture, useAttachHandler_UrlWebLinks } from '~/common/attachment-drafts/attachment-sources/useAttachmentSourceHandlers';
 import { createAttachmentDraftsVanillaStore } from '~/common/attachment-drafts/store-attachment-drafts_vanilla';
-import { collectFragmentAssetIds, gcRegisterAssetCollector } from '~/common/stores/chat/chat.gc';
 import { supportsCameraCapture } from '~/common/components/camera/useCameraCapture';
 import { supportsScreenCapture } from '~/common/util/screenCaptureUtils';
 import { useAttachmentDrafts } from '~/common/attachment-drafts/useAttachmentDrafts';
@@ -87,15 +86,7 @@ export const ChatMessageEditAttachments = React.forwardRef<EditModeAttachmentsHa
     // [effect] cleanup on unmount - remove all drafts (deleted their DBlob assets, except for 'taken' ones)
     React.useEffect(() => {
       const store = storeApiRef.current;
-      const unregister = gcRegisterAssetCollector(() => {
-        const assetIds = new Set<string>();
-        for (const draft of store?.getState().attachmentDrafts ?? [])
-          for (const fragment of draft.outputFragments)
-            collectFragmentAssetIds([fragment], assetIds);
-        return [...assetIds];
-      });
       return () => {
-        unregister();
         store?.getState().removeAllAttachmentDrafts();
       };
     }, []);

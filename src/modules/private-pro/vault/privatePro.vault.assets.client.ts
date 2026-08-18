@@ -583,11 +583,7 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
       await local.deleteAsset(asset.assetId);
     },
 
-    async prepareForUpload(
-      assetIds: readonly DBlobAssetId[],
-      signal?: AbortSignal,
-      operationIds: Readonly<Record<string, string>> = {},
-    ) {
+    async prepareForUpload(assetIds: readonly DBlobAssetId[], signal?: AbortSignal) {
       for (const assetId of [...new Set(assetIds)]) {
         throwIfAborted(signal);
         const asset = await local.getAsset(assetId);
@@ -595,7 +591,7 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
         const prepared = await preparedChunks(deps, asset, local, hashBytes, signal);
         try {
           throwIfAborted(signal);
-          const operationId = operationIds[assetId] ?? createOperationId();
+          const operationId = createOperationId();
           const reservation = await transport.reserveUpload({
             operationId,
             opaqueAssetId: prepared.opaqueAssetId,

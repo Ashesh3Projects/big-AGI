@@ -30,17 +30,6 @@ export function gcRegisterAssetCollector(collector: AssetCollectorFn): () => voi
   };
 }
 
-export function collectLiveDBlobAssetIds(): Set<DBlobAssetId> {
-  const assetIds = new Set<DBlobAssetId>();
-  for (const conversation of useChatStore.getState().conversations)
-    for (const message of conversation.messages)
-      collectFragmentAssetIds(message.fragments, assetIds);
-  for (const collector of _assetCollectors)
-    for (const assetId of collector())
-      assetIds.add(assetId);
-  return assetIds;
-}
-
 
 /**
  * Collect DBlob asset IDs referenced in message fragments.
@@ -68,21 +57,20 @@ export function collectFragmentAssetIds(fragments: Immutable<DMessageFragment[]>
 export async function gcChatImageAssets(conversations?: Immutable<DConversation[]>) {
 
   // find all the dblob references in all chats
-  const chatsAssetIDs: Set<DBlobAssetId> = conversations ? new Set() : collectLiveDBlobAssetIds();
-  if (conversations)
-    for (const chat of conversations)
-      for (const message of chat.messages)
-        collectFragmentAssetIds(message.fragments, chatsAssetIDs);
+  const chatsAssetIDs: Set<DBlobAssetId> = new Set();
+  const _conversations = conversations || useChatStore.getState().conversations;
+  for (const chat of _conversations)
+    for (const message of chat.messages)
+      collectFragmentAssetIds(message.fragments, chatsAssetIDs);
 
   // [ASSET-GC-BEAM] Collect additional asset IDs from registered collectors (Beam, scratch chat, etc.)
   // to prevent GC from deleting assets still displayed in ephemeral overlay stores (e.g. Beam rays/fusions).
   // Bug: Beam images disappeared when regenerating/deleting chat messages while Beam was open, because
   // GC only scanned conversation messages and not the vanilla Beam stores. Registration pattern avoids
   // the circular dependency (chat/ -> chat-overlay/).
-  if (conversations)
-    for (const collector of _assetCollectors)
-      for (const assetId of collector())
-        chatsAssetIDs.add(assetId);
+  for (const collector of _assetCollectors)
+    for (const assetId of collector())
+      chatsAssetIDs.add(assetId);
 
   // sanity check: if no blobs are referenced, do nothing; in case we have a state bug and we don't wipe the db
   if (!chatsAssetIDs.size)

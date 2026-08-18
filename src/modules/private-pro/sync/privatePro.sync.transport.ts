@@ -23,7 +23,6 @@ interface RemoteChatManifest {
   revision: number;
   operationId: string;
   contentHash: string;
-  chunkIds: string[];
   deviceId: string;
   updatedAtMs: number;
 }
@@ -44,7 +43,7 @@ interface RemoteTombstoneDocument {
 function isManifest(value: unknown): value is RemoteChatManifest {
   const manifest = value as Partial<RemoteChatManifest>;
   return !!manifest && typeof manifest.chatId === 'string' && typeof manifest.revision === 'number' &&
-    typeof manifest.operationId === 'string' && typeof manifest.contentHash === 'string' && Array.isArray(manifest.chunkIds);
+    typeof manifest.operationId === 'string' && typeof manifest.contentHash === 'string';
 }
 
 async function downloadChat(uid: string, manifest: RemoteChatManifest, signal?: AbortSignal): Promise<PrivateProLocalEntity> {
@@ -91,12 +90,7 @@ export function createPrivateProLegacyMigrationTransport(uid: string): PrivatePr
         const manifest = snapshot.data();
         if (!isManifest(manifest)) throw new Error('Remote chat manifest is invalid.');
         const entity = await downloadChat(uid, manifest, signal);
-        items.push({
-          entity,
-          sourceVersion: migrationVersion(entity, manifest.revision),
-          frozenRevisionPath: `users/${uid}/chats/${manifest.chatId}/revisions/${manifest.revision}-${manifest.operationId}`,
-          frozenChunkIds: manifest.chunkIds.filter((chunkId): chunkId is string => typeof chunkId === 'string'),
-        });
+        items.push({ entity, sourceVersion: migrationVersion(entity, manifest.revision) });
       }
       for (const snapshot of personas.docs) {
         const persona = snapshot.data() as RemotePersonaDocument;
@@ -104,7 +98,7 @@ export function createPrivateProLegacyMigrationTransport(uid: string): PrivatePr
           entityType: 'persona', entityId: persona.personaId, contentHash: persona.contentHash,
           payload: SyncPersonaSchema.parse(persona.payload),
         };
-        items.push({ entity, sourceVersion: migrationVersion(entity, persona.revision), frozenRevisionPath: null, frozenChunkIds: [] });
+        items.push({ entity, sourceVersion: migrationVersion(entity, persona.revision) });
       }
       return items;
     },
@@ -123,8 +117,6 @@ export function createPrivateProLegacyMigrationTransport(uid: string): PrivatePr
         entityType: _item.entity.entityType,
         entityId: _item.entity.entityId,
         sourceVersion: _item.sourceVersion,
-        frozenRevisionPath: _item.frozenRevisionPath,
-        frozenChunkIds: _item.frozenChunkIds,
       });
       if (result === 'conflict') throw new Error('Legacy cloud data changed after inventory. Cleanup was blocked.');
     },

@@ -67,26 +67,3 @@
 ### Remaining limitation
 
 - Live Firebase/Storage mutation and a real browser download acknowledgement were not exercised. Repository ports, crash-injection tests, typecheck, and the production build cover the implementation paths without deployment or server startup.
-
-## Fix round 2
-
-### Review findings resolved
-
-- Added one stable encrypted-journal operation ID and pending/complete result per frozen asset before reservation. The asset client accepts caller-owned IDs, replays reservation/object/finalize work under the same ID, and checkpoints the result immediately.
-- Added a final version check at each local item deletion and a raw live-reference gate at each asset deletion. The reference registry includes all chats, including incognito and incomplete records, active Beam input/rays/fusions, conversation composer drafts, and standalone message-edit drafts. Non-chat scopes fail closed.
-- Added an outer lifecycle attempt epoch and join barrier around bootstrap, remembered unlock, password/recovery unlock, persistence, registration, migration activation, and state publication. Teardown and a replacement start invalidate prior work before later side effects.
-- Extended frozen legacy chat cleanup identity with the exact revision path and chunk IDs. When the canonical document and receipt are both absent, the authorized server path recreates a bounded active receipt and resumes exact child cleanup instead of returning already deleted.
-- Replaced completed cleanup receipts atomically with a minimal expiring tombstone containing only UID scope, opaque operation ID, completion status, and expiry. Added Firestore TTL configuration for cleanup receipt expiry.
-
-### Fix verification
-
-- Focused migration/provider/assets/cleanup/service regression: `111` passed, `0` failed.
-- All Private Pro source tests: `314` passed, `0` failed.
-- Touched ESLint: passed with `0` errors and `0` warnings.
-- `npm run tscheck`: passed.
-- `npm run build`: passed. Next.js emitted only the existing multi-lockfile and edge-runtime static-generation warnings.
-- `git diff --check`: passed.
-
-### Remaining limitation
-
-- Live Firebase/Storage orphan cleanup and Firestore TTL execution were not exercised. The extracted receipt state helpers used by the Firebase repository, focused crash tests, full Private Pro suite, typecheck, and production build cover the implementation paths without deployment.

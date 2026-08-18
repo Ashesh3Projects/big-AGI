@@ -74,9 +74,8 @@ export interface PrivateProVaultMigrationRecordPort {
 
 export interface PrivateProVaultMigrationAssetPort {
   describe(assetIds: readonly string[], signal: AbortSignal): Promise<PrivateProVaultMigrationAssetDescriptor[]>;
-  prepareForUpload(assetIds: readonly string[], operationIds: Readonly<Record<string, string>>, signal: AbortSignal): Promise<void>;
+  prepareForUpload(assetIds: readonly string[], signal: AbortSignal): Promise<void>;
   verifyCloud(assets: readonly PrivateProVaultMigrationAssetDescriptor[], signal: AbortSignal): Promise<void>;
-  canDeleteFrozenAsset?(assetId: string, frozenSourceItemIds: readonly string[], signal: AbortSignal): Promise<boolean>;
   deleteLocal?(asset: PrivateProVaultMigrationAssetDescriptor, signal: AbortSignal): Promise<void>;
 }
 
@@ -117,7 +116,7 @@ export interface PrivateProVaultMigrationDependencies {
   cleanup: PrivateProVaultMigrationCleanupPort;
   collectAssetIds(recordType: PrivateProVaultRecordType, value: unknown): readonly string[];
   createOperationId(purpose: string): string;
-  afterEffect?(point: 'asset-upload' | 'upload' | 'verify-cloud' | 'commit' | 'cleanup-local' | 'cleanup-cloud' | 'complete'): Promise<void>;
+  afterEffect?(point: 'upload' | 'verify-cloud' | 'commit' | 'cleanup-local' | 'cleanup-cloud' | 'complete'): Promise<void>;
   now?: () => number;
 }
 
@@ -233,16 +232,7 @@ export function createPrivateProVaultLocalMigrationPort(input: {
     },
     async cleanupLocal(item, signal) {
       assertNotAborted(signal);
-      const serializer = serializerFor(item.recordType);
-      if (serializer.removeIfVersion) {
-        if (!await serializer.removeIfVersion(item.recordId, item.sourceVersion))
-          throw new Error('A plaintext source changed immediately before cleanup. Cleanup was blocked.');
-        return;
-      }
-      const record = (await serializer.snapshot()).find(candidate => candidate.recordId === item.recordId);
-      if (!record || await version(await serializer.validate(record.recordId, record.value)) !== item.sourceVersion)
-        throw new Error('A plaintext source changed immediately before cleanup. Cleanup was blocked.');
-      await serializer.remove(item.recordId);
+      await serializerFor(item.recordType).remove(item.recordId);
     },
   };
 }
@@ -267,11 +257,8 @@ interface FrozenRecord {
 
 interface FrozenAsset extends PrivateProVaultMigrationAssetDescriptor {
   sourceItemIds: string[];
-  uploadOperationId?: string;
-  uploadStatus?: 'pending' | 'complete';
   verified?: boolean;
   cleanupOperationId?: string;
-  cleanupStatus?: 'deleted' | 'preserved';
 }
 
 interface MigrationState {
@@ -607,18 +594,9 @@ export function createPrivateProVaultMigration(deps: PrivateProVaultMigrationDep
 
   type Checkpoint = () => Promise<void>;
   const uploadRecords = async (state: MigrationState, operationIds: string[], signal: AbortSignal, checkpoint: Checkpoint) => {
-    for (const asset of state.assets) {
-      assertNotAborted(signal);
-      if (asset.uploadStatus === 'complete') continue;
-      asset.uploadOperationId ??= deps.createOperationId(`upload-asset-${asset.assetId}`);
-      if (!operationIds.includes(asset.uploadOperationId)) operationIds.push(asset.uploadOperationId);
-      asset.uploadStatus = 'pending';
-      await checkpoint();
-      await deps.assets.prepareForUpload([asset.assetId], { [asset.assetId]: asset.uploadOperationId }, signal);
-      await deps.afterEffect?.('asset-upload');
-      asset.uploadStatus = 'complete';
-      await checkpoint();
-    }
+    const allAssets = [...new Set(state.records.flatMap(record => record.assetIds))];
+    await deps.assets.prepareForUpload(allAssets, signal);
+    assertNotAborted(signal);
     for (const record of state.records) {
       assertNotAborted(signal);
       if (record.uploadStatus === 'complete') continue;
@@ -735,9 +713,6 @@ export function createPrivateProVaultMigration(deps: PrivateProVaultMigrationDep
       if (source === 'local') state.localPending = item.opaqueItemId;
       else state.cloudPending = item.opaqueItemId;
       await checkpoint();
-      const finalVersion = await deps.inventory.currentVersion(item, signal);
-      if (finalVersion !== item.sourceVersion && !(pending && finalVersion === null))
-        throw new Error('A plaintext source changed immediately before cleanup. Cleanup was blocked.');
       await deps.cleanup[source](item, item.cleanupOperationId, signal);
       await deps.afterEffect?.(source === 'local' ? 'cleanup-local' : 'cleanup-cloud');
       cleaned.push(item.opaqueItemId);
@@ -748,19 +723,13 @@ export function createPrivateProVaultMigration(deps: PrivateProVaultMigrationDep
     if (source === 'local' && deps.assets.deleteLocal) {
       const localItemIds = new Set(state.items.filter(item => item.source === 'local').map(item => item.opaqueItemId));
       for (const asset of state.assets.filter(candidate => candidate.sourceItemIds.some(itemId => localItemIds.has(itemId)))) {
-        if (state.localAssetsCleaned.includes(asset.assetId) || asset.cleanupStatus) continue;
+        if (state.localAssetsCleaned.includes(asset.assetId)) continue;
         asset.cleanupOperationId ??= deps.createOperationId(`cleanup-local-asset-${asset.assetId}`);
         if (!operationIds.includes(asset.cleanupOperationId)) operationIds.push(asset.cleanupOperationId);
         state.localAssetPending = asset.assetId;
         await checkpoint();
-        const canDelete = await deps.assets.canDeleteFrozenAsset?.(asset.assetId, asset.sourceItemIds, signal) ?? true;
-        if (canDelete) {
-          await deps.assets.deleteLocal(asset, signal);
-          await deps.afterEffect?.('cleanup-local');
-          asset.cleanupStatus = 'deleted';
-        } else {
-          asset.cleanupStatus = 'preserved';
-        }
+        await deps.assets.deleteLocal(asset, signal);
+        await deps.afterEffect?.('cleanup-local');
         state.localAssetsCleaned.push(asset.assetId);
         state.localAssetPending = undefined;
         await checkpoint();
