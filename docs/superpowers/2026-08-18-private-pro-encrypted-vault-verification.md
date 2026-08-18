@@ -4,7 +4,7 @@
 
 **NOT READY FOR PRODUCTION.**
 
-Local final-fix verification completed through code commit `ec97c78d5` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
+Local final-fix verification completed through code commit `91cbc2dc6` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
 
 This verification was local and read-only except for generated files inside the isolated worktree. It did not:
 
@@ -115,8 +115,8 @@ Final-fix commands below supersede the earlier Task 23 counts. All were run from
 
 | Status | Command | Result |
 |---|---|---|
-| PASS | Final focused Private Pro/security suite | 229 passed, 0 failed. Covers portable plaintext suppression, volatile and legacy DBlob cleanup, exact encrypted asset API surface, cloud backup merge, analytics shutdown, recovery audit, engine ordering, crypto, router, schemas, headers, HTML/SVG isolation, and encrypted backup. |
-| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 256 passed, 0 failed. |
+| PASS | Final focused Private Pro/security suite | 230 passed, 0 failed. Covers portable plaintext suppression, volatile and legacy DBlob cleanup, exact encrypted asset API surface, cloud backup merge, analytics shutdown, recovery audit, engine ordering, crypto, router, schemas, headers, HTML/SVG isolation, and encrypted backup. |
+| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 257 passed, 0 failed. |
 | PASS | `npm run test:private-pro-tools` | 62 passed, 0 failed. |
 | PASS | `npm run test:firebase:exec` with Microsoft JDK 21 | 35 passed, 0 failed. Expected permission-denied lines asserted browser denial. |
 | PASS | `npm run tscheck` | Root and tools projects passed. |
