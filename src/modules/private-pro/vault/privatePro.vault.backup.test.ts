@@ -12,6 +12,7 @@ import type { PrivateProPortableMutation, PrivateProVaultSerializer } from './pr
 import type { PrivateProEncryptedBackupAsset } from '~/modules/trade/privateProEncryptedBackup';
 import { createPrivateProEncryptedBackupStream } from '~/modules/trade/privateProEncryptedBackup';
 import { createPrivateProVaultKeyset } from './privatePro.vault.keyset';
+import type { PrivateProVaultEnvelope } from './privatePro.vault.types';
 import { realArgon2idWorkerResponse, withVaultPasswordWorker } from '../../../../tools/private-pro/test-helpers/privatePro.vault.password.test-helpers';
 
 
@@ -29,10 +30,15 @@ class TestSerializer implements PrivateProVaultSerializer<ChatValue> {
   private readonly listeners = new Set<(mutation: PrivateProPortableMutation) => void>();
 
   async snapshot() { return [...this.values].map(([recordId, value]) => ({ recordId, value: structuredClone(value) })); }
-  async validate(recordId: string, input: unknown) {
+  async normalize(input: unknown) {
     const value = input as ChatValue;
-    if (recordId !== RECORD_ID || value.id !== 'chat' || !Array.isArray(value.assetIds)) throw new Error('invalid chat');
+    if (value.id !== 'chat' || !Array.isArray(value.assetIds)) throw new Error('invalid chat');
     return structuredClone(value);
+  }
+  async recordIdFor() { return RECORD_ID; }
+  async validate(recordId: string, input: unknown) {
+    if (recordId !== RECORD_ID) throw new Error('invalid chat');
+    return this.normalize(input);
   }
   async apply(recordId: string, value: ChatValue) {
     if (value.fail) throw new Error('record apply failed');
@@ -136,5 +142,69 @@ describe('private Pro vault backup orchestration', () => {
     assert.deepEqual(order, ['assets', 'rollback:asset-imported']);
     assert.equal(targetSerializer.values.size, 0);
     assert.equal(await targetDB.records.where('uid').equals(UID).count(), 0);
+  });
+
+  test('merges backup records into cloud under the active vault key before runtime hydration', async (t) => {
+    const backup = await withVaultPasswordWorker(realArgon2idWorkerResponse, () => createPrivateProVaultKeyset(PASSWORD, UID));
+    const activeMasterKey = await importVaultMasterKey(Uint8Array.from({ length: 32 }, (_, index) => 0xa0 + index));
+    const sourceDB = createDB(t);
+    const targetDB = createDB(t);
+    const serializer = new TestSerializer();
+    const importedValue = {
+      id: 'chat',
+      assetIds: ['asset-imported'],
+      messages: [{ fragments: [{ part: { dataRef: { reftype: 'dblob', dblobAssetId: 'asset-imported' } } }] }],
+    } as unknown as ChatValue;
+    const importedEnvelope = await envelope(backup.masterKey, importedValue);
+    await sourceDB.putEncryptedRecord(UID, importedEnvelope);
+    const bytes = await collect(createPrivateProEncryptedBackupStream({
+      vaultId: UID,
+      keyset: backup.keyset,
+      masterKey: backup.masterKey,
+      records: async function* () { yield importedEnvelope; },
+      assets: async function* () { /* no chunks needed for the ordering port */ },
+    }));
+    const remote = new Map<string, PrivateProVaultEnvelope>();
+    const existingId = 'e'.repeat(43);
+    remote.set(existingId, { ...importedEnvelope, recordId: existingId });
+    const order: string[] = [];
+    const backupAssets = {
+      async importAssetChunks() { order.push('backup-assets'); return ['asset-imported']; },
+      async rollbackImportedAssets() { order.push('rollback-assets'); },
+    } as never;
+    const activeAssets = { async prepareForUpload(ids: readonly string[]) { order.push(`active-assets:${ids.join(',')}`); } } as never;
+    const transport = {
+      isOnline: () => true,
+      subscribeConnectivity: () => () => undefined,
+      async getIndex() { return [...remote.values()].map(value => ({ kind: 'record' as const, recordType: value.recordType, opaqueRecordId: value.recordId, revision: value.revision, keyVersion: value.keyVersion, ciphertextBytes: value.ciphertextBytes, serverUpdatedAtMs: 1 })); },
+      async getRecords(ids: readonly string[]) { return ids.flatMap(id => remote.has(id) ? [structuredClone(remote.get(id)!)] : []); },
+      async write(operation: any) {
+        order.push('write');
+        remote.set(operation.envelope.recordId, structuredClone(operation.envelope));
+        return { status: 'committed' as const, revision: operation.envelope.revision, serverUpdatedAtMs: 2 };
+      },
+    };
+
+    await withVaultPasswordWorker(realArgon2idWorkerResponse, () => importPrivateProVaultBackup(
+      stream(bytes),
+      { kind: 'password', password: PASSWORD },
+      {
+        uid: UID, db: targetDB, serializers: [serializer],
+        activeMasterKey, activeKeyVersion: 7, activeAssets, transport,
+        createBackupAssetClient: () => backupAssets,
+        createOperationId: () => 'restore-operation-1',
+      },
+    ));
+
+    assert.deepEqual(order, ['backup-assets', 'active-assets:asset-imported', 'write']);
+    assert.equal(remote.has(existingId), true, 'merge must not delete an existing cloud record');
+    const restored = remote.get(RECORD_ID)!;
+    assert.equal(restored.keyVersion, 7);
+    const activeKey = await deriveVaultSubkey(activeMasterKey, 'record-encryption', `chat:${RECORD_ID}`, ['decrypt']);
+    const { decryptVaultRecord } = await import('./privatePro.vault.crypto');
+    const plaintext = await decryptVaultRecord(activeKey, restored, { vaultId: UID });
+    assert.deepEqual(JSON.parse(new TextDecoder().decode(plaintext)), importedValue);
+    assert.equal(serializer.values.size, 0, 'cloud merge must not report a local-only runtime apply');
+    assert.equal(await targetDB.records.where('uid').equals(UID).count(), 0, 'engine hydration owns the atomic cache apply');
   });
 });

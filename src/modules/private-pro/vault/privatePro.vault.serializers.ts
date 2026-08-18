@@ -30,6 +30,8 @@ export interface PrivateProVaultSerializer<T> {
   schemaVersion: number;
   conflictPolicy: PrivateProVaultConflictPolicy;
   snapshot(): Promise<Array<{ recordId: string; value: T }>>;
+  normalize(value: unknown): Promise<T>;
+  recordIdFor(value: T): Promise<string>;
   validate(recordId: string, value: unknown): Promise<T>;
   apply(recordId: string, value: T): Promise<void>;
   remove(recordId: string): Promise<void>;
@@ -78,6 +80,8 @@ function bindSerializer<T>(
     schemaVersion: serializer.schemaVersion,
     conflictPolicy: serializer.conflictPolicy ?? 'manual',
     snapshot,
+    normalize: async input => serializer.schema.parse(input),
+    recordIdFor: async input => opaqueId(serializer.logicalId(serializer.schema.parse(input))),
     validate,
     apply: async (recordId, input) => {
       const value = await validate(recordId, input);

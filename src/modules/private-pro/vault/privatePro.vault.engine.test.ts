@@ -58,6 +58,14 @@ class TestSerializer implements PrivateProVaultSerializer<TestValue> {
     return [...this.values].map(([recordId, value]) => ({ recordId, value: structuredClone(value) }));
   }
 
+  async normalize(input: unknown) {
+    return structuredClone(input as TestValue);
+  }
+
+  async recordIdFor(value: TestValue) {
+    return value.id;
+  }
+
   async validate(recordId: string, input: unknown) {
     if (!input || typeof input !== 'object') throw new Error('Test value is invalid.');
     const value = input as TestValue;

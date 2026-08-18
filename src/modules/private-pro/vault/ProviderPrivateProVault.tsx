@@ -564,17 +564,26 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     credential: PrivateProEncryptedBackupCredential,
   ) => {
     const runtime = runtimeRef.current;
-    if (!auth.user || !runtime.assets) throw new Error('Unlock the vault first.');
-    await runtime.engine?.stopAndWait();
+    if (!auth.user || !runtime.assets || !runtime.masterKey || !runtime.keyset || !runtime.engine) throw new Error('Unlock the vault first.');
+    const engine = runtime.engine;
+    await engine.stopAndWait();
     try {
       await importPrivateProVaultBackup(stream, credential, {
         uid: auth.user.uid,
         db: privateProVaultDB,
         serializers: privateProVaultSerializers,
-        createAssetClient: (masterKey, keyVersion, vaultId) => createPrivateProVaultAssetClient({ vaultId, masterKey, keyVersion }),
+        activeMasterKey: runtime.masterKey,
+        activeKeyVersion: runtime.keyset.keyVersion,
+        activeAssets: runtime.assets,
+        transport: createPrivateProVaultTransport(),
+        createBackupAssetClient: (masterKey, keyVersion, vaultId) => createPrivateProVaultAssetClient({ vaultId, masterKey, keyVersion }),
       });
+      await engine.hydrateBeforeOpen();
+      await engine.start();
+      await engine.whenCurrent();
+      if (!privateProVaultStore.getState().ready) throw new Error('Encrypted backup merge did not reach a verified current state.');
     } catch (error) {
-      await runtime.engine?.start();
+      await engine.start();
       throw error;
     }
   }, [auth.user]);

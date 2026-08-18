@@ -93,13 +93,14 @@ export function PrivateProAccountControl(props: { mobile?: boolean }) {
         </Stack> : <Stack spacing={1}>
             <Button variant='soft' color='neutral' onClick={() => setAction('password')}>Change vault password</Button>
             <Button variant='soft' color='neutral' loading={busy} onClick={() => void run(() => vault.createEncryptedExport(), 'Encrypted backup saved.')}>Create encrypted backup</Button>
-            <Button variant='soft' color='neutral' onClick={() => setAction('import')}>Restore encrypted backup</Button>
+            <Button variant='soft' color='neutral' onClick={() => setAction('import')}>Merge encrypted backup</Button>
             <Button variant='soft' color='neutral' loading={busy} onClick={() => void run(() => vault.revokeOtherDevices(), 'Other remembered devices revoked.')}>Revoke other devices</Button>
             <Button variant='soft' color='neutral' onClick={() => void vault.logout()}>Sign out</Button>
             <Button variant='plain' color='danger' onClick={() => setAction('wipe')}>Full local wipe</Button>
             {action === 'wipe' && <Alert color='danger'>Full local wipe removes this browser&apos;s encrypted cache and remembered key. Use account recovery to unlock again.</Alert>}
             {action === 'wipe' && <Button color='danger' loading={busy} onClick={() => void vault.fullLocalWipe()}>Confirm full local wipe</Button>}
             {action === 'import' && <Stack spacing={1.5}>
+              <Alert color='warning'>Merge adds or updates backup records in the cloud vault. Existing cloud-only records are kept.</Alert>
               <Tabs value={importKind} onChange={(_event, value) => value && setImportKind(value as 'password' | 'recovery')}>
                 <TabList><Tab value='password'>Password</Tab><Tab value='recovery'>Recovery key</Tab></TabList>
                 <TabPanel value='password' sx={{ px: 0 }} />
@@ -116,8 +117,7 @@ export function PrivateProAccountControl(props: { mobile?: boolean }) {
                 await vault.importEncryptedBackup(file.stream(), importKind === 'password'
                   ? { kind: 'password', password: importCredential }
                   : { kind: 'recovery', recoveryKey: importCredential });
-                window.location.reload();
-              }, 'Encrypted backup restored.')}>Choose encrypted backup</Button>
+              }, 'Encrypted backup merged into the cloud vault.')}>Merge encrypted backup</Button>
             </Stack>}
           </Stack>}
       </Stack>
