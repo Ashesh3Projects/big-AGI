@@ -1,6 +1,11 @@
 import Dexie from 'dexie';
 
 import type { DBlobAsset, DBlobAssetId, DBlobAssetType, DBlobDBAsset, DBlobDBContextId, DBlobDBScopeId } from './dblobs.types';
+import {
+  isPrivateProEncryptedPersistenceActive,
+  markPrivateProPortableAssetEncrypted,
+  markPrivateProPortableAssetPending,
+} from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 // configuration
@@ -40,12 +45,23 @@ const _db = globalForDexie.bigAgiDB ?? new BigAgiDB();
 if (process.env.NODE_ENV !== 'production') globalForDexie.bigAgiDB = _db;
 
 const assetsTable = _db.largeAssets;
+const volatileAssets = new Map<DBlobAssetId, DBlobDBAsset>();
+
+function privateProAssetClone<T extends DBlobDBAsset>(asset: T): T {
+  return structuredClone(asset);
+}
 
 
 // CRUD
 
 export async function _addDBAsset<T extends DBlobAsset>(asset: T, contextId: DBlobDBContextId, scopeId: DBlobDBScopeId): Promise<DBlobAssetId> {
   try {
+    if (isPrivateProEncryptedPersistenceActive()) {
+      const stored = { ...asset, contextId, scopeId } as DBlobDBAsset;
+      volatileAssets.set(asset.id, privateProAssetClone(stored));
+      markPrivateProPortableAssetPending(asset.id);
+      return asset.id;
+    }
     // returns the id of the added asset
     return await assetsTable.add({
       ...asset,
@@ -73,14 +89,24 @@ export async function _addDBAsset<T extends DBlobAsset>(asset: T, contextId: DBl
 // }
 
 export async function getDBAsset<T extends DBlobAsset = DBlobDBAsset>(id: DBlobAssetId) {
+  if (isPrivateProEncryptedPersistenceActive()) {
+    const asset = volatileAssets.get(id);
+    return asset ? privateProAssetClone(asset) as unknown as T : undefined;
+  }
   return await assetsTable.get(id) as T | undefined;
 }
 
 export async function getDBAssetsByIds(ids: DBlobAssetId[]): Promise<DBlobDBAsset[]> {
+  if (isPrivateProEncryptedPersistenceActive()) return ids.flatMap(id => volatileAssets.has(id) ? [privateProAssetClone(volatileAssets.get(id)!)] : []);
   return (await assetsTable.bulkGet(ids)).filter((asset): asset is DBlobDBAsset => !!asset);
 }
 
 export async function putDBAsset(asset: DBlobDBAsset): Promise<void> {
+  if (isPrivateProEncryptedPersistenceActive()) {
+    volatileAssets.set(asset.id, privateProAssetClone(asset));
+    markPrivateProPortableAssetPending(asset.id);
+    return;
+  }
   await assetsTable.put(asset);
 }
 
@@ -97,6 +123,9 @@ export async function putDBAsset(asset: DBlobDBAsset): Promise<void> {
  * Warning: this function all the matching assets data in memory - not suitable for large datasets.
  */
 export async function getDBAssetsByScopeAndType<T extends DBlobAsset = DBlobDBAsset>(assetType: T['assetType'], contextId: DBlobDBContextId, scopeId: DBlobDBScopeId) {
+  if (isPrivateProEncryptedPersistenceActive()) return [...volatileAssets.values()]
+    .filter(asset => asset.assetType === assetType && asset.contextId === contextId && asset.scopeId === scopeId)
+    .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()) as unknown as T[];
   const assets = await assetsTable.where({
     assetType: assetType, contextId: contextId, scopeId: scopeId,
   }).sortBy('createdAt');
@@ -107,6 +136,13 @@ export async function getDBAssetsByScopeAndType<T extends DBlobAsset = DBlobDBAs
 // UPDATE
 
 async function _updateDBAsset<T extends DBlobDBAsset = DBlobDBAsset>(id: DBlobAssetId, updates: Partial<T>) {
+  if (isPrivateProEncryptedPersistenceActive()) {
+    const current = volatileAssets.get(id);
+    if (!current) return 0;
+    volatileAssets.set(id, privateProAssetClone({ ...current, ...updates } as DBlobDBAsset));
+    markPrivateProPortableAssetPending(id);
+    return 1;
+  }
   return assetsTable.update(id, updates);
 }
 
@@ -118,6 +154,11 @@ export async function transferDBAssetContextScope(id: DBlobAssetId, contextId: D
 // DELETE
 
 export async function deleteDBAsset(id: DBlobAssetId) {
+  if (isPrivateProEncryptedPersistenceActive()) {
+    markPrivateProPortableAssetEncrypted(id);
+    volatileAssets.delete(id);
+    return;
+  }
   return assetsTable.delete(id);
 }
 
@@ -133,6 +174,16 @@ export async function deleteDBAsset(id: DBlobAssetId) {
 // }
 
 export async function gcDBAssetsByScope(contextId: DBlobDBContextId, scopeId: DBlobDBScopeId, assetType: DBlobAssetType | null, keepIds: DBlobAssetId[]) {
+  if (isPrivateProEncryptedPersistenceActive()) {
+    const keep = new Set(keepIds);
+    for (const [id, asset] of volatileAssets) {
+      if (asset.contextId === contextId && asset.scopeId === scopeId && (assetType === null || asset.assetType === assetType) && !keep.has(id)) {
+        volatileAssets.delete(id);
+        markPrivateProPortableAssetEncrypted(id);
+      }
+    }
+    return;
+  }
   // get all the DB keys
   const dbAssetIds = await assetsTable.where((assetType !== null) ? {
     assetType: assetType,

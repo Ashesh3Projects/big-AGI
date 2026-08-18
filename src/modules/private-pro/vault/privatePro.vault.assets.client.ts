@@ -16,6 +16,7 @@ import {
   type PrivateProVaultAssetStoredChunkMetadata,
 } from './privatePro.vault.assets.crypto';
 import { privateProVaultDB } from './privatePro.vault.db';
+import { markPrivateProPortableAssetEncrypted } from '../persistence/privatePro.persistence';
 
 
 const SHA256_HEX = /^[a-f0-9]{64}$/;
@@ -553,7 +554,10 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
               objectSha256,
             })),
           });
-          if (reservation.status === 'already-uploaded') continue;
+          if (reservation.status === 'already-uploaded') {
+            markPrivateProPortableAssetEncrypted(assetId);
+            continue;
+          }
           try {
             for (const upload of reservation.chunks) {
               throwIfAborted(signal);
@@ -564,6 +568,7 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
             }
             throwIfAborted(signal);
             await transport.finalizeUpload(operationId);
+            markPrivateProPortableAssetEncrypted(assetId);
           } catch (error) {
             await transport.releaseReservation(operationId).catch(() => undefined);
             throw error;

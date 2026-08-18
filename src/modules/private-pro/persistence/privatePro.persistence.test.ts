@@ -9,6 +9,10 @@ import {
   clearPrivateProPlaintextPortablePersistence,
   createPrivateProPortableLocalStorage,
   isPrivateProEncryptedPersistenceActive,
+  hasPrivateProPendingPortableAssets,
+  markPrivateProPortableAssetEncrypted,
+  markPrivateProPortableAssetPending,
+  privateProPortableAssetBeforeUnload,
   setPrivateProEncryptedPersistenceActive,
 } from './privatePro.persistence';
 
@@ -90,5 +94,19 @@ describe('private Pro portable persistence gate', () => {
     assert.equal(durable.getItem('unrelated-feature'), 'keep-me');
     assert.equal(await get('app-chats'), undefined);
     assert.equal(await get('unrelated-cell'), 'keep-me');
+  });
+
+  test('blocks reload while a volatile attachment has not reached encrypted storage', () => {
+    const event = { preventDefaultCalled: false, preventDefault() { this.preventDefaultCalled = true; }, returnValue: '' };
+    setPrivateProEncryptedPersistenceActive(true);
+    markPrivateProPortableAssetPending('asset-sentinel');
+
+    assert.equal(hasPrivateProPendingPortableAssets(), true);
+    assert.equal(privateProPortableAssetBeforeUnload(event), 'Encrypted attachments are still being saved.');
+    assert.equal(event.preventDefaultCalled, true);
+
+    markPrivateProPortableAssetEncrypted('asset-sentinel');
+    assert.equal(hasPrivateProPendingPortableAssets(), false);
+    assert.equal(privateProPortableAssetBeforeUnload(event), undefined);
   });
 });

@@ -37,6 +37,7 @@ import {
   clearPrivateProPlaintextPortablePersistence,
   clearPrivateProVolatilePortableState,
   setPrivateProEncryptedPersistenceActive,
+  privateProPortableAssetBeforeUnload,
 } from '../persistence/privatePro.persistence';
 
 
@@ -499,6 +500,11 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
   const [state, setState] = React.useState<PrivateProVaultPublicState>(INITIAL_STATE);
   const lifecycleRef = React.useRef<PrivateProVaultLifecycle | null>(null);
   const runtimeRef = React.useRef<PrivateProVaultRuntimeState>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null });
+
+  React.useEffect(() => {
+    window.addEventListener('beforeunload', privateProPortableAssetBeforeUnload);
+    return () => window.removeEventListener('beforeunload', privateProPortableAssetBeforeUnload);
+  }, []);
 
   React.useEffect(() => {
     if (!auth.user) return;

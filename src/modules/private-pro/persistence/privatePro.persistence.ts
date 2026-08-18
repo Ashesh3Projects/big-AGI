@@ -23,6 +23,7 @@ const encryptedBuild = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
 let encryptedPersistenceActive = encryptedBuild;
 const volatileLocalStorage = new Map<string, string>();
 const volatilePersistStorage = new Map<string, StorageValue<unknown>>();
+const pendingPortableAssets = new Set<string>();
 const patchedStorage = Symbol.for('big-agi.private-pro-portable-storage');
 
 
@@ -56,6 +57,27 @@ export function setPrivateProEncryptedPersistenceActive(active: boolean): void {
 export function clearPrivateProVolatilePortableState(): void {
   volatileLocalStorage.clear();
   volatilePersistStorage.clear();
+  pendingPortableAssets.clear();
+}
+
+export function markPrivateProPortableAssetPending(assetId: string): void {
+  if (encryptedPersistenceActive) pendingPortableAssets.add(assetId);
+}
+
+export function markPrivateProPortableAssetEncrypted(assetId: string): void {
+  pendingPortableAssets.delete(assetId);
+}
+
+export function hasPrivateProPendingPortableAssets(): boolean {
+  return encryptedPersistenceActive && pendingPortableAssets.size > 0;
+}
+
+export function privateProPortableAssetBeforeUnload(event: Pick<BeforeUnloadEvent, 'preventDefault' | 'returnValue'>): string | undefined {
+  if (!hasPrivateProPendingPortableAssets()) return undefined;
+  const message = 'Encrypted attachments are still being saved.';
+  event.preventDefault();
+  event.returnValue = message;
+  return message;
 }
 
 export function createPrivateProPortableLocalStorage(
