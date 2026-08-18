@@ -59,6 +59,58 @@ Mutation check:
 - `npm run tscheck` - passed application and tools TypeScript projects.
 - `npm test` - Private Pro tools passed 20/20 and the source run reported 291 passed, 18 skipped, and 1 unrelated failure. The failure is the existing live Groq model-list drift for `minimaxai/minimax-m2.7`, `llama-3.3-70b-versatile`, and `llama-3.1-8b-instant`. No Private Pro or Firebase rule test failed.
 - `git diff --check` - passed.
+
+## Fix round 2
+
+Status: complete.
+
+### Finding
+
+The fix-round-1 deployment contract inferred cron behavior from an exact source substring. A harmless refactor or formatting change could skip the `quotaReservations` index assertion while the scheduled plaintext sweep remained live.
+
+### Changes
+
+- Moved the cron handler implementation into `privatePro.sweep-expired.ts`; the App Router entry exports only the supported `runtime` and exact `GET` handler binding.
+- Added a production dependency factory for the legacy and encrypted Firebase sweep services.
+- Added an injectable HTTP handler factory. The production handler keeps the same enablement, cron-secret authorization, parallel sweep, summed `released` response, and Node.js runtime behavior.
+- Replaced route source inspection with executable assertions that:
+  - `route.GET` is the production composed handler.
+  - An authorized injected HTTP request invokes both legacy and encrypted sweeps exactly once and returns their summed count.
+  - `vercel.json` schedules exactly `/api/private-pro/sweep-expired` at `0 3 * * *`.
+  - The scheduled legacy sweep has the required `quotaReservations(status, expiresAtMs)` index.
+
+### TDD
+
+Initial behavior RED:
+
+```text
+3 tests: 2 passed, 1 failed
+createPrivateProReservationSweepDependencies is not a function
+```
+
+Strengthened HTTP-handler RED:
+
+```text
+3 tests: 2 passed, 1 failed
+createPrivateProSweepExpiredGET is not a function
+```
+
+Final focused GREEN:
+
+```text
+3 tests: 3 passed, 0 failed
+```
+
+### Verification
+
+- Focused route/deployment contract - 3 passed, 0 failed.
+- Firebase Emulator Suite with Microsoft JDK 21 - 35 passed, 0 failed.
+- All Private Pro source/tool/encrypted-backup tests - 298 passed, 0 failed.
+- Focused ESLint - passed with zero warnings.
+- `npm run tscheck` - passed application and tools TypeScript projects.
+- `git diff --check` - passed.
+- One intermediate Private Pro run hit the existing one-tick timing assertion in `privatePro.vault.engine.test.ts`. Repeated focused runs on the untouched parent commit alternated between the same pass and failure, proving baseline timing variance. The final full candidate run passed 298/298; no unrelated engine code was changed.
+- A later ESLint rerun after an indentation-only cleanup was blocked before file analysis by the local `@rushstack/eslint-patch` caller-recognition error. The focused ESLint run on the same implementation had already passed, and no lint configuration or semantic code changed afterward.
 - Main checkout `F:\Projects\big-agi` remained clean on branch `pro`.
 
 ## Cloud boundary
