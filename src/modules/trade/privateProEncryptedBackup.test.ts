@@ -599,4 +599,15 @@ describe('private Pro encrypted backup', () => {
     assert.match(markup, /unencrypted/i);
     assert.match(markup, /API keys/i);
   });
+
+  test('private Pro does not expose the generic plaintext flash backup UI', async () => {
+    const { privateProClientConfig } = await import('~/modules/private-pro/config/privatePro.config');
+    const enabled = privateProClientConfig.enabled;
+    Object.defineProperty(privateProClientConfig, 'enabled', { configurable: true, value: true });
+    try {
+      assert.equal(renderToStaticMarkup(React.createElement(FlashBackup, {})), '');
+    } finally {
+      Object.defineProperty(privateProClientConfig, 'enabled', { configurable: true, value: enabled });
+    }
+  });
 });

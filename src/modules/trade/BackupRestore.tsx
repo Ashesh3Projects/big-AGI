@@ -18,6 +18,7 @@ import { downloadBlob } from '~/common/util/downloadUtils';
 import { tradeFileVariant } from './trade.client';
 import { capitalizeFirstLetter, humanReadableBytes } from '~/common/util/textUtils';
 import { prettyTimestampForFilenames } from '~/common/util/timeUtils';
+import { privateProClientConfig } from '~/modules/private-pro/config/privatePro.config';
 
 
 // configuration
@@ -658,6 +659,8 @@ async function createFlashObject(backupType: 'full' | 'partial' | 'auto-before-r
  */
 export function FlashRestore(props: { unlockRestore?: boolean }) {
 
+  if (privateProClientConfig.enabled) return null;
+
   // state
   const [restoreState, setRestoreState] = React.useState<'idle' | 'processing' | 'confirm' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = React.useState<string | null>(null);
@@ -970,6 +973,8 @@ export function FlashRestore(props: { unlockRestore?: boolean }) {
 export function FlashBackup(props: {
   onStartedBackup?: () => void;
 }) {
+
+  if (privateProClientConfig.enabled) return null;
 
   // state
   const [includeImages, setIncludeImages] = React.useState(false);
