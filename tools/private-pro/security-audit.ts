@@ -114,6 +114,11 @@ export interface AuditReport {
   }>>;
 }
 
+export interface FirestoreRestoreEvidenceEnvironmentInput {
+  readonly evidenceBase64?: string;
+  readonly additionalExpectedCommitSha?: string;
+}
+
 interface HeaderFacts {
   contentSecurityPolicy: boolean;
   strictTransportSecurity: boolean;
@@ -1898,9 +1903,12 @@ export async function collectFirestoreRestoreTrustAtHeadWithExecutor(
   return parseStrictEvidenceJson(decodeStrictUtf8(stdout), FIRESTORE_RESTORE_TRUST_MAX_BYTES);
 }
 
-async function collectFirestoreRestoreEvidence(): Promise<FirestoreRestoreEvidenceFacts> {
-  const evidenceBase64 = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64;
-  const additionalExpectedCommitSha = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim();
+export async function collectFirestoreRestoreEvidence(
+  input: FirestoreRestoreEvidenceEnvironmentInput,
+  collectReleaseState: () => Promise<{ headSha: string; clean: boolean }> = collectGitReleaseStateWithExecutor,
+  collectTrustDescriptor: (headSha: string) => Promise<unknown> = collectFirestoreRestoreTrustAtHeadWithExecutor,
+): Promise<FirestoreRestoreEvidenceFacts> {
+  const { evidenceBase64, additionalExpectedCommitSha } = input;
   const invalidInput = {
     nowMs: Date.now(),
     actualHeadSha: '',
@@ -1908,8 +1916,8 @@ async function collectFirestoreRestoreEvidence(): Promise<FirestoreRestoreEviden
     ...(additionalExpectedCommitSha ? { additionalExpectedCommitSha } : {}),
   };
   try {
-    const releaseState = await collectGitReleaseStateWithExecutor();
-    const trustDescriptor = await collectFirestoreRestoreTrustAtHeadWithExecutor(releaseState.headSha);
+    const releaseState = await collectReleaseState();
+    const trustDescriptor = await collectTrustDescriptor(releaseState.headSha);
     return collectFirestoreRestoreEvidenceFromBase64(evidenceBase64, {
       nowMs: Date.now(),
       actualHeadSha: releaseState.headSha,
@@ -2107,7 +2115,33 @@ function validateBucket(value: string): string {
   return value;
 }
 
-async function collectReport(): Promise<AuditReport> {
+function isAuditOnlyRestoreEvidenceEnvironmentName(name: string): boolean {
+  const upper = name.toUpperCase();
+  return upper.startsWith('PRIVATE_PRO_')
+    && (upper.includes('RESTORE_EVIDENCE') || (upper.includes('RESTORE') && upper.includes('HMAC')));
+}
+
+function captureFirestoreRestoreEvidenceEnvironment(): Readonly<FirestoreRestoreEvidenceEnvironmentInput> {
+  const evidenceBase64 = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64;
+  const expectedCommit = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim();
+  const input = Object.freeze({
+    ...(evidenceBase64 !== undefined ? { evidenceBase64 } : {}),
+    ...(expectedCommit ? { additionalExpectedCommitSha: expectedCommit } : {}),
+  });
+  for (const name of Object.keys(process.env)) {
+    if (isAuditOnlyRestoreEvidenceEnvironmentName(name)) delete process.env[name];
+  }
+  return input;
+}
+
+export async function runSecurityAuditWithCollector<T>(
+  collector: (input: Readonly<FirestoreRestoreEvidenceEnvironmentInput>) => Promise<T>,
+): Promise<T> {
+  const restoreEvidenceInput = captureFirestoreRestoreEvidenceEnvironment();
+  return collector(restoreEvidenceInput);
+}
+
+async function collectReport(restoreEvidenceInput: Readonly<FirestoreRestoreEvidenceEnvironmentInput>): Promise<AuditReport> {
   const projectId = validateProjectId(process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID?.trim() || DEFAULT_PROJECT_ID);
   const deploymentOrigin = process.env.PRIVATE_PRO_AUDIT_ORIGIN?.trim() || DEFAULT_DEPLOYMENT_ORIGIN;
   const storageBucket = validateBucket(process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET?.trim() || `${projectId}.firebasestorage.app`);
@@ -2119,7 +2153,7 @@ async function collectReport(): Promise<AuditReport> {
     collectBucketCors(storageBucket).then(classifyBucketCors),
     collectAppCheck(projectId).then(classifyAppCheck),
     collectFirestoreRecoveryState(projectId).then(classifyFirestoreRecoveryState),
-    collectFirestoreRestoreEvidence().then(classifyFirestoreRestoreEvidence),
+    collectFirestoreRestoreEvidence(restoreEvidenceInput).then(classifyFirestoreRestoreEvidence),
     collectIamRoles(projectId).then(classifyIamRoles),
     collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
     collectRuntimeRoleManifest().then(classifyRuntimeRoleManifest),
@@ -2139,11 +2173,13 @@ async function collectReport(): Promise<AuditReport> {
 }
 
 async function main() {
-  const args = new Set(process.argv.slice(2));
-  if ([...args].some(arg => arg !== '--report-only')) throw new Error('Usage: security-audit.ts [--report-only]');
-  const report = await collectReport();
-  process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
-  if (!report.pass && !args.has('--report-only')) process.exitCode = 1;
+  await runSecurityAuditWithCollector(async restoreEvidenceInput => {
+    const args = new Set(process.argv.slice(2));
+    if ([...args].some(arg => arg !== '--report-only')) throw new Error('Usage: security-audit.ts [--report-only]');
+    const report = await collectReport(restoreEvidenceInput);
+    process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
+    if (!report.pass && !args.has('--report-only')) process.exitCode = 1;
+  });
 }
 
 const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;

@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { describe, test } from 'node:test';
 import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
@@ -748,6 +749,127 @@ describe('private Pro security audit classifiers', () => {
 
     assert.equal(JSON.parse(result.stdout), argument);
     await assert.rejects(readFile(sideEffect, 'utf8'));
+  });
+
+  test('isolates restore evidence before GoogleAuth and child collectors while passing captured input explicitly', async () => {
+    const audit = securityAuditModule as unknown as {
+      runSecurityAuditWithCollector<T>(collector: (input: {
+        readonly evidenceBase64?: string;
+        readonly additionalExpectedCommitSha?: string;
+      }) => Promise<T>): Promise<T>;
+      collectFirestoreRestoreEvidence(
+        input: {
+          readonly evidenceBase64?: string;
+          readonly additionalExpectedCommitSha?: string;
+        },
+        collectReleaseState: () => Promise<{ headSha: string; clean: boolean }>,
+        collectTrustDescriptor: (headSha: string) => Promise<unknown>,
+      ): Promise<{ readable: boolean; signatureVerified: boolean; releaseCommitMatches: boolean }>;
+      collectActiveAdcServiceAccountEmail(factory: () => Promise<{
+        getAccessToken(): Promise<string | null | undefined>;
+        getCredentials(): Promise<{ client_email?: string }>;
+      }>): Promise<string | undefined>;
+    };
+    const auditEnvironment = {
+      PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64: restoreEvidenceBase64(),
+      PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA: TEST_RELEASE_COMMIT,
+      PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY: 'obsolete-hmac',
+      PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE: 'obsolete-path',
+      PRIVATE_PRO_RESTORE_EVIDENCE_ROOT: 'obsolete-root',
+      GOOGLE_APPLICATION_CREDENTIALS: 'retained-google-credentials.json',
+      GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES: '1',
+      PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS: 'principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/vercel-prod/subject/deploy',
+    } as const;
+    const evidenceEnvironmentNames = Object.keys(auditEnvironment).filter(name => name.includes('RESTORE_EVIDENCE'));
+    const previous = Object.fromEntries(Object.keys(auditEnvironment).map(name => [name, process.env[name]]));
+    const runOnce = async () => audit.runSecurityAuditWithCollector(async input => {
+      assert.equal(Object.isFrozen(input), true);
+      assert.equal(input.evidenceBase64, auditEnvironment.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64);
+      assert.equal(input.additionalExpectedCommitSha, TEST_RELEASE_COMMIT);
+      for (const name of evidenceEnvironmentNames) assert.equal(process.env[name], undefined, name);
+      assert.equal(process.env.GOOGLE_APPLICATION_CREDENTIALS, auditEnvironment.GOOGLE_APPLICATION_CREDENTIALS);
+      assert.equal(process.env.GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES, '1');
+      assert.equal(process.env.PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS, auditEnvironment.PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS);
+
+      const activeEmail = await audit.collectActiveAdcServiceAccountEmail(async () => {
+        const credentialExecutable = JSON.parse(execFileSync(process.execPath, ['-e', `
+          process.stdout.write(JSON.stringify({
+            evidence: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64,
+            expectedCommit: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA,
+            legacyHmac: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY,
+            legacyPath: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE,
+            legacyRoot: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_ROOT,
+            googleCredentials: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+          }));
+        `], { encoding: 'utf8' })) as Record<string, unknown>;
+        assert.deepEqual(credentialExecutable, {
+          evidence: false,
+          expectedCommit: false,
+          legacyHmac: false,
+          legacyPath: false,
+          legacyRoot: false,
+          googleCredentials: auditEnvironment.GOOGLE_APPLICATION_CREDENTIALS,
+        });
+        return {
+          async getAccessToken() { return 'test-access-token'; },
+          async getCredentials() { return { client_email: 'private-pro-runtime@sample-project.iam.gserviceaccount.com' }; },
+        };
+      });
+      const genericChild = JSON.parse((await runCommand(process.execPath, ['-e', `
+        process.stdout.write(JSON.stringify({
+          evidence: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64,
+          expectedCommit: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA,
+          legacyHmac: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY,
+          googleCredentials: process.env.GOOGLE_APPLICATION_CREDENTIALS,
+        }));
+      `])).stdout) as Record<string, unknown>;
+      const evidence = await audit.collectFirestoreRestoreEvidence(
+        input,
+        async () => ({ headSha: TEST_RELEASE_COMMIT, clean: true }),
+        async headSha => {
+          assert.equal(headSha, TEST_RELEASE_COMMIT);
+          return TEST_TRUST;
+        },
+      );
+      return {
+        activeEmail,
+        genericChild,
+        evidence: {
+          readable: evidence.readable,
+          signatureVerified: evidence.signatureVerified,
+          releaseCommitMatches: evidence.releaseCommitMatches,
+        },
+      };
+    });
+
+    try {
+      Object.assign(process.env, auditEnvironment);
+      const first = await runOnce();
+      for (const name of evidenceEnvironmentNames) assert.equal(process.env[name], undefined, name);
+
+      Object.assign(process.env, auditEnvironment);
+      const second = await runOnce();
+      assert.deepEqual(second, first);
+      assert.deepEqual(first, {
+        activeEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+        genericChild: {
+          evidence: false,
+          expectedCommit: false,
+          legacyHmac: false,
+          googleCredentials: auditEnvironment.GOOGLE_APPLICATION_CREDENTIALS,
+        },
+        evidence: {
+          readable: true,
+          signatureVerified: true,
+          releaseCommitMatches: true,
+        },
+      });
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   test('scrubs audit evidence and attestation secrets from child processes', async () => {
