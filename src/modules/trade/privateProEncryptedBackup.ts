@@ -484,7 +484,7 @@ export async function importPrivateProEncryptedBackup(
     const recordKey = await deriveVaultSubkey(
       masterKey,
       'record-encryption',
-      `${envelope.recordType}/${envelope.recordId}`,
+      `${envelope.recordType}:${envelope.recordId}`,
       ['encrypt', 'decrypt'],
     );
     const plaintext = await decryptVaultRecord(recordKey, envelope, { vaultId: header.vaultId });

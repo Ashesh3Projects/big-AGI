@@ -227,8 +227,9 @@ async function createClient(
     beforeAcknowledgeCommit?: () => Promise<void>;
     assets?: {
       referencedAssetIds(recordType: PrivateProVaultRecordType, value: unknown): readonly string[];
-      prepareForUpload(assetIds: readonly string[]): Promise<void>;
-      prepareForHydrate(assetIds: readonly string[]): Promise<void>;
+      prepareForUpload(assetIds: readonly string[], signal: AbortSignal): Promise<void>;
+      prepareForHydrate(assetIds: readonly string[], signal: AbortSignal): Promise<void>;
+      clearHydratedAssets(): Promise<void>;
     };
     persistCurrent?: (
       index: readonly PrivateProVaultIndexEntry[],
@@ -323,6 +324,7 @@ describe('private Pro blocking multi-device vault engine', () => {
           await assetGate;
         },
         async prepareForUpload() {},
+        async clearHydratedAssets() {},
       },
     });
     const chatSerializer = serializer(client, 'chat');
@@ -360,6 +362,7 @@ describe('private Pro blocking multi-device vault engine', () => {
         referencedAssetIds: recordType => recordType === 'chat' ? ['asset-private'] : [],
         async prepareForHydrate() {},
         async prepareForUpload(assetIds) { order.push(`upload:${assetIds.join(',')}`); },
+        async clearHydratedAssets() {},
       },
     });
     await openClient(client);
@@ -368,6 +371,74 @@ describe('private Pro blocking multi-device vault engine', () => {
     await client.engine.whenCurrent();
 
     assert.deepEqual(order, ['upload:asset-private', 'write:chat']);
+  });
+
+  test('stop aborts an in-flight asset upload before any remote write or acknowledgement', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    let uploadStarted = false;
+    let uploadAborted = false;
+    const client = await createClient(t, server, masterKey, 'asset-upload-abort', {
+      assets: {
+        referencedAssetIds: recordType => recordType === 'chat' ? ['asset-private'] : [],
+        async prepareForHydrate() {},
+        async prepareForUpload(_assetIds, signal) {
+          uploadStarted = true;
+          await new Promise<void>((resolve, reject) => {
+            signal.addEventListener('abort', () => {
+              uploadAborted = true;
+              reject(new DOMException('aborted', 'AbortError'));
+            }, { once: true });
+          });
+        },
+        async clearHydratedAssets() {},
+      },
+    });
+    await openClient(client);
+
+    await serializer(client, 'chat').mutate(CHAT_ID, { id: 'chat', value: 'local' });
+    while (!uploadStarted) await new Promise(resolve => setTimeout(resolve, 0));
+    await client.engine.stopAndWait();
+
+    assert.equal(uploadAborted, true);
+    assert.equal(server.operations.length, 0);
+    assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 1);
+  });
+
+  test('stop aborts in-flight asset hydration and prevents stale apply or persistence', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    let hydrateStarted = false;
+    let hydrateAborted = false;
+    const client = await createClient(t, server, masterKey, 'asset-hydrate-abort', {
+      assets: {
+        referencedAssetIds: recordType => recordType === 'chat' ? ['asset-private'] : [],
+        async prepareForUpload() {},
+        async prepareForHydrate(_assetIds, signal) {
+          hydrateStarted = true;
+          await new Promise<void>((resolve, reject) => {
+            signal.addEventListener('abort', () => {
+              hydrateAborted = true;
+              reject(new DOMException('aborted', 'AbortError'));
+            }, { once: true });
+          });
+        },
+        async clearHydratedAssets() {},
+      },
+    });
+    server.records.set(CHAT_ID, {
+      envelope: await encryptedEnvelope(masterKey, 'chat', CHAT_ID, 1, { id: 'chat', value: 'remote' }),
+      serverUpdatedAtMs: 1,
+    });
+
+    const hydration = client.engine.hydrateBeforeOpen();
+    while (!hydrateStarted) await new Promise(resolve => setTimeout(resolve, 0));
+    await client.engine.stopAndWait();
+    await Promise.allSettled([hydration]);
+
+    assert.equal(hydrateAborted, true);
+    assert.equal(serializer(client, 'chat').values.size, 0);
+    assert.equal(await client.db.records.where('uid').equals(UID).count(), 0);
   });
 
   test('PC B downloads and applies PC A credentials before ready, then changes theme independently', async (t) => {

@@ -35,11 +35,24 @@ function asset(byteLength = PRIVATE_PRO_VAULT_ASSET_MAX_CIPHERTEXT_CHUNK_BYTES +
 
 class MemoryLocalPort implements PrivateProVaultAssetLocalPort {
   readonly assets = new Map<string, DBlobDBAsset>();
+  readonly hydrated = new Map<string, Set<string>>();
   maxPlaintextReadBytes = 0;
+  failPut = false;
 
   async getAsset(assetId: string) { return structuredClone(this.assets.get(assetId)); }
-  async putAsset(value: DBlobDBAsset) { this.assets.set(value.id, structuredClone(value)); }
+  async putAsset(value: DBlobDBAsset) {
+    if (this.failPut) throw new Error('injected asset put failure');
+    this.assets.set(value.id, structuredClone(value));
+  }
+  async deleteAsset(assetId: string) { this.assets.delete(assetId); }
   async hasAsset(assetId: string) { return this.assets.has(assetId); }
+  async listHydratedAssetIds(uid: string) { return [...(this.hydrated.get(uid) ?? [])]; }
+  async markHydratedAsset(uid: string, assetId: string) {
+    const ids = this.hydrated.get(uid) ?? new Set<string>();
+    ids.add(assetId);
+    this.hydrated.set(uid, ids);
+  }
+  async unmarkHydratedAsset(uid: string, assetId: string) { this.hydrated.get(uid)?.delete(assetId); }
   async openAssetSource(value: DBlobDBAsset) {
     const bytes = Uint8Array.from(Buffer.from(value.data.base64, 'base64'));
     let offset = 0;
@@ -160,6 +173,37 @@ describe('private Pro encrypted vault asset client', () => {
 
     assert.deepEqual(transport.downloadedIndices, [0, 1]);
     assert.deepEqual(local.assets.get(ASSET_ID), original);
+    assert.deepEqual(await local.listHydratedAssetIds(UID), [ASSET_ID]);
+  });
+
+  test('clears only vault-hydrated plaintext assets for this account', async () => {
+    const { client, local, original } = await fixture();
+    const unrelated = { ...structuredClone(original), id: 'preexisting-unrelated' };
+    local.assets.set(unrelated.id, unrelated);
+    await client.prepareForUpload([ASSET_ID]);
+    local.assets.delete(ASSET_ID);
+    await client.prepareForHydrate([ASSET_ID]);
+
+    await client.clearHydratedAssets();
+
+    assert.equal(local.assets.has(ASSET_ID), false);
+    assert.deepEqual(local.assets.get(unrelated.id), unrelated);
+    assert.deepEqual(await local.listHydratedAssetIds(UID), []);
+  });
+
+  test('preserves a preexisting local asset and rolls back failed hydration materialization', async () => {
+    const preexisting = await fixture();
+    await preexisting.client.prepareForUpload([ASSET_ID]);
+    await preexisting.client.prepareForHydrate([ASSET_ID]);
+    assert.deepEqual(await preexisting.local.listHydratedAssetIds(UID), [], 'existing local assets are not claimed by vault hydration');
+
+    const failed = await fixture();
+    await failed.client.prepareForUpload([ASSET_ID]);
+    failed.local.assets.delete(ASSET_ID);
+    failed.local.failPut = true;
+    await assert.rejects(failed.client.prepareForHydrate([ASSET_ID]), /put failure/i);
+    assert.equal(failed.local.assets.has(ASSET_ID), false);
+    assert.deepEqual(await failed.local.listHydratedAssetIds(UID), []);
   });
 
   test('releases the reservation and leaves no ready asset after upload failure or abort', async () => {

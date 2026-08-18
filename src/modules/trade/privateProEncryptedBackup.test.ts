@@ -93,7 +93,7 @@ async function fixture(): Promise<{
   const masterKeyBytes = Uint8Array.from({ length: 32 }, (_, index) => index + 32);
   const masterKey = await importVaultMasterKey(masterKeyBytes);
   const recordId = 'opaque-credential-record';
-  const recordKey = await deriveVaultSubkey(masterKey, 'record-encryption', `credential-service/${recordId}`, ['encrypt', 'decrypt']);
+  const recordKey = await deriveVaultSubkey(masterKey, 'record-encryption', `credential-service:${recordId}`, ['encrypt', 'decrypt']);
   const record = await encryptVaultRecord(recordKey, {
     vaultId: VAULT_ID,
     formatVersion: 1,
@@ -169,7 +169,7 @@ async function fixture(): Promise<{
 }
 
 async function encryptedRecord(masterKey: CryptoKey, recordId: string, apiKey: string): Promise<PrivateProVaultEnvelope> {
-  const recordKey = await deriveVaultSubkey(masterKey, 'record-encryption', `credential-service/${recordId}`, ['encrypt', 'decrypt']);
+  const recordKey = await deriveVaultSubkey(masterKey, 'record-encryption', `credential-service:${recordId}`, ['encrypt', 'decrypt']);
   return encryptVaultRecord(recordKey, {
     vaultId: VAULT_ID,
     formatVersion: 1,
@@ -215,7 +215,7 @@ async function decryptFixtureRecord(input: PrivateProEncryptedBackupApplyInput):
   const key = await deriveVaultSubkey(
     input.masterKey,
     'record-encryption',
-    `${record.recordType}/${record.recordId}`,
+    `${record.recordType}:${record.recordId}`,
     ['encrypt', 'decrypt'],
   );
   const plaintext = await decryptVaultRecord(key, record, { vaultId: input.header.vaultId });

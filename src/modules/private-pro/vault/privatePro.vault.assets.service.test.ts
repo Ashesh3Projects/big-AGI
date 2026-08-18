@@ -224,6 +224,24 @@ describe('private Pro encrypted vault asset service', () => {
     assert.equal(port.account.reservedBytes, 4_000_120);
   });
 
+  test('accepts an exact ready-asset descriptor replay and rejects divergent ciphertext for the same opaque ID', async () => {
+    const port = new MemoryPort();
+    const assets = service(port);
+    await assets.reserveUpload(UID, reserveInput('asset-operation-1'));
+    installObjects(port);
+    await assets.finalizeUpload(UID, 'asset-operation-1');
+
+    assert.deepEqual(await assets.reserveUpload(UID, reserveInput('asset-operation-2')), {
+      status: 'already-uploaded',
+      opaqueAssetId: ASSET_ID,
+      ciphertextBytes: 4_000_120,
+    });
+    await assert.rejects(assets.reserveUpload(UID, {
+      ...reserveInput('asset-operation-3'),
+      chunks: [{ ...DESCRIPTORS[0], objectSha256: 'f'.repeat(64) }, { ...DESCRIPTORS[1] }],
+    }), /different ciphertext|descriptor/i);
+  });
+
   test('releases uploaded objects when quota changes before finalization', async () => {
     const port = new MemoryPort();
     const assets = service(port);

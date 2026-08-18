@@ -54,8 +54,9 @@ interface PrivateProVaultEngineDependencies {
   beforeAcknowledgeCommit?: () => Promise<void>;
   assets?: {
     referencedAssetIds(recordType: PrivateProVaultRecordType, value: unknown): readonly string[];
-    prepareForUpload(assetIds: readonly string[]): Promise<void>;
-    prepareForHydrate(assetIds: readonly string[]): Promise<void>;
+    prepareForUpload(assetIds: readonly string[], signal: AbortSignal): Promise<void>;
+    prepareForHydrate(assetIds: readonly string[], signal: AbortSignal): Promise<void>;
+    clearHydratedAssets(): Promise<void>;
   };
   persistCurrent?: (
     index: readonly PrivateProVaultIndexEntry[],
@@ -120,11 +121,24 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
   let unsubscribeSerializers: Array<() => void> = [];
   let nextLocalSequence: number | undefined;
   let runEpoch = 0;
+  let runAbortController: AbortController | null = null;
   let stopping = Promise.resolve();
   let stoppingActive = false;
 
   const assertCurrent = (epoch: number) => {
     if (epoch !== runEpoch) throw new PrivateProVaultRunCancelledError();
+  };
+
+  const beginRun = () => {
+    runAbortController?.abort();
+    runAbortController = new AbortController();
+    return runAbortController.signal;
+  };
+
+  const currentSignal = (epoch: number) => {
+    assertCurrent(epoch);
+    if (!runAbortController) throw new PrivateProVaultRunCancelledError();
+    return runAbortController.signal;
   };
 
   const setStatus = (epoch: number, state: Partial<Omit<PrivateProVaultState, 'setState'>>) => {
@@ -270,7 +284,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
     try {
       if (deps.assets) {
         const assetIds = [...new Set(records.flatMap(record => deps.assets!.referencedAssetIds(record.serializer.recordType, record.value)))];
-        if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForHydrate(assetIds));
+        if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForHydrate(assetIds, currentSignal(epoch)));
       }
       await withSuppressedEvents(async () => {
         for (const serializer of deps.serializers) {
@@ -448,7 +462,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
         if (next.operation.kind === 'put' && deps.assets) {
           const local = await decryptAndValidate(epoch, next.operation.envelope);
           const assetIds = [...new Set(deps.assets.referencedAssetIds(local.serializer.recordType, local.value))];
-          if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForUpload(assetIds));
+          if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForUpload(assetIds, currentSignal(epoch)));
         }
         const result = await waitCurrent(epoch, deps.transport.write(next.operation));
         if (result.status === 'conflict') {
@@ -542,6 +556,8 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
   };
 
   const invalidateRun = () => {
+    runAbortController?.abort();
+    runAbortController = null;
     runEpoch++;
     stopped = true;
     started = false;
@@ -575,6 +591,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
       await stopping;
       stopped = false;
       const epoch = ++runEpoch;
+      beginRun();
       await queue(currentEpoch => reconcile(currentEpoch, true), epoch);
     },
 
@@ -584,6 +601,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
         started = true;
         stopped = false;
         const epoch = ++runEpoch;
+        beginRun();
         unsubscribeSerializers = deps.serializers.map(serializer => serializer.subscribe(onMutation));
         unsubscribeConnectivity = deps.transport.subscribeConnectivity(online => {
           if (epoch !== runEpoch) return;
@@ -618,6 +636,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
 
     async logoutAndClear() {
       await this.stopAndWait();
+      await deps.assets?.clearHydratedAssets();
       await (deps.clearSession ? deps.clearSession() : privateProVaultSession.logoutAndClear(deps.uid));
       await deps.db.transaction('rw', [
         deps.db.deviceKeys,
@@ -627,6 +646,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
         deps.db.revisions,
         deps.db.migration,
         deps.db.quarantine,
+        deps.db.hydratedAssets,
       ], async () => {
         await Promise.all([
           deps.db.deviceKeys.delete(deps.uid),
@@ -636,6 +656,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
           deps.db.revisions.where('uid').equals(deps.uid).delete(),
           deps.db.migration.where('uid').equals(deps.uid).delete(),
           deps.db.quarantine.where('uid').equals(deps.uid).delete(),
+          deps.db.hydratedAssets.where('uid').equals(deps.uid).delete(),
         ]);
       });
       await withSuppressedEvents(async () => {

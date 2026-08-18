@@ -4,8 +4,7 @@ import type { User } from 'firebase/auth';
 import { downloadBlob } from '~/common/util/downloadUtils';
 import { apiAsyncNode } from '~/common/util/trpc.client';
 import {
-  createPrivateProEncryptedBackupStream,
-  type PrivateProEncryptedBackupSource,
+  type PrivateProEncryptedBackupCredential,
 } from '~/modules/trade/privateProEncryptedBackup';
 
 import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
@@ -16,6 +15,7 @@ import { PrivateProVaultUnlock } from '../ui/PrivateProVaultUnlock';
 import { deriveVaultSubkey, hmacVaultIdentifier } from './privatePro.vault.crypto';
 import { privateProVaultDB } from './privatePro.vault.db';
 import { createPrivateProVaultEngine, type PrivateProVaultEngine } from './privatePro.vault.engine';
+import { createPrivateProVaultBackupStream, importPrivateProVaultBackup } from './privatePro.vault.backup';
 import {
   createPrivateProRememberedUnlock,
   createPrivateProVaultKeyset,
@@ -76,6 +76,60 @@ export interface PrivateProVaultLifecycle {
   destroy(): void;
 }
 
+export interface PrivateProVaultRuntimeState {
+  engine: PrivateProVaultEngine | null;
+  keyset: PrivateProVaultKeyset | null;
+  masterKey: CryptoKey | null;
+  devices: PrivateProVaultDeviceMetadata[];
+  assets: PrivateProVaultAssetClient | null;
+}
+
+export interface PrivateProVaultRuntimeCleanupPort {
+  clearSession(uid: string): Promise<void>;
+  clearDeviceId(uid: string): void;
+  deleteVaultDB?(): Promise<void>;
+  signOut(): Promise<void>;
+  reload?(): void;
+}
+
+async function clearPrivateProVaultRuntime(
+  runtime: PrivateProVaultRuntimeState,
+  uid: string,
+  port: PrivateProVaultRuntimeCleanupPort,
+) {
+  if (runtime.engine) await runtime.engine.logoutAndClear();
+  else {
+    await runtime.assets?.clearHydratedAssets();
+    await port.clearSession(uid);
+  }
+  runtime.engine = null;
+  runtime.masterKey = null;
+  runtime.keyset = null;
+  runtime.assets = null;
+  runtime.devices = [];
+  port.clearDeviceId(uid);
+}
+
+export async function logoutPrivateProVaultRuntime(
+  runtime: PrivateProVaultRuntimeState,
+  uid: string,
+  port: PrivateProVaultRuntimeCleanupPort,
+) {
+  await clearPrivateProVaultRuntime(runtime, uid, port);
+  await port.signOut();
+}
+
+export async function fullWipePrivateProVaultRuntime(
+  runtime: PrivateProVaultRuntimeState,
+  uid: string,
+  port: PrivateProVaultRuntimeCleanupPort,
+) {
+  await clearPrivateProVaultRuntime(runtime, uid, port);
+  await port.deleteVaultDB?.();
+  await port.signOut();
+  port.reload?.();
+}
+
 export interface PrivateProVaultContextValue extends PrivateProVaultPublicState {
   retry(): Promise<void>;
   setup(password: string): Promise<void>;
@@ -84,6 +138,7 @@ export interface PrivateProVaultContextValue extends PrivateProVaultPublicState 
   unlockWithRecovery(recoveryKey: string, newPassword: string): Promise<void>;
   changePassword(currentPassword: string, newPassword: string): Promise<void>;
   createEncryptedExport(): Promise<void>;
+  importEncryptedBackup(stream: ReadableStream<Uint8Array>, credential: PrivateProEncryptedBackupCredential): Promise<void>;
   revokeOtherDevices(): Promise<void>;
   logout(): Promise<void>;
   fullLocalWipe(): Promise<void>;
@@ -296,7 +351,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
 function createProductionDependencies(
   user: User,
   signOut: () => Promise<void>,
-  runtime: { engine: PrivateProVaultEngine | null; keyset: PrivateProVaultKeyset | null; masterKey: CryptoKey | null; devices: PrivateProVaultDeviceMetadata[]; assets: PrivateProVaultAssetClient | null },
+  runtime: PrivateProVaultRuntimeState,
 ): PrivateProVaultLifecycleDependencies<PrivateProVaultKeyset, CryptoKey, CryptoKey> {
   let deviceId = '';
   return {
@@ -391,8 +446,9 @@ function createProductionDependencies(
         store: privateProVaultStore,
         assets: {
           referencedAssetIds: collectPrivateProVaultAssetIds,
-          prepareForUpload: assetIds => assets.prepareForUpload(assetIds),
-          prepareForHydrate: assetIds => assets.prepareForHydrate(assetIds),
+          prepareForUpload: (assetIds, signal) => assets.prepareForUpload(assetIds, signal),
+          prepareForHydrate: (assetIds, signal) => assets.prepareForHydrate(assetIds, signal),
+          clearHydratedAssets: () => assets.clearHydratedAssets(),
         },
       });
       runtime.engine = engine;
@@ -413,14 +469,11 @@ function createProductionDependencies(
       return privateProVaultStore.subscribe(state => listener(mapPhase(state.phase)));
     },
     async logout() {
-      if (runtime.engine) await runtime.engine.logoutAndClear();
-      else await privateProVaultSession.logoutAndClear(user.uid);
-      runtime.engine = null;
-      runtime.masterKey = null;
-      runtime.keyset = null;
-      runtime.assets = null;
-      clearPrivateProVaultDeviceId(user.uid);
-      await signOut();
+      await logoutPrivateProVaultRuntime(runtime, user.uid, {
+        clearSession: uid => privateProVaultSession.logoutAndClear(uid),
+        clearDeviceId: clearPrivateProVaultDeviceId,
+        signOut,
+      });
     },
   };
 }
@@ -436,13 +489,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
   const auth = usePrivateProAuth();
   const [state, setState] = React.useState<PrivateProVaultPublicState>(INITIAL_STATE);
   const lifecycleRef = React.useRef<PrivateProVaultLifecycle | null>(null);
-  const runtimeRef = React.useRef<{
-    engine: PrivateProVaultEngine | null;
-    keyset: PrivateProVaultKeyset | null;
-    masterKey: CryptoKey | null;
-    devices: PrivateProVaultDeviceMetadata[];
-    assets: PrivateProVaultAssetClient | null;
-  }>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null });
+  const runtimeRef = React.useRef<PrivateProVaultRuntimeState>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null });
 
   React.useEffect(() => {
     if (!auth.user) return;
@@ -483,29 +530,38 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
   const createEncryptedExport = React.useCallback(async () => {
     const runtime = runtimeRef.current;
     if (!auth.user || !runtime.masterKey || !runtime.keyset) throw new Error('Unlock the vault first.');
-    const source: PrivateProEncryptedBackupSource = {
-      vaultId: auth.user.uid,
+    if (!runtime.assets) throw new Error('Encrypted asset client is unavailable.');
+    const response = new Response(await createPrivateProVaultBackupStream({
+      uid: auth.user.uid,
       keyset: runtime.keyset,
       masterKey: runtime.masterKey,
-      records: async function* () {
-        for (const envelope of await privateProVaultDB.listEncryptedRecords(auth.user!.uid)) yield envelope;
-      },
-      ...(runtime.assets ? {
-        assets: async function* () {
-          const assetIds = new Set<string>();
-          for (const serializer of privateProVaultSerializers) {
-            if (serializer.recordType !== 'chat') continue;
-            for (const record of await serializer.snapshot())
-              for (const assetId of collectPrivateProVaultAssetIds(serializer.recordType, record.value)) assetIds.add(assetId);
-          }
-          await runtime.assets!.prepareForUpload([...assetIds]);
-          yield* runtime.assets!.exportAssetChunks([...assetIds]);
-        },
-      } : {}),
-    };
-    const response = new Response(createPrivateProEncryptedBackupStream(source));
+      db: privateProVaultDB,
+      serializers: privateProVaultSerializers,
+      assets: runtime.assets,
+      collectAssetIds: collectPrivateProVaultAssetIds,
+    }));
     const blob = await response.blob();
     downloadBlob(blob, `Big-AGI-private-pro-encrypted-${new Date().toISOString().slice(0, 10)}.ndjson`);
+  }, [auth.user]);
+
+  const importEncryptedBackup = React.useCallback(async (
+    stream: ReadableStream<Uint8Array>,
+    credential: PrivateProEncryptedBackupCredential,
+  ) => {
+    const runtime = runtimeRef.current;
+    if (!auth.user || !runtime.assets) throw new Error('Unlock the vault first.');
+    await runtime.engine?.stopAndWait();
+    try {
+      await importPrivateProVaultBackup(stream, credential, {
+        uid: auth.user.uid,
+        db: privateProVaultDB,
+        serializers: privateProVaultSerializers,
+        createAssetClient: (masterKey, keyVersion, vaultId) => createPrivateProVaultAssetClient({ vaultId, masterKey, keyVersion }),
+      });
+    } catch (error) {
+      await runtime.engine?.start();
+      throw error;
+    }
   }, [auth.user]);
 
   const revokeOtherDevices = React.useCallback(async () => {
@@ -523,11 +579,13 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
 
   const fullLocalWipe = React.useCallback(async () => {
     if (!auth.user) return;
-    await runtimeRef.current.engine?.logoutAndClear();
-    clearPrivateProVaultDeviceId(auth.user.uid);
-    await privateProVaultDB.delete();
-    await auth.signOut();
-    window.location.reload();
+    await fullWipePrivateProVaultRuntime(runtimeRef.current, auth.user.uid, {
+      clearSession: uid => privateProVaultSession.logoutAndClear(uid),
+      clearDeviceId: clearPrivateProVaultDeviceId,
+      deleteVaultDB: () => privateProVaultDB.delete(),
+      signOut: auth.signOut,
+      reload: () => window.location.reload(),
+    });
   }, [auth]);
 
   const value = React.useMemo<PrivateProVaultContextValue>(() => ({
@@ -539,10 +597,11 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     unlockWithRecovery: (recoveryKey, newPassword) => lifecycle().unlockWithRecovery(recoveryKey, newPassword),
     changePassword,
     createEncryptedExport,
+    importEncryptedBackup,
     revokeOtherDevices,
     logout: () => lifecycle().logout(),
     fullLocalWipe,
-  }), [changePassword, createEncryptedExport, fullLocalWipe, revokeOtherDevices, state]);
+  }), [changePassword, createEncryptedExport, fullLocalWipe, importEncryptedBackup, revokeOtherDevices, state]);
 
   if (state.phase === 'setup') return <PrivateProVaultSetup
     busy={state.busy}

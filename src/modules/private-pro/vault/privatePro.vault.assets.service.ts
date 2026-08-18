@@ -28,6 +28,7 @@ export interface PrivateProVaultAssetRecord {
   opaqueAssetId: string;
   chunks: PrivateProVaultAssetChunkDescriptor[];
   ciphertextBytes: number;
+  descriptorFingerprint: string;
   status: 'ready';
   createdAtMs: number;
   updatedAtMs: number;
@@ -39,6 +40,7 @@ export interface PrivateProVaultAssetReservation {
   opaqueAssetId: string;
   chunks: PrivateProVaultAssetChunkDescriptor[];
   ciphertextBytes: number;
+  descriptorFingerprint: string;
   status: 'reserved' | 'ready' | 'released';
   createdAtMs: number;
   expiresAtMs: number;
@@ -118,7 +120,7 @@ function rateWindowId(atMs: number, windowMs: number): string {
   return Math.floor(atMs / windowMs).toString(36);
 }
 
-function inputFingerprint(input: Pick<PrivateProVaultAssetReservation, 'opaqueAssetId' | 'chunks'>): string {
+function descriptorFingerprint(input: Pick<PrivateProVaultAssetReservation, 'opaqueAssetId' | 'chunks'>): string {
   return JSON.stringify({ opaqueAssetId: input.opaqueAssetId, chunks: input.chunks });
 }
 
@@ -201,10 +203,14 @@ export function createPrivateProVaultAssetsService(
           transaction.getActiveReservationForAsset(input.opaqueAssetId),
         ]);
         if (!account.active || account.uid !== uid) throw new Error('Private Pro account is inactive.');
-        if (asset)
+        const fingerprint = descriptorFingerprint({ opaqueAssetId: input.opaqueAssetId, chunks: validated.chunks });
+        if (asset) {
+          if (asset.descriptorFingerprint !== fingerprint)
+            throw new Error('Encrypted asset ID is already used by different ciphertext descriptors.');
           return { status: 'already-uploaded' as const, opaqueAssetId: asset.opaqueAssetId, ciphertextBytes: asset.ciphertextBytes };
+        }
         if (existing) {
-          if (inputFingerprint(existing) !== inputFingerprint({ opaqueAssetId: input.opaqueAssetId, chunks: validated.chunks }))
+          if (existing.descriptorFingerprint !== fingerprint)
             throw new Error('Encrypted asset operation ID is already used by different ciphertext.');
           if (existing.status === 'ready')
             return { status: 'already-uploaded' as const, opaqueAssetId: existing.opaqueAssetId, ciphertextBytes: existing.ciphertextBytes };
@@ -240,6 +246,7 @@ export function createPrivateProVaultAssetsService(
           opaqueAssetId: input.opaqueAssetId,
           chunks: validated.chunks,
           ciphertextBytes: validated.ciphertextBytes,
+          descriptorFingerprint: fingerprint,
           status: 'reserved',
           createdAtMs,
           expiresAtMs: createdAtMs + RESERVATION_TTL_MS,
@@ -323,6 +330,7 @@ export function createPrivateProVaultAssetsService(
           opaqueAssetId: current.opaqueAssetId,
           chunks: current.chunks.map(chunk => ({ ...chunk })),
           ciphertextBytes: current.ciphertextBytes,
+          descriptorFingerprint: current.descriptorFingerprint,
           status: 'ready',
           createdAtMs: current.createdAtMs,
           updatedAtMs,

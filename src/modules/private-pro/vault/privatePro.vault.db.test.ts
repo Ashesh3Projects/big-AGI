@@ -5,7 +5,7 @@ import { describe, test, type TestContext } from 'node:test';
 
 import Dexie from 'dexie';
 
-import { PrivateProVaultDB } from './privatePro.vault.db';
+import { PRIVATE_PRO_VAULT_DB_VERSION, PrivateProVaultDB } from './privatePro.vault.db';
 import { PrivateProVaultSession } from './privatePro.vault.session';
 import type { PrivateProVaultEnvelope, PrivateProVaultOperation, PrivateProVaultWrappedKeyEnvelope } from './privatePro.vault.types';
 
@@ -100,10 +100,10 @@ describe('private Pro encrypted vault database', () => {
 
     await db.open();
 
-    assert.equal(db.verno, 2);
+    assert.equal(db.verno, PRIVATE_PRO_VAULT_DB_VERSION);
     assert.deepEqual(
       db.tables.map(table => table.name).sort(),
-      ['deviceKeys', 'migration', 'outbox', 'quarantine', 'records', 'revisions', 'wrappedKeys'].sort(),
+      ['deviceKeys', 'hydratedAssets', 'migration', 'outbox', 'quarantine', 'records', 'revisions', 'wrappedKeys'].sort(),
     );
   });
 

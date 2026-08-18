@@ -1,5 +1,6 @@
 import * as React from 'react';
-import { Alert, Avatar, Button, Divider, FormControl, FormLabel, IconButton, Input, Stack, Tooltip, Typography } from '@mui/joy';
+import { fileOpen } from 'browser-fs-access';
+import { Alert, Avatar, Button, Divider, FormControl, FormLabel, IconButton, Input, Stack, Tab, TabList, TabPanel, Tabs, Tooltip, Typography } from '@mui/joy';
 import AccountCircleRoundedIcon from '@mui/icons-material/AccountCircleRounded';
 
 import { GoodModal } from '~/common/components/modals/GoodModal';
@@ -13,11 +14,13 @@ export function PrivateProAccountControl(props: { mobile?: boolean }) {
   const { user } = usePrivateProAuth();
   const vault = usePrivateProVault();
   const [open, setOpen] = React.useState(false);
-  const [action, setAction] = React.useState<'password' | 'wipe' | null>(null);
+  const [action, setAction] = React.useState<'password' | 'import' | 'wipe' | null>(null);
   const [currentPassword, setCurrentPassword] = React.useState('');
   const [password, setPassword] = React.useState('');
   const [passwordConfirmation, setPasswordConfirmation] = React.useState('');
   const [message, setMessage] = React.useState<string | null>(null);
+  const [importCredential, setImportCredential] = React.useState('');
+  const [importKind, setImportKind] = React.useState<'password' | 'recovery'>('password');
   const [busy, setBusy] = React.useState(false);
   const strength = privateProVaultPasswordStrength(password);
 
@@ -90,11 +93,32 @@ export function PrivateProAccountControl(props: { mobile?: boolean }) {
         </Stack> : <Stack spacing={1}>
             <Button variant='soft' color='neutral' onClick={() => setAction('password')}>Change vault password</Button>
             <Button variant='soft' color='neutral' loading={busy} onClick={() => void run(() => vault.createEncryptedExport(), 'Encrypted backup saved.')}>Create encrypted backup</Button>
+            <Button variant='soft' color='neutral' onClick={() => setAction('import')}>Restore encrypted backup</Button>
             <Button variant='soft' color='neutral' loading={busy} onClick={() => void run(() => vault.revokeOtherDevices(), 'Other remembered devices revoked.')}>Revoke other devices</Button>
             <Button variant='soft' color='neutral' onClick={() => void vault.logout()}>Sign out</Button>
             <Button variant='plain' color='danger' onClick={() => setAction('wipe')}>Full local wipe</Button>
             {action === 'wipe' && <Alert color='danger'>Full local wipe removes this browser&apos;s encrypted cache and remembered key. Use account recovery to unlock again.</Alert>}
             {action === 'wipe' && <Button color='danger' loading={busy} onClick={() => void vault.fullLocalWipe()}>Confirm full local wipe</Button>}
+            {action === 'import' && <Stack spacing={1.5}>
+              <Tabs value={importKind} onChange={(_event, value) => value && setImportKind(value as 'password' | 'recovery')}>
+                <TabList><Tab value='password'>Password</Tab><Tab value='recovery'>Recovery key</Tab></TabList>
+                <TabPanel value='password' sx={{ px: 0 }} />
+                <TabPanel value='recovery' sx={{ px: 0 }} />
+              </Tabs>
+              <Input
+                type={importKind === 'password' ? 'password' : 'text'}
+                aria-label={importKind === 'password' ? 'Backup vault password' : 'Backup recovery key'}
+                value={importCredential}
+                onChange={event => setImportCredential(event.target.value)}
+              />
+              <Button loading={busy} disabled={!importCredential} onClick={() => void run(async () => {
+                const file = await fileOpen({ extensions: ['.ndjson'], description: 'Private Pro encrypted backup', mimeTypes: ['application/x-ndjson'] });
+                await vault.importEncryptedBackup(file.stream(), importKind === 'password'
+                  ? { kind: 'password', password: importCredential }
+                  : { kind: 'recovery', recoveryKey: importCredential });
+                window.location.reload();
+              }, 'Encrypted backup restored.')}>Choose encrypted backup</Button>
+            </Stack>}
           </Stack>}
       </Stack>
     </GoodModal>

@@ -9,7 +9,7 @@ import type {
 } from './privatePro.vault.types';
 
 
-export const PRIVATE_PRO_VAULT_DB_VERSION = 2;
+export const PRIVATE_PRO_VAULT_DB_VERSION = 3;
 
 export interface PrivateProVaultDeviceKeyRecord {
   uid: string;
@@ -63,6 +63,11 @@ export interface PrivateProVaultQuarantineRecord {
   createdAtMs: number;
 }
 
+export interface PrivateProVaultHydratedAssetRecord {
+  uid: string;
+  assetId: string;
+}
+
 
 function hasExactKeyUsages(key: CryptoKey, expectedUsages: readonly KeyUsage[]): boolean {
   return key.usages.length === expectedUsages.length
@@ -91,6 +96,7 @@ export class PrivateProVaultDB extends Dexie {
   revisions!: Table<PrivateProVaultRevisionRecord, [string, PrivateProVaultRecordType, string]>;
   migration!: Table<PrivateProVaultMigrationRecord, [string, string]>;
   quarantine!: EntityTable<PrivateProVaultQuarantineRecord, 'id'>;
+  hydratedAssets!: Table<PrivateProVaultHydratedAssetRecord, [string, string]>;
 
   constructor(name = 'private-pro-vault-v1') {
     super(name);
@@ -102,6 +108,7 @@ export class PrivateProVaultDB extends Dexie {
       revisions: '[uid+recordType+recordId], uid, revision',
       migration: '[uid+migrationId], uid, phase, updatedAtMs',
       quarantine: '++id, uid, [uid+recordType+recordId], createdAtMs',
+      hydratedAssets: '[uid+assetId], uid, assetId',
     });
   }
 

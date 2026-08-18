@@ -1,5 +1,5 @@
 import { apiAsyncNode } from '~/common/util/trpc.client';
-import { getDBAsset, putDBAsset } from '~/common/stores/blob/dblobs-portability';
+import { deleteDBAsset, getDBAsset, putDBAsset } from '~/common/stores/blob/dblobs-portability';
 import type { DBlobAssetId, DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import type { PrivateProEncryptedBackupAsset } from '~/modules/trade/privateProEncryptedBackup';
 
@@ -15,6 +15,7 @@ import {
   type PrivateProVaultAssetPlaintextSource,
   type PrivateProVaultAssetStoredChunkMetadata,
 } from './privatePro.vault.assets.crypto';
+import { privateProVaultDB } from './privatePro.vault.db';
 
 
 const SHA256_HEX = /^[a-f0-9]{64}$/;
@@ -22,7 +23,11 @@ const SHA256_HEX = /^[a-f0-9]{64}$/;
 export interface PrivateProVaultAssetLocalPort {
   getAsset(assetId: string): Promise<DBlobDBAsset | undefined>;
   putAsset(asset: DBlobDBAsset): Promise<void>;
+  deleteAsset(assetId: string): Promise<void>;
   hasAsset(assetId: string): Promise<boolean>;
+  listHydratedAssetIds(uid: string): Promise<string[]>;
+  markHydratedAsset(uid: string, assetId: string): Promise<void>;
+  unmarkHydratedAsset(uid: string, assetId: string): Promise<void>;
   openAssetSource(asset: DBlobDBAsset): Promise<{
     plaintextBytes: number;
     source: PrivateProVaultAssetPlaintextSource;
@@ -212,7 +217,13 @@ function defaultLocalPort(): PrivateProVaultAssetLocalPort {
   return {
     getAsset: assetId => getDBAsset<DBlobDBAsset>(assetId),
     putAsset: putDBAsset,
+    deleteAsset: deleteDBAsset,
     async hasAsset(assetId) { return !!await getDBAsset(assetId); },
+    async listHydratedAssetIds(uid) {
+      return (await privateProVaultDB.hydratedAssets.where('uid').equals(uid).toArray()).map(record => record.assetId);
+    },
+    async markHydratedAsset(uid, assetId) { await privateProVaultDB.hydratedAssets.put({ uid, assetId }); },
+    async unmarkHydratedAsset(uid, assetId) { await privateProVaultDB.hydratedAssets.delete([uid, assetId]); },
     async openAssetSource(asset) { return base64ToStream(asset.data.base64); },
   };
 }
@@ -420,14 +431,39 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
     return chunks;
   };
 
-  const decryptAndStore = async (assetId: string, chunks: readonly PrivateProVaultAssetChunk[]) => {
+  const decryptAsset = async (assetId: string, chunks: readonly PrivateProVaultAssetChunk[]) => {
     const encoder = new StreamingBase64Encoder();
     const manifest = await decryptPrivateProVaultAssetToSink(
       { masterKey: deps.masterKey, vaultId: deps.vaultId, chunks },
       plaintext => encoder.write(plaintext),
     );
     if (manifest.assetId !== assetId) throw new Error('Encrypted attachment manifest identity is invalid.');
-    await local.putAsset(assetFromManifest(manifest, encoder.finish()));
+    return assetFromManifest(manifest, encoder.finish());
+  };
+
+  const materializeAsset = async (asset: DBlobDBAsset): Promise<boolean> => {
+    const existing = await local.getAsset(asset.id);
+    if (existing) {
+      if (JSON.stringify(existing) !== JSON.stringify(asset))
+        throw new Error('Encrypted backup attachment conflicts with an existing local asset.');
+      return false;
+    }
+    await local.markHydratedAsset(deps.vaultId, asset.id);
+    try {
+      await local.putAsset(asset);
+      return true;
+    } catch (error) {
+      await local.deleteAsset(asset.id).catch(() => undefined);
+      await local.unmarkHydratedAsset(deps.vaultId, asset.id).catch(() => undefined);
+      throw error;
+    }
+  };
+
+  const rollbackAssets = async (assetIds: readonly string[]) => {
+    for (const assetId of [...assetIds].reverse()) {
+      await local.deleteAsset(assetId);
+      await local.unmarkHydratedAsset(deps.vaultId, assetId);
+    }
   };
 
   return {
@@ -470,10 +506,24 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
     },
 
     async prepareForHydrate(assetIds: readonly DBlobAssetId[], signal?: AbortSignal) {
-      for (const assetId of [...new Set(assetIds)]) {
-        throwIfAborted(signal);
-        if (await local.hasAsset(assetId)) continue;
-        await decryptAndStore(assetId, await downloadChunks(assetId, signal));
+      const materialized: string[] = [];
+      try {
+        for (const assetId of [...new Set(assetIds)]) {
+          throwIfAborted(signal);
+          if (await local.hasAsset(assetId)) continue;
+          if (await materializeAsset(await decryptAsset(assetId, await downloadChunks(assetId, signal)))) materialized.push(assetId);
+          throwIfAborted(signal);
+        }
+      } catch (error) {
+        await rollbackAssets(materialized);
+        throw error;
+      }
+    },
+
+    async clearHydratedAssets() {
+      for (const assetId of await local.listHydratedAssetIds(deps.vaultId)) {
+        await local.deleteAsset(assetId);
+        await local.unmarkHydratedAsset(deps.vaultId, assetId);
       }
     },
 
@@ -521,35 +571,45 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
         existing.push(chunk);
         byAsset.set(chunk.assetId, existing);
       }
-      for (const [opaqueId, assetChunks] of byAsset) {
-        const ordered = [...assetChunks].sort((left, right) => left.chunkIndex - right.chunkIndex);
-        if (ordered.some((chunk, index) => chunk.chunkIndex !== index || chunk.assetId !== opaqueId))
-          throw new Error('Encrypted backup attachment chunks are out of order.');
-        const totalPlaintextBytes = ordered.reduce((sum, chunk) => sum + chunk.ciphertextBytes - 16, 0);
-        const restored = ordered.map(chunk => ({
-          formatVersion: 1 as const,
-          schemaVersion: 1 as const,
-          keyVersion: chunk.keyVersion,
-          opaqueAssetId: chunk.assetId,
-          opaqueChunkId: chunk.chunkId,
-          chunkIndex: chunk.chunkIndex,
-          chunkCount: ordered.length,
-          totalPlaintextBytes,
-          plaintextBytes: chunk.ciphertextBytes - 16,
-          nonceBase64: chunk.nonceBase64,
-          ciphertextBase64: chunk.ciphertextBase64,
-          ciphertextBytes: chunk.ciphertextBytes,
-        }));
-        const encoder = new StreamingBase64Encoder();
-        const manifest = await decryptPrivateProVaultAssetToSink(
-          { masterKey: deps.masterKey, vaultId: deps.vaultId, chunks: restored },
-          plaintext => encoder.write(plaintext),
-        );
-        if (await privateProVaultAssetId(deps.masterKey, manifest.assetId) !== opaqueId)
-          throw new Error('Encrypted backup attachment identity is invalid.');
-        await local.putAsset(assetFromManifest(manifest, encoder.finish()));
+      const materialized: string[] = [];
+      try {
+        for (const [opaqueId, assetChunks] of byAsset) {
+          const ordered = [...assetChunks].sort((left, right) => left.chunkIndex - right.chunkIndex);
+          if (ordered.some((chunk, index) => chunk.chunkIndex !== index || chunk.assetId !== opaqueId))
+            throw new Error('Encrypted backup attachment chunks are out of order.');
+          const totalPlaintextBytes = ordered.reduce((sum, chunk) => sum + chunk.ciphertextBytes - 16, 0);
+          const restored = ordered.map(chunk => ({
+            formatVersion: 1 as const,
+            schemaVersion: 1 as const,
+            keyVersion: chunk.keyVersion,
+            opaqueAssetId: chunk.assetId,
+            opaqueChunkId: chunk.chunkId,
+            chunkIndex: chunk.chunkIndex,
+            chunkCount: ordered.length,
+            totalPlaintextBytes,
+            plaintextBytes: chunk.ciphertextBytes - 16,
+            nonceBase64: chunk.nonceBase64,
+            ciphertextBase64: chunk.ciphertextBase64,
+            ciphertextBytes: chunk.ciphertextBytes,
+          }));
+          const encoder = new StreamingBase64Encoder();
+          const manifest = await decryptPrivateProVaultAssetToSink(
+            { masterKey: deps.masterKey, vaultId: deps.vaultId, chunks: restored },
+            plaintext => encoder.write(plaintext),
+          );
+          if (await privateProVaultAssetId(deps.masterKey, manifest.assetId) !== opaqueId)
+            throw new Error('Encrypted backup attachment identity is invalid.');
+          const asset = assetFromManifest(manifest, encoder.finish());
+          if (await materializeAsset(asset)) materialized.push(asset.id);
+        }
+        return materialized;
+      } catch (error) {
+        await rollbackAssets(materialized);
+        throw error;
       }
     },
+
+    rollbackImportedAssets: rollbackAssets,
   };
 }
 
