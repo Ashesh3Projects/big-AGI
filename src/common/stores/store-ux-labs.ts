@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
+
 
 
 // UX Labs Experiments
@@ -55,6 +57,7 @@ export const useUXLabsStore = create<UXLabsStore>()(
     }),
     {
       name: 'app-ux-labs',
+      ...createPrivateProPortableLocalStorageOptions<UXLabsStore>(),
 
       // Migrations:
       // - 1: turn on the screen capture by default (subsequently removed)

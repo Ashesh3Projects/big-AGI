@@ -5,7 +5,7 @@ import { persist } from 'zustand/middleware';
 import type { ContentScaling, UIComplexityMode } from '~/common/app.theme';
 import { BrowserLang } from '~/common/util/pwaUtils';
 import { Release } from '~/common/app.release';
-import { privateProPortableLocalStorage } from '~/modules/private-pro/persistence/privatePro.persistence';
+import { createPrivateProPortableLocalStorageOptions, privateProPortableLocalStorage } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 // UI Preferences
@@ -180,6 +180,7 @@ export const useUIPreferencesStore = create<UIPreferencesStore>()(
     }),
     {
       name: 'app-ui',
+      ...createPrivateProPortableLocalStorageOptions<unknown>(),
 
       /* versioning:
        * 1: rename 'enterToSend' to 'enterIsNewline' (flip the meaning)

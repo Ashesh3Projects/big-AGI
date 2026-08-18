@@ -1,6 +1,10 @@
 import 'fake-indexeddb/auto';
 
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
+import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, relative, sep } from 'node:path';
 import { afterEach, describe, test } from 'node:test';
 import { get, set } from 'idb-keyval';
 
@@ -67,17 +71,104 @@ describe('private Pro portable persistence gate', () => {
   test('declares every Task 11 localStorage persistence key explicitly', () => {
     assert.deepEqual([...PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS].sort(), [
       'agi-scratch-clip',
+      'app-ai-preferences',
+      'app-app-call',
+      'app-app-chat',
       'app-app-personas',
       'app-folders',
       'app-models',
       'app-module-asrx',
+      'app-module-beam',
+      'app-module-browse',
       'app-module-google-search',
       'app-module-speex',
+      'app-module-t2i',
+      'app-purpose',
       'app-sharing',
+      'app-ui',
+      'app-ux-labs',
       'joy-color-scheme-dark',
       'joy-color-scheme-light',
       'joy-mode',
     ]);
+  });
+
+  test('registers every durable source store and routes every included store through the private Pro adapter', () => {
+    const sourceRoot = join(process.cwd(), 'src');
+    const persistedStores = [
+      ['apps/call/state/store-app-call.ts', 'app-app-call', 'portable'],
+      ['apps/chat/components/panes/store-panes-manager.ts', 'app-app-chat-panes-2', 'transient'],
+      ['apps/chat/components/persona-selector/store-purposes.ts', 'app-purpose', 'portable'],
+      ['apps/chat/store-app-chat.ts', 'app-app-chat', 'portable'],
+      ['apps/personas/store-app-personas.ts', 'app-app-personas', 'portable'],
+      ['common/layout/optima/scratchclip/store-scratchclip.ts', 'agi-scratch-clip', 'portable'],
+      ['common/livefile/store-live-file.ts', 'agi-live-file', 'device-only'],
+      ['common/logger/store-logger.ts', 'agi-logger-log', 'excluded'],
+      ['common/logic/store-logic-sherpa.ts', 'app-state', 'transient'],
+      ['common/stores/chat/store-chats.ts', 'app-chats', 'portable-idb'],
+      ['common/stores/folders/store-chat-folders.ts', 'app-folders', 'portable'],
+      ['common/stores/llms/store-llms.ts', 'app-models', 'portable'],
+      ['common/stores/metrics/store-metrics.ts', 'app-metrics', 'excluded'],
+      ['common/stores/store-ai.ts', 'app-ai-preferences', 'portable'],
+      ['common/stores/store-client.ts', 'app-device', 'device-only'],
+      ['common/stores/store-ui.ts', 'app-ui', 'portable'],
+      ['common/stores/store-ux-labs.ts', 'app-ux-labs', 'portable'],
+      ['common/stores/workspace/store-client-workspace.ts', 'agi-client-workspace', 'device-only'],
+      ['modules/asrx/store-module-asrx.ts', 'app-module-asrx', 'portable'],
+      ['modules/beam/store-module-beam.tsx', 'app-module-beam', 'portable'],
+      ['modules/browse/store-module-browsing.tsx', 'app-module-browse', 'portable'],
+      ['modules/google/store-module-google.ts', 'app-module-google-search', 'portable'],
+      ['modules/speex/store-module-speex.ts', 'app-module-speex', 'portable'],
+      ['modules/t2i/store-module-t2i.ts', 'app-module-t2i', 'portable'],
+      ['modules/trade/link/store-share-link.ts', 'app-sharing', 'portable'],
+    ] as const;
+    const actual = new Map<string, string>();
+    const visit = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const absolute = join(directory, entry.name);
+        if (entry.isDirectory()) visit(absolute);
+        else if (/\.tsx?$/.test(entry.name)) {
+          const source = readFileSync(absolute, 'utf8');
+          if (!/\bpersist\s*\(/.test(source) || source.includes('// persist(')) continue;
+          const name = source.match(/name:\s*['"]([^'"]+)['"]/)?.[1];
+          if (name) actual.set(relative(sourceRoot, absolute).split(sep).join('/'), name);
+        }
+      }
+    };
+    visit(sourceRoot);
+    assert.deepEqual([...actual].sort(), persistedStores.map(([file, key]) => [file, key]).sort());
+    for (const [file, key, classification] of persistedStores) {
+      if (classification !== 'portable') continue;
+      const source = readFileSync(join(sourceRoot, file), 'utf8');
+      assert.match(source, /createPrivateProPortableLocalStorageOptions/, `${file} must use the volatile adapter`);
+      assert.equal(PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS.has(key as never), true, `${key} must be allowlisted`);
+    }
+  });
+
+  test('physically removes allowlisted keys through a real patched Storage prototype while private Pro is active', () => {
+    const directory = mkdtempSync(join(tmpdir(), 'big-agi-private-pro-storage-'));
+    const storageFile = join(directory, 'local-storage.json');
+    const script = `
+      await import('fake-indexeddb/auto');
+      Object.defineProperty(globalThis, 'window', { value: globalThis });
+      process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED = 'true';
+      import('./src/modules/private-pro/persistence/privatePro.persistence.ts').then(async imported => {
+        const module = imported.default ?? imported;
+        const nativeSetItem = Storage.prototype.setItem;
+        Reflect.apply(nativeSetItem, localStorage, ['app-models', 'plaintext-secret']);
+        Reflect.apply(nativeSetItem, localStorage, ['unrelated-feature', 'keep-me']);
+        await module.clearPrivateProPlaintextPortablePersistence();
+        const nativeGetItem = Storage.prototype.getItem;
+        if (Reflect.apply(nativeGetItem, localStorage, ['app-models']) !== null) throw new Error('allowlisted plaintext survived');
+        if (Reflect.apply(nativeGetItem, localStorage, ['unrelated-feature']) !== 'keep-me') throw new Error('unrelated key was removed');
+      }).catch(error => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, [
+      '--experimental-webstorage', `--localstorage-file=${storageFile}`,
+      '--import', 'tsx', '--eval', script,
+    ], { cwd: process.cwd(), encoding: 'utf8', env: { ...process.env, NODE_ENV: 'development' } });
+    rmSync(directory, { recursive: true, force: true });
+    assert.equal(result.status, 0, result.stderr);
   });
 
   test('removes only allowlisted legacy plaintext keys and chat cells', async () => {

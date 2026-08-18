@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
+
 
 /// Global AI Preferences ///
 
@@ -55,6 +57,7 @@ export const useAIPreferencesStore = create<AIPreferencesState & AIPreferencesAc
 
 }), {
   name: 'app-ai-preferences',
+  ...createPrivateProPortableLocalStorageOptions<AIPreferencesState & AIPreferencesActions>(),
 }));
 
 

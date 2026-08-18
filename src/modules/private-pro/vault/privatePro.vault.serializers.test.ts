@@ -11,6 +11,13 @@ const INCLUDED = {
   googleKey: 'sentinel-google-key',
   speechKey: 'sentinel-speech-key',
   shareDeletionKey: 'sentinel-share-deletion-key',
+  chatConfig: 'sentinel-chat-config',
+  purpose: 'sentinel-purpose-config',
+  aiPreference: 'resolve',
+  uiLanguage: 'sentinel-ui-language',
+  beam: 'sentinel-beam-preset',
+  browsing: 'wss://sentinel-browse.example/socket',
+  image: 'sentinel-image-engine',
   chat: 'sentinel-portable-chat',
   persona: 'sentinel-portable-persona',
   folder: 'sentinel-portable-folder',
@@ -37,6 +44,8 @@ const EXCLUDED = {
   nestedInitialParameter: 'sentinel-nested-initial-parameter',
   nestedUserPricing: 'sentinel-nested-user-pricing',
   nestedUserParameter: 'sentinel-nested-user-parameter',
+  beamOpen: 'sentinel-open-beam-conversation',
+  uiInspector: 'sentinel-ui-inspector',
 } as const;
 
 const CURRENT_SERVICE_SETUP_FIELDS = {
@@ -53,7 +62,7 @@ const CURRENT_SERVICE_SETUP_FIELDS = {
 } as const;
 
 
-test('portable serializer registry includes only explicit portable state', async () => {
+test('portable serializer registry reconstructs every explicit portable group on PC B', async () => {
   const localStorageValues = new Map<string, string>([['joy-mode', INCLUDED.theme]]);
   Object.defineProperty(globalThis, 'localStorage', {
     configurable: true,
@@ -76,6 +85,15 @@ test('portable serializer registry includes only explicit portable state', async
     { useASRxStore },
     { useSpeexStore },
     { shareVaultApply },
+    { useAppCallStore },
+    { setIsNotificationEnabledForModel },
+    { usePurposeStore },
+    { useAIPreferencesStore },
+    { useUIPreferencesStore },
+    { useUXLabsStore },
+    { useModuleBeamStore },
+    { useBrowseStore },
+    { useT2IStore },
   ] = await Promise.all([
     import('./privatePro.vault.serializers'),
     import('./privatePro.vault.crypto'),
@@ -88,6 +106,15 @@ test('portable serializer registry includes only explicit portable state', async
     import('../../asrx/store-module-asrx'),
     import('../../speex/store-module-speex'),
     import('../../trade/link/store-share-link'),
+    import('../../../apps/call/state/store-app-call'),
+    import('../../../apps/chat/store-app-chat'),
+    import('../../../apps/chat/components/persona-selector/store-purposes'),
+    import('../../../common/stores/store-ai'),
+    import('../../../common/stores/store-ui'),
+    import('../../../common/stores/store-ux-labs'),
+    import('../../beam/store-module-beam'),
+    import('../../browse/store-module-browsing'),
+    import('../../t2i/store-module-t2i'),
   ]);
 
   const { setPrivateProEncryptedPersistenceActive, privateProPortableLocalStorage } = await import('../persistence/privatePro.persistence');
@@ -232,6 +259,76 @@ test('portable serializer registry includes only explicit portable state', async
       chatTitle: 'Shared', objectId: 'share-portable', createdAt: '2026-08-17T00:00:00.000Z',
       expiresAt: null, deletionKey: INCLUDED.shareDeletionKey,
     }],
+  });
+  useAppCallStore.setState({ grayUI: true, showConversations: false, showSupport: false });
+  setIsNotificationEnabledForModel(INCLUDED.chatConfig, true);
+  usePurposeStore.setState({ hiddenPurposeIDs: [INCLUDED.purpose] });
+  useAIPreferencesStore.setState({ vndAntInlineFiles: 'inline-file-and-delete', vndGeminiVertexLinks: INCLUDED.aiPreference });
+  useUIPreferencesStore.setState({
+    preferredLanguage: INCLUDED.uiLanguage,
+    centerMode: 'wide',
+    complexityMode: 'extra',
+    contentScaling: 'md',
+    disableMarkdown: true,
+    doubleClickToEdit: true,
+    enterIsNewline: true,
+    messageFullWidth: true,
+    renderCodeLineNumbers: true,
+    renderCodeSoftWrap: true,
+    showPersonaFinder: true,
+    showModelsFn: true,
+    showModelsHidden: false,
+    showModelsStarredOnly: true,
+    modelsStarredOnTop: false,
+    composerQuickButton: 'call',
+    aixInspector: true,
+    dismissals: { portable: true },
+    actionCounters: { portable: 7 },
+    panelGroupCollapseStates: { [EXCLUDED.uiInspector]: true },
+  });
+  useUXLabsStore.setState({
+    labsHighPerformance: true,
+    labsAutoHideComposer: true,
+    labsShowShortcutBar: false,
+    labsComposerAttachmentsInline: true,
+    labsLosslessImages: true,
+    labsSingleDollarLatex: true,
+  });
+  useModuleBeamStore.setState({
+    presets: [{ id: 'beam-preset', name: INCLUDED.beam, rayLlmIds: ['model-a'], gatherFactoryId: 'fuse', gatherLlmId: 'model-b' }],
+    lastConfig: { id: 'current', name: INCLUDED.beam, rayLlmIds: ['model-a'] },
+    cardAdd: false,
+    cardScrolling: true,
+    scatterShowLettering: true,
+    scatterShowPrevMessages: true,
+    gatherAutoStartAfterScatter: true,
+    gatherShowAllPrompts: true,
+    openBeamConversationIds: { [EXCLUDED.beamOpen]: true },
+  });
+  useBrowseStore.setState({
+    wssEndpoint: INCLUDED.browsing,
+    pageTransform: 'markdown',
+    enableComposerAttach: false,
+    enableReactTool: false,
+    enablePersonaTool: false,
+  });
+  useT2IStore.setState({
+    engines: {
+      [INCLUDED.image]: {
+        engineId: INCLUDED.image,
+        vendorType: 'openrouter',
+        label: 'Portable image engine',
+        isAutoDetected: false,
+        isAutoLinked: true,
+        isDeleted: false,
+        credentials: { type: 'llms-service', serviceId: 'openrouter' },
+        profile: { dialect: 'openrouter', imageModelId: 'google/gemini-3-pro-image' },
+        createdAt: 1,
+        updatedAt: 2,
+      },
+    },
+    activeEngineId: INCLUDED.image,
+    hasInitializedLlms: true,
   });
 
   const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());

@@ -9,6 +9,13 @@ import type { DSpeexCredentialsAny, DSpeexVoiceAny } from '~/modules/speex/speex
 import { shareVaultApply, shareVaultReset, shareVaultSnapshot, shareVaultSubscribe } from '~/modules/trade/link/store-share-link';
 
 import type { PrivateProVaultLogicalSerializer } from '../privatePro.vault.serializers';
+import {
+  PrivateProPortableAppSettingsSchema,
+  privateProPortableAppSettingsApply,
+  privateProPortableAppSettingsReset,
+  privateProPortableAppSettingsSnapshot,
+  privateProPortableAppSettingsSubscribe,
+} from './settings.portable';
 
 
 export const PRIVATE_PRO_VAULT_SETTINGS_THEME_ID = 'theme';
@@ -83,6 +90,7 @@ const SettingsSchema = z.discriminatedUnion('group', [
   GoogleSettingsSchema,
   SpeechSettingsSchema,
   ShareSettingsSchema,
+  ...PrivateProPortableAppSettingsSchema.options,
 ]);
 type SettingsValue = z.infer<typeof SettingsSchema>;
 
@@ -187,6 +195,7 @@ export const privateProVaultSettingsSerializer: PrivateProVaultLogicalSerializer
       ...(share.chatLinkItems.length
         ? [{ logicalId: PRIVATE_PRO_VAULT_SETTINGS_SHARE_ID, value: ShareSettingsSchema.parse({ group: 'share-credentials', ...share }) }]
         : []),
+      ...privateProPortableAppSettingsSnapshot().map(value => ({ logicalId: value.group, value })),
     ];
   },
   apply: (_logicalId, value) => {
@@ -195,6 +204,7 @@ export const privateProVaultSettingsSerializer: PrivateProVaultLogicalSerializer
       case 'google-search': return googleVaultApply(value);
       case 'speech': return speechVaultApply(value);
       case 'share-credentials': return shareVaultApply(value);
+      default: return privateProPortableAppSettingsApply(PrivateProPortableAppSettingsSchema.parse(value));
     }
   },
   remove: logicalId => {
@@ -203,10 +213,11 @@ export const privateProVaultSettingsSerializer: PrivateProVaultLogicalSerializer
       case PRIVATE_PRO_VAULT_SETTINGS_GOOGLE_ID: return googleVaultReset();
       case PRIVATE_PRO_VAULT_SETTINGS_SPEECH_ID: return speechVaultReset();
       case PRIVATE_PRO_VAULT_SETTINGS_SHARE_ID: return shareVaultReset();
+      default: return privateProPortableAppSettingsReset(logicalId as Parameters<typeof privateProPortableAppSettingsReset>[0]);
     }
   },
   subscribe: listener => {
-    const unsubscribers = [themeVaultSubscribe(listener), googleVaultSubscribe(listener), speechVaultSubscribe(listener), shareVaultSubscribe(listener)];
+    const unsubscribers = [themeVaultSubscribe(listener), googleVaultSubscribe(listener), speechVaultSubscribe(listener), shareVaultSubscribe(listener), privateProPortableAppSettingsSubscribe(listener)];
     return () => unsubscribers.forEach(unsubscribe => unsubscribe());
   },
 };

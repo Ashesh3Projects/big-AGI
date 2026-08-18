@@ -5,13 +5,22 @@ import { createIDBPersistStorage } from '~/common/util/idbUtils';
 
 export const PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS = new Set([
   'agi-scratch-clip',
+  'app-ai-preferences',
+  'app-app-call',
+  'app-app-chat',
   'app-app-personas',
   'app-folders',
   'app-models',
   'app-module-asrx',
+  'app-module-beam',
+  'app-module-browse',
   'app-module-google-search',
   'app-module-speex',
+  'app-module-t2i',
+  'app-purpose',
   'app-sharing',
+  'app-ui',
+  'app-ux-labs',
   'joy-color-scheme-dark',
   'joy-color-scheme-light',
   'joy-mode',
@@ -25,6 +34,7 @@ const volatileLocalStorage = new Map<string, string>();
 const volatilePersistStorage = new Map<string, StorageValue<unknown>>();
 const pendingPortableAssets = new Set<string>();
 const patchedStorage = Symbol.for('big-agi.private-pro-portable-storage');
+let rawLocalStorageRemoveItem: ((storage: Storage, key: string) => void) | null = null;
 
 
 function assertPortableLocalStorageKey(key: string): void {
@@ -194,7 +204,10 @@ export function createPrivateProPortableIDBStorage<S>(): PersistStorage<S> | und
 export async function clearPrivateProPlaintextPortablePersistence(): Promise<void> {
   clearPrivateProVolatilePortableState();
   if (typeof window === 'undefined') return;
-  for (const key of PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS) window.localStorage.removeItem(key);
+  for (const key of PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS) {
+    if (rawLocalStorageRemoveItem) rawLocalStorageRemoveItem(window.localStorage, key);
+    else window.localStorage.removeItem(key);
+  }
   const { del } = await import('idb-keyval');
   const { clearPrivateProPlaintextDBlobPersistence } = await import('~/modules/dblobs/dblobs.db');
   await Promise.all([
@@ -215,6 +228,7 @@ function installPrivateProStoragePrototypeGate(): void {
   const getItem = descriptor('getItem');
   const setItem = descriptor('setItem');
   const removeItem = descriptor('removeItem');
+  rawLocalStorageRemoveItem = (storage, key) => { Reflect.apply(removeItem, storage, [key]); };
   Object.defineProperty(prototype, patchedStorage, { value: true });
   prototype.getItem = function(key: string) {
     if (encryptedPersistenceActive && PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS.has(key as never))

@@ -4,6 +4,7 @@ import { useShallow } from 'zustand/react/shallow';
 
 import type { DLLMId } from '~/common/stores/llms/llms.types';
 import { Is } from '~/common/util/pwaUtils';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 export type ChatAutoSpeakType = 'off' | 'firstLine' | 'all';
@@ -96,7 +97,7 @@ interface AppChatStore {
 }
 
 
-const useAppChatStore = create<AppChatStore>()(persist(
+export const useAppChatStore = create<AppChatStore>()(persist(
   (_set, _get) => ({
 
     // Chat AI
@@ -185,6 +186,7 @@ const useAppChatStore = create<AppChatStore>()(persist(
 
   }), {
     name: 'app-app-chat',
+    ...createPrivateProPortableLocalStorageOptions<AppChatStore>(),
     version: 3, // note: v2 is a `dev`-only progressive-disclosure migration (panels not present on `main`); jump 1 -> 3 to stay aligned
 
     onRehydrateStorage: () => (state) => {

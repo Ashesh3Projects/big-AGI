@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
+
 
 interface PurposeStore {
 
@@ -34,6 +36,7 @@ export const usePurposeStore = create<PurposeStore>()(
     }),
     {
       name: 'app-purpose',
+      ...createPrivateProPortableLocalStorageOptions<PurposeStore>(),
 
       /* versioning:
        * 1: hide 'Developer' as 'DeveloperPreview' is best

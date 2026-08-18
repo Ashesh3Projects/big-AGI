@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 
 import { CapabilityBrowsing } from '~/common/components/useCapabilities';
 import { getBackendCapabilities } from '~/modules/backend/store-backend-capabilities';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 export type BrowsePageTransform = 'html' | 'text' | 'markdown';
@@ -48,6 +49,7 @@ export const useBrowseStore = create<BrowseState>()(
     }),
     {
       name: 'app-module-browse',
+      ...createPrivateProPortableLocalStorageOptions<BrowseState>(),
     },
   ),
 );

@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 
 import { agiUuidV4 } from '~/common/util/idUtils';
 import { llmsStoreState, useModelsStore } from '~/common/stores/llms/store-llms';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 import type { DT2ICredentialsAny, DT2IEngine, DT2IEngineAny, DT2IEngineId, DT2IVendorType } from './t2i.types';
 import { t2iFindVendor, t2iFindVendorForLLMVendor } from './t2i.vendors-registry';
@@ -187,6 +188,7 @@ export const useT2IStore = create<T2IStore>()(persist(
 
   }), {
     name: 'app-module-t2i',
+    ...createPrivateProPortableLocalStorageOptions<unknown>(),
     version: 2,
 
     // 2: engine-instance store (ASRx-style) - discard the v1 shape ({selectedT2IProviderId});

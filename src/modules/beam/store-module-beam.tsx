@@ -4,6 +4,7 @@ import { persist } from 'zustand/middleware';
 import type { DConversationId } from '~/common/stores/chat/chat.conversation';
 import type { DLLMId } from '~/common/stores/llms/llms.types';
 import { agiUuid } from '~/common/util/idUtils';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 import type { FFactoryId } from './gather/instructions/beam.gather.factories';
 
@@ -127,6 +128,7 @@ export const useModuleBeamStore = create<ModuleBeamStore>()(persist(
 
   }), {
     name: 'app-module-beam',
+    ...createPrivateProPortableLocalStorageOptions<unknown>(),
     version: 1,
 
     partialize: (state) => {

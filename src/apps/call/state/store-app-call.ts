@@ -1,6 +1,8 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
+
 
 // Call settings
 
@@ -31,5 +33,6 @@ export const useAppCallStore = create<AppCallStore>()(persist(
 
   }), {
     name: 'app-app-call',
+    ...createPrivateProPortableLocalStorageOptions<AppCallStore>(),
   },
 ));
