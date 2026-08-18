@@ -208,6 +208,10 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
       return record ? [clone(record)] : [];
     });
   }
+
+  getSecurityEvent(uid: string, eventId: string) {
+    return clone(this.vault(uid).securityEvents.get(eventId) ?? null);
+  }
 }
 
 function serviceFixture() {
@@ -668,17 +672,17 @@ describe('Private Pro encrypted vault service', () => {
   });
 
   test('records a bounded security event after recovery without accepting sensitive metadata', async () => {
-    const { service } = serviceFixture();
+    const { repository, service } = serviceFixture();
     const eventId = 'sssssssssssssssssssssssssssssssssssssssssss';
     const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
-
-    assert.deepEqual(await service.recordSecurityEvent(UID_A, {
-      eventId,
-      deviceId,
-      type: 'recovery-password-reset',
-    }), {
-      status: 'recorded',
-      event: { formatVersion: 1, eventId, deviceId, type: 'recovery-password-reset', createdAtMs: 1_000 },
+    await service.putKeyset(UID_A, {
+      operationId: 'keyset-security-event',
+      baseWrappingVersion: 0,
+      keyset: keyset(1),
+      securityEvent: { eventId, deviceId, type: 'recovery-password-reset' },
+    });
+    assert.deepEqual(repository.getSecurityEvent(UID_A, eventId), {
+      formatVersion: 1, eventId, deviceId, type: 'recovery-password-reset', createdAtMs: 1_000,
     });
   });
 

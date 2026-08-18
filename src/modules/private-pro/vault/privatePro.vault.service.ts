@@ -41,6 +41,11 @@ export interface PutVaultKeysetInput {
   operationId: string;
   baseWrappingVersion: number;
   keyset: PrivateProVaultKeyset;
+  securityEvent?: {
+    eventId: string;
+    deviceId: string;
+    type: 'recovery-password-reset' | 'password-changed';
+  };
 }
 
 export type PutVaultKeysetResult =
@@ -51,12 +56,6 @@ export type PutVaultKeysetResult =
 export interface RevokeVaultDeviceInput {
   operationId: string;
   deviceId: string;
-}
-
-export interface RecordVaultSecurityEventInput {
-  eventId: string;
-  deviceId: string;
-  type: 'recovery-password-reset' | 'password-changed';
 }
 
 export interface BeginVaultDeviceRegistrationInput {
@@ -354,6 +353,10 @@ export function createPrivateProVaultService(
       assertOperationId(input.operationId);
       if (!Number.isSafeInteger(input.baseWrappingVersion) || input.baseWrappingVersion < 0) throw new Error('Vault base wrapping version is invalid.');
       const keyset = PrivateProVaultKeysetSchema.parse(input.keyset);
+      if (input.securityEvent) {
+        assertOpaqueRecordId(input.securityEvent.eventId, 'security event ID');
+        assertOpaqueRecordId(input.securityEvent.deviceId, 'device ID');
+      }
       if (keyset.wrappingVersion !== input.baseWrappingVersion + 1) throw new Error('Vault wrapping version must follow the base wrapping version.');
       const requestFingerprint = fingerprint({ kind: 'put-keyset', ...input, keyset });
 
@@ -370,6 +373,11 @@ export function createPrivateProVaultService(
         if (current) assertPasswordWrappingRotation(current.keyset, keyset);
         const serverUpdatedAtMs = now();
         await transaction.setKeyset({ keyVersion: keyset.keyVersion, wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs, keyset: structuredClone(keyset) });
+        if (input.securityEvent) await transaction.createSecurityEvent({
+          formatVersion: 1,
+          ...input.securityEvent,
+          createdAtMs: serverUpdatedAtMs,
+        });
         const outcome = { kind: 'keyset', status: 'committed', wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs } as const;
         await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
         return { status: 'committed', wrappingVersion: keyset.wrappingVersion, serverUpdatedAtMs };
@@ -400,18 +408,6 @@ export function createPrivateProVaultService(
       });
     },
 
-    async recordSecurityEvent(uid: string, input: RecordVaultSecurityEventInput) {
-      assertUid(uid);
-      assertOpaqueRecordId(input.eventId, 'security event ID');
-      assertOpaqueRecordId(input.deviceId, 'device ID');
-      if (input.type !== 'recovery-password-reset' && input.type !== 'password-changed')
-        throw new Error('Vault security event type is invalid.');
-      const event = { formatVersion: 1 as const, ...input, createdAtMs: now() };
-      return repository.transaction(uid, async transaction => {
-        await transaction.createSecurityEvent(event);
-        return { status: 'recorded' as const, event };
-      });
-    },
   };
 }
 

@@ -117,24 +117,22 @@ export function createPrivateProVaultRouter(
       operationId: operationIdSchema,
       baseWrappingVersion: baseVersionSchema,
       keyset: PrivateProVaultKeysetSchema,
+      securityEvent: z.object({
+        eventId: opaqueIdSchema,
+        deviceId: opaqueIdSchema,
+        type: z.enum(['recovery-password-reset', 'password-changed']),
+      }).strict().optional(),
     }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => service().putKeyset(ctx.privateProIdentity.uid, input))),
+    .mutation(({ ctx, input }) => vaultCall(() => {
+      if (input.securityEvent && ctx.privateProDeviceId !== input.securityEvent.deviceId)
+        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
+      return service().putKeyset(ctx.privateProIdentity.uid, input);
+    })),
 
   revokeDevice: deviceProcedure
     .input(z.object({ operationId: operationIdSchema, deviceId: opaqueIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().revokeDevice(ctx.privateProIdentity.uid, input))),
 
-  recordSecurityEvent: deviceProcedure
-    .input(z.object({
-      eventId: opaqueIdSchema,
-      deviceId: opaqueIdSchema,
-      type: z.enum(['recovery-password-reset', 'password-changed']),
-    }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => {
-      if (ctx.privateProDeviceId !== input.deviceId)
-        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
-      return service().recordSecurityEvent(ctx.privateProIdentity.uid, input);
-    })),
 });
 }
 

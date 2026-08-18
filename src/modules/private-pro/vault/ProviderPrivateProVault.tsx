@@ -59,7 +59,6 @@ export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnro
   unlockPassword(keyset: TKeyset, password: string): Promise<{ masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
   unlockRecovery(keyset: TKeyset, recoveryKey: string, newPassword: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
   commitRecovery(previousKeyset: TKeyset, rotatedKeyset: TKeyset): Promise<'committed' | 'conflict'>;
-  recordRecoveryEvent(): Promise<void>;
   setup(password: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; recoveryKey: string }>;
   commitSetup(keyset: TKeyset, operationId: string): Promise<'committed' | 'conflict'>;
   remember(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
@@ -330,7 +329,6 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
         const unlocked = await deps.unlockRecovery(keyset, recoveryKey, newPassword);
         const commit = await deps.commitRecovery(keyset, unlocked.keyset);
         if (commit === 'conflict') throw new Error('Vault keyset changed.');
-        await deps.recordRecoveryEvent();
         keyset = unlocked.keyset;
         await deps.remember(unlocked.masterKey, unlocked.keyset);
         await deps.register(unlocked.keyset, unlocked.enrollmentKey);
@@ -407,15 +405,9 @@ function createProductionDependencies(
         operationId: `recover-${crypto.randomUUID()}`,
         baseWrappingVersion: keyset.wrappingVersion,
         keyset: rotated,
+        securityEvent: { eventId: createPrivateProOpaqueId(), deviceId, type: 'recovery-password-reset' },
       });
       return result.status === 'conflict' ? 'conflict' : 'committed';
-    },
-    async recordRecoveryEvent() {
-      await apiAsyncNode.privateProVault.recordSecurityEvent.mutate({
-        eventId: createPrivateProOpaqueId(),
-        deviceId,
-        type: 'recovery-password-reset',
-      });
     },
     async setup(password) {
       await clearPrivateProPlaintextPortablePersistence();
@@ -549,15 +541,14 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
       operationId: `password-${crypto.randomUUID()}`,
       baseWrappingVersion: runtime.keyset.wrappingVersion,
       keyset: rotated,
+      securityEvent: {
+        eventId: createPrivateProOpaqueId(),
+        deviceId: await resolvePrivateProVaultRequestDeviceId(auth.user!.uid, privateProVaultDB),
+        type: 'password-changed',
+      },
     });
     if (result.status === 'conflict') throw new Error('The vault changed on another device. Reconnect and try again.');
     runtime.keyset = rotated;
-    const deviceId = await resolvePrivateProVaultRequestDeviceId(auth.user!.uid, privateProVaultDB);
-    await apiAsyncNode.privateProVault.recordSecurityEvent.mutate({
-      eventId: createPrivateProOpaqueId(),
-      deviceId,
-      type: 'password-changed',
-    });
     setState(current => ({ ...current, revokeOtherDevicesRecommended: true }));
   }, [auth.user]);
 
