@@ -298,7 +298,7 @@ try {
 }
 ```
 
-Use this only for an approved rehearsal or release gate. Do not save, print, echo, log, or include the environment value in a report. The attestor or CI job stores the immutable artifact externally and injects its exact base64 only into the audit process environment. The audit keeps that value in-process for verification and removes restore evidence, legacy HMAC, attestation, signing, private-key, and access-token variables from every child-process environment while retaining ordinary required environment variables. Clear the variable immediately after the audit.
+Use this only for an approved rehearsal or release gate. Do not save, print, echo, log, or include the environment value in a report. The attestor or CI job stores the immutable artifact externally and injects its exact base64 only into the audit process environment. At audit startup, the encoded evidence and optional expected commit are copied into a frozen local input. The audit then deletes active and obsolete restore-evidence and restore-HMAC variables from `process.env` before any concurrent collector, GoogleAuth construction, or credential executable can start. Google ADC and WIF variables remain available. The captured input is passed explicitly to evidence verification, and production audit code never restores the consumed variables. Attestation, signing, private-key, and access-token variables remain scrubbed from the generic child-process wrapper. Clear the caller's variable immediately after the audit as defense in depth.
 
 The evidence schema is strict. Extra or missing keys block.
 
