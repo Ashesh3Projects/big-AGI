@@ -11,7 +11,7 @@ import { PostHog } from 'posthog-node';
 import { Release } from '~/common/app.release';
 
 
-export const hasPostHogServer = !!process.env.NEXT_PUBLIC_POSTHOG_KEY;
+export const hasPostHogServer = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED !== 'true' && !!process.env.NEXT_PUBLIC_POSTHOG_KEY;
 
 
 // --- Singleton instance ---

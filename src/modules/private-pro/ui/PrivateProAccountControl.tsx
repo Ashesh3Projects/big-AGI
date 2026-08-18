@@ -61,6 +61,10 @@ export function PrivateProAccountControl(props: { mobile?: boolean }) {
         </Stack>
         <Divider />
         {message && <Alert color={message.endsWith('failed.') ? 'danger' : 'success'}>{message}</Alert>}
+        {vault.revokeOtherDevicesRecommended && <Alert color='warning'>
+          Vault credentials changed. Revoke other remembered devices if this was recovery or a security-sensitive password rotation.
+          <Button size='sm' color='warning' loading={busy} onClick={() => void run(() => vault.revokeOtherDevices(), 'Other remembered devices revoked.')}>Revoke other devices now</Button>
+        </Alert>}
         {action === 'password' ? <Stack spacing={1.5}>
           <FormControl>
             <FormLabel>Current vault password</FormLabel>

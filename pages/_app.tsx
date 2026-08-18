@@ -32,6 +32,7 @@ import { hasPostHogAnalytics, OptionalPostHogAnalytics } from '~/common/componen
 import { OptionalUrlTrackingCleaner } from '~/common/components/3rdparty/UrlTrackingCleaner';
 import { ProviderPrivatePro } from '~/modules/private-pro/auth/ProviderPrivatePro';
 import { ProviderPrivateProVault } from '~/modules/private-pro/vault/ProviderPrivateProVault';
+import { privateProClientConfig } from '~/modules/private-pro/config/privatePro.config';
 
 
 const ApplicationWithTRPC = apiQuery.withTRPC(({ Component, pageProps }: MyAppProps) => {
@@ -74,11 +75,11 @@ const Big_AGI_App = (props: MyAppProps) => {
       </ProviderPrivatePro>
     </ProviderTheming>
 
-    {hasGoogleAnalytics && <OptionalGoogleAnalytics />}
-    {hasPostHogAnalytics && <OptionalPostHogAnalytics />}
+    {!privateProClientConfig.enabled && hasGoogleAnalytics && <OptionalGoogleAnalytics />}
+    {!privateProClientConfig.enabled && hasPostHogAnalytics && <OptionalPostHogAnalytics />}
     <OptionalUrlTrackingCleaner />
 
-    {Is.Deployment.VercelFromFrontend && <VercelAnalytics debug={false} />}
+    {!privateProClientConfig.enabled && Is.Deployment.VercelFromFrontend && <VercelAnalytics debug={false} />}
     {/*{Is.Deployment.VercelFromFrontend && <VercelSpeedInsights debug={false} sampleRate={1 / 2} />}*/}
 
   </>;

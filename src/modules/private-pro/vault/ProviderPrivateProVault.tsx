@@ -31,7 +31,7 @@ import { privateProVaultSession } from './privatePro.vault.session';
 import { createPrivateProVaultStore, privateProVaultStore, type PrivateProVaultPhase } from './store-private-pro-vault';
 import { createPrivateProVaultTransport } from './privatePro.vault.transport';
 import type { PrivateProVaultDeviceMetadata, PrivateProVaultKeyset } from './privatePro.vault.types';
-import { clearPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
+import { clearPrivateProVaultDeviceId, createPrivateProOpaqueId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
 import { signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 import {
   clearPrivateProPlaintextPortablePersistence,
@@ -49,6 +49,7 @@ export interface PrivateProVaultPublicState {
   busy: boolean;
   error: string | null;
   recoveryKey: string | null;
+  revokeOtherDevicesRecommended: boolean;
 }
 
 export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnrollmentKey = unknown> {
@@ -58,6 +59,7 @@ export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnro
   unlockPassword(keyset: TKeyset, password: string): Promise<{ masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
   unlockRecovery(keyset: TKeyset, recoveryKey: string, newPassword: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
   commitRecovery(previousKeyset: TKeyset, rotatedKeyset: TKeyset): Promise<'committed' | 'conflict'>;
+  recordRecoveryEvent(): Promise<void>;
   setup(password: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; recoveryKey: string }>;
   commitSetup(keyset: TKeyset, operationId: string): Promise<'committed' | 'conflict'>;
   remember(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
@@ -157,6 +159,7 @@ const INITIAL_STATE: PrivateProVaultPublicState = {
   busy: false,
   error: null,
   recoveryKey: null,
+  revokeOtherDevicesRecommended: false,
 };
 
 const INVALID_CREDENTIALS = 'Vault password or recovery key is incorrect.';
@@ -327,10 +330,12 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
         const unlocked = await deps.unlockRecovery(keyset, recoveryKey, newPassword);
         const commit = await deps.commitRecovery(keyset, unlocked.keyset);
         if (commit === 'conflict') throw new Error('Vault keyset changed.');
+        await deps.recordRecoveryEvent();
         keyset = unlocked.keyset;
         await deps.remember(unlocked.masterKey, unlocked.keyset);
         await deps.register(unlocked.keyset, unlocked.enrollmentKey);
         await activate(unlocked.masterKey, unlocked.keyset);
+        setState({ revokeOtherDevicesRecommended: true });
       } catch {
         setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
       }
@@ -404,6 +409,13 @@ function createProductionDependencies(
         keyset: rotated,
       });
       return result.status === 'conflict' ? 'conflict' : 'committed';
+    },
+    async recordRecoveryEvent() {
+      await apiAsyncNode.privateProVault.recordSecurityEvent.mutate({
+        eventId: createPrivateProOpaqueId(),
+        deviceId,
+        type: 'recovery-password-reset',
+      });
     },
     async setup(password) {
       await clearPrivateProPlaintextPortablePersistence();
@@ -540,6 +552,13 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     });
     if (result.status === 'conflict') throw new Error('The vault changed on another device. Reconnect and try again.');
     runtime.keyset = rotated;
+    const deviceId = await resolvePrivateProVaultRequestDeviceId(auth.user!.uid, privateProVaultDB);
+    await apiAsyncNode.privateProVault.recordSecurityEvent.mutate({
+      eventId: createPrivateProOpaqueId(),
+      deviceId,
+      type: 'password-changed',
+    });
+    setState(current => ({ ...current, revokeOtherDevicesRecommended: true }));
   }, [auth.user]);
 
   const createEncryptedExport = React.useCallback(async () => {
@@ -599,6 +618,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     runtimeRef.current.devices = runtimeRef.current.devices.map(device => devices.some(revoked => revoked.deviceId === device.deviceId)
       ? { ...device, revokedAtMs: Date.now() }
       : device);
+    setState(current => ({ ...current, revokeOtherDevicesRecommended: false }));
   }, [auth.user]);
 
   const fullLocalWipe = React.useCallback(async () => {

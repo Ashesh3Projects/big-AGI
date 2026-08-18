@@ -120,6 +120,7 @@ interface MemoryVault {
   keyset: PrivateProVaultStoredKeyset | null;
   devices: Map<string, PrivateProVaultStoredDevice>;
   registrationChallenges: Map<string, PrivateProVaultRegistrationChallenge>;
+  securityEvents: Map<string, import('./privatePro.vault.repository').PrivateProVaultSecurityEvent>;
 }
 
 class MemoryVaultRepository implements PrivateProVaultRepository {
@@ -135,6 +136,7 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         keyset: null,
         devices: new Map(),
         registrationChallenges: new Map(),
+        securityEvents: new Map(),
       };
       this.vaults.set(uid, vault);
     }
@@ -166,6 +168,10 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         vault.registrationChallenges.set(challenge.challengeId, clone(challenge));
       },
       deleteRegistrationChallenge: async challengeId => { vault.registrationChallenges.delete(challengeId); },
+      createSecurityEvent: async event => {
+        if (vault.securityEvents.has(event.eventId)) throw new Error('Security event already exists.');
+        vault.securityEvents.set(event.eventId, clone(event));
+      },
     };
     return callback(transaction);
   }
@@ -659,6 +665,21 @@ describe('Private Pro encrypted vault service', () => {
     assert.equal((await service.getIndex(UID_A, { pageSize: 10 })).entries.length, 1);
     assert.equal((await service.getIndex(UID_B, { pageSize: 10 })).entries.length, 1);
     assert.equal(await service.getKeyset(UID_B), null);
+  });
+
+  test('records a bounded security event after recovery without accepting sensitive metadata', async () => {
+    const { service } = serviceFixture();
+    const eventId = 'sssssssssssssssssssssssssssssssssssssssssss';
+    const deviceId = 'ddddddddddddddddddddddddddddddddddddddddddd';
+
+    assert.deepEqual(await service.recordSecurityEvent(UID_A, {
+      eventId,
+      deviceId,
+      type: 'recovery-password-reset',
+    }), {
+      status: 'recorded',
+      event: { formatVersion: 1, eventId, deviceId, type: 'recovery-password-reset', createdAtMs: 1_000 },
+    });
   });
 
   test('rejects visible record metadata that disagrees with the route', async () => {

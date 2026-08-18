@@ -53,6 +53,12 @@ export interface RevokeVaultDeviceInput {
   deviceId: string;
 }
 
+export interface RecordVaultSecurityEventInput {
+  eventId: string;
+  deviceId: string;
+  type: 'recovery-password-reset' | 'password-changed';
+}
+
 export interface BeginVaultDeviceRegistrationInput {
   deviceId: string;
   keyVersion: number;
@@ -391,6 +397,19 @@ export function createPrivateProVaultService(
         const outcome = { kind: 'device', status: 'committed', revokedAtMs } as const;
         await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
         return { status: 'committed' as const, revokedAtMs };
+      });
+    },
+
+    async recordSecurityEvent(uid: string, input: RecordVaultSecurityEventInput) {
+      assertUid(uid);
+      assertOpaqueRecordId(input.eventId, 'security event ID');
+      assertOpaqueRecordId(input.deviceId, 'device ID');
+      if (input.type !== 'recovery-password-reset' && input.type !== 'password-changed')
+        throw new Error('Vault security event type is invalid.');
+      const event = { formatVersion: 1 as const, ...input, createdAtMs: now() };
+      return repository.transaction(uid, async transaction => {
+        await transaction.createSecurityEvent(event);
+        return { status: 'recorded' as const, event };
       });
     },
   };

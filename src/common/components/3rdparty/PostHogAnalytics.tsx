@@ -6,7 +6,7 @@ import { isBrowser } from '~/common/util/pwaUtils';
 import { Release } from '~/common/app.release';
 
 
-export const hasPostHogAnalytics = !!process.env.NEXT_PUBLIC_POSTHOG_KEY;
+export const hasPostHogAnalytics = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED !== 'true' && !!process.env.NEXT_PUBLIC_POSTHOG_KEY;
 
 
 // global to survive route changes

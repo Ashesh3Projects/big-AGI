@@ -10,6 +10,7 @@ import type {
   PrivateProVaultStoredDevice,
   PrivateProVaultStoredRecord,
   PrivateProVaultStoredTombstone,
+  PrivateProVaultSecurityEvent,
 } from './privatePro.vault.repository';
 import { mergePrivateProVaultIndexEntries } from './privatePro.vault.repository';
 import { createPrivateProVaultService } from './privatePro.vault.service';
@@ -104,6 +105,10 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
 
   async deleteRegistrationChallenge(challengeId: string) {
     this.transaction.delete(this.db.doc(`${vaultRoot(this.uid)}/registrationChallenges/${challengeId}`));
+  }
+
+  async createSecurityEvent(event: PrivateProVaultSecurityEvent) {
+    this.transaction.create(this.db.doc(`${vaultRoot(this.uid)}/securityEvents/${event.eventId}`), event);
   }
 
 }

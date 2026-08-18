@@ -82,6 +82,10 @@ const service = {
     state.calls.push({ method: 'revokeDevice', uid, input });
     return { status: 'committed' as const, revokedAtMs: 1 };
   },
+  recordSecurityEvent: async (uid: string, input: unknown) => {
+    state.calls.push({ method: 'recordSecurityEvent', uid, input });
+    return { status: 'recorded' as const, event: { formatVersion: 1 as const, ...(input as object), createdAtMs: 1 } };
+  },
 };
 
 let routerPromise: Promise<ReturnType<(typeof import('./privatePro.vault.router'))['createPrivateProVaultRouter']>> | undefined;
@@ -233,6 +237,7 @@ describe('private Pro vault router input bounds', () => {
     });
     await caller.putKeyset({ operationId: 'put-keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
     await caller.revokeDevice({ operationId: 'revoke-device-1', deviceId: DEVICE_ID });
+    await caller.recordSecurityEvent({ eventId: RECORD_ID, deviceId: DEVICE_ID, type: 'recovery-password-reset' });
   });
 
   test('rejects missing, revoked, and stale-key devices from protected vault operations', async () => {

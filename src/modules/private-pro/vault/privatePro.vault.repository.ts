@@ -33,6 +33,14 @@ export interface PrivateProVaultStoredKeyset {
 
 export type PrivateProVaultStoredDevice = PrivateProVaultDeviceMetadata;
 
+export interface PrivateProVaultSecurityEvent {
+  formatVersion: 1;
+  eventId: string;
+  deviceId: string;
+  type: 'recovery-password-reset' | 'password-changed';
+  createdAtMs: number;
+}
+
 export interface PrivateProVaultRegistrationChallenge {
   formatVersion: 1;
   challengeId: string;
@@ -86,6 +94,7 @@ export interface PrivateProVaultRepositoryTransaction {
   getRegistrationChallenge(challengeId: string): Promise<PrivateProVaultRegistrationChallenge | null>;
   createRegistrationChallenge(challenge: PrivateProVaultRegistrationChallenge): Promise<void>;
   deleteRegistrationChallenge(challengeId: string): Promise<void>;
+  createSecurityEvent(event: PrivateProVaultSecurityEvent): Promise<void>;
 }
 
 export interface PrivateProVaultRepository {

@@ -106,6 +106,7 @@ function createHarness(options: {
       return { keyset: 'keyset-2', masterKey: 'recovery-master-key', enrollmentKey: 'recovery-enrollment-key' };
     },
     commitRecovery: async () => { counts.commitRecovery++; return 'committed'; },
+    recordRecoveryEvent: async () => {},
     setup: async (_password) => {
       counts.setup++;
       return { keyset: 'keyset-1', masterKey: 'setup-master-key', enrollmentKey: 'setup-enrollment-key', recoveryKey: 'AAAA-BBBB-CCCC-DDDD' };
@@ -284,6 +285,7 @@ describe('private Pro vault lifecycle', () => {
       busy: false,
       error: 'The encrypted vault could not be created.',
       recoveryKey: 'AAAA-BBBB-CCCC-DDDD',
+      revokeOtherDevicesRecommended: false,
     });
 
     failing.deps.commitSetup = async () => { failing.counts.commitSetup++; return 'committed'; };

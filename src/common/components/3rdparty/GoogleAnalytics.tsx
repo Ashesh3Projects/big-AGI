@@ -4,10 +4,10 @@ import Script from 'next/script';
 import { Release } from '~/common/app.release';
 
 
-export const hasGoogleAnalytics = !!process.env.NEXT_PUBLIC_GA4_MEASUREMENT_ID;
+export const hasGoogleAnalytics = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED !== 'true' && !!process.env.NEXT_PUBLIC_GA4_MEASUREMENT_ID;
 
 export function getGA4MeasurementId(): string | null {
-  return process.env.NEXT_PUBLIC_GA4_MEASUREMENT_ID || null;
+  return process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED !== 'true' ? process.env.NEXT_PUBLIC_GA4_MEASUREMENT_ID || null : null;
 }
 
 export function sendGAEvent(..._args: Object[]) {

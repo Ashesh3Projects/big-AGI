@@ -123,6 +123,18 @@ export function createPrivateProVaultRouter(
   revokeDevice: deviceProcedure
     .input(z.object({ operationId: operationIdSchema, deviceId: opaqueIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().revokeDevice(ctx.privateProIdentity.uid, input))),
+
+  recordSecurityEvent: deviceProcedure
+    .input(z.object({
+      eventId: opaqueIdSchema,
+      deviceId: opaqueIdSchema,
+      type: z.enum(['recovery-password-reset', 'password-changed']),
+    }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => {
+      if (ctx.privateProDeviceId !== input.deviceId)
+        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
+      return service().recordSecurityEvent(ctx.privateProIdentity.uid, input);
+    })),
 });
 }
 

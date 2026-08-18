@@ -152,7 +152,9 @@ The accepted production state is defined in `infra/private-pro/firebase-origin-r
 - That key targets exactly `firebaseappcheck.googleapis.com`, `identitytoolkit.googleapis.com`, and `securetoken.googleapis.com`.
 - Bucket CORS is readable and exactly matches the policy above.
 
-Task 19 denies all browser Firestore and Storage SDK access. `firebase/firestore` is referenced only by the unmounted legacy plaintext sync transport. Mounted browser code uses Firebase Auth, App Check, and signed Storage URLs. The installed `@firebase/app-check` 0.13.0 package calls the App Check endpoint directly and has no Installations dependency. Therefore `firestore.googleapis.com`, `firebasestorage.googleapis.com`, and `firebaseinstallations.googleapis.com` are not browser-key targets. Firebase Admin APIs use server credentials and are unrelated to browser API-key restrictions.
+Task 19 denies all browser Firestore and Storage SDK access. The legacy plaintext Private Pro sync transport and mutation service are removed. Mounted browser code uses Firebase Auth, App Check, and signed Storage URLs. The installed `@firebase/app-check` 0.13.0 package calls the App Check endpoint directly and has no Installations dependency. Therefore `firestore.googleapis.com`, `firebasestorage.googleapis.com`, and `firebaseinstallations.googleapis.com` are not browser-key targets. Firebase Admin APIs use server credentials and are unrelated to browser API-key restrictions.
+
+Private Pro builds do not mount Google Analytics, PostHog, Vercel Analytics, or Speed Insights even when analytics environment variables are present. Client and server analytics helpers also fail closed when `NEXT_PUBLIC_PRIVATE_PRO_ENABLED=true`. Open and self-hosted builds keep their existing opt-in analytics behavior.
 
 Private Pro must emit `Referrer-Policy: strict-origin-when-cross-origin`. HTTP-referrer API-key restrictions depend on a cross-origin Referer. This policy sends only `https://chatgpt.ashesh.dev/` to Firebase APIs and omits path and query data. `no-referrer` is incompatible with the restricted browser key and blocks rollout.
 
