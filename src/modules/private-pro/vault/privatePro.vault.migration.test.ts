@@ -399,20 +399,6 @@ describe('private Pro plaintext-to-encrypted migration', () => {
     });
   }
 
-  test('reports intentionally deferred local attachment cleanup at completion', async (t) => {
-    const harness = await createHarness(t);
-    harness.setAssetDeletionAllowed(false);
-    const migration = harness.create();
-
-    await migration.run();
-
-    assert.equal(migration.getProgress().phase, 'complete');
-    assert.equal(migration.getProgress().deferredLocalAssets, 1);
-    assert.equal(harness.deletedAssets, 0);
-    const markup = renderPrivateProVaultMigrationProgress(migration.getProgress());
-    assert.match(markup, /1 local attachment retained/i);
-  });
-
   test('blocks a local source added after inventory', async (t) => {
     const harness = await createHarness(t);
     const migration = harness.create();
@@ -563,9 +549,9 @@ describe('private Pro plaintext-to-encrypted migration', () => {
     let attempts = 0;
     let stopped = 0;
     const migration = {
-      getProgress: () => ({ phase: 'upload' as const, revision: 2, completedItems: 1, totalItems: 2, deferredLocalAssets: 0, error: null }),
-      subscribe: (listener: (progress: { phase: 'upload'; revision: number; completedItems: number; totalItems: number; deferredLocalAssets: number; error: null }) => void) => {
-        listener({ phase: 'upload', revision: 2, completedItems: 1, totalItems: 2, deferredLocalAssets: 0, error: null });
+      getProgress: () => ({ phase: 'upload' as const, revision: 2, completedItems: 1, totalItems: 2, error: null }),
+      subscribe: (listener: (progress: { phase: 'upload'; revision: number; completedItems: number; totalItems: number; error: null }) => void) => {
+        listener({ phase: 'upload', revision: 2, completedItems: 1, totalItems: 2, error: null });
         return () => {};
       },
       async run() {
@@ -596,7 +582,7 @@ describe('private Pro plaintext-to-encrypted migration', () => {
 
   test('renders resumable migration progress with retry and export actions', () => {
     const markup = renderPrivateProVaultMigrationProgress({
-      phase: 'commit', revision: 7, completedItems: 4, totalItems: 6, deferredLocalAssets: 0, error: 'Encrypted vault migration needs attention.',
+      phase: 'commit', revision: 7, completedItems: 4, totalItems: 6, error: 'Encrypted vault migration needs attention.',
     });
 
     assert.match(markup, /Commit encrypted migration/);
@@ -619,7 +605,7 @@ describe('private Pro plaintext-to-encrypted migration', () => {
 
     await activatePrivateProVaultRuntime(runtime, {
       createMigration: () => ({
-        getProgress: () => ({ phase: 'inventory' as const, revision: 0, completedItems: 0, totalItems: 1, deferredLocalAssets: 0, error: null }),
+        getProgress: () => ({ phase: 'inventory' as const, revision: 0, completedItems: 0, totalItems: 1, error: null }),
         subscribe: () => () => {},
         run: async () => { order.push('migration'); },
         getEncryptedExportBinding: async () => ({ migrationId: 'test', inventoryDigest: 'a'.repeat(64) }),
@@ -648,7 +634,7 @@ describe('private Pro plaintext-to-encrypted migration', () => {
     const { activatePrivateProVaultRuntime } = await import('./ProviderPrivateProVault');
     await assert.rejects(activatePrivateProVaultRuntime(runtime, {
       createMigration: () => ({
-        getProgress: () => ({ phase: 'upload' as const, revision: 1, completedItems: 0, totalItems: 1, deferredLocalAssets: 0, error: null }),
+        getProgress: () => ({ phase: 'upload' as const, revision: 1, completedItems: 0, totalItems: 1, error: null }),
         subscribe: () => () => {},
         run: async () => { order.push('run'); throw new Error('injected activation failure'); },
         getEncryptedExportBinding: async () => ({ migrationId: 'test', inventoryDigest: 'a'.repeat(64) }),
@@ -669,9 +655,9 @@ describe('private Pro plaintext-to-encrypted migration', () => {
     const { activatePrivateProVaultRuntime, stopPrivateProVaultMigrationActivation } = await import('./ProviderPrivateProVault');
     const activation = activatePrivateProVaultRuntime(runtime, {
       createMigration: () => ({
-        getProgress: () => ({ phase: 'upload' as const, revision: 1, completedItems: 0, totalItems: 1, deferredLocalAssets: 0, error: null }),
+        getProgress: () => ({ phase: 'upload' as const, revision: 1, completedItems: 0, totalItems: 1, error: null }),
         subscribe: callback => {
-          publishStaleProgress = () => callback({ phase: 'upload', revision: 2, completedItems: 0, totalItems: 1, deferredLocalAssets: 0, error: null });
+          publishStaleProgress = () => callback({ phase: 'upload', revision: 2, completedItems: 0, totalItems: 1, error: null });
           return () => { publishStaleProgress = () => {}; };
         },
         run: () => new Promise<void>(resolve => { releaseRun = resolve; }),

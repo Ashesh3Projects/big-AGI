@@ -619,8 +619,7 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
             throwIfAborted(signal);
             await transport.finalizeUpload(operationId);
           } catch (error) {
-            if (!operationIds[assetId])
-              await transport.releaseReservation(operationId).catch(() => undefined);
+            await transport.releaseReservation(operationId).catch(() => undefined);
             throw error;
           }
         } finally {

@@ -52,7 +52,6 @@ export interface PrivateProVaultMigrationProgress {
   revision: number;
   completedItems: number;
   totalItems: number;
-  deferredLocalAssets: number;
   error: string | null;
 }
 
@@ -405,7 +404,7 @@ export function createPrivateProVaultMigration(deps: PrivateProVaultMigrationDep
   const serializers = new Map(deps.serializers.map(serializer => [serializer.recordType, serializer]));
   const listeners = new Set<(progress: PrivateProVaultMigrationProgress) => void>();
   let progress: PrivateProVaultMigrationProgress = {
-    phase: 'inventory', revision: 0, completedItems: 0, totalItems: 0, deferredLocalAssets: 0, error: null,
+    phase: 'inventory', revision: 0, completedItems: 0, totalItems: 0, error: null,
   };
   let abortController: AbortController | null = null;
   let running: Promise<void> | null = null;
@@ -433,8 +432,6 @@ export function createPrivateProVaultMigration(deps: PrivateProVaultMigrationDep
     progress = { ...progress, ...patch };
     for (const listener of listeners) listener({ ...progress });
   };
-
-  const deferredLocalAssets = (state: MigrationState) => state.assets.filter(asset => asset.cleanupStatus === 'preserved').length;
 
   const encryptState = async (state: MigrationState, revision: number) => encryptVaultRecord(
     await stateKey('encrypt'),
@@ -795,10 +792,7 @@ export function createPrivateProVaultMigration(deps: PrivateProVaultMigrationDep
     const signal = abortController.signal;
     const restored = await load();
     if (restored.record?.phase === 'complete') {
-      emit({
-        phase: 'complete', revision: restored.record!.revision ?? 0, completedItems: restored.state.items.length,
-        totalItems: restored.state.items.length, deferredLocalAssets: deferredLocalAssets(restored.state), error: null,
-      });
+      emit({ phase: 'complete', revision: restored.record!.revision ?? 0, completedItems: restored.state.items.length, totalItems: restored.state.items.length, error: null });
       return;
     }
     let record = restored.record ?? await save(null, 'inventory', restored.state, restored.operationIds);
@@ -815,7 +809,6 @@ export function createPrivateProVaultMigration(deps: PrivateProVaultMigrationDep
         revision: record.revision ?? 0,
         completedItems: record.completedItems ?? 0,
         totalItems: record.totalItems ?? loaded.state.items.length,
-        deferredLocalAssets: deferredLocalAssets(loaded.state),
         error: null,
       }, epoch);
       assertRun(epoch, signal);

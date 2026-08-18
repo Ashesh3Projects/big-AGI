@@ -56,6 +56,8 @@ export interface PrivateProSyncTransport {
 export interface PrivateProLegacyMigrationItem {
   entity: PrivateProLocalEntity;
   sourceVersion: string;
+  frozenRevisionPath: string | null;
+  frozenChunkIds: string[];
 }
 
 export interface PrivateProLegacyMigrationTransport {

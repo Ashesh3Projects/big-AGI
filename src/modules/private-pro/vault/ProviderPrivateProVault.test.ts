@@ -271,23 +271,6 @@ describe('private Pro vault lifecycle', () => {
     assert.deepEqual(order, ['migration', 'session', 'device', 'db', 'signout']);
   });
 
-  test('runtime cleanup stops migration before joining the engine', async () => {
-    const order: string[] = [];
-    const runtime = {
-      engine: { async logoutAndClear() { order.push('engine'); } },
-      keyset: null, masterKey: null, devices: [], assets: null,
-      migration: { async stopAndWait() { order.push('migration'); } },
-    } as never;
-
-    await logoutPrivateProVaultRuntime(runtime, 'uid-test', {
-      async clearSession() { order.push('session'); },
-      clearDeviceId() { order.push('device'); },
-      async signOut() { order.push('signout'); },
-    });
-
-    assert.deepEqual(order, ['migration', 'engine', 'device', 'signout']);
-  });
-
   test('new users remain blocked in setup until keyset creation and remote apply complete', async () => {
     const harness = createHarness({ keyset: null, deferApply: true });
     const lifecycle = createPrivateProVaultLifecycle(harness.deps);
@@ -348,54 +331,6 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.deepEqual(harness.operationIds, ['setup-operation-1', 'setup-operation-1']);
   });
-
-  test('stop joins deferred setup before publishing a recovery key', async () => {
-    const harness = createHarness({ keyset: null });
-    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
-    await lifecycle.start();
-    let releaseSetup = () => {};
-    harness.deps.setup = async () => {
-      harness.counts.setup++;
-      await new Promise<void>(resolve => { releaseSetup = resolve; });
-      return { keyset: 'late-keyset', masterKey: 'late-master', enrollmentKey: 'late-enrollment', recoveryKey: 'LATE-SECRET' };
-    };
-    const setup = lifecycle.setup('correct horse battery staple');
-    await new Promise(resolve => setTimeout(resolve, 0));
-
-    const stopped = lifecycle.stopAndWait();
-    releaseSetup();
-    await stopped;
-    await setup;
-
-    assert.equal(lifecycle.getState().recoveryKey, null);
-  });
-
-  for (const point of ['commit', 'remember', 'register', 'activate'] as const) {
-    test(`stop joins setup confirmation during ${point} without later side effects`, async () => {
-      const harness = createHarness({ keyset: null });
-      const lifecycle = createPrivateProVaultLifecycle(harness.deps);
-      await lifecycle.start();
-      await lifecycle.setup('correct horse battery staple');
-      let release = () => {};
-      const barrier = () => new Promise<void>(resolve => { release = resolve; });
-      if (point === 'commit') harness.deps.commitSetup = async () => { harness.counts.commitSetup++; await barrier(); return 'committed'; };
-      if (point === 'remember') harness.deps.remember = async () => { harness.counts.remember++; await barrier(); };
-      if (point === 'register') harness.deps.register = async () => { harness.counts.register++; await barrier(); };
-      if (point === 'activate') harness.deps.activate = async () => { harness.counts.activate++; await barrier(); };
-      const confirmation = lifecycle.acknowledgeRecoveryKey();
-      await new Promise(resolve => setTimeout(resolve, 0));
-
-      const stopped = lifecycle.stopAndWait();
-      release();
-      await stopped;
-      await confirmation;
-
-      if (point === 'commit') assert.equal(harness.counts.remember, 0);
-      if (point === 'remember') assert.equal(harness.counts.register, 0);
-      if (point === 'register') assert.equal(harness.counts.activate, 0);
-      assert.notEqual(lifecycle.getState().phase, 'ready');
-    });
-  }
 
   test('remembered devices auto-unlock before the application opens', async () => {
     const harness = createHarness({ keyset: 'keyset-1', rememberedKey: 'remembered-master-key' });

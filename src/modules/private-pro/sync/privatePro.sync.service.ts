@@ -39,6 +39,8 @@ export interface CleanupMigratedEntityRequest {
   entityType: 'chat' | 'persona';
   entityId: string;
   sourceVersion: string;
+  frozenRevisionPath: string | null;
+  frozenChunkIds: string[];
 }
 
 function requireNonNegativeRevision(revision: number): void {
@@ -156,7 +158,8 @@ export function createPrivateProSyncService(repository: PrivateProSyncRepository
     },
 
     cleanupMigratedEntity(identity: PrivateProIdentity, request: CleanupMigratedEntityRequest) {
-      if (!request.operationId || !request.entityId || !/^\d+:[a-f0-9]{64}$/.test(request.sourceVersion))
+      if (!request.operationId || !request.entityId || !/^\d+:[a-f0-9]{64}$/.test(request.sourceVersion)
+        || !Array.isArray(request.frozenChunkIds) || request.frozenChunkIds.some(chunkId => !chunkId || chunkId.length > 80))
         throw new Error('Legacy migration cleanup input is invalid.');
       return repository.cleanupMigratedEntity({ uid: identity.uid, ...request, expiresAtMs: now() + 24 * 60 * 60 * 1_000 });
     },

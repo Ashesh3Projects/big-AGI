@@ -598,33 +598,9 @@ describe('private Pro encrypted vault asset client', () => {
         'migration-asset-stable-op',
         'migration-asset-stable-op',
       ]);
-      assert.equal(
-        crash === 'reservation' ? transport.reservations.length === 2 : transport.reservations.length === 2,
-        true,
-      );
-      assert.equal(transport.releases, 0, 'retryable migration failures must not burn the stable operation ID');
+      assert.equal(crash === 'reservation' ? transport.reservations.length === 2 : transport.finalized >= 1, true);
     });
   }
-
-  test('restarts an aborted migration upload with the same active operation ID', async () => {
-    const { client, transport } = await fixture();
-    const controller = new AbortController();
-    transport.abortUploadAt = 1;
-    transport.abortController = controller;
-
-    await assert.rejects(
-      client.prepareForUpload([ASSET_ID], controller.signal, { [ASSET_ID]: 'migration-asset-stable-op' }),
-      error => error instanceof DOMException && error.name === 'AbortError',
-    );
-    assert.equal(transport.releases, 0);
-    transport.abortUploadAt = null;
-    transport.abortController = null;
-    await client.prepareForUpload([ASSET_ID], undefined, { [ASSET_ID]: 'migration-asset-stable-op' });
-
-    assert.deepEqual(transport.reservations.map(reservation => reservation.operationId), [
-      'migration-asset-stable-op', 'migration-asset-stable-op',
-    ]);
-  });
 
   test('rejects changed payload or metadata under the immutable logical asset ID', async () => {
     const payloadChanged = await fixture();

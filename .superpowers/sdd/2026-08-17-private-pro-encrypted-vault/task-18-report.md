@@ -90,27 +90,3 @@
 ### Remaining limitation
 
 - Live Firebase/Storage orphan cleanup and Firestore TTL execution were not exercised. The extracted receipt state helpers used by the Firebase repository, focused crash tests, full Private Pro suite, typecheck, and production build cover the implementation paths without deployment.
-
-## Fix round 3
-
-### Review findings resolved
-
-- Migration-owned asset upload IDs now survive retryable abort, network, object upload, and finalize-response failures without releasing the active receipt. Exact released-operation replay is also safely reactivated only for the same descriptor fingerprint and without a conflicting active owner.
-- Added per-record-type serializer critical sections. `removeIfVersion` rechecks the canonical value hash and removes the record inside the same serialized operation. Local DBlob cleanup remains fail closed because raw references span independent stores: uncertain assets are recorded as intentionally deferred, migration completion reports the retained count, and the UI does not claim they were deleted.
-- Routed setup and recovery-key acknowledgement through the lifecycle epoch barrier. Commit, remember, registration, activation, and state publication check the epoch after each await. Runtime cleanup stops migration before joining engine/runtime cleanup, avoiding migration-blocked activation deadlock.
-- Removed all client-controlled revision paths, chunk lists, and revision operation IDs from cleanup requests. The server validates canonical and revision documents, creates a server-owned locator with exact revision metadata, uses it for receipt-loss recovery, transactionally rechecks the final child collection, deletes the locator on completion, and rejects forged/stale identities.
-- Firestore cleanup receipts and minimal completion tombstones now persist `expiresAt` as a Firestore `Timestamp`; TTL targets that field. Active receipt retries refresh expiry before completion.
-
-### Fix verification
-
-- Focused migration/provider/assets service/client/serializer/sync regression: `131` passed, `0` failed before the final deferred-progress addition; migration regression after that addition: `41` passed, `0` failed.
-- All Private Pro source tests: `326` passed, `0` failed.
-- Touched ESLint: passed with `0` errors and `0` warnings.
-- `npm run tscheck`: passed.
-- `npm run build`: passed. Next.js emitted only the existing multi-lockfile and edge-runtime static-generation warnings.
-- `git diff --check`: passed.
-- Firebase emulator command was attempted but could not start: `firebase-tools no longer supports Java version before 21. Please install a JDK at version 21 or above to get a compatible runtime.` No system Java change was made.
-
-### Remaining limitation
-
-- The Admin SDK locator recovery and concurrent empty-query insertion behavior could not be exercised against the Firebase emulator because the local JDK is below version 21. Production helpers, repository compilation, transactional query code, full Private Pro tests, typecheck, and build cover the static and unit behavior.

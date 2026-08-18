@@ -306,18 +306,6 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
     return attempt;
   };
 
-  const runConfirmation = (operation: (epoch: number) => Promise<void>): Promise<void> => {
-    if (confirmation) return confirmation;
-    const attempt = runAttempt(operation);
-    let wrapped!: Promise<void>;
-    wrapped = attempt.finally(() => {
-      if (confirmation === wrapped) confirmation = null;
-    });
-    confirmation = wrapped;
-    activeAttempt = wrapped;
-    return wrapped;
-  };
-
   const assertCurrent = (epoch: number) => {
     if (destroyed || epoch !== lifecycleEpoch) throw new DOMException('Vault lifecycle attempt was cancelled.', 'AbortError');
   };
@@ -336,7 +324,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
     activationReady = false;
     masterKey = nextMasterKey;
     keyset = nextKeyset;
-    if (!state.recoveryKey) setState({ phase: 'hydrating', busy: true, error: null }, epoch);
+    setState({ phase: 'hydrating', busy: true, error: null }, epoch);
     bindRuntime(epoch);
     try {
       await deps.activate(nextMasterKey, nextKeyset);
@@ -345,7 +333,6 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
       setState({ phase: 'ready', busy: false, error: null }, epoch);
     } catch {
       setState({ phase: 'error', busy: false, error: errorForPhase('error') }, epoch);
-      throw new Error('Vault activation failed.');
     }
   };
 
@@ -390,53 +377,52 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
       if (keyset && masterKey) return runAttempt(epoch => activate(masterKey!, keyset!, epoch));
       return runAttempt(startAttempt);
     },
-    setup(password) {
+    async setup(password) {
       if (!privateProVaultPasswordStrength(password).acceptable) {
         setState({ phase: 'setup', error: 'Use at least 14 characters.' });
-        return Promise.resolve();
+        return;
       }
-      return runAttempt(async epoch => {
-        setState({ phase: 'setup', busy: true, error: null }, epoch);
-        try {
-          const created = await deps.setup(password);
-          assertCurrent(epoch);
-          pendingSetup = { ...created, operationId: deps.createOperationId?.() ?? `setup-${crypto.randomUUID()}` };
-          setState({ phase: 'setup', busy: false, error: null, recoveryKey: created.recoveryKey }, epoch);
-        } catch {
-          setState({ phase: 'setup', busy: false, error: 'The encrypted vault could not be created.' }, epoch);
-        }
-      });
+      setState({ phase: 'setup', busy: true, error: null });
+      try {
+        const created = await deps.setup(password);
+        pendingSetup = { ...created, operationId: deps.createOperationId?.() ?? `setup-${crypto.randomUUID()}` };
+        setState({ phase: 'setup', busy: false, error: null, recoveryKey: created.recoveryKey });
+      } catch {
+        setState({ phase: 'setup', busy: false, error: 'The encrypted vault could not be created.' });
+      }
     },
-    acknowledgeRecoveryKey() {
+    async acknowledgeRecoveryKey() {
       if (confirmation) return confirmation;
-      if (!pendingSetup || !state.recoveryKey) return Promise.resolve();
+      if (!pendingSetup || !state.recoveryKey) return;
       const pending = pendingSetup;
-      return runConfirmation(async epoch => {
-        setState({ phase: 'setup', busy: true, error: null }, epoch);
+      confirmation = (async () => {
+        setState({ phase: 'setup', busy: true, error: null });
         try {
           const result = await deps.commitSetup(pending.keyset, pending.operationId);
-          assertCurrent(epoch);
           if (result === 'conflict') {
             pendingSetup = null;
             const bootstrap = await deps.bootstrap();
-            assertCurrent(epoch);
             keyset = bootstrap.keyset;
             masterKey = null;
-            setState({ phase: 'locked', busy: false, error: 'This vault already exists. Unlock it to continue.', recoveryKey: null }, epoch);
+            setState({ phase: 'locked', busy: false, error: 'This vault already exists. Unlock it to continue.', recoveryKey: null });
             return;
           }
           await deps.remember(pending.masterKey, pending.keyset);
-          assertCurrent(epoch);
           await deps.register(pending.keyset, pending.enrollmentKey);
-          assertCurrent(epoch);
-          await activate(pending.masterKey, pending.keyset, epoch);
-          assertCurrent(epoch);
+          await deps.activate(pending.masterKey, pending.keyset);
+          masterKey = pending.masterKey;
+          keyset = pending.keyset;
+          activationReady = true;
+          bindRuntime();
           pendingSetup = null;
-          setState({ phase: 'ready', busy: false, error: null, recoveryKey: null }, epoch);
+          setState({ phase: 'ready', busy: false, error: null, recoveryKey: null });
         } catch {
-          setState({ phase: 'setup', busy: false, error: 'The encrypted vault could not be created.', recoveryKey: pending.recoveryKey }, epoch);
+          setState({ phase: 'setup', busy: false, error: 'The encrypted vault could not be created.', recoveryKey: pending.recoveryKey });
+        } finally {
+          confirmation = null;
         }
-      });
+      })();
+      return confirmation;
     },
     async unlockWithPassword(password) {
       if (!keyset) return runAttempt(startAttempt);

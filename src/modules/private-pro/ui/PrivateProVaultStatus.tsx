@@ -60,9 +60,6 @@ function PrivateProVaultMigrationProgressView(props: { progress: PrivateProVault
   return <Stack spacing={0.5} alignItems='center'>
     <Typography level='title-md'>{migrationLabels[props.progress.phase]}</Typography>
     <Typography level='body-sm' textColor='text.secondary'>{props.progress.completedItems} of {props.progress.totalItems} source items cleaned</Typography>
-    {!!props.progress.deferredLocalAssets && <Typography level='body-sm' color='warning'>
-      {props.progress.deferredLocalAssets} local attachment{props.progress.deferredLocalAssets === 1 ? '' : 's'} retained because active references could not be excluded.
-    </Typography>}
   </Stack>;
 }
 

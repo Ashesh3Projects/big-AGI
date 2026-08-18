@@ -215,22 +215,6 @@ describe('private Pro encrypted vault asset service', () => {
     assert.equal(abortPort.objects.size, 0);
   });
 
-  test('reactivates an exact released operation and rejects a divergent descriptor replay', async () => {
-    const port = new MemoryPort();
-    const assets = service(port);
-    await assets.reserveUpload(UID, reserveInput());
-    assert.equal(await assets.releaseReservation(UID, 'asset-operation-1'), true);
-
-    const resumed = await assets.reserveUpload(UID, reserveInput());
-    assert.equal(resumed.status, 'upload-required');
-    assert.equal(port.reservations.get('asset-operation-1')?.status, 'reserved');
-    assert.equal(port.account.reservedBytes, 4_000_120);
-    await assert.rejects(assets.reserveUpload(UID, {
-      ...reserveInput(),
-      chunks: [{ ...DESCRIPTORS[0], objectSha256: 'f'.repeat(64) }, { ...DESCRIPTORS[1] }],
-    }), /different ciphertext|operation ID|descriptor/i);
-  });
-
   test('prevents concurrent reservations from overwriting the same opaque chunk paths', async () => {
     const port = new MemoryPort();
     const assets = service(port);
