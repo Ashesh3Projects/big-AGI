@@ -6,6 +6,7 @@ import {
   comparePrivateProVaultOpaqueIds,
   mergePrivateProVaultIndexEntries,
   type PrivateProVaultOperationReceipt,
+  type PrivateProVaultBackupMergeReceipt,
   type PrivateProVaultRegistrationChallenge,
   type PrivateProVaultRepository,
   type PrivateProVaultRepositoryTransaction,
@@ -121,6 +122,7 @@ interface MemoryVault {
   devices: Map<string, PrivateProVaultStoredDevice>;
   registrationChallenges: Map<string, PrivateProVaultRegistrationChallenge>;
   securityEvents: Map<string, import('./privatePro.vault.repository').PrivateProVaultSecurityEvent>;
+  backupMerges: Map<string, PrivateProVaultBackupMergeReceipt>;
 }
 
 class MemoryVaultRepository implements PrivateProVaultRepository {
@@ -137,6 +139,7 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         devices: new Map(),
         registrationChallenges: new Map(),
         securityEvents: new Map(),
+        backupMerges: new Map(),
       };
       this.vaults.set(uid, vault);
     }
@@ -171,6 +174,11 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
       createSecurityEvent: async event => {
         if (vault.securityEvents.has(event.eventId)) throw new Error('Security event already exists.');
         vault.securityEvents.set(event.eventId, clone(event));
+      },
+      getBackupMerge: async operationId => clone(vault.backupMerges.get(operationId) ?? null),
+      createBackupMerge: async receipt => {
+        if (vault.backupMerges.has(receipt.operationId)) throw new Error('Backup merge already exists.');
+        vault.backupMerges.set(receipt.operationId, clone(receipt));
       },
     };
     return callback(transaction);
@@ -669,6 +677,78 @@ describe('Private Pro encrypted vault service', () => {
     assert.equal((await service.getIndex(UID_A, { pageSize: 10 })).entries.length, 1);
     assert.equal((await service.getIndex(UID_B, { pageSize: 10 })).entries.length, 1);
     assert.equal(await service.getKeyset(UID_B), null);
+  });
+
+  test('atomically merges a bounded backup batch and replays the operation idempotently', async () => {
+    const { service } = serviceFixture();
+    const input = {
+      operationId: 'merge-backup-1',
+      records: [
+        { opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) },
+        { opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1, 'chat') },
+      ],
+    };
+
+    const committed = await service.mergeBackup(UID_A, input);
+    assert.deepEqual(committed, {
+      status: 'committed',
+      records: [
+        { opaqueRecordId: RECORD_A, revision: 1, serverUpdatedAtMs: 1_000 },
+        { opaqueRecordId: RECORD_B, revision: 1, serverUpdatedAtMs: 1_000 },
+      ],
+    });
+    assert.deepEqual(await service.mergeBackup(UID_A, input), { status: 'unchanged', records: committed.records });
+    assert.equal((await service.getRecords(UID_A, [RECORD_A, RECORD_B])).length, 2);
+  });
+
+  test('rejects an atomic backup conflict without partially changing earlier records', async () => {
+    const { service } = serviceFixture();
+    await service.putRecord(UID_A, {
+      operationId: 'seed-record-b', opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1, 'chat'),
+    });
+
+    const result = await service.mergeBackup(UID_A, {
+      operationId: 'merge-backup-conflict',
+      records: [
+        { opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) },
+        { opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1, 'chat') },
+      ],
+    });
+
+    assert.deepEqual(result, { status: 'conflict', conflicts: [{ opaqueRecordId: RECORD_B, currentRevision: 1 }] });
+    assert.deepEqual(await service.getRecords(UID_A, [RECORD_A]), []);
+    assert.equal((await service.getRecords(UID_A, [RECORD_B]))[0].revision, 1);
+  });
+
+  test('rejects a malformed middle backup record before changing cloud state', async () => {
+    const { service } = serviceFixture();
+    await assert.rejects(service.mergeBackup(UID_A, {
+      operationId: 'merge-backup-invalid',
+      records: [
+        { opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) },
+        { opaqueRecordId: RECORD_B, baseRevision: 0, envelope: { ...envelope(RECORD_B, 2, 'chat'), revision: 2 } },
+      ],
+    }), /revision/i);
+    assert.deepEqual(await service.getRecords(UID_A, [RECORD_A, RECORD_B]), []);
+  });
+
+  test('enforces backup merge count and byte bounds', async () => {
+    const { service } = serviceFixture();
+    await assert.rejects(service.mergeBackup(UID_A, {
+      operationId: 'merge-backup-count',
+      records: Array.from({ length: 201 }, (_, index) => ({
+        opaqueRecordId: Buffer.alloc(32, index).toString('base64url'),
+        baseRevision: 0,
+        envelope: envelope(Buffer.alloc(32, index).toString('base64url'), 1),
+      })),
+    }), /too many/i);
+    await assert.rejects(service.mergeBackup(UID_A, {
+      operationId: 'merge-backup-bytes',
+      records: Array.from({ length: 8 }, (_, index) => {
+        const id = Buffer.alloc(32, index + 1).toString('base64url');
+        return { opaqueRecordId: id, baseRevision: 0, envelope: envelope(id, 1, 'settings', 700 * 1024) };
+      }),
+    }), /byte limit/i);
   });
 
   test('records a bounded security event after recovery without accepting sensitive metadata', async () => {

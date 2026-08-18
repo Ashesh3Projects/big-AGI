@@ -69,6 +69,10 @@ const service = {
     state.calls.push({ method: 'putRecord', uid, input });
     return { status: 'committed' as const, revision: 1, serverUpdatedAtMs: 1 };
   },
+  mergeBackup: async (uid: string, input: unknown) => {
+    state.calls.push({ method: 'mergeBackup', uid, input });
+    return { status: 'committed' as const, records: [] };
+  },
   deleteRecord: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'deleteRecord', uid, input });
     return { status: 'committed' as const, revision: 1, serverUpdatedAtMs: 1 };
@@ -216,6 +220,10 @@ describe('private Pro vault router input bounds', () => {
       opaqueRecordId: RECORD_ID,
       baseRevision: 0,
       envelope: envelope(RECORD_ID, 1),
+    });
+    await caller.mergeBackup({
+      operationId: 'merge-backup-1',
+      records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
     });
     await caller.deleteRecord({
       operationId: 'delete-record-1',

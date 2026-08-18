@@ -14,6 +14,14 @@ import {
 
 
 const textDecoder = new TextDecoder('utf-8', { fatal: true });
+const textEncoder = new TextEncoder();
+
+export class PrivateProVaultBackupCommittedError extends Error {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'PrivateProVaultBackupCommittedError';
+  }
+}
 
 export interface PrivateProVaultBackupDependencies {
   uid: string;
@@ -32,6 +40,15 @@ interface FrozenRecord {
 
 function serializerMap(serializers: readonly PrivateProVaultSerializer<unknown>[]) {
   return new Map(serializers.map(serializer => [serializer.recordType, serializer]));
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
+  return `{${Object.entries(value)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJson(nested)}`)
+    .join(',')}}`;
 }
 
 async function decryptAndValidate(
@@ -126,6 +143,8 @@ export async function importPrivateProVaultBackup(
     async input => {
       if (input.header.vaultId !== deps.uid) throw new Error('Encrypted backup belongs to another vault.');
       if (deps.activeMasterKey && deps.activeKeyVersion && deps.activeAssets && deps.transport) {
+        const activeMasterKey = deps.activeMasterKey;
+        const activeKeyVersion = deps.activeKeyVersion;
         if (!deps.transport.isOnline()) throw new Error('Reconnect before merging an encrypted backup.');
         const backupAssets = (deps.createBackupAssetClient ?? deps.createAssetClient)?.(
           input.masterKey, input.header.keyset.keyVersion, input.header.vaultId,
@@ -138,14 +157,15 @@ export async function importPrivateProVaultBackup(
         }));
         const assetIds = [...new Set(staged.flatMap(record => collectPrivateProVaultAssetIds(record.serializer.recordType, record.value)))];
         const materializedAssetIds = await backupAssets.importAssetChunks(input.assets);
+        let cloudCommitted = false;
         try {
           await deps.activeAssets.prepareForUpload(assetIds);
           const index = await deps.transport.getIndex();
           const revisions = new Map(index.map(entry => [`${entry.recordType}:${entry.opaqueRecordId}`, entry.revision]));
-          for (const record of staged) {
+          const mergeRecords = await Promise.all(staged.map(async record => {
             const baseRevision = revisions.get(`${record.serializer.recordType}:${record.recordId}`) ?? 0;
             const key = await deriveVaultSubkey(
-              deps.activeMasterKey, 'record-encryption', `${record.serializer.recordType}:${record.recordId}`, ['encrypt'],
+              activeMasterKey, 'record-encryption', `${record.serializer.recordType}:${record.recordId}`, ['encrypt'],
             );
             const envelope = await encryptVaultRecord(key, {
               vaultId: deps.uid,
@@ -153,33 +173,67 @@ export async function importPrivateProVaultBackup(
               recordType: record.serializer.recordType,
               recordId: record.recordId,
               schemaVersion: record.serializer.schemaVersion,
-              keyVersion: deps.activeKeyVersion,
+              keyVersion: activeKeyVersion,
               revision: baseRevision + 1,
-            }, new TextEncoder().encode(JSON.stringify(record.value)));
-            const result = await deps.transport.write({
-              formatVersion: 1,
-              operationId: deps.createOperationId?.() ?? `restore-${crypto.randomUUID()}`,
-              kind: 'put',
-              baseRevision,
-              envelope,
-            });
-            if (result.status === 'conflict') throw new Error('The cloud vault changed during backup merge. Retry the merge.');
-          }
+            }, textEncoder.encode(JSON.stringify(record.value)));
+            return { ...record, baseRevision, envelope };
+          }));
+          const operationId = deps.createOperationId?.() ?? `restore-${crypto.randomUUID()}`;
+          const result = await deps.transport.mergeBackup({
+            operationId,
+            records: mergeRecords.map(record => ({
+              opaqueRecordId: record.recordId,
+              baseRevision: record.baseRevision,
+              envelope: record.envelope,
+            })),
+          });
+          if (result.status === 'conflict') throw new Error('The cloud vault changed during backup merge. Retry the merge.');
+          cloudCommitted = true;
+          const committedById = new Map(result.records.map(record => [record.opaqueRecordId, record]));
+          if (committedById.size !== mergeRecords.length)
+            throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification is incomplete. Restart to reconcile.');
           const verifiedIndex = await deps.transport.getIndex();
-          const restoredIds = new Set(staged.map(record => `${record.serializer.recordType}:${record.recordId}`));
-          const verifiedEnvelopes = await deps.transport.getRecords(verifiedIndex
+          const restoredIds = new Set(mergeRecords.map(record => `${record.serializer.recordType}:${record.recordId}`));
+          const relevantIndex = verifiedIndex
             .filter(entry => restoredIds.has(`${entry.recordType}:${entry.opaqueRecordId}`))
-            .map(entry => entry.opaqueRecordId));
-          for (const envelope of verifiedEnvelopes) {
-            const serializer = serializers.get(envelope.recordType);
-            if (!serializer) throw new Error('Restored cloud record type is unsupported.');
-            await decryptAndValidate({ uid: deps.uid, masterKey: deps.activeMasterKey, serializers: deps.serializers }, envelope);
+            .sort((left, right) => left.opaqueRecordId.localeCompare(right.opaqueRecordId));
+          const verifiedEnvelopes = await deps.transport.getRecords(relevantIndex.map(entry => entry.opaqueRecordId));
+          const verifiedById = new Map(verifiedEnvelopes.map(envelope => [envelope.recordId, envelope]));
+          for (const record of mergeRecords) {
+            const receipt = committedById.get(record.recordId);
+            const entry = relevantIndex.find(candidate => candidate.opaqueRecordId === record.recordId);
+            const envelope = verifiedById.get(record.recordId);
+            if (
+              !receipt || !entry || !envelope
+              || receipt.revision !== record.envelope.revision
+              || entry.recordType !== record.serializer.recordType
+              || entry.revision !== record.envelope.revision
+              || entry.keyVersion !== activeKeyVersion
+              || envelope.recordType !== record.serializer.recordType
+              || envelope.recordId !== record.recordId
+              || envelope.schemaVersion !== record.serializer.schemaVersion
+              || envelope.keyVersion !== activeKeyVersion
+              || envelope.revision !== record.envelope.revision
+            ) throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification metadata mismatched. Restart to reconcile.');
+            const verifiedValue = await decryptAndValidate(
+              { uid: deps.uid, masterKey: activeMasterKey, serializers: deps.serializers }, envelope,
+            );
+            if (canonicalJson(verifiedValue) !== canonicalJson(record.value))
+              throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification mismatch was detected. Restart to reconcile.');
           }
-          if (verifiedEnvelopes.length !== staged.length) throw new Error('Cloud backup merge verification is incomplete.');
+          if (verifiedEnvelopes.length !== mergeRecords.length)
+            throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification is incomplete. Restart to reconcile.');
           return;
         } catch (error) {
-          await backupAssets.rollbackImportedAssets(materializedAssetIds);
-          throw error;
+          if (!cloudCommitted) {
+            await backupAssets.rollbackImportedAssets(materializedAssetIds);
+            throw error;
+          }
+          if (error instanceof PrivateProVaultBackupCommittedError) throw error;
+          throw new PrivateProVaultBackupCommittedError(
+            'Cloud backup merge committed, but local verification did not finish. Restart to reconcile.',
+            { cause: error },
+          );
         }
       }
 

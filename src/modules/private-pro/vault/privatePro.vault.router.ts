@@ -6,6 +6,7 @@ import { createTRPCRouter } from '~/server/trpc/trpc.server';
 import { createPrivateProVaultProcedure, createPrivateProVaultPutKeysetProcedure, privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
+  PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS,
   PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE,
 } from './privatePro.vault.repository';
 import { getFirebasePrivateProVaultService } from './privatePro.vault.repository.firebase';
@@ -102,6 +103,17 @@ export function createPrivateProVaultRouter(
       envelope: firestoreEnvelopeSchema,
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().putRecord(ctx.privateProIdentity.uid, input))),
+
+  mergeBackup: deviceProcedure
+    .input(z.object({
+      operationId: operationIdSchema,
+      records: z.array(z.object({
+        opaqueRecordId: opaqueIdSchema,
+        baseRevision: baseVersionSchema,
+        envelope: firestoreEnvelopeSchema,
+      }).strict()).min(1).max(PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS),
+    }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => service().mergeBackup(ctx.privateProIdentity.uid, input))),
 
   deleteRecord: deviceProcedure
     .input(z.object({

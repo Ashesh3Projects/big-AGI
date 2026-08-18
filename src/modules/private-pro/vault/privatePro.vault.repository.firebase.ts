@@ -3,6 +3,7 @@ import { FieldPath, type CollectionReference, type DocumentData, type Firestore,
 import { getPrivateProFirestore } from '../firebase/firebase.admin';
 import type {
   PrivateProVaultOperationReceipt,
+  PrivateProVaultBackupMergeReceipt,
   PrivateProVaultRegistrationChallenge,
   PrivateProVaultRepository,
   PrivateProVaultRepositoryTransaction,
@@ -69,6 +70,16 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
 
   async createOperation(operation: PrivateProVaultOperationReceipt) {
     this.transaction.create(this.db.doc(`${vaultRoot(this.uid)}/operations/${operation.operationId}`), operation);
+  }
+
+  async getBackupMerge(operationId: string) {
+    const reference = this.db.doc(`${vaultRoot(this.uid)}/backupMerges/${operationId}`);
+    const snapshot = await this.transaction.get(reference);
+    return snapshot.exists ? snapshot.data() as PrivateProVaultBackupMergeReceipt : null;
+  }
+
+  async createBackupMerge(receipt: PrivateProVaultBackupMergeReceipt) {
+    this.transaction.create(this.db.doc(`${vaultRoot(this.uid)}/backupMerges/${receipt.operationId}`), receipt);
   }
 
   async getKeyset() {

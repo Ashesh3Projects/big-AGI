@@ -9,6 +9,8 @@ import type {
 
 export const PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES = 700 * 1024;
 export const PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE = 500;
+export const PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS = 200;
+export const PRIVATE_PRO_VAULT_BACKUP_MAX_TOTAL_CIPHERTEXT_BYTES = 4 * 1024 * 1024;
 
 export interface PrivateProVaultStoredRecord {
   opaqueRecordId: string;
@@ -58,10 +60,27 @@ export type PrivateProVaultOperationOutcome =
   | { kind: 'device'; status: 'committed'; revokedAtMs: number }
   | { kind: 'device-registration'; status: 'committed'; device: PrivateProVaultStoredDevice };
 
+export interface PrivateProVaultBackupMergeRecordOutcome {
+  opaqueRecordId: string;
+  revision: number;
+  serverUpdatedAtMs: number;
+}
+
+export type PrivateProVaultBackupMergeOutcome = {
+  status: 'committed';
+  records: PrivateProVaultBackupMergeRecordOutcome[];
+};
+
 export interface PrivateProVaultOperationReceipt {
   operationId: string;
   requestFingerprint: string;
   outcome: PrivateProVaultOperationOutcome;
+}
+
+export interface PrivateProVaultBackupMergeReceipt {
+  operationId: string;
+  requestFingerprint: string;
+  outcome: PrivateProVaultBackupMergeOutcome;
 }
 
 export type PrivateProVaultIndexEntry = {
@@ -86,6 +105,8 @@ export interface PrivateProVaultRepositoryTransaction {
   deleteTombstone(opaqueRecordId: string): Promise<void>;
   getOperation(operationId: string): Promise<PrivateProVaultOperationReceipt | null>;
   createOperation(operation: PrivateProVaultOperationReceipt): Promise<void>;
+  getBackupMerge(operationId: string): Promise<PrivateProVaultBackupMergeReceipt | null>;
+  createBackupMerge(receipt: PrivateProVaultBackupMergeReceipt): Promise<void>;
   getKeyset(): Promise<PrivateProVaultStoredKeyset | null>;
   setKeyset(keyset: PrivateProVaultStoredKeyset): Promise<void>;
   getDevice(deviceId: string): Promise<PrivateProVaultStoredDevice | null>;

@@ -140,6 +140,10 @@ class TestVaultServer {
     });
   }
 
+  async mergeBackup(): Promise<never> {
+    throw new Error('Backup merge is not used by engine tests.');
+  }
+
   async write(operation: PrivateProVaultOperation): Promise<PrivateProVaultWriteResult> {
     this.operations.push(structuredClone(operation));
     await this.delayWrite;
@@ -205,6 +209,10 @@ class TestTransport implements PrivateProVaultTransport {
   async getRecords(recordIds: readonly string[]) {
     if (!this.online) throw new TypeError('offline');
     return this.server.getRecords(recordIds);
+  }
+
+  async mergeBackup(): Promise<never> {
+    throw new Error('Backup merge is not used by engine tests.');
   }
 
   async write(operation: PrivateProVaultOperation) {

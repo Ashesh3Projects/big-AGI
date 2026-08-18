@@ -15,7 +15,7 @@ import { PrivateProVaultUnlock } from '../ui/PrivateProVaultUnlock';
 import { deriveVaultSubkey, hmacVaultIdentifier } from './privatePro.vault.crypto';
 import { privateProVaultDB } from './privatePro.vault.db';
 import { createPrivateProVaultEngine, type PrivateProVaultEngine } from './privatePro.vault.engine';
-import { createPrivateProVaultBackupStream, importPrivateProVaultBackup } from './privatePro.vault.backup';
+import { createPrivateProVaultBackupStream, importPrivateProVaultBackup, PrivateProVaultBackupCommittedError } from './privatePro.vault.backup';
 import {
   createPrivateProRememberedUnlock,
   createPrivateProVaultKeyset,
@@ -89,6 +89,32 @@ export interface PrivateProVaultRuntimeState {
   masterKey: CryptoKey | null;
   devices: PrivateProVaultDeviceMetadata[];
   assets: PrivateProVaultAssetClient | null;
+}
+
+export async function runPrivateProVaultBackupImport(
+  engine: Pick<PrivateProVaultEngine, 'stopAndWait' | 'hydrateBeforeOpen' | 'start' | 'whenCurrent'>,
+  store: ReturnType<typeof createPrivateProVaultStore>,
+  importBackup: () => Promise<unknown>,
+): Promise<void> {
+  await engine.stopAndWait();
+  let committed = false;
+  try {
+    await importBackup();
+    committed = true;
+    await engine.hydrateBeforeOpen();
+    await engine.start();
+    await engine.whenCurrent();
+    if (!store.getState().ready) throw new Error('Encrypted backup merge did not reach a verified current state.');
+  } catch (error) {
+    if (committed || error instanceof PrivateProVaultBackupCommittedError) {
+      const message = 'Encrypted backup committed to the cloud, but local hydration failed. Restart to reconcile.';
+      store.getState().setState({ phase: 'error', ready: false, lastError: message });
+      throw new PrivateProVaultBackupCommittedError(message, { cause: error });
+    }
+    await engine.start();
+    await engine.whenCurrent();
+    throw error;
+  }
 }
 
 export interface PrivateProVaultRuntimeCleanupPort {
@@ -574,28 +600,22 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     credential: PrivateProEncryptedBackupCredential,
   ) => {
     const runtime = runtimeRef.current;
-    if (!auth.user || !runtime.assets || !runtime.masterKey || !runtime.keyset || !runtime.engine) throw new Error('Unlock the vault first.');
+    const user = auth.user;
+    const assets = runtime.assets;
+    const masterKey = runtime.masterKey;
+    const keyset = runtime.keyset;
+    if (!user || !assets || !masterKey || !keyset || !runtime.engine) throw new Error('Unlock the vault first.');
     const engine = runtime.engine;
-    await engine.stopAndWait();
-    try {
-      await importPrivateProVaultBackup(stream, credential, {
-        uid: auth.user.uid,
+    await runPrivateProVaultBackupImport(engine, privateProVaultStore, () => importPrivateProVaultBackup(stream, credential, {
+        uid: user.uid,
         db: privateProVaultDB,
         serializers: privateProVaultSerializers,
-        activeMasterKey: runtime.masterKey,
-        activeKeyVersion: runtime.keyset.keyVersion,
-        activeAssets: runtime.assets,
+        activeMasterKey: masterKey,
+        activeKeyVersion: keyset.keyVersion,
+        activeAssets: assets,
         transport: createPrivateProVaultTransport(),
         createBackupAssetClient: (masterKey, keyVersion, vaultId) => createPrivateProVaultAssetClient({ vaultId, masterKey, keyVersion }),
-      });
-      await engine.hydrateBeforeOpen();
-      await engine.start();
-      await engine.whenCurrent();
-      if (!privateProVaultStore.getState().ready) throw new Error('Encrypted backup merge did not reach a verified current state.');
-    } catch (error) {
-      await engine.start();
-      throw error;
-    }
+      }));
   }, [auth.user]);
 
   const revokeOtherDevices = React.useCallback(async () => {

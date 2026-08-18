@@ -2,6 +2,8 @@ import { createHash, randomBytes } from 'node:crypto';
 
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
+  PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS,
+  PRIVATE_PRO_VAULT_BACKUP_MAX_TOTAL_CIPHERTEXT_BYTES,
   PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE,
   type PrivateProVaultOperationOutcome,
   type PrivateProVaultRepository,
@@ -47,6 +49,19 @@ export interface PutVaultKeysetInput {
     type: 'recovery-password-reset' | 'password-changed';
   };
 }
+
+export interface MergeVaultBackupInput {
+  operationId: string;
+  records: Array<{
+    opaqueRecordId: string;
+    baseRevision: number;
+    envelope: PrivateProVaultEnvelope;
+  }>;
+}
+
+export type MergeVaultBackupResult =
+  | { status: 'committed' | 'unchanged'; records: Array<{ opaqueRecordId: string; revision: number; serverUpdatedAtMs: number }> }
+  | { status: 'conflict'; conflicts: Array<{ opaqueRecordId: string; currentRevision: number }> };
 
 export type PutVaultKeysetResult =
   | { status: 'committed'; wrappingVersion: number; serverUpdatedAtMs: number }
@@ -405,6 +420,71 @@ export function createPrivateProVaultService(
         const outcome = { kind: 'device', status: 'committed', revokedAtMs } as const;
         await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
         return { status: 'committed' as const, revokedAtMs };
+      });
+    },
+
+    async mergeBackup(uid: string, input: MergeVaultBackupInput): Promise<MergeVaultBackupResult> {
+      assertUid(uid);
+      assertOperationId(input.operationId);
+      if (input.records.length < 1 || input.records.length > PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS)
+        throw new Error('Vault backup merge contains too many records.');
+      const seen = new Set<string>();
+      let totalCiphertextBytes = 0;
+      const records = input.records.map(record => {
+        assertOpaqueRecordId(record.opaqueRecordId);
+        assertBaseRevision(record.baseRevision);
+        const envelope = PrivateProVaultEnvelopeSchema.parse(record.envelope);
+        if (seen.has(record.opaqueRecordId)) throw new Error('Vault backup merge contains duplicate records.');
+        seen.add(record.opaqueRecordId);
+        if (envelope.recordId !== record.opaqueRecordId) throw new Error('Vault envelope record ID disagrees with the route.');
+        if (envelope.revision !== record.baseRevision + 1) throw new Error('Vault envelope revision must follow the base revision.');
+        if (envelope.ciphertextBytes > PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES)
+          throw new Error('Vault record ciphertext exceeds the 700 KiB server limit.');
+        totalCiphertextBytes += envelope.ciphertextBytes;
+        return { ...record, envelope };
+      });
+      if (totalCiphertextBytes > PRIVATE_PRO_VAULT_BACKUP_MAX_TOTAL_CIPHERTEXT_BYTES)
+        throw new Error('Vault backup merge exceeds the total ciphertext byte limit.');
+      const requestFingerprint = fingerprint({ kind: 'merge-backup', operationId: input.operationId, records });
+
+      return repository.transaction(uid, async transaction => {
+        const repeated = await transaction.getBackupMerge(input.operationId);
+        if (repeated) {
+          if (repeated.requestFingerprint !== requestFingerprint)
+            throw new Error('Vault operation ID is already used by different content.');
+          return { status: 'unchanged', records: repeated.outcome.records };
+        }
+        const current = await Promise.all(records.map(async record => {
+          const [stored, tombstone] = await Promise.all([
+            transaction.getRecord(record.opaqueRecordId),
+            transaction.getTombstone(record.opaqueRecordId),
+          ]);
+          return { record, currentRevision: Math.max(stored?.revision ?? 0, tombstone?.revision ?? 0) };
+        }));
+        const conflicts = current
+          .filter(entry => entry.currentRevision !== entry.record.baseRevision)
+          .map(entry => ({ opaqueRecordId: entry.record.opaqueRecordId, currentRevision: entry.currentRevision }));
+        if (conflicts.length) {
+          return { status: 'conflict' as const, conflicts };
+        }
+        const serverUpdatedAtMs = now();
+        const outcomes = records.map(record => ({
+          opaqueRecordId: record.opaqueRecordId,
+          revision: record.envelope.revision,
+          serverUpdatedAtMs,
+        }));
+        for (const record of records) {
+          await transaction.setRecord({
+            opaqueRecordId: record.opaqueRecordId,
+            revision: record.envelope.revision,
+            serverUpdatedAtMs,
+            envelope: structuredClone(record.envelope),
+          });
+          await transaction.deleteTombstone(record.opaqueRecordId);
+        }
+        const outcome = { status: 'committed' as const, records: outcomes };
+        await transaction.createBackupMerge({ operationId: input.operationId, requestFingerprint, outcome });
+        return outcome;
       });
     },
 

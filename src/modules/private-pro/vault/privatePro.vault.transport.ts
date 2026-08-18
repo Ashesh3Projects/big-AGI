@@ -3,6 +3,7 @@ import { apiAsyncNode } from '~/common/util/trpc.client';
 import { PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES } from './privatePro.vault.repository';
 import type { PrivateProVaultIndexEntry } from './privatePro.vault.repository';
 import type { PutVaultRecordResult } from './privatePro.vault.service';
+import type { MergeVaultBackupInput, MergeVaultBackupResult } from './privatePro.vault.service';
 import type { PrivateProVaultEnvelope, PrivateProVaultOperation } from './privatePro.vault.types';
 
 
@@ -14,6 +15,7 @@ export interface PrivateProVaultTransport {
   subscribeConnectivity(listener: (online: boolean) => void): () => void;
   getIndex(): Promise<PrivateProVaultIndexEntry[]>;
   getRecords(recordIds: readonly string[]): Promise<PrivateProVaultEnvelope[]>;
+  mergeBackup(input: MergeVaultBackupInput): Promise<MergeVaultBackupResult>;
   write(operation: PrivateProVaultOperation): Promise<PrivateProVaultWriteResult>;
 }
 
@@ -60,6 +62,8 @@ export function createPrivateProVaultTransport(): PrivateProVaultTransport {
       }
       return envelopes;
     },
+
+    mergeBackup: input => apiAsyncNode.privateProVault.mergeBackup.mutate(input),
 
     async write(operation) {
       if (operation.kind === 'put') {

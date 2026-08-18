@@ -9,6 +9,7 @@ import {
   fullWipePrivateProVaultRuntime,
   logoutPrivateProVaultRuntime,
   ProviderPrivateProVault,
+  runPrivateProVaultBackupImport,
   privateProVaultPasswordStrength,
   type PrivateProVaultLifecycleDependencies,
   type PrivateProVaultLifecyclePhase,
@@ -29,6 +30,7 @@ import { createPrivateProVaultEnrollmentAuthority } from './privatePro.vault.reg
 import { realArgon2idWorkerResponse, withVaultPasswordWorker } from '../../../../tools/private-pro/test-helpers/privatePro.vault.password.test-helpers';
 import { privateProClientConfig } from '../config/privatePro.config';
 import { getPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
+import { createPrivateProVaultStore } from './store-private-pro-vault';
 
 
 type AssertFalse<T extends false> = T;
@@ -207,6 +209,47 @@ async function keysetFixture(password: string): Promise<{ keyset: PrivateProVaul
 
 
 describe('private Pro vault lifecycle', () => {
+  test('backup import restarts and reconciles after a pre-commit failure', async () => {
+    const order: string[] = [];
+    const engine = {
+      async stopAndWait() { order.push('stop'); },
+      async hydrateBeforeOpen() { order.push('hydrate'); },
+      async start() { order.push('start'); },
+      async whenCurrent() { order.push('current'); },
+    } as never;
+    const store = createPrivateProVaultStore();
+    store.getState().setState({ phase: 'ready', ready: true });
+
+    await assert.rejects(runPrivateProVaultBackupImport(engine, store, async () => {
+      order.push('import');
+      throw new Error('pre-commit validation failed');
+    }), /pre-commit/);
+
+    assert.deepEqual(order, ['stop', 'import', 'start', 'current']);
+  });
+
+  test('backup import blocks ready state when cloud committed before local hydration failed', async () => {
+    const { PrivateProVaultBackupCommittedError } = await import('./privatePro.vault.backup');
+    const order: string[] = [];
+    const engine = {
+      async stopAndWait() { order.push('stop'); },
+      async hydrateBeforeOpen() { order.push('hydrate'); throw new Error('local cache unavailable'); },
+      async start() { order.push('start'); },
+      async whenCurrent() { order.push('current'); },
+    } as never;
+    const store = createPrivateProVaultStore();
+    store.getState().setState({ phase: 'ready', ready: true });
+
+    await assert.rejects(runPrivateProVaultBackupImport(engine, store, async () => {
+      order.push('import');
+    }), PrivateProVaultBackupCommittedError);
+
+    assert.deepEqual(order, ['stop', 'import', 'hydrate']);
+    assert.equal(store.getState().phase, 'error');
+    assert.equal(store.getState().ready, false);
+    assert.match(store.getState().lastError ?? '', /committed.*restart|restart.*reconcile/i);
+  });
+
   test('normal logout clears tracked hydrated assets before sign-out when no engine is active', async () => {
     const order: string[] = [];
     const runtime = {
