@@ -167,7 +167,12 @@ export default async function buildNextConfig(
   phase: string,
   context: { defaultConfig: NextConfigContext },
 ): Promise<NextConfig> {
-  if (phase !== PHASE_PRODUCTION_BUILD || !process.env.POSTHOG_API_KEY || !process.env.POSTHOG_ENV_ID)
+  if (
+    process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true'
+    || phase !== PHASE_PRODUCTION_BUILD
+    || !process.env.POSTHOG_API_KEY
+    || !process.env.POSTHOG_ENV_ID
+  )
     return nextConfig;
 
   let withPostHogConfig: typeof import('@posthog/nextjs-config').withPostHogConfig;

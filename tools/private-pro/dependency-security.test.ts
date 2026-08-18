@@ -174,6 +174,41 @@ test('resolves the PostHog wrapper to a production build config object', () => {
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('private Pro production build never imports or applies the PostHog source-map wrapper', () => {
+  const script = `
+    const Module = require('node:module');
+    const originalLoad = Module._load;
+    Module._load = function(request, parent, isMain) {
+      if (request === '@posthog/nextjs-config') throw new Error('Private Pro imported PostHog source-map tooling');
+      return originalLoad.call(this, request, parent, isMain);
+    };
+    process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED = 'true';
+    process.env.PRIVATE_PRO_ALLOWED_EMAILS = 'friend@example.com';
+    process.env.NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY = 'dummy-app-check-site-key';
+    process.env.POSTHOG_API_KEY = 'dummy-token';
+    process.env.POSTHOG_ENV_ID = 'dummy-env';
+    delete process.env.ANALYZE_BUNDLE;
+    const loadConfig = require('next/dist/server/config').default;
+    const { PHASE_PRODUCTION_BUILD } = require('next/constants');
+    loadConfig(PHASE_PRODUCTION_BUILD, process.cwd(), { silent: true })
+      .then(config => {
+        const webpackConfig = config.webpack({
+          resolve: { alias: {} }, experiments: {}, plugins: [], output: { environment: {} },
+          optimization: { splitChunks: { minSize: 1 } },
+        }, { isServer: false, webpack: { NormalModuleReplacementPlugin: class {} } });
+        if (webpackConfig.devtool === 'hidden-source-map') throw new Error('Private Pro applied PostHog source maps');
+      })
+      .catch(error => { console.error(error); process.exitCode = 1; });
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: new URL('../..', import.meta.url),
+    encoding: 'utf8',
+    env: { ...process.env, NODE_ENV: 'production' },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
 test('fails closed when a PostHog source-map build omits dev dependencies', () => {
   for (const errorCode of ['MODULE_NOT_FOUND', 'ERR_MODULE_NOT_FOUND']) {
     const script = `
