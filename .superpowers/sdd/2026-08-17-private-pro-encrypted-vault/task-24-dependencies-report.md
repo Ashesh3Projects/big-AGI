@@ -177,3 +177,46 @@ Upgrade trigger: move to Firebase Admin `14.2.0` after its production bundle, Au
 | `npm audit --omit=dev --json` | 0 critical, 0 high, 8 moderate. |
 | `npm audit --omit=dev --audit-level=high --json` | Exit 0. |
 | Browse cleaner move comparison | Exact implementation match after adding the Cheerio import and module export. |
+
+## Fix round 2
+
+### PostHog config resolution
+
+`withPostHogConfig()` is typed as returning a Next config object, but `@posthog/nextjs-config@1.6.4` returns an async Next config function at runtime. Returning that wrapper directly from `buildNextConfig()` caused Next's config loader to receive the wrong value and fail with `Cannot add property experimental, object is not extensible` during `PHASE_PRODUCTION_BUILD` with PostHog keys.
+
+`next.config.ts` now resolves any PostHog wrapper as Next itself does:
+
+1. call the wrapper with the real `(phase, { defaultConfig })` arguments when it is a function;
+2. await either synchronous or Promise results;
+3. return the concrete config object to Next.
+
+The production-build regression loads the real config with dummy PostHog credentials, verifies the base config is preserved, invokes the resulting Webpack config without compiling, and proves PostHog applies `hidden-source-map`. This constructs the upload plugin but does not execute compilation or contact PostHog.
+
+PostHog remains a dev/build dependency. Moving it into production dependencies would add seven current high audit findings through its CLI subtree. Source-map builds with PostHog credentials must therefore install dev dependencies. If the module is absent, both CommonJS `MODULE_NOT_FOUND` and ESM `ERR_MODULE_NOT_FOUND` fail closed with: `PostHog source-map builds require dev dependencies. Run npm ci without --omit=dev.` Production-server config never imports PostHog even when the credentials remain in the runtime environment.
+
+### UUID advisory semantics
+
+The audit policy now pins both the graph and the reviewed advisory meaning:
+
+- installed affected node: `uuid@9.0.1`;
+- npm source: `1119441`;
+- name/dependency: `uuid`;
+- title: `uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided`;
+- severity: `moderate`;
+- range: `<11.1.1`;
+- CWE set: `CWE-787`, `CWE-1285`.
+
+Mutation tests change the title, range, and CWE set independently and prove each change fails the policy. Any advisory reinterpretation now forces a fresh reachability review instead of inheriting the old waiver from the same npm source number.
+
+### Fix round 2 verification
+
+| Command | Result |
+| --- | --- |
+| Focused config, audit, DOCX, Sharp, and browse tests | 14 passed, 0 failed. |
+| `npm run tscheck` | Passed. |
+| `npm run lint` | Passed. |
+| Key-free `npm test` | 306 passed, 19 key-gated skips, 0 failed. |
+| `npm run build` without PostHog credentials | Passed on Next.js 15.5.23. |
+| `npm audit --omit=dev --json` | 0 critical, 0 high, 8 moderate. |
+| `npm audit --omit=dev --audit-level=high --json` | Exit 0. |
+| `git diff --check` | Passed. |

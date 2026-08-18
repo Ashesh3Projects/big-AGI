@@ -1,5 +1,5 @@
 import type { NextConfig } from 'next';
-import type { WebpackConfigContext } from 'next/dist/server/config-shared';
+import type { NextConfig as NextConfigContext, WebpackConfigContext } from 'next/dist/server/config-shared';
 import { PHASE_PRODUCTION_BUILD } from 'next/constants';
 import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
@@ -148,13 +148,38 @@ if (process.env.ANALYZE_BUNDLE) {
   nextConfig = withBundleAnalyzer({ openAnalyzer: true })(nextConfig) as NextConfig;
 }
 
-export default async function buildNextConfig(phase: string): Promise<NextConfig> {
+type ResolvableNextConfig = NextConfig | Promise<NextConfig>;
+
+type NextConfigFactory = (
+  phase: string,
+  context: { defaultConfig: NextConfigContext },
+) => ResolvableNextConfig;
+
+async function resolveNextConfig(
+  config: ResolvableNextConfig | NextConfigFactory,
+  phase: string,
+  context: { defaultConfig: NextConfigContext },
+): Promise<NextConfig> {
+  return await (typeof config === 'function' ? config(phase, context) : config);
+}
+
+export default async function buildNextConfig(
+  phase: string,
+  context: { defaultConfig: NextConfigContext },
+): Promise<NextConfig> {
   if (phase !== PHASE_PRODUCTION_BUILD || !process.env.POSTHOG_API_KEY || !process.env.POSTHOG_ENV_ID)
     return nextConfig;
 
-  const { withPostHogConfig } = await import('@posthog/nextjs-config');
+  let withPostHogConfig: typeof import('@posthog/nextjs-config').withPostHogConfig;
+  try {
+    ({ withPostHogConfig } = await import('@posthog/nextjs-config'));
+  } catch (error) {
+    if (error instanceof Error && 'code' in error && (error.code === 'MODULE_NOT_FOUND' || error.code === 'ERR_MODULE_NOT_FOUND'))
+      throw new Error('PostHog source-map builds require dev dependencies. Run npm ci without --omit=dev.', { cause: error });
+    throw error;
+  }
   console.log(' 🧠 \x1b[1mbig-AGI\x1b[0m: building with PostHog issue reporting and source maps...');
-  return withPostHogConfig(nextConfig, {
+  const wrappedConfig = withPostHogConfig(nextConfig, {
     personalApiKey: process.env.POSTHOG_API_KEY,
     envId: process.env.POSTHOG_ENV_ID,
     host: 'https://us.i.posthog.com', // backtrace upload host
@@ -166,4 +191,5 @@ export default async function buildNextConfig(phase: string): Promise<NextConfig
       deleteAfterUpload: false, // false: leave them in the tree, which would also help debugging of open-source installs
     },
   });
+  return resolveNextConfig(wrappedConfig as ResolvableNextConfig | NextConfigFactory, phase, context);
 }

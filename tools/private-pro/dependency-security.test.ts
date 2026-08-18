@@ -26,6 +26,43 @@ const EXPECTED_MODERATE_AUDIT = {
   uuid: [1119441],
 } as const;
 
+const EXPECTED_UUID_ADVISORY = {
+  source: 1119441,
+  name: 'uuid',
+  dependency: 'uuid',
+  title: 'uuid: Missing buffer bounds check in v3/v5/v6 when buf is provided',
+  severity: 'moderate',
+  cwe: ['CWE-787', 'CWE-1285'],
+  range: '<11.1.1',
+} as const;
+
+type AuditAdvisory = {
+  source: number;
+  name: string;
+  dependency: string;
+  title: string;
+  severity: string;
+  cwe: string[];
+  range: string;
+};
+
+function inspectReviewedUuidAdvisory(value: unknown): typeof EXPECTED_UUID_ADVISORY | null {
+  if (!value || typeof value !== 'object') return null;
+  const advisory = value as Partial<AuditAdvisory>;
+  const normalized = {
+    source: advisory.source,
+    name: advisory.name,
+    dependency: advisory.dependency,
+    title: advisory.title,
+    severity: advisory.severity,
+    cwe: advisory.cwe,
+    range: advisory.range,
+  };
+  return assert.deepEqual(normalized, EXPECTED_UUID_ADVISORY) === undefined
+    ? EXPECTED_UUID_ADVISORY
+    : null;
+}
+
 test('uses the approved patched private Pro dependency floors', () => {
   assert.match(packageJson.dependencies.next, /^~15\.(?:5\.(?:2[3-9]|[3-9]\d)|[6-9]\.)/);
   assert.match(packageJson.dependencies.nanoid, /^(?:\^|~)?(?:5\.1\.1[6-9]|5\.[2-9]|6\.)/);
@@ -100,6 +137,78 @@ test('loads Next config without dev-only PostHog tooling when upload is disabled
   assert.equal(result.status, 0, result.stderr);
 });
 
+test('resolves the PostHog wrapper to a production build config object', () => {
+  const script = `
+    process.env.POSTHOG_API_KEY = 'dummy-token';
+    process.env.POSTHOG_ENV_ID = 'dummy-env';
+    delete process.env.ANALYZE_BUNDLE;
+    const loadConfig = require('next/dist/server/config').default;
+    const { PHASE_PRODUCTION_BUILD } = require('next/constants');
+    loadConfig(PHASE_PRODUCTION_BUILD, process.cwd(), { silent: true })
+      .then(config => {
+        if (typeof config.webpack !== 'function') throw new Error('PostHog webpack config was not resolved');
+        if (!config.reactStrictMode) throw new Error('base Next config was not preserved');
+        const webpackConfig = config.webpack({
+          resolve: { alias: {} },
+          experiments: {},
+          plugins: [],
+          output: { environment: {} },
+          optimization: { splitChunks: { minSize: 1 } },
+        }, {
+          isServer: false,
+          webpack: { NormalModuleReplacementPlugin: class {} },
+        });
+        if (webpackConfig.devtool !== 'hidden-source-map') throw new Error('PostHog source-map webpack config was not applied');
+      })
+      .catch(error => {
+        console.error(error);
+        process.exitCode = 1;
+      });
+  `;
+  const result = spawnSync(process.execPath, ['-e', script], {
+    cwd: new URL('../..', import.meta.url),
+    encoding: 'utf8',
+    env: { ...process.env, NODE_ENV: 'production' },
+  });
+
+  assert.equal(result.status, 0, result.stderr);
+});
+
+test('fails closed when a PostHog source-map build omits dev dependencies', () => {
+  for (const errorCode of ['MODULE_NOT_FOUND', 'ERR_MODULE_NOT_FOUND']) {
+    const script = `
+      const Module = require('node:module');
+      const originalLoad = Module._load;
+      Module._load = function(request, parent, isMain) {
+        if (request === '@posthog/nextjs-config') {
+          const error = new Error('Cannot find module @posthog/nextjs-config');
+          error.code = ${JSON.stringify(errorCode)};
+          throw error;
+        }
+        return originalLoad.call(this, request, parent, isMain);
+      };
+      process.env.POSTHOG_API_KEY = 'dummy-token';
+      process.env.POSTHOG_ENV_ID = 'dummy-env';
+      const loadConfig = require('next/dist/server/config').default;
+      const { PHASE_PRODUCTION_BUILD } = require('next/constants');
+      loadConfig(PHASE_PRODUCTION_BUILD, process.cwd(), { silent: true })
+        .then(() => {
+          throw new Error('PostHog build unexpectedly loaded without its dev dependency');
+        })
+        .catch(error => {
+          if (!String(error.message).includes('npm ci without --omit=dev')) throw error;
+        });
+    `;
+    const result = spawnSync(process.execPath, ['-e', script], {
+      cwd: new URL('../..', import.meta.url),
+      encoding: 'utf8',
+      env: { ...process.env, NODE_ENV: 'production' },
+    });
+
+    assert.equal(result.status, 0, `${errorCode}: ${result.stderr}`);
+  }
+});
+
 test('locks production dependency paths to audited patched versions', () => {
   const packages = packageLock.packages;
 
@@ -141,4 +250,18 @@ test('allows only the reviewed Firebase Admin moderate advisory chain', () => {
     name,
     (value as { severity: string; via: Array<string | { source: number }> }).via.map(item => typeof item === 'string' ? item : item.source),
   ])), EXPECTED_MODERATE_AUDIT);
+  const uuidNode = audit.vulnerabilities.uuid;
+  assert.equal(packageLock.packages['node_modules/uuid']?.version, '9.0.1');
+  assert.deepEqual(inspectReviewedUuidAdvisory(uuidNode.via[0]), EXPECTED_UUID_ADVISORY);
+});
+
+test('requires re-review when UUID advisory semantics change', () => {
+  const baseline = { ...EXPECTED_UUID_ADVISORY, cwe: [...EXPECTED_UUID_ADVISORY.cwe] };
+  for (const mutation of [
+    { ...baseline, title: `${baseline.title} changed` },
+    { ...baseline, range: '<12.0.0' },
+    { ...baseline, cwe: ['CWE-787'] },
+  ]) {
+    assert.throws(() => inspectReviewedUuidAdvisory(mutation));
+  }
 });
