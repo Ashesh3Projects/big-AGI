@@ -221,20 +221,6 @@ describe('private Pro vault lifecycle', () => {
     assert.deepEqual(order, ['assets', 'session', 'device', 'signout']);
   });
 
-  test('logout joins an active migration before clearing session and signing out', async () => {
-    const order: string[] = [];
-    const runtime = {
-      engine: null, keyset: null, masterKey: null, devices: [], assets: null,
-      migration: { async stopAndWait() { order.push('migration'); } },
-    } as never;
-    await logoutPrivateProVaultRuntime(runtime, 'uid-test', {
-      async clearSession() { order.push('session'); },
-      clearDeviceId() { order.push('device'); },
-      async signOut() { order.push('signout'); },
-    });
-    assert.deepEqual(order, ['migration', 'session', 'device', 'signout']);
-  });
-
   test('full wipe routes through engine logout before deleting the vault database and reloading', async () => {
     const order: string[] = [];
     const runtime = {
@@ -254,21 +240,6 @@ describe('private Pro vault lifecycle', () => {
     });
 
     assert.deepEqual(order, ['engine', 'device', 'db', 'signout', 'reload']);
-  });
-
-  test('full wipe joins an active migration before deleting the vault database', async () => {
-    const order: string[] = [];
-    const runtime = {
-      engine: null, keyset: null, masterKey: null, devices: [], assets: null,
-      migration: { async stopAndWait() { order.push('migration'); } },
-    } as never;
-    await fullWipePrivateProVaultRuntime(runtime, 'uid-test', {
-      async clearSession() { order.push('session'); },
-      clearDeviceId() { order.push('device'); },
-      async deleteVaultDB() { order.push('db'); },
-      async signOut() { order.push('signout'); },
-    });
-    assert.deepEqual(order, ['migration', 'session', 'device', 'db', 'signout']);
   });
 
   test('new users remain blocked in setup until keyset creation and remote apply complete', async () => {

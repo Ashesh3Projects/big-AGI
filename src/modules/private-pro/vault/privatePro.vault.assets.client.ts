@@ -148,15 +148,6 @@ function manifestFromAsset(asset: DBlobDBAsset): PrivateProVaultAssetManifest {
     };
 }
 
-function canonicalJson(value: unknown): string {
-  if (value === null || typeof value !== 'object') return JSON.stringify(value);
-  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`;
-  return `{${Object.entries(value as Record<string, unknown>)
-    .sort(([left], [right]) => left < right ? -1 : left > right ? 1 : 0)
-    .map(([key, nested]) => `${JSON.stringify(key)}:${canonicalJson(nested)}`)
-    .join(',')}}`;
-}
-
 function assetFromManifest(manifest: PrivateProVaultAssetManifest, base64: string): DBlobDBAsset {
   return {
     id: manifest.assetId,
@@ -542,45 +533,11 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
   };
 
   return {
-    async describe(assetIds: readonly DBlobAssetId[], signal?: AbortSignal) {
-      const descriptions = [];
+    async verifyCloud(assetIds: readonly DBlobAssetId[], signal?: AbortSignal) {
       for (const assetId of [...new Set(assetIds)]) {
         throwIfAborted(signal);
-        const asset = await local.getAsset(assetId);
-        if (!asset) continue;
-        const bytes = Uint8Array.from(atob(asset.data.base64), character => character.charCodeAt(0));
-        try {
-          descriptions.push({
-            assetId,
-            plaintextBytes: bytes.byteLength,
-            contentSha256: await hashBytes(bytes, signal),
-            manifestSha256: await hashBytes(new TextEncoder().encode(canonicalJson(manifestFromAsset(asset))), signal),
-          });
-        } finally {
-          bytes.fill(0);
-        }
+        await decryptAsset(assetId, await downloadChunks(assetId, signal));
       }
-      return descriptions;
-    },
-
-    async verifyCloud(assets: readonly { assetId: string; plaintextBytes: number; contentSha256: string; manifestSha256: string }[], signal?: AbortSignal) {
-      for (const expected of assets) {
-        throwIfAborted(signal);
-        const asset = await decryptAsset(expected.assetId, await downloadChunks(expected.assetId, signal));
-        const bytes = Uint8Array.from(atob(asset.data.base64), character => character.charCodeAt(0));
-        try {
-          if (bytes.byteLength !== expected.plaintextBytes || await hashBytes(bytes, signal) !== expected.contentSha256
-            || await hashBytes(new TextEncoder().encode(canonicalJson(manifestFromAsset(asset))), signal) !== expected.manifestSha256)
-            throw new Error('Encrypted attachment differs from the frozen migration asset.');
-        } finally {
-          bytes.fill(0);
-        }
-      }
-    },
-
-    async deleteLocal(asset: { assetId: string }, signal?: AbortSignal) {
-      throwIfAborted(signal);
-      await local.deleteAsset(asset.assetId);
     },
 
     async prepareForUpload(assetIds: readonly DBlobAssetId[], signal?: AbortSignal) {

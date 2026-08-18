@@ -640,20 +640,11 @@ describe('private Pro encrypted vault asset client', () => {
   test('verifies cloud asset ciphertext by fully decrypting without materializing plaintext', async () => {
     const { client, local, original } = await fixture();
     await client.prepareForUpload([ASSET_ID]);
-    const [descriptor] = await client.describe([ASSET_ID]);
     local.assets.delete(ASSET_ID);
 
-    await client.verifyCloud([descriptor]);
+    await client.verifyCloud([ASSET_ID]);
 
     assert.equal(local.assets.has(ASSET_ID), false);
     assert.deepEqual(original.id, ASSET_ID);
-  });
-
-  test('rejects cloud asset bytes or encrypted manifest metadata that differ from the frozen descriptor', async () => {
-    const payloadChanged = await fixture();
-    await payloadChanged.client.prepareForUpload([ASSET_ID]);
-    const [descriptor] = await payloadChanged.client.describe([ASSET_ID]);
-    await assert.rejects(payloadChanged.client.verifyCloud([{ ...descriptor, contentSha256: 'f'.repeat(64) }]), /differs from the frozen/i);
-    await assert.rejects(payloadChanged.client.verifyCloud([{ ...descriptor, manifestSha256: 'e'.repeat(64) }]), /differs from the frozen/i);
   });
 });

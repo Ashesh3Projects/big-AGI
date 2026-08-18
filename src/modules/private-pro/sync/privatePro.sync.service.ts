@@ -35,7 +35,6 @@ export interface DeleteEntityRequest {
 }
 
 export interface CleanupMigratedEntityRequest {
-  operationId: string;
   entityType: 'chat' | 'persona';
   entityId: string;
   sourceVersion: string;
@@ -156,7 +155,7 @@ export function createPrivateProSyncService(repository: PrivateProSyncRepository
     },
 
     cleanupMigratedEntity(identity: PrivateProIdentity, request: CleanupMigratedEntityRequest) {
-      if (!request.operationId || !request.entityId || !/^\d+:[a-f0-9]{64}$/.test(request.sourceVersion))
+      if (!request.entityId || !/^\d+:[a-f0-9]{64}$/.test(request.sourceVersion))
         throw new Error('Legacy migration cleanup input is invalid.');
       return repository.cleanupMigratedEntity({ uid: identity.uid, ...request });
     },

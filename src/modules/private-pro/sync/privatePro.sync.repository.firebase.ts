@@ -1,7 +1,6 @@
 import { FieldValue, type DocumentData, type DocumentReference, type Firestore } from 'firebase-admin/firestore';
 
 import { getPrivateProFirestore } from '../firebase/firebase.admin';
-import { resumePrivateProLegacyMigrationCleanup } from './privatePro.sync.repository';
 import type {
   PrivateProChatManifest,
   PrivateProChatUpload,
@@ -10,8 +9,6 @@ import type {
   PrivateProEntityType,
   PrivateProPutEntityResult,
   PrivateProPutPersonaRequest,
-  PrivateProLegacyCleanupPort,
-  PrivateProLegacyCleanupReceipt,
   PrivateProSyncRepository,
   PrivateProTombstone,
 } from './privatePro.sync.repository';
@@ -228,85 +225,34 @@ export class FirebasePrivateProSyncRepository implements PrivateProSyncRepositor
     });
   }
 
-  async cleanupMigratedEntity(input: { uid: string; operationId: string; entityType: PrivateProEntityType; entityId: string; sourceVersion: string }) {
-    return resumePrivateProLegacyMigrationCleanup(new FirebasePrivateProLegacyCleanupPort(this.db), input);
-  }
-}
-
-function cleanupReceiptRef(db: Firestore, uid: string, operationId: string) {
-  return db.doc(`users/${uid}/legacyCleanupReceipts/${operationId}`);
-}
-
-class FirebasePrivateProLegacyCleanupPort implements PrivateProLegacyCleanupPort {
-  constructor(private readonly db: Firestore) {}
-
-  async prepare(input: Parameters<PrivateProLegacyCleanupPort['prepare']>[0]) {
+  async cleanupMigratedEntity(input: { uid: string; entityType: PrivateProEntityType; entityId: string; sourceVersion: string }) {
     const [revisionText, contentHash] = input.sourceVersion.split(':');
     const expectedRevision = Number(revisionText);
-    const canonical = input.entityType === 'chat' ? chatRef(this.db, input.uid, input.entityId) : personaRef(this.db, input.uid, input.entityId);
-    const receiptRef = cleanupReceiptRef(this.db, input.uid, input.operationId);
-    return this.db.runTransaction(async transaction => {
-      const [receiptSnapshot, canonicalSnapshot] = await Promise.all([transaction.get(receiptRef), transaction.get(canonical)]);
-      if (receiptSnapshot.exists) {
-        const receipt = receiptSnapshot.data() as PrivateProLegacyCleanupReceipt;
-        if (receipt.uid !== input.uid || receipt.entityType !== input.entityType || receipt.entityId !== input.entityId || receipt.sourceVersion !== input.sourceVersion)
-          throw new Error('Legacy cleanup operation ID is already used by different content.');
-        return { status: receipt.status === 'complete' ? 'complete' as const : 'ready' as const, receipt };
-      }
-      if (!canonicalSnapshot.exists) return { status: 'already-deleted' as const };
-      const value = canonicalSnapshot.data();
-      if (personaRevision(value) !== expectedRevision || currentHash(value) !== contentHash) return { status: 'conflict' as const };
-      const canonicalOperationId = typeof value?.operationId === 'string' ? value.operationId : null;
-      const revisionPath = input.entityType === 'chat' && canonicalOperationId
-        ? canonical.collection('revisions').doc(`${expectedRevision}-${canonicalOperationId}`).path
-        : null;
-      const chunkIds = input.entityType === 'chat' && Array.isArray(value?.chunkIds)
-        ? value.chunkIds.filter((chunkId): chunkId is string => typeof chunkId === 'string')
-        : [];
-      const receipt: PrivateProLegacyCleanupReceipt = {
-        uid: input.uid, operationId: input.operationId, entityType: input.entityType, entityId: input.entityId,
-        sourceVersion: input.sourceVersion, revisionPath, chunkIds, chunkCursor: 0, status: 'children',
-      };
-      transaction.create(receiptRef, receipt);
+    const canonical = input.entityType === 'chat'
+      ? chatRef(this.db, input.uid, input.entityId)
+      : personaRef(this.db, input.uid, input.entityId);
+    const revisionRoot = input.entityType === 'chat' ? canonical.collection('revisions') : null;
+    const cleanup = await this.db.runTransaction(async transaction => {
+      const snapshot = await transaction.get(canonical);
+      if (!snapshot.exists) return { status: 'already-deleted' as const, revisionPath: null as string | null };
+      const value = snapshot.data();
+      if (personaRevision(value) !== expectedRevision || currentHash(value) !== contentHash)
+        return { status: 'conflict' as const, revisionPath: null as string | null };
+      const operationId = typeof value?.operationId === 'string' ? value.operationId : null;
       transaction.delete(canonical);
-      return { status: 'ready' as const, receipt };
+      return {
+        status: 'deleted' as const,
+        revisionPath: revisionRoot && operationId ? revisionRoot.doc(`${expectedRevision}-${operationId}`).path : null,
+      };
     });
-  }
-
-  async deleteChunk(input: Parameters<PrivateProLegacyCleanupPort['deleteChunk']>[0]) {
-    const receiptRef = cleanupReceiptRef(this.db, input.receipt.uid, input.receipt.operationId);
-    return this.db.runTransaction(async transaction => {
-      const snapshot = await transaction.get(receiptRef);
-      if (!snapshot.exists) throw new Error('Legacy cleanup receipt was not found.');
-      const receipt = snapshot.data() as PrivateProLegacyCleanupReceipt;
-      if (receipt.chunkCursor > input.expectedCursor) return receipt;
-      if (receipt.chunkCursor !== input.expectedCursor || receipt.chunkIds[input.expectedCursor] !== input.chunkId)
-        throw new Error('Legacy cleanup cursor conflicts with this retry.');
-      if (receipt.revisionPath) transaction.delete(this.db.doc(receipt.revisionPath).collection('chunks').doc(input.chunkId));
-      const next = { ...receipt, chunkCursor: receipt.chunkCursor + 1 };
-      transaction.set(receiptRef, next);
-      return next;
-    });
-  }
-
-  async listUnexpectedChunks(receipt: PrivateProLegacyCleanupReceipt) {
-    if (!receipt.revisionPath) return [];
-    const snapshot = await this.db.doc(receipt.revisionPath).collection('chunks').get();
-    return snapshot.docs.map(document => document.id).filter(chunkId => !receipt.chunkIds.includes(chunkId));
-  }
-
-  async finalize(input: { receipt: PrivateProLegacyCleanupReceipt }) {
-    const receiptRef = cleanupReceiptRef(this.db, input.receipt.uid, input.receipt.operationId);
-    return this.db.runTransaction(async transaction => {
-      const snapshot = await transaction.get(receiptRef);
-      if (!snapshot.exists) throw new Error('Legacy cleanup receipt was not found.');
-      const receipt = snapshot.data() as PrivateProLegacyCleanupReceipt;
-      if (receipt.status === 'complete') return receipt;
-      if (receipt.chunkCursor !== receipt.chunkIds.length) throw new Error('Legacy cleanup children are incomplete.');
-      if (receipt.revisionPath) transaction.delete(this.db.doc(receipt.revisionPath));
-      const complete = { ...receipt, status: 'complete' as const };
-      transaction.set(receiptRef, complete);
-      return complete;
-    });
+    if (cleanup.status === 'deleted' && cleanup.revisionPath) {
+      const revision = this.db.doc(cleanup.revisionPath);
+      const chunks = await revision.collection('chunks').get();
+      const batch = this.db.batch();
+      for (const chunk of chunks.docs) batch.delete(chunk.ref);
+      batch.delete(revision);
+      await batch.commit();
+    }
+    return cleanup.status;
   }
 }

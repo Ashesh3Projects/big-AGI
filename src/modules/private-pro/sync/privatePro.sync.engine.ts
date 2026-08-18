@@ -61,7 +61,7 @@ export interface PrivateProLegacyMigrationItem {
 export interface PrivateProLegacyMigrationTransport {
   listForMigration(signal: AbortSignal): Promise<PrivateProLegacyMigrationItem[]>;
   currentVersion(entityType: PrivateProEntityType, entityId: string, signal: AbortSignal): Promise<string | null>;
-  cleanupMigrationItem(item: PrivateProLegacyMigrationItem, operationId: string, signal: AbortSignal): Promise<void>;
+  cleanupMigrationItem(item: PrivateProLegacyMigrationItem, signal: AbortSignal): Promise<void>;
 }
 
 export type PrivateProSyncStartResult = 'started' | 'already-started' | 'binding-conflict';

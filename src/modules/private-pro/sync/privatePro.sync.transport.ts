@@ -110,10 +110,9 @@ export function createPrivateProLegacyMigrationTransport(uid: string): PrivatePr
       return migrationVersion(remote.entity, remote.revision);
     },
 
-    async cleanupMigrationItem(_item, operationId, signal) {
+    async cleanupMigrationItem(_item, signal) {
       if (signal.aborted) throw new DOMException('Legacy sync migration was cancelled.', 'AbortError');
       const result = await apiAsyncNode.privateProSync.cleanupMigratedEntity.mutate({
-        operationId,
         entityType: _item.entity.entityType,
         entityId: _item.entity.entityId,
         sourceVersion: _item.sourceVersion,

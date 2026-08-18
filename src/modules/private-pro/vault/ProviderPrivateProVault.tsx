@@ -38,11 +38,11 @@ import {
   createPrivateProVaultLocalMigrationPort,
   createPrivateProVaultMigration,
   type PrivateProVaultMigration,
-  type PrivateProVaultEncryptedExportConfirmation,
   type PrivateProVaultMigrationProgress,
 } from './privatePro.vault.migration';
 import { createPrivateProLegacyMigrationTransport } from '../sync/privatePro.sync.transport';
 import { privateProVaultRecordId } from './privatePro.vault.recordIds';
+import { deleteDBAsset } from '~/common/stores/blob/dblobs-portability';
 
 
 export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'migrating' | 'error';
@@ -94,16 +94,6 @@ export interface PrivateProVaultRuntimeState {
   assets: PrivateProVaultAssetClient | null;
   migration?: PrivateProVaultMigration | null;
   migrationProgress?: PrivateProVaultMigrationProgress | null;
-  migrationActivation?: PrivateProVaultMigrationActivation | null;
-  migrationEpoch?: number;
-}
-
-interface PrivateProVaultMigrationActivation {
-  epoch: number;
-  migration: PrivateProVaultMigration;
-  invalidated: boolean;
-  unsubscribe: (() => void) | null;
-  stopPromise: Promise<void> | null;
 }
 
 export interface PrivateProVaultRuntimeCleanupPort {
@@ -119,7 +109,6 @@ async function clearPrivateProVaultRuntime(
   uid: string,
   port: PrivateProVaultRuntimeCleanupPort,
 ) {
-  await stopPrivateProVaultMigrationActivation(runtime);
   if (runtime.engine) await runtime.engine.logoutAndClear();
   else {
     await runtime.assets?.clearHydratedAssets();
@@ -135,37 +124,6 @@ async function clearPrivateProVaultRuntime(
   port.clearDeviceId(uid);
 }
 
-function isCurrentPrivateProVaultMigrationActivation(
-  runtime: PrivateProVaultRuntimeState,
-  activation: PrivateProVaultMigrationActivation,
-): boolean {
-  return !activation.invalidated
-    && runtime.migrationActivation === activation
-    && runtime.migrationEpoch === activation.epoch
-    && runtime.migration === activation.migration;
-}
-
-export function stopPrivateProVaultMigrationActivation(
-  runtime: PrivateProVaultRuntimeState,
-  preserveMigration = false,
-): Promise<void> {
-  const activation = runtime.migrationActivation;
-  if (!activation) {
-    const migration = runtime.migration;
-    if (!preserveMigration) runtime.migration = null;
-    return migration?.stopAndWait() ?? Promise.resolve();
-  }
-  if (!activation.invalidated) {
-    activation.invalidated = true;
-    runtime.migrationEpoch = Math.max(runtime.migrationEpoch ?? 0, activation.epoch + 1);
-    activation.unsubscribe?.();
-    activation.unsubscribe = null;
-  }
-  if (!preserveMigration && runtime.migration === activation.migration) runtime.migration = null;
-  activation.stopPromise ??= activation.migration.stopAndWait();
-  return activation.stopPromise;
-}
-
 export async function activatePrivateProVaultRuntime(
   runtime: PrivateProVaultRuntimeState,
   deps: {
@@ -175,43 +133,18 @@ export async function activatePrivateProVaultRuntime(
   },
 ): Promise<void> {
   await runtime.engine?.stopAndWait();
-  await stopPrivateProVaultMigrationActivation(runtime);
+  await runtime.migration?.stopAndWait();
   const migration = deps.createMigration();
-  const epoch = (runtime.migrationEpoch ?? 0) + 1;
-  const activation: PrivateProVaultMigrationActivation = {
-    epoch,
-    migration,
-    invalidated: false,
-    unsubscribe: null,
-    stopPromise: null,
-  };
-  runtime.migrationEpoch = epoch;
   runtime.migration = migration;
-  runtime.migrationActivation = activation;
-  activation.unsubscribe = migration.subscribe(progress => {
-    if (isCurrentPrivateProVaultMigrationActivation(runtime, activation)) deps.onMigrationProgress(progress);
-  });
-  let completed = false;
+  const unsubscribe = migration.subscribe(progress => deps.onMigrationProgress(progress));
   try {
     await migration.run();
-    if (!isCurrentPrivateProVaultMigrationActivation(runtime, activation))
-      throw new DOMException('Vault migration activation was cancelled.', 'AbortError');
     const engine = deps.createEngine();
     runtime.engine = engine;
     await engine.hydrateBeforeOpen();
-    if (!isCurrentPrivateProVaultMigrationActivation(runtime, activation))
-      throw new DOMException('Vault migration activation was cancelled.', 'AbortError');
     await engine.start();
-    if (!isCurrentPrivateProVaultMigrationActivation(runtime, activation))
-      throw new DOMException('Vault migration activation was cancelled.', 'AbortError');
-    completed = true;
   } finally {
-    if (completed) {
-      activation.unsubscribe?.();
-      activation.unsubscribe = null;
-    } else {
-      await stopPrivateProVaultMigrationActivation(runtime, runtime.migration === migration);
-    }
+    unsubscribe();
   }
 }
 
@@ -546,6 +479,7 @@ function createProductionDependencies(
       const local = createPrivateProVaultLocalMigrationPort({
         serializers,
         collectAssetIds: collectPrivateProVaultAssetIds,
+        deleteAsset: deleteDBAsset,
       });
       const legacyCloud = createPrivateProVaultLegacyCloudInventoryPort({
         transport: createPrivateProLegacyMigrationTransport(user.uid),
@@ -571,10 +505,8 @@ function createProductionDependencies(
             download: (recordIds, _signal) => transport.getRecords(recordIds),
           },
           assets: {
-            describe: (assetIds, signal) => assets.describe(assetIds, signal),
             prepareForUpload: (assetIds, signal) => assets.prepareForUpload(assetIds, signal),
-            verifyCloud: (frozenAssets, signal) => assets.verifyCloud(frozenAssets, signal),
-            deleteLocal: (asset, signal) => assets.deleteLocal(asset, signal),
+            verifyCloud: (assetIds, signal) => assets.verifyCloud(assetIds, signal),
           },
           server: {
             async commit(input) {
@@ -584,9 +516,10 @@ function createProductionDependencies(
                 : { status: result.status, phase: result.phase as PrivateProVaultMigrationProgress['phase'] };
             },
           },
+          exportGate: { isConfirmed: async () => false },
           cleanup: {
-            local: (item, _operationId, signal) => local.cleanupLocal(item, signal),
-            cloud: (item, operationId, signal) => legacyCloud.cleanupCloud(item, operationId, signal),
+            local: (item, signal) => local.cleanupLocal(item, signal),
+            cloud: (item, signal) => legacyCloud.cleanupCloud(item, signal),
           },
           collectAssetIds: collectPrivateProVaultAssetIds,
           createOperationId: purpose => `migration-${purpose.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 72)}-${crypto.randomUUID()}`.slice(0, 128),
@@ -651,7 +584,6 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
   const [state, setState] = React.useState<PrivateProVaultPublicState>(INITIAL_STATE);
   const lifecycleRef = React.useRef<PrivateProVaultLifecycle | null>(null);
   const runtimeRef = React.useRef<PrivateProVaultRuntimeState>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null, migration: null, migrationProgress: null });
-  const [pendingExportConfirmation, setPendingExportConfirmation] = React.useState<PrivateProVaultEncryptedExportConfirmation | null>(null);
 
   React.useEffect(() => {
     if (!auth.user) return;
@@ -663,7 +595,6 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     void lifecycle.start();
     return () => {
       unsubscribe();
-      void stopPrivateProVaultMigrationActivation(runtime);
       runtime.engine?.stop();
       lifecycle.destroy();
       lifecycleRef.current = null;
@@ -694,9 +625,6 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     const runtime = runtimeRef.current;
     if (!auth.user || !runtime.masterKey || !runtime.keyset) throw new Error('Unlock the vault first.');
     if (!runtime.assets) throw new Error('Encrypted asset client is unavailable.');
-    const migrationBinding = runtime.migration?.getProgress().phase === 'commit'
-      ? await runtime.migration.getEncryptedExportBinding()
-      : null;
     const response = new Response(await createPrivateProVaultBackupStream({
       uid: auth.user.uid,
       keyset: runtime.keyset,
@@ -707,21 +635,10 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
       collectAssetIds: collectPrivateProVaultAssetIds,
     }));
     const blob = await response.blob();
-    const exportDigest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', await blob.arrayBuffer()))]
-      .map(byte => byte.toString(16).padStart(2, '0')).join('');
     downloadBlob(blob, `Big-AGI-private-pro-encrypted-${new Date().toISOString().slice(0, 10)}.ndjson`);
-    const confirmation = migrationBinding ? { ...migrationBinding, exportDigest } : null;
-    if (confirmation) await runtime.migration!.registerEncryptedExport(confirmation);
-    setPendingExportConfirmation(confirmation);
+    if (runtime.migration && runtime.migration.getProgress().phase === 'commit')
+      await runtime.migration.confirmEncryptedExport();
   }, [auth.user]);
-
-  const confirmEncryptedExport = React.useCallback(async () => {
-    const migration = runtimeRef.current.migration;
-    if (!migration || !pendingExportConfirmation) throw new Error('Create the current encrypted export first.');
-    await migration.confirmEncryptedExport(pendingExportConfirmation);
-    setPendingExportConfirmation(null);
-    await lifecycle().retry();
-  }, [pendingExportConfirmation]);
 
   const importEncryptedBackup = React.useCallback(async (
     stream: ReadableStream<Uint8Array>,
@@ -801,7 +718,6 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     error={state.error}
     migration={runtimeRef.current.migrationProgress ?? null}
     onCreateEncryptedExport={runtimeRef.current.migrationProgress?.phase === 'commit' ? createEncryptedExport : undefined}
-    onConfirmEncryptedExport={runtimeRef.current.migrationProgress?.phase === 'commit' && pendingExportConfirmation ? confirmEncryptedExport : undefined}
     onRetry={() => value.retry()}
     onLogout={() => value.logout()}
   />;
