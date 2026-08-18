@@ -4,7 +4,7 @@
 
 **NOT READY FOR PRODUCTION.**
 
-Local final-fix verification completed through code commit `91cbc2dc6` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
+Local residual-fix verification completed through code commit `e8bcc2195` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch is ready for Pro branch integration, but production still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
 
 This verification was local and read-only except for generated files inside the isolated worktree. It did not:
 
@@ -23,6 +23,7 @@ This verification was local and read-only except for generated files inside the 
 - Acknowledgment verification stabilization: `bf7ff8848`
 - One-shot audit evidence verification: `b9b04d6a1`
 - Final persistence, restore, analytics, recovery, route, and plaintext-backup fixes: `3f499a60d..91cbc2dc6`
+- Residual persistence, atomic restore, build analytics, recovery prompt, and rules fixes: `5c504abaa..e8bcc2195`
 - Verification timezone: Asia/Calcutta, UTC+05:30
 - OS: Windows 10 Pro, 10.0.19045, x64
 - Node.js: `v24.5.0`
@@ -111,33 +112,33 @@ TDD and stress evidence:
 
 ## Command matrix
 
-Final-fix commands below supersede the earlier Task 23 counts. All were run from `ec97c78d5` unless noted.
+Residual-fix commands below supersede the earlier final-fix counts. All were run from `e8bcc2195` unless noted.
 
 | Status | Command | Result |
 |---|---|---|
-| PASS | Final focused Private Pro/security suite | 230 passed, 0 failed. Covers portable plaintext suppression, volatile and legacy DBlob cleanup, exact encrypted asset API surface, cloud backup merge, analytics shutdown, recovery audit, engine ordering, crypto, router, schemas, headers, HTML/SVG isolation, and encrypted backup. |
-| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 257 passed, 0 failed. |
-| PASS | `npm run test:private-pro-tools` | 62 passed, 0 failed. |
-| PASS | `npm run test:firebase:exec` with Microsoft JDK 21 | 35 passed, 0 failed. Expected permission-denied lines asserted browser denial. |
+| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 268 passed, 0 failed. Includes exhaustive durable-store inventory, real Storage prototype cleanup, portable PC A/B reconstruction, atomic backup merge, exact verification, committed-failure recovery, PostHog isolation source boundaries, and visible recovery action. |
+| PASS | `npm run test:private-pro-tools` | 63 passed, 0 failed. Includes executable Private Pro production-build proof that PostHog tooling is not imported or applied with dummy credentials. |
+| PASS | `npm run test:firebase:exec` with Microsoft JDK 21 | 36 passed, 0 failed. Expected permission-denied lines asserted browser denial, including the new backup-merge receipt path. |
 | PASS | `npm run tscheck` | Root and tools projects passed. |
 | PASS | `npm run lint` | Passed. |
 | PASS | Private Pro production build with analytics environment variables set and non-secret placeholder deployment config | Compiled, linted, type-checked, generated 17 static pages, and completed trace collection. Analytics source and mount contract tests prove Private Pro excludes GA, PostHog, Vercel Analytics, and Speed Insights. |
 | PASS | `npm audit --omit=dev --audit-level=high --json` | 0 critical, 0 high, 8 reviewed moderate findings. |
 | KNOWN UNRELATED BASELINE | `npm test` with ambient live-vendor environment | Private Pro tools passed. Repository result: 275 passed, 18 skipped, 1 failed. Only failure: live Groq catalog drift for three stale curated IDs. No Private Pro test failed. |
-| PASS | Key-free `npm test` with all live-vendor and local-host opt-in variables cleared | 278 passed, 19 skipped, 0 failed. |
+| PASS | Key-free `npm test` with all live-vendor and local-host opt-in variables cleared | Private Pro tools: 63 passed. Source: 289 passed, 19 skipped, 0 failed. |
 | PASS WITH LIVE BLOCKERS | `npm run private-pro:security-audit -- --report-only` | Exit 0 by report-only contract: 47 pass, 8 warn, 43 block; clean-worktree check passed. |
 | EXPECTED BLOCKING FAILURE | `npm run private-pro:security-audit` | Exit 1 with the same 47 pass, 8 warn, 43 block live findings. |
 
 ### Final-fix coverage
 
-- Every Task 11 portable Zustand/localStorage key and the chat IndexedDB cell use a central build-activated volatile adapter in Private Pro. Open behavior remains durable.
-- Setup/logout clear only the explicit portable key/cell list plus the dedicated `Big-AGI/largeAssets` plaintext table and volatile DBlob map.
+- Every persisted Zustand store and every direct durable browser owner is machine-inventoried and classified. Every spec-portable Zustand/localStorage key and the chat IndexedDB cells use the central build-activated volatile adapter. Open behavior remains durable.
+- Portable settings include chat, call, Beam, image/T2I, speech, browsing, Google integration, AI preferences, UI, theme, UX labs, purposes, sharing secrets, models, folders, personas, chats, and Scratch Clip. Transient pane state, Beam-open state, UI inspector/panel state, logs, metrics, device identity, file handles, analytics opt-out, and V1 markers stay excluded.
+- Setup/logout clear only the explicit portable key/cell list plus the dedicated `Big-AGI/largeAssets` plaintext table and volatile DBlob map. Cleanup uses the captured native Storage method, so the active prototype gate cannot intercept physical deletion.
 - DBlobs stay runtime-available in memory; new referenced assets finalize encrypted cloud storage before the record outbox reference becomes durable. Reload is blocked while an asset is pending.
 - `privateProSync` and the legacy `privateProAssets` namespace are absent. Only four encrypted procedures are mounted under `privateProVaultAssets`.
-- Backup import is a cloud merge: backup-key decryption is staged, assets upload first under the active vault key, records are re-encrypted with active key version and current revisions, existing cloud-only records remain, and cloud reconstruction is downloaded and verified before engine hydration reports success.
-- Private Pro analytics are disabled at mount and source flag boundaries even if analytics environment variables are present.
+- Backup import is one bounded atomic cloud merge: backup-key decryption is staged, assets finalize first under the active vault key, every base revision is validated before any record write, records are re-encrypted with the active key version, existing cloud-only records remain, exact canonical reconstruction is downloaded and compared, and committed-but-unhydrated failures block ready state until restart/reconcile.
+- Private Pro analytics are disabled at mount and source flag boundaries. The Next production-build phase also returns before importing the PostHog source-map wrapper, even when server credentials are present.
 - The generic unencrypted Flash backup/restore UI is not rendered in Private Pro; only the encrypted cloud-merge flow is exposed.
-- Password/recovery rotation records one bounded server security event in the same keyset transaction and prompts for immediate revocation of other remembered devices.
+- Password/recovery rotation records one bounded server security event in the same keyset transaction and renders an immediate ready-state revocation prompt outside the account modal.
 
 The rows below this note are the historical Task 23 matrix from 2026-08-18 UTC+05:30. They are retained as earlier evidence and are superseded by the final-fix table above where counts or audit state changed.
 
