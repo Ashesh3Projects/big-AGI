@@ -33,7 +33,9 @@ npm run private-pro:security-audit -- --report-only
 
 The security audit uses the exact `gcloud firestore databases describe` command and requires the complete current resource shape: name, database type, edition, location, deletion protection, PITR enablement, earliest version time, and retention period. It accepts only the exact current combinations of disabled PITR with `3600s` or enabled PITR with `604800s`. Missing, malformed, unknown, or inconsistent fields block.
 
-The audit also reads restore rehearsal evidence from `infra/private-pro/firestore-restore-evidence.json`, or from the path in `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE`. Missing evidence blocks. Valid evidence must be no older than 90 days. The canonical evidence file does not exist because no restore rehearsal has run.
+The audit also reads restore rehearsal evidence from the absolute canonical path `infra/private-pro/firestore-restore-evidence.json`. An override in `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE` is accepted only when it is absolute and its real path is below the absolute `PRIVATE_PRO_RESTORE_EVIDENCE_ROOT`. Relative paths, traversal, and symlink escapes block. Evidence is capped at 1 MiB and JSON duplicate keys block.
+
+Evidence verification also requires `PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA` and `PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY` at audit time. The expected commit is the exact 40-character audited release commit. The HMAC key is a canonical base64 value decoding to 32-64 bytes. Do not write either value into the evidence file, repository, command transcript, or report. Missing key, missing expected commit, unsigned evidence, wrong MAC, or a MAC-invalid field change blocks. Valid evidence must be no older than 90 days. The canonical evidence file does not exist because no restore rehearsal has run.
 
 ## Options
 
@@ -278,31 +280,72 @@ Rehearsal checks:
 
 ## Restore evidence
 
-Commit only the redacted structure below. The audit exposes a strict validator for this schema and rejects extra fields.
+The evidence file is generated from rehearsal tooling or an operator collection pipeline. Do not create it by editing pass/fail booleans. The collector records provenance and redacted measurements, sorts JSON object keys recursively, excludes only `macBase64`, computes HMAC-SHA256 over the UTF-8 canonical JSON, then adds `macBase64` and writes the final JSON. The audit independently repeats that canonicalization and verifies the MAC with the audit-time key.
+
+The evidence schema is strict. Extra or missing keys block.
 
 ```json
 {
   "schemaVersion": 1,
-  "evidenceType": "firestore-restore-rehearsal",
-  "collectedAt": "2026-08-18T00:00:00Z",
-  "sourceDatabase": "(default)",
-  "restoreMethod": "pitr-clone",
-  "targetIsolation": "separate-database",
-  "targetDatabaseDefault": false,
-  "status": "passed",
-  "sourceUnchanged": true,
-  "targetInitiallyEmpty": true,
-  "indexesVerified": true,
-  "rulesVerified": true,
-  "configVerified": true,
-  "documentCountsVerified": true,
-  "documentHashesVerified": true,
-  "dataVerificationPassed": true,
-  "applicationVerificationPassed": true
+  "evidenceVersion": 1,
+  "runId": "UUID_V4",
+  "recoveryMethod": "firestore-export-import",
+  "startedAt": "RFC3339_UTC_TIMESTAMP",
+  "completedAt": "RFC3339_UTC_TIMESTAMP",
+  "sourceDatabaseIdentitySha256": "64_LOWERCASE_HEX",
+  "sourcePreFingerprintSha256": "64_LOWERCASE_HEX",
+  "sourcePostFingerprintSha256": "SAME_64_LOWERCASE_HEX_AS_PRE",
+  "destinationDatabaseId": "NON_DEFAULT_DATABASE_ID",
+  "destinationInitialDocumentCount": 0,
+  "destinationInitiallyEmptyProofSha256": "64_LOWERCASE_HEX",
+  "recoveryArtifactIdentifierSha256": "64_LOWERCASE_HEX",
+  "recoveryArtifactTimestamp": "RFC3339_UTC_TIMESTAMP",
+  "commandTranscriptSha256": "64_LOWERCASE_HEX",
+  "tool": {
+    "name": "private-pro-firestore-rehearsal",
+    "version": "SEMVER_OR_BUILD_VERSION"
+  },
+  "testSuiteCommitSha": "40_LOWERCASE_HEX_AUDITED_RELEASE_COMMIT",
+  "manifests": {
+    "configSha256": "64_LOWERCASE_HEX",
+    "indexesSha256": "64_LOWERCASE_HEX",
+    "rulesSha256": "64_LOWERCASE_HEX"
+  },
+  "collectionFamilies": {
+    "accounts": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultAssetRateWindows": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultAssetReservations": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultAssets": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultDevices": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultKeysets": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultOperations": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultRecords": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultRegistrationChallenges": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" },
+    "vaultTombstones": { "expectedCount": 0, "actualCount": 0, "expectedCiphertextHmacSha256": "64_LOWERCASE_HEX", "actualCiphertextHmacSha256": "SAME_64_LOWERCASE_HEX" }
+  },
+  "applicationAcceptance": {
+    "status": "passed",
+    "resultSha256": "64_LOWERCASE_HEX"
+  },
+  "cleanup": {
+    "status": "completed",
+    "evidenceSha256": "64_LOWERCASE_HEX"
+  },
+  "approverAttestation": {
+    "identity": "BOUNDED_OPERATOR_OR_CI_IDENTITY",
+    "role": "recovery-approver",
+    "attestedAt": "RFC3339_UTC_TIMESTAMP",
+    "statementSha256": "64_LOWERCASE_HEX"
+  },
+  "macBase64": "HMAC_SHA256_BASE64_OVER_CANONICAL_JSON_WITHOUT_THIS_FIELD"
 }
 ```
 
-Allowed `restoreMethod` values are `pitr-clone`, `native-backup-restore`, and `firestore-export-import`. Allowed `targetIsolation` values are `separate-database` and `separate-project`. Never include project numbers, billing account IDs, backup IDs, export URIs, database resource names, document IDs, user IDs, tokens, keys, raw records, IAM policies, or raw command output.
+Allowed `recoveryMethod` values are `pitr-clone`, `native-backup-restore`, and `firestore-export-import`. The source identity and recovery artifact identifiers are SHA-256 digests, not raw resource names. `sourcePreFingerprintSha256` and `sourcePostFingerprintSha256` must match. The destination ID must be explicit and cannot be `(default)`. The artifact timestamp must not be later than `startedAt`; `startedAt` must not be later than `completedAt`; `completedAt` must not be later than the approver attestation.
+
+The collection-family object must contain exactly the ten keys above. Each expected/actual count is a bounded nonnegative integer and must match. Each expected/actual ciphertext HMAC is a keyed aggregate over a canonical family stream using a separate operator-held evidence HMAC key, and the pair must match. Do not store that key or replace the keyed digest with a raw content hash. Application acceptance must have `status: passed` and a digest of the detailed acceptance result artifact.
+
+The command transcript, test output, manifests, acceptance result, cleanup result, and attestation statement remain separate restricted artifacts. The evidence stores only their SHA-256 digests. Never include project numbers, billing account IDs, backup IDs, export URIs, database resource names, document IDs, user IDs, tokens, keys, raw records, IAM policies, or raw command output.
 
 ## RTO and RPO approval
 

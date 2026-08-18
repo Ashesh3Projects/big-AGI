@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
+import { createHmac } from 'node:crypto';
 import { describe, test } from 'node:test';
 import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 
 import {
   classifyAppCheck,
@@ -43,6 +44,88 @@ import * as securityAuditModule from './security-audit';
 
 function severities(findings: AuditFinding[]) {
   return findings.map(finding => finding.severity);
+}
+
+const RESTORE_EVIDENCE_FAMILIES = [
+  'accounts',
+  'vaultAssetRateWindows',
+  'vaultAssetReservations',
+  'vaultAssets',
+  'vaultDevices',
+  'vaultKeysets',
+  'vaultOperations',
+  'vaultRecords',
+  'vaultRegistrationChallenges',
+  'vaultTombstones',
+] as const;
+const TEST_EVIDENCE_KEY = Buffer.alloc(32, 0x42);
+const TEST_EVIDENCE_KEY_BASE64 = TEST_EVIDENCE_KEY.toString('base64');
+const TEST_RELEASE_COMMIT = 'a'.repeat(40);
+
+function canonicalJsonForTest(value: unknown): string {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'number') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(canonicalJsonForTest).join(',')}]`;
+  const record = value as Record<string, unknown>;
+  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonicalJsonForTest(record[key])}`).join(',')}}`;
+}
+
+function unsignedRestoreEvidence() {
+  const collectionFamilies = Object.fromEntries(RESTORE_EVIDENCE_FAMILIES.map((family, index) => [family, {
+    expectedCount: index,
+    actualCount: index,
+    expectedCiphertextHmacSha256: (index + 1).toString(16).padStart(64, '0'),
+    actualCiphertextHmacSha256: (index + 1).toString(16).padStart(64, '0'),
+  }]));
+  return {
+    schemaVersion: 1,
+    evidenceVersion: 1,
+    runId: '123e4567-e89b-42d3-a456-426614174000',
+    recoveryMethod: 'firestore-export-import',
+    startedAt: '2026-08-18T00:00:00Z',
+    completedAt: '2026-08-18T00:30:00Z',
+    sourceDatabaseIdentitySha256: '1'.repeat(64),
+    sourcePreFingerprintSha256: '2'.repeat(64),
+    sourcePostFingerprintSha256: '2'.repeat(64),
+    destinationDatabaseId: 'private-pro-restore-20260818',
+    destinationInitialDocumentCount: 0,
+    destinationInitiallyEmptyProofSha256: '3'.repeat(64),
+    recoveryArtifactIdentifierSha256: '4'.repeat(64),
+    recoveryArtifactTimestamp: '2026-08-17T23:55:00Z',
+    commandTranscriptSha256: '5'.repeat(64),
+    tool: {
+      name: 'private-pro-firestore-rehearsal',
+      version: '1.0.0',
+    },
+    testSuiteCommitSha: TEST_RELEASE_COMMIT,
+    manifests: {
+      configSha256: '6'.repeat(64),
+      indexesSha256: '7'.repeat(64),
+      rulesSha256: '8'.repeat(64),
+    },
+    collectionFamilies,
+    applicationAcceptance: {
+      status: 'passed',
+      resultSha256: '9'.repeat(64),
+    },
+    cleanup: {
+      status: 'completed',
+      evidenceSha256: 'a'.repeat(64),
+    },
+    approverAttestation: {
+      identity: 'operator:release-owner',
+      role: 'recovery-approver',
+      attestedAt: '2026-08-18T00:35:00Z',
+      statementSha256: 'b'.repeat(64),
+    },
+  };
+}
+
+function signedRestoreEvidence(value = unsignedRestoreEvidence(), key = TEST_EVIDENCE_KEY) {
+  return {
+    ...value,
+    macBase64: createHmac('sha256', key).update(canonicalJsonForTest(value)).digest('base64'),
+  };
 }
 
 describe('private Pro security audit classifiers', () => {
@@ -244,9 +327,13 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(facts.readable, true);
   });
 
-  test('accepts only fresh complete redacted Firestore restore rehearsal evidence', () => {
+  test('accepts only fresh provenance-bound MAC-verified restore rehearsal evidence', () => {
     const audit = securityAuditModule as unknown as {
-      inspectFirestoreRestoreEvidence(value: unknown, nowMs?: number): {
+      inspectFirestoreRestoreEvidence(value: unknown, input: {
+        nowMs: number;
+        expectedCommitSha: string;
+        hmacKeyBase64: string;
+      }): {
         readable: boolean;
         schemaErrors: number;
         completed: boolean;
@@ -262,29 +349,17 @@ describe('private Pro security audit classifiers', () => {
         documentHashesVerified: boolean;
         dataVerified: boolean;
         applicationVerified: boolean;
+        macVerified: boolean;
+        releaseCommitMatches: boolean;
       };
     };
-    const evidence = {
-      schemaVersion: 1,
-      evidenceType: 'firestore-restore-rehearsal',
-      collectedAt: '2026-08-18T00:00:00Z',
-      sourceDatabase: '(default)',
-      restoreMethod: 'pitr-clone',
-      targetIsolation: 'separate-database',
-      targetDatabaseDefault: false,
-      status: 'passed',
-      sourceUnchanged: true,
-      targetInitiallyEmpty: true,
-      indexesVerified: true,
-      rulesVerified: true,
-      configVerified: true,
-      documentCountsVerified: true,
-      documentHashesVerified: true,
-      dataVerificationPassed: true,
-      applicationVerificationPassed: true,
+    const input = {
+      nowMs: Date.parse('2026-08-18T12:00:00Z'),
+      expectedCommitSha: TEST_RELEASE_COMMIT,
+      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
     };
 
-    assert.deepEqual(audit.inspectFirestoreRestoreEvidence(evidence, Date.parse('2026-08-18T12:00:00Z')), {
+    assert.deepEqual(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), input), {
       readable: true,
       schemaErrors: 0,
       completed: true,
@@ -300,103 +375,161 @@ describe('private Pro security audit classifiers', () => {
       documentHashesVerified: true,
       dataVerified: true,
       applicationVerified: true,
+      macVerified: true,
+      releaseCommitMatches: true,
     });
+  });
 
-    const mutations: Array<(value: Record<string, unknown>) => void> = [
-      value => { value.schemaVersion = 2; },
-      value => { value.evidenceType = 'raw-firestore-export'; },
-      value => { value.collectedAt = 'today'; },
-      value => { value.sourceDatabase = 'projects/sample-project/databases/(default)'; },
-      value => { value.restoreMethod = 'overwrite-production'; },
-      value => { value.targetIsolation = 'same-database'; },
-      value => { value.targetDatabaseDefault = true; },
-      value => { value.status = 'unknown'; },
-      value => { value.sourceUnchanged = 'yes'; },
-      value => { value.rawPayload = { secret: true }; },
-      value => { delete value.applicationVerificationPassed; },
-    ];
-    for (const mutate of mutations) {
-      const changed = structuredClone(evidence) as Record<string, unknown>;
-      mutate(changed);
-      const facts = audit.inspectFirestoreRestoreEvidence(changed, Date.parse('2026-08-18T12:00:00Z'));
-      assert.equal(facts.readable, false);
-      assert.ok(facts.schemaErrors > 0);
-    }
-    const stale = audit.inspectFirestoreRestoreEvidence({ ...evidence, collectedAt: '2026-05-01T00:00:00Z' }, Date.parse('2026-08-18T12:00:00Z'));
+  test('rejects unsigned, wrongly signed, tampered, wrong-release, and changed-source evidence', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectFirestoreRestoreEvidence(value: unknown, input: {
+        nowMs: number;
+        expectedCommitSha: string;
+        hmacKeyBase64: string;
+      }): {
+        readable: boolean;
+        sourceUnchanged: boolean;
+        macVerified: boolean;
+        releaseCommitMatches: boolean;
+      };
+    };
+    const input = {
+      nowMs: Date.parse('2026-08-18T12:00:00Z'),
+      expectedCommitSha: TEST_RELEASE_COMMIT,
+      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
+    };
+    const unsigned = audit.inspectFirestoreRestoreEvidence(unsignedRestoreEvidence(), input);
+    assert.equal(unsigned.readable, false);
+    assert.equal(unsigned.macVerified, false);
+
+    const missingKey = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), { ...input, hmacKeyBase64: '' });
+    assert.equal(missingKey.readable, false);
+    assert.equal(missingKey.macVerified, false);
+
+    const wrongMac = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(unsignedRestoreEvidence(), Buffer.alloc(32, 0x24)), input);
+    assert.equal(wrongMac.readable, false);
+    assert.equal(wrongMac.macVerified, false);
+
+    const tampered = signedRestoreEvidence();
+    tampered.destinationDatabaseId = 'private-pro-restore-tampered';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(tampered, input).macVerified, false);
+
+    const wrongCommit = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), { ...input, expectedCommitSha: 'c'.repeat(40) });
+    assert.equal(wrongCommit.releaseCommitMatches, false);
+    assert.equal(wrongCommit.readable, false);
+
+    const changedSourceValue = unsignedRestoreEvidence();
+    changedSourceValue.sourcePostFingerprintSha256 = 'c'.repeat(64);
+    const changedSource = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(changedSourceValue), input);
+    assert.equal(changedSource.sourceUnchanged, false);
+    assert.equal(changedSource.readable, false);
+  });
+
+  test('rejects stale, reversed-time, invalid family, and malformed provenance evidence', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectFirestoreRestoreEvidence(value: unknown, input: {
+        nowMs: number;
+        expectedCommitSha: string;
+        hmacKeyBase64: string;
+      }): { readable: boolean; stale: boolean; schemaErrors: number };
+    };
+    const input = {
+      nowMs: Date.parse('2026-08-18T12:00:00Z'),
+      expectedCommitSha: TEST_RELEASE_COMMIT,
+      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
+    };
+    const staleValue = unsignedRestoreEvidence();
+    staleValue.startedAt = '2026-04-01T00:00:00Z';
+    staleValue.completedAt = '2026-04-01T00:30:00Z';
+    staleValue.recoveryArtifactTimestamp = '2026-03-31T23:55:00Z';
+    staleValue.approverAttestation.attestedAt = '2026-04-01T00:35:00Z';
+    const stale = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(staleValue), input);
     assert.equal(stale.readable, true);
     assert.equal(stale.stale, true);
-    const nativeBackup = audit.inspectFirestoreRestoreEvidence({ ...evidence, restoreMethod: 'native-backup-restore' }, Date.parse('2026-08-18T12:00:00Z'));
-    assert.equal(nativeBackup.readable, true);
-  });
 
-  test('classifies restore evidence as a release gate', () => {
-    const audit = securityAuditModule as unknown as {
-      inspectFirestoreRestoreEvidence(value: unknown, nowMs?: number): {
-        readable: boolean;
-        schemaErrors: number;
-        completed: boolean;
-        stale: boolean;
-        sourceUnchanged: boolean;
-        isolatedTarget: boolean;
-        targetNotDefault: boolean;
-        targetInitiallyEmpty: boolean;
-        indexesVerified: boolean;
-        rulesVerified: boolean;
-        configVerified: boolean;
-        documentCountsVerified: boolean;
-        documentHashesVerified: boolean;
-        dataVerified: boolean;
-        applicationVerified: boolean;
-      };
-      classifyFirestoreRestoreEvidence(facts: ReturnType<typeof audit.inspectFirestoreRestoreEvidence>): AuditFinding[];
+    const reversed = unsignedRestoreEvidence();
+    reversed.completedAt = '2026-08-17T23:00:00Z';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(reversed), input).readable, false);
+
+    const extraFamily = unsignedRestoreEvidence() as ReturnType<typeof unsignedRestoreEvidence> & { collectionFamilies: Record<string, unknown> };
+    extraFamily.collectionFamilies.unapprovedFamily = {
+      expectedCount: 1,
+      actualCount: 1,
+      expectedCiphertextHmacSha256: 'd'.repeat(64),
+      actualCiphertextHmacSha256: 'd'.repeat(64),
     };
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(extraFamily), input).readable, false);
 
-    assert.equal(audit.classifyFirestoreRestoreEvidence(audit.inspectFirestoreRestoreEvidence(undefined))[0].severity, 'block');
-    const failed = audit.inspectFirestoreRestoreEvidence({
-      schemaVersion: 1,
-      evidenceType: 'firestore-restore-rehearsal',
-      collectedAt: '2026-08-18T00:00:00Z',
-      sourceDatabase: '(default)',
-      restoreMethod: 'firestore-export-import',
-      targetIsolation: 'separate-project',
-      targetDatabaseDefault: false,
-      status: 'failed',
-      sourceUnchanged: true,
-      targetInitiallyEmpty: true,
-      indexesVerified: true,
-      rulesVerified: true,
-      configVerified: true,
-      documentCountsVerified: false,
-      documentHashesVerified: false,
-      dataVerificationPassed: false,
-      applicationVerificationPassed: false,
-    }, Date.parse('2026-08-18T12:00:00Z'));
-    assert.deepEqual(severities(audit.classifyFirestoreRestoreEvidence(failed)), [
-      'pass', 'pass', 'block', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'block', 'block', 'block', 'block',
-    ]);
+    const familyMismatch = unsignedRestoreEvidence();
+    familyMismatch.collectionFamilies.vaultRecords.actualCiphertextHmacSha256 = 'e'.repeat(64);
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(familyMismatch), input).readable, false);
+
+    const applicationFailed = unsignedRestoreEvidence();
+    applicationFailed.applicationAcceptance.status = 'failed';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(applicationFailed), input).readable, false);
+
+    const malformed = unsignedRestoreEvidence();
+    malformed.runId = 'not-a-uuid';
+    assert.ok(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(malformed), input).schemaErrors > 0);
   });
 
-  test('collects canonical restore evidence locally and fails closed when it is missing', async () => {
+  test('collects strict authenticated evidence and rejects unsafe paths and raw JSON attacks', async () => {
     const audit = securityAuditModule as unknown as {
       collectFirestoreRestoreEvidenceWithReader(
         path: string,
-        nowMs: number,
+        input: {
+          nowMs: number;
+          expectedCommitSha: string;
+          hmacKeyBase64: string;
+          repoRoot: string;
+        },
         readText: (path: string) => Promise<string>,
-      ): Promise<{ readable: boolean; completed: boolean }>;
+        canonicalizePath?: (path: string) => Promise<string>,
+      ): Promise<{ readable: boolean; completed: boolean; macVerified: boolean }>;
+    };
+    const repoRoot = resolve('F:/repo');
+    const canonicalPath = join(repoRoot, 'infra/private-pro/firestore-restore-evidence.json');
+    const input = {
+      nowMs: Date.parse('2026-08-18T12:00:00Z'),
+      expectedCommitSha: TEST_RELEASE_COMMIT,
+      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
+      repoRoot,
     };
     const paths: string[] = [];
-    const missing = await audit.collectFirestoreRestoreEvidenceWithReader(
-      'infra/private-pro/firestore-restore-evidence.json',
-      Date.parse('2026-08-18T12:00:00Z'),
-      async path => {
-        paths.push(path);
-        throw new Error('missing');
-      },
-    );
+    const canonicalize = async (path: string) => resolve(path);
+    const accepted = await audit.collectFirestoreRestoreEvidenceWithReader(canonicalPath, input, async path => {
+      paths.push(path);
+      return JSON.stringify(signedRestoreEvidence());
+    }, canonicalize);
+    assert.deepEqual(paths, [canonicalPath]);
+    assert.equal(accepted.readable, true);
+    assert.equal(accepted.macVerified, true);
 
-    assert.deepEqual(paths, ['infra/private-pro/firestore-restore-evidence.json']);
-    assert.equal(missing.readable, false);
-    assert.equal(missing.completed, false);
+    for (const path of ['infra/private-pro/firestore-restore-evidence.json', join(repoRoot, '../escape/evidence.json')]) {
+      const result = await audit.collectFirestoreRestoreEvidenceWithReader(path, input, async () => JSON.stringify(signedRestoreEvidence()), canonicalize);
+      assert.equal(result.readable, false);
+    }
+
+    const duplicateKey = `{"schemaVersion":1,"schemaVersion":1}`;
+    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(canonicalPath, input, async () => duplicateKey, canonicalize)).readable, false);
+    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(canonicalPath, input, async () => 'x'.repeat(1024 * 1024 + 1), canonicalize)).readable, false);
+
+    const operatorRoot = resolve('F:/operator-evidence');
+    const operatorPath = join(operatorRoot, 'run-123.json');
+    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(
+      operatorPath,
+      { ...input, repoRoot: operatorRoot },
+      async () => JSON.stringify(signedRestoreEvidence()),
+      canonicalize,
+    )).readable, true);
+
+    const symlinkEscape = async (path: string) => path === canonicalPath ? resolve('F:/escape/evidence.json') : resolve(path);
+    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(
+      canonicalPath,
+      input,
+      async () => JSON.stringify(signedRestoreEvidence()),
+      symlinkEscape,
+    )).readable, false);
   });
 
   test('passes shell metacharacters as one argument without executing them', async () => {

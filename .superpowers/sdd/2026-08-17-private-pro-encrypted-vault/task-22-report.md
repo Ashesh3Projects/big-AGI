@@ -200,3 +200,83 @@ Final verification reran focused TypeScript, all 46 Private Pro tool tests, repo
 ### Sources
 
 All pricing and product semantics in this fix round use the official sources already listed above, accessed 2026-08-18. Account-specific effective prices still require the billing price table or Pricing API.
+
+## Fix round 2
+
+Status: complete. No cloud mutation occurred. No restore evidence or HMAC key was generated.
+
+### Review finding
+
+The previous restore evidence schema consisted of self-asserted booleans. A handwritten all-true file could satisfy the release gate without proving that a rehearsal ran or that the evidence belonged to the audited release.
+
+### Changes
+
+- Replaced boolean evidence with a strict provenance-bound schema containing:
+  - schema/evidence versions and UUIDv4 run ID;
+  - recovery method and ordered start/completion/artifact/attestation timestamps;
+  - hashed source database identity;
+  - immutable pre/post source fingerprints that must match;
+  - explicit non-default destination ID and zero-document initial-state proof;
+  - hashed recovery artifact identifier and timestamp;
+  - command transcript digest;
+  - bounded tool name/version;
+  - exact audited release commit SHA;
+  - index, rules, and config manifest digests;
+  - exact expected/actual counts and keyed ciphertext HMAC digests for ten approved Private Pro Firestore families;
+  - passed application acceptance artifact digest;
+  - completed cleanup artifact digest;
+  - bounded approver identity/role plus attestation timestamp and statement digest.
+- Added HMAC-SHA256 authentication over recursively key-sorted canonical JSON excluding only `macBase64`.
+- The audit reads `PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY` only at audit time. The key must be canonical base64 decoding to 32-64 bytes and is never stored in evidence, docs, reports, or normal application config.
+- The audit binds evidence to `PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA`. A wrong or missing release SHA blocks.
+- The canonical repository evidence path is absolute. Overrides require an absolute evidence path and absolute `PRIVATE_PRO_RESTORE_EVIDENCE_ROOT`; both are resolved through real paths, and the evidence must remain below the approved root. Relative paths, traversal, and symlink escapes block.
+- Added a 1 MiB evidence cap and duplicate JSON object-key rejection before `JSON.parse`.
+- Kept the report redacted: the audit emits only booleans/counts, including `macVerified` and `releaseCommitMatches`.
+
+### TDD
+
+RED:
+
+```text
+42 audit tests: 38 passed, 4 failed
+```
+
+The four failures covered valid authenticated evidence, unsigned/wrong-MAC/tampered/wrong-release/changed-source evidence, stale/reversed/invalid-family provenance, and path/duplicate-key/oversized JSON collection.
+
+GREEN:
+
+```text
+42 focused audit tests: 42 passed, 0 failed
+47 Private Pro tool tests: 47 passed, 0 failed
+```
+
+Focused Task 22 TypeScript passed. The temporary project file was deleted and is not committed.
+
+### Report-only state
+
+`npm run private-pro:security-audit -- --report-only` exited 0 with 45 pass, 8 warn, and 42 block findings across the existing audit.
+
+The restore evidence gate remains blocked because no approved rehearsal evidence, audit-time HMAC key, or expected release commit is present. `macVerified` and `releaseCommitMatches` are explicit blockers. This is the expected current state.
+
+### Adversarial coverage
+
+- all-true unsigned evidence;
+- absent HMAC key;
+- wrong HMAC key;
+- post-MAC field mutation;
+- wrong expected release commit;
+- changed source fingerprint;
+- stale evidence;
+- reversed timestamps;
+- malformed UUID/provenance;
+- unapproved collection family;
+- count or keyed digest mismatch;
+- failed application acceptance;
+- relative path and traversal;
+- realpath/symlink escape;
+- oversized file;
+- duplicate JSON keys.
+
+### Cloud boundary
+
+No restore, backup, export, import, database, schedule, IAM, storage, deployment, cleanup, key, or evidence mutation ran.
