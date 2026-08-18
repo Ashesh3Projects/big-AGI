@@ -4,7 +4,7 @@
 
 **NOT READY FOR PRODUCTION.**
 
-Local verification completed against code commit `e86685620ab4392a60b0af46ca181332cd687662` on 2026-08-18 IST. The branch still has approval-gated live-control blockers, nine high dependency audit findings, and unexecuted clean-profile and multi-device acceptance.
+Local verification and fix-round verification completed through test commit `b9b04d6a1` on 2026-08-18 IST. The branch still has approval-gated live-control blockers, nine high dependency audit findings, and unexecuted clean-profile and multi-device acceptance.
 
 This verification was local and read-only except for generated files inside the isolated worktree. It did not:
 
@@ -19,7 +19,9 @@ This verification was local and read-only except for generated files inside the 
 
 - Branch: `codex/private-pro-encrypted-vault`
 - Worktree: `F:\Projects\big-agi\.worktrees\private-pro-encrypted-vault`
-- Verified code commit: `e86685620ab4392a60b0af46ca181332cd687662`
+- Restore audit isolation commit: `e86685620ab4392a60b0af46ca181332cd687662`
+- Acknowledgment verification stabilization: `bf7ff8848`
+- One-shot audit evidence verification: `b9b04d6a1`
 - Verification timezone: Asia/Calcutta, UTC+05:30
 - OS: Windows 10 Pro, 10.0.19045, x64
 - Node.js: `v24.5.0`
@@ -51,13 +53,14 @@ TDD evidence:
 | Broad tool regression | `npm run test:private-pro-tools` | 54 passed, 0 failed. |
 | Focused type check | `npx tsc --ignoreConfig --noEmit --target es2022 --module ESNext --moduleResolution Bundler --esModuleInterop --skipLibCheck --strict --types node --lib dom,dom.iterable,ESNext tools/private-pro/security-audit.ts tools/private-pro/security-audit.test.ts` | Passed. |
 
-The regression test executes two audit invocations in one process. It proves that:
+The regression test executes multiple audit startups in one process. It proves that:
 
 - a fake Google credential executable inheriting raw `process.env` cannot see the signed evidence, expected commit, legacy HMAC, obsolete evidence path, or obsolete evidence root;
 - the generic child-process wrapper cannot see the signed evidence, expected commit, or legacy HMAC;
 - `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES`, and the configured WIF principal variable remain available;
 - the explicitly passed signed evidence still verifies its signature and release binding;
-- repeated invocation produces the same result;
+- a second audit startup without re-injection receives an empty frozen evidence input because audit evidence is one-shot;
+- after identical evidence inputs are explicitly re-injected, the next startup produces the same verification result;
 - only the test restores environment state in its `finally` block.
 
 ## Worktree dependency repair
@@ -83,6 +86,28 @@ Evidence:
 
 No generated `.next` directory, broad cache, or main-checkout dependency tree was deleted.
 
+## Acknowledgment verification stabilization
+
+Review reproduced a flaky assertion in `privatePro.vault.engine.test.ts`. The test waited until the transport write was visible, yielded one timer turn, and assumed the later IndexedDB acknowledgment transaction had entered `beforeAcknowledgeCommit`. That ordering is not guaranteed.
+
+The production engine behavior was unchanged. Commit `bf7ff8848` replaces the timer assumption with explicit promises using the existing test hook:
+
+1. the acknowledgment transaction signals that it entered the hook;
+2. the test requests engine stop;
+3. the blocked hook reports that the stop promise is still pending;
+4. the test releases the acknowledgment transaction;
+5. stop completes and the atomic durable-state assertions run.
+
+No sleep, polling loop, retry, or production-only instrumentation is used.
+
+TDD and stress evidence:
+
+- RED reproduction with the valid local `tsx` entrypoint: 9 failures in 12 fresh-process runs at the original `acknowledgeStarted` assertion;
+- GREEN named-test stress after the final change: 30 passed in 30 fresh processes from 21:53:56 to 21:54:23;
+- complete engine test file: 20 passed, 0 failed;
+- exact Task 23 focused suite: 213 passed, 0 failed;
+- all Private Pro source and tool tests: 339 passed, 0 failed.
+
 ## Command matrix
 
 All timestamps are 2026-08-18 UTC+05:30.
@@ -102,6 +127,17 @@ All timestamps are 2026-08-18 UTC+05:30.
 | PASS WITH BLOCKERS REPORTED | 21:24:56 - 21:25:00 | `npm run private-pro:security-audit -- --report-only` | Exit 0 by report-only contract. Summary: 46 pass, 8 warn, 44 block. The clean-worktree check passed. |
 | EXPECTED BLOCKING FAILURE | 21:25:00 - 21:25:04 | `npm run private-pro:security-audit` | Exit 1. Same 46 pass, 8 warn, 44 block findings. |
 | PASS | 21:25:04 | `git diff --check` | Passed against the clean verified code commit. |
+| RED REPRODUCTION | 21:49:31 - 21:49:47 | Named acknowledgment test in 12 fresh local `tsx` processes | 3 passed, 9 failed at the timer-dependent `acknowledgeStarted` assertion. |
+| PASS | 21:53:56 - 21:54:23 | Named acknowledgment test in 30 fresh local `tsx` processes after stabilization | 30 passed, 0 failed. |
+| PASS | 21:54 | `node node_modules/tsx/dist/cli.mjs --test src/modules/private-pro/vault/privatePro.vault.engine.test.ts` | 20 passed, 0 failed. |
+| PASS | 21:54 | Exact focused Task 23 suite | 213 passed, 0 failed. |
+| PASS | 21:55:28 - 21:55:48 | All Private Pro source and tool tests in one invocation | 339 passed, 0 failed. |
+| PASS | 21:55:57 - 21:56:21 | Key-free `npm test` after stabilization | 301 passed, 19 live-vendor tests skipped, 0 failed. |
+| PASS | 21:56:28 - 21:57:00 | `npm run tscheck` after stabilization | Passed. |
+| PASS | 21:57:00 - 21:57:34 | `npm run lint` after stabilization | Passed. |
+| PASS | 22:01:25 - 22:01:27 | Combined acknowledgment-engine and one-shot audit tests | 69 passed, 0 failed. |
+| PASS | 22:01:36 - 22:01:55 | Final exact focused Task 23 suite after both test commits | 213 passed, 0 failed. |
+| PASS | 22:02:13 - 22:02:35 | Final all Private Pro source and tool tests after both test commits | 339 passed, 0 failed. |
 
 ## Repository test baseline
 
@@ -226,7 +262,7 @@ All items below are PENDING. None was simulated as a production success.
 
 ## Release decision
 
-Local implementation and regression verification are complete for the encrypted vault code at `e86685620ab4392a60b0af46ca181332cd687662`.
+Local implementation and regression verification are complete through test commit `b9b04d6a1`. Production vault behavior was not changed by the acknowledgment test stabilization.
 
 The release decision remains **NOT READY FOR PRODUCTION** until:
 

@@ -12,7 +12,10 @@ No deployment, push, real-account operation, IAM/WIF/API-key/Auth-domain/CORS mu
 
 - Base: `257f22a59a10ebe6cc4577a2aa274dd65851e986`
 - Carried Task 22 fix: `e86685620ab4392a60b0af46ca181332cd687662` - `Security: isolate restore audit evidence`
-- Verification evidence and this report: commit containing this file with subject `Docs: verify encrypted private vault`
+- Initial verification evidence: `85ecbda112214c495423b96f1b7fc0ca109cb8a0` - `Docs: verify encrypted private vault`
+- Acknowledgment test stabilization: `bf7ff8848` - `Test: stabilize vault acknowledgement verification`
+- Audit one-shot coverage: `b9b04d6a1` - `Test: verify one-shot restore audit evidence`
+- Fix-round evidence and this report: commit containing this update with subject `Docs: refresh encrypted vault verification`
 
 ## Carried security fix
 
@@ -25,13 +28,32 @@ TDD:
 - Broad Private Pro tools: 54/54 passed.
 - Focused TypeScript and `git diff --check`: passed.
 
-Coverage includes a raw-environment credential executable, the generic child wrapper, explicit signed-evidence verification, retained Google ADC/WIF state, and two deterministic audit invocations in one process. Environment restoration exists only in test cleanup.
+Coverage includes a raw-environment credential executable, the generic child wrapper, explicit signed-evidence verification, retained Google ADC/WIF state, one-shot evidence consumption, and deterministic verification only after identical evidence is explicitly re-injected before the next audit startup. Environment restoration exists only in test cleanup.
 
 ## Dependency baseline repair
 
 The earlier 337 React/JSX type errors and Rushstack startup failure came from an incomplete worktree `node_modules`: Emotion packages declared in the lockfile were absent, so tools loaded React/Emotion declarations from the main checkout.
 
 `npm install --ignore-scripts --no-audit --no-fund` repaired only the isolated worktree. Package and lockfile hashes did not change, Git stayed clean, and no broad cache or main checkout was altered. TypeScript and ESLint then passed.
+
+## Fix round 1
+
+Review reproduced the acknowledgment barrier test as flaky. The original test waited for the server write and one timer turn, but the `beforeAcknowledgeCommit` hook runs later inside an IndexedDB transaction. The timer did not establish that ordering.
+
+Production behavior did not change. The test now uses explicit deferred signals through the existing hook: acknowledgment entered, stop requested, stop observed blocked, then acknowledgment released.
+
+Evidence:
+
+- RED: 9 failures in 12 fresh-process runs at the old line 669 assertion.
+- GREEN stress: 30 passed in 30 fresh-process runs.
+- Engine test file: 20 passed, 0 failed.
+- Exact focused suite: 213 passed, 0 failed.
+- All Private Pro source and tool tests: 339 passed, 0 failed.
+- Key-free `npm test`: 301 passed, 19 skipped, 0 failed.
+- `npm run tscheck`: passed.
+- `npm run lint`: passed.
+
+The restore-audit test and documentation now state the one-shot contract exactly. A startup consumes the evidence variables. A second startup without re-injection receives an empty frozen input. Deterministic matching verification requires explicitly re-injecting identical evidence before the later startup. Focused audit tests passed 49/49.
 
 ## Verification
 
@@ -48,6 +70,14 @@ The earlier 337 React/JSX type errors and Rushstack startup failure came from an
 - Clean-tree audit report-only: exit 0 by contract, 46 pass, 8 warn, 44 block.
 - Clean-tree blocking audit: expected exit 1, same 46 pass, 8 warn, 44 block.
 - `git diff --check`: passed before documentation edits.
+- Fix round 1 named-test stress: 30/30 passed.
+- Fix round 1 exact focused suite: 213/213 passed.
+- Fix round 1 all Private Pro source and tools: 339/339 passed.
+- Fix round 1 key-free repository suite: 301 passed, 19 skipped, 0 failed.
+- Fix round 1 `npm run tscheck` and `npm run lint`: passed.
+- Final post-one-shot combined engine/audit tests: 69/69 passed.
+- Final post-one-shot exact focused suite: 213/213 passed.
+- Final post-one-shot all Private Pro source and tools: 339/339 passed.
 
 ## Plaintext review
 
