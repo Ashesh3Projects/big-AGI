@@ -124,7 +124,7 @@ export function ProviderPrivateProSync(props: { children: React.ReactNode }) {
     setBindingGate({ uid: user.uid, status: 'checking' });
     const syncState = privateProSyncState();
     syncState.setState({
-      phase: 'migrating',
+      phase: 'syncing',
       lastError: null,
       usedBytes: bootstrap?.usedBytes ?? 0,
       reservedBytes: bootstrap?.reservedBytes ?? 0,

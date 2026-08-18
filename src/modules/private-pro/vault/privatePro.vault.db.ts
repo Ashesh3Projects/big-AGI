@@ -45,14 +45,6 @@ export interface PrivateProVaultRevisionRecord {
   revision: number;
 }
 
-export interface PrivateProVaultMigrationRecord {
-  uid: string;
-  migrationId: string;
-  phase: string;
-  updatedAtMs: number;
-  encryptedError?: PrivateProVaultEnvelope;
-}
-
 export interface PrivateProVaultQuarantineRecord {
   id?: number;
   uid: string;
@@ -94,7 +86,6 @@ export class PrivateProVaultDB extends Dexie {
   records!: Table<PrivateProVaultEncryptedRecord, [string, PrivateProVaultRecordType, string]>;
   outbox!: Table<PrivateProVaultOutboxRecord, [string, string]>;
   revisions!: Table<PrivateProVaultRevisionRecord, [string, PrivateProVaultRecordType, string]>;
-  migration!: Table<PrivateProVaultMigrationRecord, [string, string]>;
   quarantine!: EntityTable<PrivateProVaultQuarantineRecord, 'id'>;
   hydratedAssets!: Table<PrivateProVaultHydratedAssetRecord, [string, string]>;
 
@@ -106,7 +97,6 @@ export class PrivateProVaultDB extends Dexie {
       records: '[uid+recordType+recordId], uid, [uid+recordType], revision',
       outbox: '[uid+operationId], uid, createdAtMs',
       revisions: '[uid+recordType+recordId], uid, revision',
-      migration: '[uid+migrationId], uid, phase, updatedAtMs',
       quarantine: '++id, uid, [uid+recordType+recordId], createdAtMs',
       hydratedAssets: '[uid+assetId], uid, assetId',
     });

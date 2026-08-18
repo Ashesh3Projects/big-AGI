@@ -4,7 +4,7 @@
 
 **Goal:** Replace private Pro plaintext persistence and partial cloud sync with a blocking, multi-device, end-to-end encrypted vault for chats, attachments, AI credentials, model configuration, and portable settings.
 
-**Architecture:** Implement this as four release stages: security hardening, browser cryptographic/persistence foundation, encrypted segmented synchronization and migration, then live rollout. The browser alone holds plaintext and encryption keys; Vercel assigns revisions and stores opaque envelopes in Firebase. Private Pro startup stays blocked until the remembered device or password unlocks the vault and all current server revisions are downloaded and applied.
+**Architecture:** Implement this as four release stages: security hardening, browser cryptographic/persistence foundation, encrypted segmented synchronization, then Firebase enforcement and live rollout. The browser alone holds plaintext and encryption keys; Vercel assigns revisions and stores opaque envelopes in Firebase. Private Pro startup stays blocked until the remembered device or password unlocks the vault and all current server revisions are downloaded and applied. This is a greenfield application with zero existing users or legacy production data, so encrypted storage starts at first setup and no plaintext migration or cleanup path is built.
 
 **Tech Stack:** Next.js 15, React 18, TypeScript 6, Zustand 5, Dexie 4, Web Crypto AES-GCM/HKDF/PBKDF2, Argon2id WASM worker, Firebase Auth/Firestore/Storage/App Check, tRPC 11, Zod 4, Firebase Emulator Suite, Node test runner through `tsx`.
 
@@ -20,7 +20,7 @@
 - Never log plaintext records, API keys, tokens, key envelopes, ciphertext, or provider request bodies.
 - Every production-code change follows test-first red-green-refactor.
 - No reachable critical or high production dependency advisory may remain when credential sync is enabled.
-- Do not delete legacy plaintext data until its encrypted replacement has been uploaded, downloaded, decrypted, and validated.
+- Require encrypted vault creation before the first user can persist portable Private Pro data.
 - Do not push or deploy until the user explicitly approves that action.
 
 ---
@@ -51,7 +51,7 @@
 - `src/modules/private-pro/vault/privatePro.vault.password.ts`: worker client and PBKDF2 compatibility fallback.
 - `src/modules/private-pro/vault/privatePro.vault.recovery.ts`: printable recovery-key generation/parsing/checksum.
 - `src/modules/private-pro/vault/privatePro.vault.crypto.test.ts`: known-answer, tamper, and nonce tests.
-- `src/modules/private-pro/vault/privatePro.vault.db.ts`: Dexie encrypted cache/outbox/device-key/migration database.
+- `src/modules/private-pro/vault/privatePro.vault.db.ts`: Dexie encrypted cache/outbox/device-key database.
 - `src/modules/private-pro/vault/privatePro.vault.db.test.ts`: IndexedDB and non-exportable `CryptoKey` tests.
 - `src/modules/private-pro/vault/privatePro.vault.session.ts`: runtime key/session lifecycle and best-effort clearing.
 
@@ -62,13 +62,13 @@
 - `src/modules/private-pro/vault/serializers/*.ts`: focused serializers for models/credentials, settings groups, chats, personas, folders, Scratch Clip, and asset manifests.
 - `src/modules/private-pro/vault/privatePro.vault.serializers.test.ts`: portable inclusion/exclusion matrix.
 - Existing stores under `src/apps/**/store-*`, `src/common/stores/**`, and `src/modules/**/store-*`: narrow snapshot/apply/subscribe adapters only.
-- `src/modules/trade/BackupRestore.tsx`: encrypted export/import, with explicit legacy plaintext warning.
+- `src/modules/trade/BackupRestore.tsx`: encrypted export/import, with an explicit warning on any unencrypted export.
 
 ### Server storage and sync
 
 - `src/modules/private-pro/vault/privatePro.vault.repository.ts`: server repository contract.
 - `src/modules/private-pro/vault/privatePro.vault.repository.firebase.ts`: Firestore implementation.
-- `src/modules/private-pro/vault/privatePro.vault.service.ts`: compare-and-swap, index, keyset, and migration service.
+- `src/modules/private-pro/vault/privatePro.vault.service.ts`: compare-and-swap, index, keyset, and device service.
 - `src/modules/private-pro/vault/privatePro.vault.router.ts`: authenticated tRPC procedures.
 - `src/modules/private-pro/vault/privatePro.vault.service.test.ts`: in-memory service tests.
 - `src/modules/private-pro/vault/privatePro.vault.transport.ts`: browser transport.
@@ -79,17 +79,15 @@
 - `pages/_app.tsx`: install vault provider before application UI.
 - `src/server/trpc/trpc.router-cloud.ts`: mount the vault router.
 
-### Encrypted assets and migration
+### Encrypted assets and vault UI
 
 - `src/modules/private-pro/vault/privatePro.vault.assets.crypto.ts`: asset chunk encryption/decryption.
 - `src/modules/private-pro/vault/privatePro.vault.assets.client.ts`: encrypted upload/download orchestration.
 - `src/modules/private-pro/vault/privatePro.vault.assets.service.ts`: opaque encrypted-object quota/finalization.
 - `src/modules/private-pro/vault/privatePro.vault.assets.firebase.ts`: signed encrypted chunk storage.
-- `src/modules/private-pro/vault/privatePro.vault.migration.ts`: local/cloud migration state machine.
-- `src/modules/private-pro/vault/privatePro.vault.migration.test.ts`: interruption and verification tests.
 - `src/modules/private-pro/ui/PrivateProVaultSetup.tsx`: password/recovery setup.
 - `src/modules/private-pro/ui/PrivateProVaultUnlock.tsx`: password/recovery unlock.
-- `src/modules/private-pro/ui/PrivateProVaultStatus.tsx`: blocking sync/migration/reconnect screens.
+- `src/modules/private-pro/ui/PrivateProVaultStatus.tsx`: blocking hydration/reconnect screens.
 - `src/modules/private-pro/ui/PrivateProAccountControl.tsx`: password change, device revocation, encrypted export, logout.
 
 ### Firebase and deployment
@@ -684,7 +682,7 @@ Use `fake-indexeddb`. Generate a non-exportable AES key, store and retrieve it, 
 
 - [ ] **Step 3: Implement focused Dexie tables**
 
-Tables: `deviceKeys`, `wrappedKeys`, `records`, `outbox`, `revisions`, `migration`, and `quarantine`. Never store decrypted values.
+Tables: `deviceKeys`, `wrappedKeys`, `records`, `outbox`, `revisions`, and `quarantine`. Never store decrypted values. Later encrypted schema versions may add tables through normal Dexie version upgrades, but no legacy plaintext migration table is required.
 
 - [ ] **Step 4: Implement session lifecycle**
 
@@ -769,7 +767,7 @@ git commit -m "Cloud: serialize portable private vault state"
 
 - [ ] **Step 1: Write failing export tests**
 
-Assert a sentinel API key is absent from exported bytes, the encrypted export decrypts with the correct password/recovery key, wrong credentials fail, and the legacy plaintext export UI displays an explicit API-key warning.
+Assert a sentinel API key is absent from encrypted exported bytes, the encrypted export decrypts with the correct password/recovery key, wrong credentials fail, and any unencrypted export UI displays an explicit API-key warning.
 
 - [ ] **Step 2: Run to verify RED**
 
@@ -813,7 +811,7 @@ export type PutVaultRecordResult =
 
 - [ ] **Step 1: Write in-memory service tests**
 
-Cover first write, idempotent repeat, conflicting operation ID, stale base revision, independent record revisions, tombstone, paged index, keyset CAS, migration phase CAS, size bounds, and UID scoping.
+Cover first write, idempotent repeat, conflicting operation ID, stale base revision, independent record revisions, tombstone, paged index, keyset CAS, device operations, size bounds, and UID scoping.
 
 - [ ] **Step 2: Run to verify RED**
 
@@ -823,7 +821,7 @@ The service validates envelope shape and authenticated metadata consistency avai
 
 - [ ] **Step 4: Implement Firebase repository**
 
-Use only `users/{uid}/vault/**`. Store records under opaque IDs. Add bounded paging and no collection-group queries that cross user scope except administrative cleanup with explicit safeguards.
+Use only `users/{uid}/vault/**`. Store records under opaque IDs. Add bounded paging and no collection-group queries that cross user scope.
 
 - [ ] **Step 5: Verify and commit**
 
@@ -843,7 +841,7 @@ git commit -m "Cloud: store encrypted private vault records"
 - Modify: `src/server/trpc/trpc.router-cloud.ts`
 
 **Interfaces:**
-- Produces tRPC procedures: `bootstrap`, `getIndex`, `getRecords`, `putRecord`, `deleteRecord`, `putKeyset`, `commitMigration`, and `revokeDevice`.
+- Produces tRPC procedures: `bootstrap`, `getIndex`, `getRecords`, `putRecord`, `deleteRecord`, `putKeyset`, device registration/listing, and `revokeDevice`.
 
 - [ ] **Step 1: Write router authorization and size tests**
 
@@ -935,7 +933,7 @@ git commit -m "Cloud: synchronize encrypted private vaults"
 - Create: `src/modules/private-pro/vault/ProviderPrivateProVault.test.ts`
 
 **Interfaces:**
-- Produces React context with locked/setup/hydrating/ready/reconnecting/migrating/error states and password/recovery/logout actions.
+- Produces React context with locked/setup/hydrating/ready/reconnecting/error states and password/recovery/logout actions.
 
 - [ ] **Step 1: Write provider state-machine tests**
 
@@ -1014,46 +1012,33 @@ git commit -m "Cloud: encrypt private vault attachments"
 
 ---
 
-## Stage 4: Migration, Firebase enforcement, and rollout
+## Stage 4: Greenfield enforcement and rollout
 
-### Task 18: Implement resumable plaintext-to-encrypted migration
+### Task 18: Superseded - remove plaintext migration surface
 
 **Files:**
-- Create: `src/modules/private-pro/vault/privatePro.vault.migration.ts`
-- Create: `src/modules/private-pro/vault/privatePro.vault.migration.test.ts`
-- Modify: `src/modules/private-pro/vault/ProviderPrivateProVault.tsx`
-- Modify: legacy sync modules under `src/modules/private-pro/sync/**`
+- Modify: vault repository, service, router, Firebase repository, local database, engine, provider, UI, rules, tests, and this design/plan.
 
 **Interfaces:**
-- Produces migration phases: `inventory`, `encrypt-local`, `upload`, `verify-cloud`, `commit`, `cleanup-local`, `cleanup-cloud`, `complete`.
+- Produces no plaintext migration interface. Private Pro has zero existing users, chats, personas, assets, or legacy production records.
 
-- [ ] **Step 1: Write interruption tests for every phase**
+- [x] **Step 1: Add failing greenfield contract tests**
 
-For each phase, simulate process interruption and restart. Assert no plaintext source is deleted before `verify-cloud`, repeat operations are idempotent, and completion reconstructs equivalent portable state.
+Assert the vault router/service expose no migration operation, Firestore has no migration path, the current Dexie schema has no migration table, and the vault UI has no migration gate.
 
-- [ ] **Step 2: Run to verify RED**
+The older general sync engine retains its internal first-scan journal and generic database upgrade tests. Only migration-specific vault API/storage/UI surface is removed.
 
-- [ ] **Step 3: Implement encrypted local migration journal**
+- [x] **Step 2: Remove the unused migration surface**
 
-Journal contains opaque IDs, phases, revisions, and encrypted error context only.
+Remove migration repository state, operation outcomes, service/router methods, Firebase access, local table/logout references, fakes, tests, and migration-only UI phases.
 
-- [ ] **Step 4: Implement cloud conversion and verification**
+- [x] **Step 3: Preserve supported evolution and recovery**
 
-Download authorized legacy chats/personas/assets, validate, encrypt, upload, download ciphertext, decrypt, and compare the serialized portable state.
+Keep encrypted backup import/export, password/recovery flows, encrypted schema evolution, normal Dexie version upgrades, sync database upgrade tests, and logout clearing of decrypted state.
 
-- [ ] **Step 5: Implement cleanup gates**
+- [ ] **Step 4: Verify and commit**
 
-Require an encrypted export confirmation and committed server migration state before deleting included plaintext local keys or invoking legacy cloud cleanup.
-
-- [ ] **Step 6: Verify and commit**
-
-```powershell
-npx cross-env NODE_ENV=development tsx --test src/modules/private-pro/vault/privatePro.vault.migration.test.ts
-npx eslint src/modules/private-pro/vault/privatePro.vault.migration.ts src/modules/private-pro/vault/ProviderPrivateProVault.tsx
-npm run tscheck
-git add src/modules/private-pro/vault/privatePro.vault.migration* src/modules/private-pro/vault/ProviderPrivateProVault.tsx src/modules/private-pro/sync
-git commit -m "Cloud: migrate private data into encrypted vaults"
-```
+Run focused tests, all Private Pro tests, touched ESLint, `npm run tscheck`, `npm run build`, and `git diff --check`. Commit `Cloud: remove unused vault migration surface`.
 
 ### Task 19: Secure Firebase rules for encrypted vault paths
 
@@ -1158,35 +1143,30 @@ Use a clean browser profile and the production custom domain. If any check fails
 
 Cloud mutations require explicit user approval at execution time.
 
-### Task 22: Add database recovery controls and encrypted cleanup jobs
+### Task 22: Add database recovery controls
 
 **Files:**
-- Create: `pages/api/private-pro/cleanup-legacy-vault.ts`
-- Create: `src/modules/private-pro/vault/privatePro.vault.cleanup.ts`
-- Create: `src/modules/private-pro/vault/privatePro.vault.cleanup.test.ts`
-- Modify: `vercel.json`
 - Modify: `docs/deploy-private-pro-firebase.md`
+- Modify: deployment configuration only after explicit approval.
 
 **Interfaces:**
-- Produces idempotent cleanup of only verified migrated plaintext records/assets and documented Firestore recovery configuration.
+- Produces documented and verified Firestore database recovery controls. No legacy cleanup API, cron job, or plaintext deletion code exists.
 
-- [ ] **Step 1: Write cleanup safety tests**
+- [ ] **Step 1: Verify deletion protection state**
 
-Assert the job skips accounts without committed migration, skips unverified records, deletes only known legacy paths, is idempotent, and requires the cron secret.
+Capture the current database setting without changing cloud state. Enabling deletion protection is a cloud mutation and requires explicit user approval at execution time.
 
-- [ ] **Step 2: Run to verify RED**
+- [ ] **Step 2: Decide point-in-time recovery or scheduled encrypted exports**
 
-- [ ] **Step 3: Implement bounded cleanup**
+Document current Google Cloud cost, retention, restore procedure, and operational ownership for Firestore PITR and for scheduled encrypted exports. Obtain an explicit cost decision before enabling either paid control.
 
-Process a limited number of accounts/records per run. Record counts only. Never log IDs, titles, ciphertext, or errors containing payloads.
+- [ ] **Step 3: Apply approved recovery controls**
 
-- [ ] **Step 4: Enable Firestore deletion protection and decide PITR**
+After explicit approval, enable deletion protection and only the accepted PITR/export option. Do not create legacy cleanup endpoints or scheduled deletion jobs.
 
-Deletion protection is required. PITR or scheduled encrypted exports require an explicit cost decision at execution time.
+- [ ] **Step 4: Verify and document restore evidence**
 
-- [ ] **Step 5: Verify and commit**
-
-Run tests and a dry-run cleanup against staging fixtures, then commit.
+Verify settings through read-only commands and document a non-destructive restore rehearsal. Cloud mutations still require explicit approval.
 
 ### Task 23: Full verification and two-device acceptance
 
@@ -1229,9 +1209,9 @@ Run: `npm run private-pro:security-audit`
 
 Expected: no blocking finding. Warnings must have written reachability/compensating-control notes.
 
-- [ ] **Step 5: Rehearse migration on a copied test vault**
+- [ ] **Step 5: Verify greenfield first setup and encrypted reconstruction**
 
-Use sentinel credentials and non-sensitive copied data. Interrupt every phase, recover, validate encrypted reconstruction, and verify plaintext cleanup is gated.
+Use an empty browser profile and test account. Complete password/recovery setup, add sentinel portable data through the encrypted vault, create an encrypted export, restore it into a clean profile, and verify there is no plaintext storage or migration gate.
 
 - [ ] **Step 6: Perform clean PC A/PC B acceptance**
 
@@ -1256,31 +1236,31 @@ git commit -m "Docs: verify encrypted private vault"
 - No new code expected.
 
 **Interfaces:**
-- Produces a migrated encrypted production vault with plaintext cleanup completed only after verification.
+- Produces a greenfield encrypted production vault that stores portable data encrypted from first user setup.
 
 - [ ] **Step 1: Obtain explicit approval for cloud mutations, push, and deployment**
 
-List exact Git commits, Firebase rule/index changes, App Check enforcement, IAM changes, API-key/origin restrictions, deletion protection, scheduled jobs, and deployment target.
+List exact Git commits, Firebase rule/index changes, App Check enforcement, IAM changes, API-key/origin restrictions, deletion protection, any approved PITR/export control, and deployment target.
 
 - [ ] **Step 2: Deploy security hardening with encrypted vault feature disabled**
 
-Verify sign-in, existing sync, headers, App Check monitoring, dependency/runtime health, and no analytics.
+Verify sign-in, headers, App Check monitoring, dependency/runtime health, and no analytics.
 
 - [ ] **Step 3: Enable encrypted vault for a staging/test account**
 
-Complete setup, export, migration, clean-device hydration, logout, and recovery.
+Start from an empty profile. Complete setup, encrypted export/import, clean-device hydration, logout, and recovery.
 
 - [ ] **Step 4: Enable production vault setup for the user**
 
-Require password, recovery-key confirmation, and encrypted export before migration continues.
+Require password and recovery-key confirmation before the application opens. Offer an encrypted export immediately after setup.
 
-- [ ] **Step 5: Migrate and verify production data**
+- [ ] **Step 5: Verify first encrypted production writes**
 
-Do not delete plaintext. First verify the encrypted cloud index reconstructs the same portable state on a clean second profile.
+Create sentinel portable data only after vault setup. Verify the encrypted cloud index reconstructs the same portable state on a clean second profile and that Firebase/Vercel never receive plaintext.
 
-- [ ] **Step 6: Commit migration and clean plaintext**
+- [ ] **Step 6: Verify database recovery controls**
 
-Remove legacy local/cloud plaintext only after the verification gate reports success.
+Confirm deletion protection and the approved PITR/export decision. Any cloud change requires explicit approval before execution.
 
 - [ ] **Step 7: Enable encrypted credential and settings mutation sync**
 
@@ -1297,7 +1277,7 @@ Verify deployment revision, clean Git state, protected endpoints, App Check enfo
 - Every spec data family maps to Task 11 or Task 17.
 - Password, recovery, remembered devices, password change, and logout map to Tasks 8-10 and 16.
 - Download-before-edit and PC A/PC B behavior map to Task 15 and Task 23.
-- Plaintext local/cloud migration and cleanup map to Tasks 18 and 22.
+- Greenfield removal of plaintext migration surface maps to Task 18; database recovery controls map to Task 22.
 - XSS, CSP, headers, dependencies, App Check, Firebase restrictions, and least privilege map to Tasks 1-6 and 19-21.
-- Recovery and destructive cleanup gates are tested before production rollout.
+- Recovery and encrypted reconstruction gates are tested before production rollout.
 - No step instructs the executor to store the raw password or serialize localStorage wholesale.

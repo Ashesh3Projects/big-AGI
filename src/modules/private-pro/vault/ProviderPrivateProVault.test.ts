@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import { describe, test } from 'node:test';
 import * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
@@ -30,13 +31,17 @@ import { privateProClientConfig } from '../config/privatePro.config';
 import { getPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
 
 
+type AssertFalse<T extends false> = T;
+type _MigratingIsNotAVaultPhase = AssertFalse<'migrating' extends PrivateProVaultLifecyclePhase ? true : false>;
+
+
 interface Harness {
   deps: PrivateProVaultLifecycleDependencies<string, string, string>;
   phases: PrivateProVaultLifecyclePhase[];
   operationIds: string[];
   registrationKeys: string[];
   resolveApply?: () => void;
-  runtimePhase(phase: 'ready' | 'reconnecting' | 'migrating' | 'error'): void;
+  runtimePhase(phase: 'hydrating' | 'ready' | 'reconnecting' | 'error'): void;
   counts: {
     activate: number;
     bootstrap: number;
@@ -77,7 +82,7 @@ function createHarness(options: {
   const phases: PrivateProVaultLifecyclePhase[] = [];
   const operationIds: string[] = [];
   const registrationKeys: string[] = [];
-  let runtimeListener: ((phase: 'ready' | 'reconnecting' | 'migrating' | 'error') => void) | undefined;
+  let runtimeListener: ((phase: 'hydrating' | 'ready' | 'reconnecting' | 'error') => void) | undefined;
   let resolveApply: (() => void) | undefined;
 
   const deps: PrivateProVaultLifecycleDependencies<string, string, string> = {
@@ -411,15 +416,15 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(lifecycle.getState().phase, 'ready');
   });
 
-  test('runtime reconnect and migration phases block an already-open application', async () => {
+  test('runtime hydration and reconnect block an already-open application until the vault is ready', async () => {
     const harness = createHarness({ keyset: 'keyset-1', rememberedKey: 'remembered-master-key' });
     const lifecycle = createPrivateProVaultLifecycle(harness.deps);
     await lifecycle.start();
 
+    harness.runtimePhase('hydrating');
+    assert.equal(lifecycle.getState().phase, 'hydrating');
     harness.runtimePhase('reconnecting');
     assert.equal(lifecycle.getState().phase, 'reconnecting');
-    harness.runtimePhase('migrating');
-    assert.equal(lifecycle.getState().phase, 'migrating');
     harness.runtimePhase('ready');
     assert.equal(lifecycle.getState().phase, 'ready');
   });
@@ -449,6 +454,12 @@ describe('private Pro vault lifecycle', () => {
 
 
 describe('private Pro vault accessibility', () => {
+  test('does not ship a plaintext migration UI gate', () => {
+    const statusSource = readFileSync('src/modules/private-pro/ui/PrivateProVaultStatus.tsx', 'utf8');
+
+    assert.doesNotMatch(statusSource, /\bmigrat(?:e|ing|ion)\b/i);
+  });
+
   test('disabled private Pro renders the open application without vault context', () => {
     const enabled = privateProClientConfig.enabled;
     Object.defineProperty(privateProClientConfig, 'enabled', { configurable: true, value: false });

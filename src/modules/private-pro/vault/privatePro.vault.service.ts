@@ -3,7 +3,6 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
   PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE,
-  type PrivateProVaultMigrationPhase,
   type PrivateProVaultOperationOutcome,
   type PrivateProVaultRepository,
 } from './privatePro.vault.repository';
@@ -18,7 +17,6 @@ import { verifyPrivateProVaultDeviceRegistration } from './privatePro.vault.regi
 
 const OPAQUE_RECORD_ID = /^[A-Za-z0-9_-]{43}$/;
 const OPERATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
-const MIGRATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 
 export interface PutVaultRecordInput {
   operationId: string;
@@ -50,13 +48,6 @@ export type PutVaultKeysetResult =
   | { status: 'unchanged'; wrappingVersion: number; serverUpdatedAtMs: number }
   | { status: 'conflict'; currentWrappingVersion: number };
 
-export interface CommitVaultMigrationInput {
-  operationId: string;
-  migrationId: string;
-  basePhase: PrivateProVaultMigrationPhase | null;
-  phase: PrivateProVaultMigrationPhase;
-}
-
 export interface RevokeVaultDeviceInput {
   operationId: string;
   deviceId: string;
@@ -76,11 +67,6 @@ export interface CompleteVaultDeviceRegistrationInput {
   expiresAtMs: number;
   signatureBase64: string;
 }
-
-export type CommitVaultMigrationResult =
-  | { status: 'committed'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
-  | { status: 'unchanged'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
-  | { status: 'conflict'; currentPhase: PrivateProVaultMigrationPhase | null };
 
 function assertUid(uid: string): void {
   if (!uid || uid.includes('/')) throw new Error('Authenticated UID is invalid.');
@@ -136,10 +122,6 @@ function repeatOutcome(outcome: PrivateProVaultOperationOutcome) {
       return outcome.status === 'committed'
         ? { status: 'unchanged' as const, wrappingVersion: outcome.wrappingVersion, serverUpdatedAtMs: outcome.serverUpdatedAtMs }
         : { status: 'conflict' as const, currentWrappingVersion: outcome.currentWrappingVersion };
-    case 'migration':
-      return outcome.status === 'committed'
-        ? { status: 'unchanged' as const, phase: outcome.phase, serverUpdatedAtMs: outcome.serverUpdatedAtMs }
-        : { status: 'conflict' as const, currentPhase: outcome.currentPhase };
     case 'device':
       return { status: 'unchanged' as const, revokedAtMs: outcome.revokedAtMs };
     case 'device-registration':
@@ -410,37 +392,6 @@ export function createPrivateProVaultService(
         await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
         return { status: 'committed' as const, revokedAtMs };
       });
-    },
-
-    async commitMigration(uid: string, input: CommitVaultMigrationInput): Promise<CommitVaultMigrationResult> {
-      assertUid(uid);
-      assertOperationId(input.operationId);
-      if (!MIGRATION_ID.test(input.migrationId) || !input.phase || input.phase.length > 128)
-        throw new Error('Vault migration input is invalid.');
-      const requestFingerprint = fingerprint({ kind: 'migration', ...input });
-
-      return repository.transaction(uid, async transaction => {
-        const repeated = await existingOperation(transaction, input.operationId, requestFingerprint);
-        if (repeated) return repeated as CommitVaultMigrationResult;
-        const current = await transaction.getMigration(input.migrationId);
-        const currentPhase = current?.phase ?? null;
-        if (currentPhase !== input.basePhase) {
-          const outcome = { kind: 'migration', status: 'conflict', currentPhase } as const;
-          await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
-          return { status: 'conflict', currentPhase };
-        }
-        const serverUpdatedAtMs = now();
-        await transaction.setMigration({ migrationId: input.migrationId, phase: input.phase, serverUpdatedAtMs });
-        const outcome = { kind: 'migration', status: 'committed', phase: input.phase, serverUpdatedAtMs } as const;
-        await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
-        return { status: 'committed', phase: input.phase, serverUpdatedAtMs };
-      });
-    },
-
-    async getMigration(uid: string, migrationId: string) {
-      assertUid(uid);
-      if (!MIGRATION_ID.test(migrationId)) throw new Error('Vault migration ID is invalid.');
-      return repository.transaction(uid, transaction => transaction.getMigration(migrationId));
     },
   };
 }

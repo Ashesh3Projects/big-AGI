@@ -78,10 +78,6 @@ const service = {
     if (state.putKeysetError) throw state.putKeysetError;
     return { status: 'committed' as const, wrappingVersion: 1, serverUpdatedAtMs: 1 };
   },
-  commitMigration: async (uid: string, input: unknown) => {
-    state.calls.push({ method: 'commitMigration', uid, input });
-    return { status: 'committed' as const, phase: 'complete', serverUpdatedAtMs: 1 };
-  },
   revokeDevice: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'revokeDevice', uid, input });
     return { status: 'committed' as const, revokedAtMs: 1 };
@@ -113,6 +109,10 @@ function router() {
   }
   return routerPromise;
 }
+
+type VaultRouterCaller = ReturnType<Awaited<ReturnType<typeof router>>['createCaller']>;
+type AssertFalse<T extends false> = T;
+type _CommitMigrationIsNotAProcedure = AssertFalse<'commitMigration' extends keyof VaultRouterCaller ? true : false>;
 
 function identity(overrides: Partial<PrivateProIdentity> = {}): PrivateProIdentity {
   return {
@@ -203,6 +203,8 @@ describe('private Pro vault router input bounds', () => {
     state.account = account();
     const caller = (await router()).createCaller(context(identity()));
 
+    assert.equal('commitMigration' in caller, false);
+
     await caller.bootstrap({ deviceId: DEVICE_ID });
     await caller.listDevices();
     await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
@@ -230,7 +232,6 @@ describe('private Pro vault router input bounds', () => {
       },
     });
     await caller.putKeyset({ operationId: 'put-keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
-    await caller.commitMigration({ operationId: 'migration-1', migrationId: 'legacy-v1', basePhase: null, phase: 'complete' });
     await caller.revokeDevice({ operationId: 'revoke-device-1', deviceId: DEVICE_ID });
   });
 

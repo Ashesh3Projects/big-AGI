@@ -2,13 +2,17 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 
 import { privateProSyncLabel } from './privatePro.ui';
+import type { PrivateProSyncPhase } from '../sync/store-private-pro-sync';
+
+
+type AssertFalse<T extends false> = T;
+type _MigratingIsNotASyncPhase = AssertFalse<'migrating' extends PrivateProSyncPhase ? true : false>;
 
 
 describe('private Pro sync labels', () => {
   test('maps every sync phase to concise user-facing copy', () => {
     assert.deepEqual({
       local: privateProSyncLabel('local'),
-      migrating: privateProSyncLabel('migrating'),
       syncing: privateProSyncLabel('syncing'),
       synced: privateProSyncLabel('synced'),
       offline: privateProSyncLabel('offline'),
@@ -18,7 +22,6 @@ describe('private Pro sync labels', () => {
       error: privateProSyncLabel('error'),
     }, {
       local: 'Local only',
-      migrating: 'Uploading this device',
       syncing: 'Syncing',
       synced: 'Synced',
       offline: 'Offline',

@@ -192,15 +192,16 @@ The suite verifies cross-account denial, claim and epoch enforcement, inactive-a
 7. Deploy Vercel and verify valid App Check metrics and request headers.
 8. Enable Firestore and Storage App Check enforcement in that order.
 9. Sign in with one allowlisted Google account.
-10. Confirm existing local chats, personas, and referenced attachments enter the migration queue automatically.
-11. Open the app on a second browser/device and confirm the same private vault downloads.
-12. Try a non-allowlisted account and confirm it receives Access denied.
+10. Start with an empty browser profile and complete encrypted vault password/recovery setup before creating portable data.
+11. Add a sentinel chat, setting, credential, and attachment, then open a second clean browser/device and confirm the encrypted vault reconstructs them before the app becomes editable.
+12. Create and restore an encrypted backup in a clean profile.
+13. Try a non-allowlisted account and confirm it receives Access denied.
 
 ## Production checks
 
 - The account menu shows the approved Google email.
 - The sync state reaches Synced.
-- Local model settings and API keys do not appear on another device.
+- Local model settings and API keys appear on another approved device only after vault unlock and encrypted hydration.
 - Incognito chats do not appear on another device.
 - Deleting a chat propagates to another device.
 - Concurrent edits preserve a conflict copy.

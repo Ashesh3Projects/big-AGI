@@ -35,7 +35,7 @@ import { clearPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } f
 import { signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 
 
-export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'migrating' | 'error';
+export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'error';
 export type PrivateProVaultLifecyclePhase = PrivateProVaultPublicPhase;
 
 export interface PrivateProVaultPublicState {
@@ -57,7 +57,7 @@ export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnro
   remember(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
   register(keyset: TKeyset, enrollmentKey: TEnrollmentKey): Promise<void>;
   activate(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
-  subscribeRuntime(listener: (phase: 'ready' | 'reconnecting' | 'migrating' | 'error') => void): () => void;
+  subscribeRuntime(listener: (phase: 'hydrating' | 'ready' | 'reconnecting' | 'error') => void): () => void;
   logout(): Promise<void>;
   onState?(state: PrivateProVaultPublicState): void;
   createOperationId?(): string;
@@ -460,10 +460,10 @@ function createProductionDependencies(
       runtime.devices = await apiAsyncNode.privateProVault.listDevices.query();
     },
     subscribeRuntime(listener) {
-      const mapPhase = (phase: PrivateProVaultPhase): 'ready' | 'reconnecting' | 'migrating' | 'error' => {
+      const mapPhase = (phase: PrivateProVaultPhase): 'hydrating' | 'ready' | 'reconnecting' | 'error' => {
         if (phase === 'ready') return 'ready';
         if (phase === 'reconnecting') return 'reconnecting';
-        if (phase === 'hydrating') return 'migrating';
+        if (phase === 'hydrating') return 'hydrating';
         return 'error';
       };
       return privateProVaultStore.subscribe(state => listener(mapPhase(state.phase)));

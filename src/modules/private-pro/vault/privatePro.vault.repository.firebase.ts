@@ -2,7 +2,6 @@ import { FieldPath, type CollectionReference, type DocumentData, type Firestore,
 
 import { getPrivateProFirestore } from '../firebase/firebase.admin';
 import type {
-  PrivateProVaultMigrationState,
   PrivateProVaultOperationReceipt,
   PrivateProVaultRegistrationChallenge,
   PrivateProVaultRepository,
@@ -107,14 +106,6 @@ class FirebasePrivateProVaultTransaction implements PrivateProVaultRepositoryTra
     this.transaction.delete(this.db.doc(`${vaultRoot(this.uid)}/registrationChallenges/${challengeId}`));
   }
 
-  async getMigration(migrationId: string) {
-    const snapshot = await this.transaction.get(this.db.doc(`${vaultRoot(this.uid)}/migrations/${migrationId}`));
-    return snapshot.exists ? snapshot.data() as PrivateProVaultMigrationState : null;
-  }
-
-  async setMigration(migration: PrivateProVaultMigrationState) {
-    this.transaction.set(this.db.doc(`${vaultRoot(this.uid)}/migrations/${migration.migrationId}`), migration);
-  }
 }
 
 export class FirebasePrivateProVaultRepository implements PrivateProVaultRepository {

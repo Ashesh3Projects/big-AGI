@@ -3,7 +3,6 @@ import type { PrivateProSyncPhase } from '../sync/store-private-pro-sync';
 
 const labels: Record<PrivateProSyncPhase, string> = {
   local: 'Local only',
-  migrating: 'Uploading this device',
   syncing: 'Syncing',
   synced: 'Synced',
   offline: 'Offline',

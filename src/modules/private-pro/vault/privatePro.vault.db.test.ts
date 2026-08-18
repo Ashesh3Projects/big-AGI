@@ -103,7 +103,7 @@ describe('private Pro encrypted vault database', () => {
     assert.equal(db.verno, PRIVATE_PRO_VAULT_DB_VERSION);
     assert.deepEqual(
       db.tables.map(table => table.name).sort(),
-      ['deviceKeys', 'hydratedAssets', 'migration', 'outbox', 'quarantine', 'records', 'revisions', 'wrappedKeys'].sort(),
+      ['deviceKeys', 'hydratedAssets', 'outbox', 'quarantine', 'records', 'revisions', 'wrappedKeys'].sort(),
     );
   });
 

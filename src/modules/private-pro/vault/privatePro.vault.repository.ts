@@ -42,21 +42,11 @@ export interface PrivateProVaultRegistrationChallenge {
   expiresAtMs: number;
 }
 
-export type PrivateProVaultMigrationPhase = string;
-
-export interface PrivateProVaultMigrationState {
-  migrationId: string;
-  phase: PrivateProVaultMigrationPhase;
-  serverUpdatedAtMs: number;
-}
-
 export type PrivateProVaultOperationOutcome =
   | { kind: 'record'; status: 'committed'; revision: number; serverUpdatedAtMs: number }
   | { kind: 'record'; status: 'conflict'; currentRevision: number }
   | { kind: 'keyset'; status: 'committed'; wrappingVersion: number; serverUpdatedAtMs: number }
   | { kind: 'keyset'; status: 'conflict'; currentWrappingVersion: number }
-  | { kind: 'migration'; status: 'committed'; phase: PrivateProVaultMigrationPhase; serverUpdatedAtMs: number }
-  | { kind: 'migration'; status: 'conflict'; currentPhase: PrivateProVaultMigrationPhase | null }
   | { kind: 'device'; status: 'committed'; revokedAtMs: number }
   | { kind: 'device-registration'; status: 'committed'; device: PrivateProVaultStoredDevice };
 
@@ -96,8 +86,6 @@ export interface PrivateProVaultRepositoryTransaction {
   getRegistrationChallenge(challengeId: string): Promise<PrivateProVaultRegistrationChallenge | null>;
   createRegistrationChallenge(challenge: PrivateProVaultRegistrationChallenge): Promise<void>;
   deleteRegistrationChallenge(challengeId: string): Promise<void>;
-  getMigration(migrationId: string): Promise<PrivateProVaultMigrationState | null>;
-  setMigration(migration: PrivateProVaultMigrationState): Promise<void>;
 }
 
 export interface PrivateProVaultRepository {

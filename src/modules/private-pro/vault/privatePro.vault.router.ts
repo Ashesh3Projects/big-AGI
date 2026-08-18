@@ -20,7 +20,6 @@ import type { PrivateProVaultService } from './privatePro.vault.service';
 const opaqueIdSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const operationIdSchema = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
 const baseVersionSchema = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
-const migrationValueSchema = z.string().regex(/^[A-Za-z0-9._:-]{1,128}$/);
 const firestoreEnvelopeSchema = PrivateProVaultEnvelopeSchema.refine(
   envelope => envelope.ciphertextBytes <= PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
   'Vault record ciphertext exceeds the server limit.',
@@ -120,15 +119,6 @@ export function createPrivateProVaultRouter(
       keyset: PrivateProVaultKeysetSchema,
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().putKeyset(ctx.privateProIdentity.uid, input))),
-
-  commitMigration: deviceProcedure
-    .input(z.object({
-      operationId: operationIdSchema,
-      migrationId: migrationValueSchema,
-      basePhase: migrationValueSchema.nullable(),
-      phase: migrationValueSchema,
-    }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => service().commitMigration(ctx.privateProIdentity.uid, input))),
 
   revokeDevice: deviceProcedure
     .input(z.object({ operationId: operationIdSchema, deviceId: opaqueIdSchema }).strict())

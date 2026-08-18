@@ -59,11 +59,6 @@ service cloud.firestore {
         allow write: if false;
       }
 
-      match /migrations/{migrationId} {
-        allow read: if ownsActiveVault(uid);
-        allow write: if false;
-      }
-
       match /quotaReservations/{reservationId} {
         allow read, write: if false;
       }

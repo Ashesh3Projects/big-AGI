@@ -8,6 +8,8 @@ Private Pro is online-gated. After Google sign-in, startup remains blocked until
 
 This design replaces the earlier explicit exclusion of model configuration, API keys, general settings, and plaintext cloud records. It does not change the Open/self-hosted build.
 
+Private Pro is a greenfield application. At launch there are zero existing users, chats, personas, assets, or legacy production records. Every account creates and writes the encrypted vault from first setup. There is no plaintext-to-encrypted migration, compatibility read window, migration journal, or legacy cleanup path in this design.
+
 ## Goals
 
 - Recreate the user's portable Big-AGI experience on a new computer after Google sign-in and vault unlock.
@@ -18,7 +20,6 @@ This design replaces the earlier explicit exclusion of model configuration, API 
 - Download and apply all latest remote revisions before the user may edit or use the app.
 - Merge independent settings records without losing unrelated changes from another computer.
 - Use server-assigned monotonic revisions instead of device clocks for conflict decisions.
-- Migrate existing plaintext local and cloud data without loss, then remove legacy plaintext copies after verification.
 - Harden the live application before encrypted credential synchronization is enabled.
 
 ## Non-goals
@@ -77,7 +78,7 @@ Vercel remains the only mutation authority. It:
 
 ### Firebase
 
-Firestore stores account state, wrapped-key metadata, encrypted record manifests, encrypted record payloads, tombstones, device metadata, migration journals, and quota state. Cloud Storage stores encrypted attachment chunks. Direct browser writes remain denied. Direct browser reads are removed for vault ciphertext where practical and replaced with authenticated Vercel reads so App Check, entitlement, and current account state are checked consistently.
+Firestore stores account state, wrapped-key metadata, encrypted record manifests, encrypted record payloads, tombstones, device metadata, and quota state. Cloud Storage stores encrypted attachment chunks. Direct browser writes remain denied. Direct browser reads are removed for vault ciphertext where practical and replaced with authenticated Vercel reads so App Check, entitlement, and current account state are checked consistently.
 
 ## Cryptography
 
@@ -184,7 +185,7 @@ Do not upload localStorage wholesale. Define a versioned serializer and parser f
 - Reject functions, class instances, `CryptoKey`, file handles, object URLs, DOM objects, and unknown transient fields.
 - Support deterministic record discovery without exposing plaintext record names to the server.
 
-The existing full JSON export remains available as a manual tool but receives an encrypted export option before credential sync ships. The UI must warn that legacy unencrypted exports contain API keys.
+The existing full JSON export remains available as a manual tool, and the encrypted vault provides encrypted export/import before credential sync ships. Any unencrypted export UI must warn that the file can contain API keys.
 
 ## Startup and online gate
 
@@ -247,10 +248,9 @@ Create a dedicated IndexedDB database for:
 - Encrypted record cache.
 - Encrypted outbox operations.
 - Applied remote revisions and index cursor.
-- Migration journal.
 - Quarantined invalid ciphertext envelopes.
 
-Private Pro store adapters must stop writing plaintext portable values to existing localStorage keys and plaintext IndexedDB cells. During the transition, reads may import legacy values once, but post-migration writes go only through encrypted persistence. Runtime Zustand stores continue to expose their current typed APIs so most UI code does not need cryptographic knowledge.
+Private Pro store adapters write portable values only through encrypted persistence from first setup. They do not import legacy plaintext values. Runtime Zustand stores continue to expose their current typed APIs so most UI code does not need cryptographic knowledge.
 
 ## Attachment encryption
 
@@ -262,37 +262,6 @@ Private Pro store adapters must stop writing plaintext portable values to existi
 - Signed upload URLs remain path-scoped, short-lived, and authorized after identity, entitlement, App Check, rate, and quota checks.
 - Downloads return ciphertext only and are decrypted after hash and authenticated-encryption verification.
 
-## Migration
-
-### Preconditions
-
-- Complete dependency and content-execution security hardening.
-- Deploy and verify new encrypted schemas, endpoints, rules, App Check, and quotas.
-- Require a fresh manual encrypted export before destructive plaintext cleanup.
-
-### Local migration
-
-1. Freeze portable edits behind the startup/migration screen.
-2. Inventory all included legacy localStorage and IndexedDB records through explicit serializers.
-3. Create or unlock the encrypted vault.
-4. Encrypt every record and attachment into the local encrypted cache.
-5. Decrypt and validate every local encrypted envelope before upload.
-6. Upload in idempotent batches and verify server revisions and ciphertext hashes.
-7. Download the resulting cloud index and verify it reconstructs the same portable state.
-8. Mark the migration committed.
-9. Remove included plaintext localStorage and plaintext IndexedDB values.
-
-### Cloud migration
-
-Existing plaintext chat/persona documents and plaintext attachment objects remain readable only during migration. The client downloads them through the authorized legacy path, validates them, encrypts them, and uploads encrypted replacements. After the client verifies the encrypted cloud copy:
-
-- Vercel marks the account encryption migration complete.
-- Legacy rules deny further plaintext reads.
-- A server cleanup job deletes plaintext Firestore revisions and plaintext Storage objects.
-- Cleanup is idempotent and retains a bounded encrypted migration audit record without plaintext.
-
-Never delete a plaintext source until its encrypted replacement has been uploaded, downloaded, decrypted, and schema-validated successfully.
-
 ## Password, recovery, and logout
 
 ### First setup
@@ -301,7 +270,7 @@ Never delete a plaintext source until its encrypted replacement has been uploade
 - Reject weak passwords with a local strength meter and minimum length.
 - Generate and display the recovery key before accepting setup completion.
 - Require the user to confirm selected recovery-key groups.
-- Create an encrypted export after vault creation and before legacy deletion.
+- Offer an encrypted export immediately after vault creation.
 
 ### Password change
 
@@ -324,7 +293,7 @@ Explicit logout:
 - Stops synchronization and removes Firebase authentication persistence.
 - Deletes the remembered-device key and wrapped master key.
 - Clears decrypted runtime stores and plaintext drafts.
-- Removes decrypted caches and legacy plaintext storage.
+- Removes decrypted caches and other decrypted local state.
 - Retains only ciphertext that is useless without a future password/recovery unlock, or removes all local ciphertext when the user selects a full local wipe.
 
 ## Security hardening prerequisites
@@ -394,7 +363,6 @@ users/{uid}/vault/keysets/{keyVersion}
 users/{uid}/vault/records/{opaqueRecordId}
 users/{uid}/vault/tombstones/{opaqueRecordId}
 users/{uid}/vault/devices/{deviceId}
-users/{uid}/vault/migrations/{migrationId}
 users/{uid}/vault/uploads/{operationId}
 users/{uid}/vault/uploads/{operationId}/chunks/{chunkId}
 users/{uid}/vault/assets/{assetId}
@@ -429,7 +397,6 @@ Required operations:
 - Reserve/finalize/release encrypted attachment chunks.
 - Rotate password/recovery envelopes.
 - Register/revoke remembered-device metadata without uploading a device unlock key.
-- Commit and clean up encryption migration.
 
 Rate-limit password-envelope attempts, record mutations, index scans, and attachment operations per UID and source. Password validation remains local, so rate limiting primarily protects metadata and denial-of-service surfaces.
 
@@ -443,7 +410,6 @@ Rate-limit password-envelope attempts, record mutations, index scans, and attach
 - Recovery-key entry.
 - Initial vault setup and recovery-key confirmation.
 - Downloading latest vault.
-- Migrating and verifying encrypted data.
 - Reconnecting after connectivity loss.
 - Security/version upgrade required.
 
@@ -467,7 +433,6 @@ Never display secrets in conflict messages, logs, toast details, or account diag
 - Corrupt envelope: quarantine it, block startup if it is required state, and offer recovery from prior encrypted revision/export.
 - Remote rollback: detect revision/index regression and block instead of silently applying older state.
 - App Check failure: block with a specific retry message without falling back to an unprotected endpoint.
-- Migration interruption: resume from the encrypted local and server journals.
 - Quota exhaustion: block the affected upload without deleting existing encrypted data.
 - Dependency/security gate failure: do not enable encrypted credential sync in production.
 
@@ -485,7 +450,7 @@ Never display secrets in conflict messages, logs, toast details, or account diag
 - Store and restore a non-exportable device `CryptoKey` through IndexedDB.
 - Remembered-device auto-unlock survives reload and browser restart.
 - Explicit logout destroys automatic unlock and decrypted local state.
-- Private Pro durable stores contain ciphertext only after migration.
+- Private Pro durable stores contain ciphertext only from first setup.
 
 ### Synchronization
 
@@ -496,12 +461,11 @@ Never display secrets in conflict messages, logs, toast details, or account diag
 - Startup blocks with stale cache, offline state, failed decryption, or unapplied newer revisions.
 - Remote rollback and replayed operation IDs are rejected.
 
-### Migration and recovery
+### Setup, backup, and recovery
 
 - Import all explicitly included stores and exclude every non-portable field.
-- Encrypt and verify existing plaintext local chats, personas, settings, keys, and assets.
-- Convert legacy Firebase data and delete plaintext only after end-to-end verification.
-- Resume after interruption at every migration phase.
+- Encrypt and validate every newly persisted chat, persona, setting, key, and asset before cloud upload.
+- Encrypted export/import reconstructs the portable vault without exposing plaintext to cloud services.
 - Password change rewraps without record re-encryption.
 - Recovery key restores and rotates password.
 
@@ -523,23 +487,19 @@ Never display secrets in conflict messages, logs, toast details, or account diag
 - TypeScript and ESLint.
 - Production build and Vercel bundle/runtime probes.
 - Real two-browser-profile multi-device acceptance test.
-- Migration rehearsal using a copied test vault before the production account migration.
 - Post-deploy live checks for headers, Firebase rules, App Check, sign-in, unlock, download-before-edit, upload, logout, and recovery.
 
 ## Rollout
 
-1. Land and deploy security hardening without changing existing sync payloads.
-2. Add encrypted vault code behind a server and client feature flag.
-3. Enable App Check monitoring, then enforcement.
-4. Run a test-account encrypted migration and destructive cleanup rehearsal.
-5. Require the production user to create a password, save the recovery key, and create an encrypted export.
-6. Migrate local and cloud plaintext data to encrypted records.
-7. Verify reconstruction on a second clean browser profile.
-8. Delete legacy plaintext cloud data and local persistence.
-9. Enable encrypted credential/settings mutation sync.
-10. Monitor error rates, App Check rejection, quota, and migration completion without logging plaintext.
+1. Land and deploy security hardening with the encrypted vault feature disabled.
+2. Deploy encrypted vault schemas, endpoints, rules, App Check, quotas, and database recovery controls.
+3. Verify a staging/test account creates an encrypted vault from empty first setup.
+4. Verify reconstruction on a second clean browser profile, encrypted export/import, logout, and recovery.
+5. Enable production first setup and require password plus recovery-key confirmation before the application opens.
+6. Enable encrypted credential/settings mutation sync only after the startup and two-device gates pass.
+7. Monitor error rates, App Check rejection, quota, and recovery health without logging plaintext.
 
-Rollback before plaintext cleanup may return to legacy sync. After verified plaintext cleanup, rollback must use the encrypted vault or restore from the encrypted export. Never reintroduce plaintext credential synchronization as a rollback path.
+Rollback must keep encrypted vault data encrypted or restore from an encrypted export. Never add plaintext credential synchronization as a rollback path.
 
 ## Success criteria
 
@@ -549,4 +509,4 @@ Rollback before plaintext cleanup may return to legacy sync. After verified plai
 - A theme change on PC B does not overwrite unrelated credentials or model settings.
 - Firebase, Vercel, logs, and exported cloud records contain no plaintext chats, settings, attachments, or API keys.
 - Logout removes automatic local unlock and decrypted durable data.
-- Cross-account, XSS, App Check, migration, recovery, and dependency release gates pass.
+- Cross-account, XSS, App Check, recovery, and dependency release gates pass.

@@ -4,7 +4,6 @@ import { create } from 'zustand';
 export type PrivateProSyncPhase =
   | 'local'
   | 'binding-conflict'
-  | 'migrating'
   | 'syncing'
   | 'synced'
   | 'offline'

@@ -644,7 +644,6 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
         deps.db.records,
         deps.db.outbox,
         deps.db.revisions,
-        deps.db.migration,
         deps.db.quarantine,
         deps.db.hydratedAssets,
       ], async () => {
@@ -654,7 +653,6 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
           deps.db.records.where('uid').equals(deps.uid).delete(),
           deps.db.outbox.where('uid').equals(deps.uid).delete(),
           deps.db.revisions.where('uid').equals(deps.uid).delete(),
-          deps.db.migration.where('uid').equals(deps.uid).delete(),
           deps.db.quarantine.where('uid').equals(deps.uid).delete(),
           deps.db.hydratedAssets.where('uid').equals(deps.uid).delete(),
         ]);

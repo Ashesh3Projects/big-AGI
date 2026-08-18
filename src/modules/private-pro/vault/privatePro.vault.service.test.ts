@@ -5,7 +5,6 @@ import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
   comparePrivateProVaultOpaqueIds,
   mergePrivateProVaultIndexEntries,
-  type PrivateProVaultMigrationState,
   type PrivateProVaultOperationReceipt,
   type PrivateProVaultRegistrationChallenge,
   type PrivateProVaultRepository,
@@ -15,7 +14,7 @@ import {
   type PrivateProVaultStoredRecord,
   type PrivateProVaultStoredTombstone,
 } from './privatePro.vault.repository';
-import { createPrivateProVaultService } from './privatePro.vault.service';
+import { createPrivateProVaultService, type PrivateProVaultService } from './privatePro.vault.service';
 import { createPrivateProVaultEnrollmentAuthority, signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 import type {
   PrivateProVaultEnvelope,
@@ -31,6 +30,10 @@ const RECORD_A = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa';
 const RECORD_B = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb';
 const NONCE_BASE64 = 'AAAAAAAAAAAAAAAA';
 const CIPHERTEXT_BASE64 = 'AAAAAAAAAAAAAAAAAAAAAA==';
+
+type AssertFalse<T extends false> = T;
+type _CommitMigrationIsNotAServiceMethod = AssertFalse<'commitMigration' extends keyof PrivateProVaultService ? true : false>;
+type _GetMigrationIsNotAServiceMethod = AssertFalse<'getMigration' extends keyof PrivateProVaultService ? true : false>;
 
 
 function clone<T>(value: T): T {
@@ -117,7 +120,6 @@ interface MemoryVault {
   keyset: PrivateProVaultStoredKeyset | null;
   devices: Map<string, PrivateProVaultStoredDevice>;
   registrationChallenges: Map<string, PrivateProVaultRegistrationChallenge>;
-  migrations: Map<string, PrivateProVaultMigrationState>;
 }
 
 class MemoryVaultRepository implements PrivateProVaultRepository {
@@ -133,7 +135,6 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         keyset: null,
         devices: new Map(),
         registrationChallenges: new Map(),
-        migrations: new Map(),
       };
       this.vaults.set(uid, vault);
     }
@@ -165,8 +166,6 @@ class MemoryVaultRepository implements PrivateProVaultRepository {
         vault.registrationChallenges.set(challenge.challengeId, clone(challenge));
       },
       deleteRegistrationChallenge: async challengeId => { vault.registrationChallenges.delete(challengeId); },
-      getMigration: async migrationId => clone(vault.migrations.get(migrationId) ?? null),
-      setMigration: async migration => { vault.migrations.set(migration.migrationId, clone(migration)); },
     };
     return callback(transaction);
   }
@@ -225,6 +224,13 @@ async function registrationFixture() {
 
 
 describe('Private Pro encrypted vault service', () => {
+  test('does not expose legacy migration operations', () => {
+    const { service } = serviceFixture();
+
+    assert.equal('commitMigration' in service, false);
+    assert.equal('getMigration' in service, false);
+  });
+
   test('commits the first record write with a server revision and timestamp', async () => {
     const { service } = serviceFixture();
 
@@ -627,38 +633,6 @@ describe('Private Pro encrypted vault service', () => {
     assert.deepEqual(Object.keys(stored).sort(), ['createdAtMs', 'deviceId', 'formatVersion', 'keyVersion', 'lastSeenAtMs', 'revokedAtMs']);
   });
 
-  test('compare-and-swaps migration phases and makes retries idempotent', async () => {
-    const { service } = serviceFixture();
-    const start = {
-      operationId: 'migration-start',
-      migrationId: 'legacy-v1',
-      basePhase: null,
-      phase: 'encrypting',
-    };
-    assert.deepEqual(await service.commitMigration(UID_A, start), {
-      status: 'committed',
-      phase: 'encrypting',
-      serverUpdatedAtMs: 1_000,
-    });
-    assert.deepEqual(await service.commitMigration(UID_A, start), {
-      status: 'unchanged',
-      phase: 'encrypting',
-      serverUpdatedAtMs: 1_000,
-    });
-    assert.deepEqual(await service.commitMigration(UID_A, {
-      operationId: 'migration-stale',
-      migrationId: 'legacy-v1',
-      basePhase: null,
-      phase: 'committed',
-    }), { status: 'conflict', currentPhase: 'encrypting' });
-    assert.deepEqual(await service.commitMigration(UID_A, {
-      operationId: 'migration-finish',
-      migrationId: 'legacy-v1',
-      basePhase: 'encrypting',
-      phase: 'committed',
-    }), { status: 'committed', phase: 'committed', serverUpdatedAtMs: 1_001 });
-  });
-
   test('rejects records above the Firestore-safe ciphertext bound', async () => {
     const { service } = serviceFixture();
 
@@ -670,7 +644,7 @@ describe('Private Pro encrypted vault service', () => {
     }), /ciphertext.*700 KiB/i);
   });
 
-  test('scopes records, operations, keysets, and migrations by authenticated UID', async () => {
+  test('scopes records, operations, and keysets by authenticated UID', async () => {
     const { service } = serviceFixture();
     const input = {
       operationId: 'same-operation-id',
@@ -681,14 +655,10 @@ describe('Private Pro encrypted vault service', () => {
     await service.putRecord(UID_A, input);
     await service.putRecord(UID_B, input);
     await service.putKeyset(UID_A, { operationId: 'same-keyset-op', baseWrappingVersion: 0, keyset: keyset(1) });
-    await service.commitMigration(UID_A, {
-      operationId: 'same-migration-op', migrationId: 'legacy-v1', basePhase: null, phase: 'encrypting',
-    });
 
     assert.equal((await service.getIndex(UID_A, { pageSize: 10 })).entries.length, 1);
     assert.equal((await service.getIndex(UID_B, { pageSize: 10 })).entries.length, 1);
     assert.equal(await service.getKeyset(UID_B), null);
-    assert.equal(await service.getMigration(UID_B, 'legacy-v1'), null);
   });
 
   test('rejects visible record metadata that disagrees with the route', async () => {

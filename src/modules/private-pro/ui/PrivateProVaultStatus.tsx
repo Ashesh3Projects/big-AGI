@@ -13,7 +13,6 @@ export interface PrivateProVaultStatusProps {
 
 const copy: Record<PrivateProVaultStatusProps['phase'], { title: string; body: string }> = {
   hydrating: { title: 'Opening encrypted vault', body: 'Downloading and applying the latest encrypted state.' },
-  migrating: { title: 'Migrating encrypted vault', body: 'Portable data remains blocked until migration is verified.' },
   reconnecting: { title: 'Reconnect required', body: 'Private Pro cannot open or edit a stale vault.' },
   error: { title: 'Vault unavailable', body: 'The encrypted vault could not be opened safely.' },
 };
