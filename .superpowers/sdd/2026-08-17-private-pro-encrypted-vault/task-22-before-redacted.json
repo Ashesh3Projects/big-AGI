@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "collectedAt": "2026-08-18T12:38:57Z",
+  "collector": "gcloud-firestore-databases-describe",
+  "database": "(default)",
+  "readable": true,
+  "databaseType": "FIRESTORE_NATIVE",
+  "databaseEdition": "STANDARD",
+  "location": "us-central1",
+  "deletionProtection": "disabled",
+  "pitr": "disabled",
+  "earliestVersionTime": "2026-08-18T11:30:50Z",
+  "versionRetentionPeriod": "3600s",
+  "blockerCount": 1,
+  "costDecisionPending": true,
+  "cloudMutationCount": 0
+}

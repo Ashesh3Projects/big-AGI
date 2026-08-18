@@ -268,25 +268,38 @@ npm run test:firebase:exec
 
 The suite verifies that browser Firestore reads and writes, Storage reads and writes, cross-account access, legacy plaintext paths, encrypted-vault paths, and Storage listing are denied.
 
+## Database recovery
+
+Before production approval, follow `infra/private-pro/firestore-recovery-controls.md`.
+
+The read-only Task 22 collection on 2026-08-18 found Firestore deletion protection disabled. This is a deployment blocker. Enabling it is a cloud mutation and still requires explicit approval for the exact command in the recovery runbook.
+
+PITR is also disabled. Do not enable PITR or provision scheduled exports until the product owner selects an RPO/RTO and the cost approver accepts the current location, edition, storage, operation, runtime, and retention estimate. The Task 12 password-encrypted archive is interactive and must not be described or implemented as a server-scheduled backup without a separate safe noninteractive key design. A managed Firestore export preserves stored ciphertext and metadata, but it is an infrastructure restore artifact rather than the user-facing encrypted archive.
+
+No restore rehearsal may target `(default)`. Use a separate database or approved separate project, verify the application against it, and delete rehearsal resources only with separate cleanup approval.
+
 ## Deployment
 
 Before step 1, confirm there are zero existing plaintext Private Pro users, chats, personas, assets, credentials, settings, or cloud records. If this is false, stop. A separate migration design, implementation, test plan, and review must finish before encrypted-vault rollout.
 
-1. Obtain approval for IAM provisioning. Create the dedicated runtime identity, WIF provider or static fallback, custom project role, and runtime-service-account-scoped Token Creator binding outside production first.
-2. Validate every manifest permission with a staging identity and protected endpoint probes. This Task 20 implementation has not performed that live validation.
-3. Push branch `pro` using your normal Git workflow.
-4. Select branch `pro` for the Vercel production project or create a separate Vercel project.
-5. Add all environment variables.
-6. Register reCAPTCHA Enterprise App Check in metrics-only mode.
-7. Deploy Firebase rules and indexes.
-8. Obtain separate approval for the exact browser-key, authorized-domain, deployment-alias, and Storage CORS changes in `infra/private-pro/firebase-origin-restrictions.md`. Save a redacted before snapshot, apply only the approved commands, and save a redacted after snapshot.
-9. Deploy Vercel and verify valid App Check metrics and request headers.
-10. Enable Firestore and Storage App Check enforcement in that order.
-11. Sign in with one allowlisted Google account.
-12. Start with an empty browser profile and complete encrypted vault password/recovery setup before creating portable data.
-13. Add a sentinel chat, setting, credential, and attachment, then open a second clean browser/device and confirm the encrypted vault reconstructs them before the app becomes editable.
-14. Create and restore an encrypted backup in a clean profile.
-15. Try a non-allowlisted account and confirm it receives Access denied.
+1. Clear the Firestore deletion-protection blocker using the separately approved command in the recovery runbook, then save a redacted verification snapshot.
+2. Record the approved RPO/RTO and cost decision for PITR, scheduled Firestore ciphertext exports, both, or explicit acceptance of the remaining recovery risk. Do not infer approval from deletion-protection approval.
+3. Obtain approval for IAM provisioning. Create the dedicated runtime identity, WIF provider or static fallback, custom project role, and runtime-service-account-scoped Token Creator binding outside production first.
+4. Validate every manifest permission with a staging identity and protected endpoint probes. This Task 20 implementation has not performed that live validation.
+5. Push branch `pro` using your normal Git workflow.
+6. Select branch `pro` for the Vercel production project or create a separate Vercel project.
+7. Add all environment variables.
+8. Register reCAPTCHA Enterprise App Check in metrics-only mode.
+9. Deploy Firebase rules and indexes.
+10. Obtain separate approval for the exact browser-key, authorized-domain, deployment-alias, and Storage CORS changes in `infra/private-pro/firebase-origin-restrictions.md`. Save a redacted before snapshot, apply only the approved commands, and save a redacted after snapshot.
+11. Deploy Vercel and verify valid App Check metrics and request headers.
+12. Enable Firestore and Storage App Check enforcement in that order.
+13. Sign in with one allowlisted Google account.
+14. Start with an empty browser profile and complete encrypted vault password/recovery setup before creating portable data.
+15. Add a sentinel chat, setting, credential, and attachment, then open a second clean browser/device and confirm the encrypted vault reconstructs them before the app becomes editable.
+16. Create and restore an encrypted backup in a clean profile.
+17. Complete the separately approved non-destructive Firestore restore rehearsal and record redacted evidence.
+18. Try a non-allowlisted account and confirm it receives Access denied.
 
 ## Production checks
 
@@ -297,6 +310,9 @@ Before step 1, confirm there are zero existing plaintext Private Pro users, chat
 - Deleting a chat propagates to another device.
 - Concurrent edits preserve a conflict copy.
 - Direct Firestore writes and direct Storage uploads fail.
+- Firestore deletion protection is enabled and the security audit reports no recovery-state blocker.
+- The approved PITR or export recovery control matches the recorded RPO/RTO and current cost decision.
+- The latest restore rehearsal used an isolated target, left `(default)` unchanged, and produced only redacted evidence.
 - The security audit reports no blockers for the exact custom-domain deployment alias, Firebase Auth domains, browser API-key referrers/API targets, or bucket CORS.
 - Removing an email and running access sync blocks its server mutations.
 - Missing or invalid `x-firebase-appcheck` blocks every private Pro procedure.

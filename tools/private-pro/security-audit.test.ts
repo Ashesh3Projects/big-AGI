@@ -46,6 +46,215 @@ function severities(findings: AuditFinding[]) {
 }
 
 describe('private Pro security audit classifiers', () => {
+  test('classifies exact Firestore deletion protection and PITR states without retaining database identity', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectFirestoreRecoveryState(value: unknown, projectId: string): {
+        readable: boolean;
+        databaseNameMatches: boolean;
+        deletionProtection: 'enabled' | 'disabled' | 'unspecified' | 'unknown';
+        pitr: 'enabled' | 'disabled' | 'unknown';
+        earliestVersionTimePresent: boolean;
+        versionRetentionPeriod: 'seven-days' | 'one-hour' | 'other' | 'missing';
+      };
+      classifyFirestoreRecoveryState(facts: ReturnType<typeof audit.inspectFirestoreRecoveryState>): AuditFinding[];
+    };
+    const enabled = audit.inspectFirestoreRecoveryState({
+      name: 'projects/sample-project/databases/(default)',
+      deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+      pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+      earliestVersionTime: '2026-08-18T00:00:00.123456Z',
+      versionRetentionPeriod: '604800s',
+    }, 'sample-project');
+    const disabled = audit.inspectFirestoreRecoveryState({
+      name: 'projects/sample-project/databases/(default)',
+      deleteProtectionState: 'DELETE_PROTECTION_DISABLED',
+      pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_DISABLED',
+      earliestVersionTime: '2026-08-18T00:00:00Z',
+      versionRetentionPeriod: '3600s',
+    }, 'sample-project');
+    const unspecified = audit.inspectFirestoreRecoveryState({
+      name: 'projects/sample-project/databases/(default)',
+      deleteProtectionState: 'DELETE_PROTECTION_STATE_UNSPECIFIED',
+      pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLEMENT_UNSPECIFIED',
+    }, 'sample-project');
+
+    assert.deepEqual(enabled, {
+      readable: true,
+      databaseNameMatches: true,
+      deletionProtection: 'enabled',
+      pitr: 'enabled',
+      earliestVersionTimePresent: true,
+      versionRetentionPeriod: 'seven-days',
+    });
+    assert.deepEqual(disabled, {
+      readable: true,
+      databaseNameMatches: true,
+      deletionProtection: 'disabled',
+      pitr: 'disabled',
+      earliestVersionTimePresent: true,
+      versionRetentionPeriod: 'one-hour',
+    });
+    assert.deepEqual(unspecified, {
+      readable: true,
+      databaseNameMatches: true,
+      deletionProtection: 'unspecified',
+      pitr: 'unknown',
+      earliestVersionTimePresent: false,
+      versionRetentionPeriod: 'missing',
+    });
+    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(enabled)), ['pass', 'pass', 'pass', 'pass', 'pass', 'pass']);
+    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(disabled)), ['pass', 'pass', 'block', 'pass', 'pass', 'warn']);
+    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(unspecified)), ['pass', 'pass', 'block', 'block', 'pass', 'block']);
+    assert.doesNotMatch(JSON.stringify(buildAuditReport(audit.classifyFirestoreRecoveryState(enabled))), /sample-project|projects\//);
+  });
+
+  test('fails closed on malformed or unrecognized Firestore recovery database shapes', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectFirestoreRecoveryState(value: unknown, projectId: string): {
+        readable: boolean;
+        databaseNameMatches: boolean;
+        deletionProtection: 'enabled' | 'disabled' | 'unspecified' | 'unknown';
+        pitr: 'enabled' | 'disabled' | 'unknown';
+        earliestVersionTimePresent: boolean;
+        versionRetentionPeriod: 'seven-days' | 'one-hour' | 'other' | 'missing';
+      };
+      classifyFirestoreRecoveryState(facts: ReturnType<typeof audit.inspectFirestoreRecoveryState>): AuditFinding[];
+    };
+    const invalidValues = [
+      null,
+      [],
+      'database',
+      {},
+      {
+        name: 'projects/sample-project/databases/(default)',
+        deleteProtectionState: 'DELETE_PROTECTION_MAGIC',
+        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+      },
+      {
+        name: 'projects/sample-project/databases/(default)',
+        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_MAGIC',
+      },
+      {
+        name: 'projects/sample-project/databases/(default)',
+        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+        earliestVersionTime: 'not-a-timestamp',
+      },
+      {
+        name: 'projects/sample-project/databases/(default)',
+        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+        earliestVersionTime: '2026-02-30T00:00:00Z',
+      },
+      {
+        name: 'projects/sample-project/databases/(default)',
+        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+        versionRetentionPeriod: 604800,
+      },
+    ];
+
+    for (const value of invalidValues) {
+      const facts = audit.inspectFirestoreRecoveryState(value, 'sample-project');
+      assert.equal(facts.readable, false);
+      assert.equal(audit.classifyFirestoreRecoveryState(facts).some(finding => finding.severity === 'block'), true);
+    }
+
+    const wrongDatabase = audit.inspectFirestoreRecoveryState({
+      name: 'projects/other-project/databases/(default)',
+      deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+      pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_DISABLED',
+    }, 'sample-project');
+    assert.equal(wrongDatabase.readable, true);
+    assert.equal(wrongDatabase.databaseNameMatches, false);
+    assert.equal(audit.classifyFirestoreRecoveryState(wrongDatabase)[1].severity, 'block');
+  });
+
+  test('uses only the read-only Firestore database describe command for recovery collection', async () => {
+    const audit = securityAuditModule as unknown as {
+      collectFirestoreRecoveryStateWithExecutor(
+        projectId: string,
+        execute: (command: string, args: string[]) => Promise<unknown>,
+      ): Promise<{ readable: boolean }>;
+    };
+    const calls: Array<{ command: string; args: string[] }> = [];
+
+    const facts = await audit.collectFirestoreRecoveryStateWithExecutor('sample-project', async (command, args) => {
+      calls.push({ command, args });
+      return {
+        name: 'projects/sample-project/databases/(default)',
+        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_DISABLED',
+        earliestVersionTime: '2026-08-18T00:00:00Z',
+        versionRetentionPeriod: '3600s',
+      };
+    });
+
+    assert.deepEqual(calls, [{
+      command: 'gcloud',
+      args: ['firestore', 'databases', 'describe', '--database=(default)', '--project=sample-project', '--format=json'],
+    }]);
+    assert.equal(facts.readable, true);
+  });
+
+  test('accepts only strict redacted Firestore restore rehearsal evidence', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectFirestoreRestoreEvidence(value: unknown): {
+        readable: boolean;
+        schemaErrors: number;
+        completed: boolean;
+        sourceUnchanged: boolean;
+        isolatedTarget: boolean;
+        dataVerified: boolean;
+        applicationVerified: boolean;
+      };
+    };
+    const evidence = {
+      schemaVersion: 1,
+      evidenceType: 'firestore-restore-rehearsal',
+      collectedAt: '2026-08-18T00:00:00Z',
+      sourceDatabase: '(default)',
+      restoreMethod: 'pitr-clone',
+      targetIsolation: 'separate-database',
+      status: 'passed',
+      sourceUnchanged: true,
+      dataVerificationPassed: true,
+      applicationVerificationPassed: true,
+    };
+
+    assert.deepEqual(audit.inspectFirestoreRestoreEvidence(evidence), {
+      readable: true,
+      schemaErrors: 0,
+      completed: true,
+      sourceUnchanged: true,
+      isolatedTarget: true,
+      dataVerified: true,
+      applicationVerified: true,
+    });
+
+    const mutations: Array<(value: Record<string, unknown>) => void> = [
+      value => { value.schemaVersion = 2; },
+      value => { value.evidenceType = 'raw-firestore-export'; },
+      value => { value.collectedAt = 'today'; },
+      value => { value.sourceDatabase = 'projects/sample-project/databases/(default)'; },
+      value => { value.restoreMethod = 'overwrite-production'; },
+      value => { value.targetIsolation = 'same-database'; },
+      value => { value.status = 'unknown'; },
+      value => { value.sourceUnchanged = 'yes'; },
+      value => { value.dataVerificationPassed = false; },
+      value => { value.rawPayload = { secret: true }; },
+      value => { delete value.applicationVerificationPassed; },
+    ];
+    for (const mutate of mutations) {
+      const changed = structuredClone(evidence) as Record<string, unknown>;
+      mutate(changed);
+      const facts = audit.inspectFirestoreRestoreEvidence(changed);
+      assert.equal(facts.readable, false);
+      assert.ok(facts.schemaErrors > 0);
+    }
+  });
+
   test('passes shell metacharacters as one argument without executing them', async () => {
     const directory = await mkdtemp(join(tmpdir(), 'private-pro-audit-'));
     const script = join(directory, 'echo-args.ps1');

@@ -279,6 +279,29 @@ interface FirebaseRuleProbeFacts {
   storageWrite: ProbeState;
 }
 
+type FirestoreDeletionProtectionState = 'enabled' | 'disabled' | 'unspecified' | 'unknown';
+type FirestorePitrState = 'enabled' | 'disabled' | 'unknown';
+type FirestoreVersionRetentionPeriod = 'seven-days' | 'one-hour' | 'other' | 'missing';
+
+export interface FirestoreRecoveryFacts {
+  readable: boolean;
+  databaseNameMatches: boolean;
+  deletionProtection: FirestoreDeletionProtectionState;
+  pitr: FirestorePitrState;
+  earliestVersionTimePresent: boolean;
+  versionRetentionPeriod: FirestoreVersionRetentionPeriod;
+}
+
+export interface FirestoreRestoreEvidenceFacts {
+  readable: boolean;
+  schemaErrors: number;
+  completed: boolean;
+  sourceUnchanged: boolean;
+  isolatedTarget: boolean;
+  dataVerified: boolean;
+  applicationVerified: boolean;
+}
+
 interface JsonRecord {
   [key: string]: unknown;
 }
@@ -480,6 +503,27 @@ export function classifyFirebaseRuleProbes(facts: FirebaseRuleProbeFacts): Audit
   ];
 }
 
+export function classifyFirestoreRecoveryState(facts: FirestoreRecoveryFacts): AuditFinding[] {
+  const retentionConsistent = facts.pitr === 'enabled'
+    ? facts.versionRetentionPeriod === 'seven-days' || facts.versionRetentionPeriod === 'missing'
+    : facts.pitr === 'disabled'
+      ? facts.versionRetentionPeriod === 'one-hour' || facts.versionRetentionPeriod === 'missing'
+      : false;
+  return [
+    booleanFinding('firestoreRecovery', 'readable', facts.readable),
+    booleanFinding('firestoreRecovery', 'databaseNameMatches', facts.databaseNameMatches),
+    booleanFinding('firestoreRecovery', 'deletionProtectionEnabled', facts.deletionProtection === 'enabled'),
+    booleanFinding('firestoreRecovery', 'retentionConsistent', facts.readable && retentionConsistent),
+    finding('firestoreRecovery', 'earliestVersionTimePresent', 'pass', facts.earliestVersionTimePresent ? 1 : 0),
+    finding(
+      'firestoreRecovery',
+      facts.pitr === 'enabled' ? 'pitrEnabled' : facts.pitr === 'disabled' ? 'pitrDecisionPending' : 'pitrUnknown',
+      facts.pitr === 'enabled' ? 'pass' : facts.pitr === 'disabled' ? 'warn' : 'block',
+      facts.pitr === 'enabled' ? 0 : 1,
+    ),
+  ];
+}
+
 function asRecord(value: unknown): JsonRecord {
   return typeof value === 'object' && value !== null ? value as JsonRecord : {};
 }
@@ -490,6 +534,126 @@ function asRecords(value: unknown): JsonRecord[] {
 
 function asStrings(value: unknown): string[] {
   return Array.isArray(value) ? value.filter((item): item is string => typeof item === 'string') : [];
+}
+
+function isProtobufTimestamp(value: unknown): value is string {
+  if (typeof value !== 'string') return false;
+  const match = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?Z$/.exec(value);
+  if (!match) return false;
+  const milliseconds = value.replace(/\.(\d{3})\d+Z$/, '.$1Z');
+  const parsed = new Date(milliseconds);
+  return Number.isFinite(parsed.getTime())
+    && parsed.getUTCFullYear() === Number(match[1])
+    && parsed.getUTCMonth() + 1 === Number(match[2])
+    && parsed.getUTCDate() === Number(match[3])
+    && parsed.getUTCHours() === Number(match[4])
+    && parsed.getUTCMinutes() === Number(match[5])
+    && parsed.getUTCSeconds() === Number(match[6]);
+}
+
+function inspectVersionRetentionPeriod(value: unknown): FirestoreVersionRetentionPeriod | undefined {
+  if (value === undefined) return 'missing';
+  if (typeof value !== 'string' || !/^\d+(?:\.\d{1,9})?s$/.test(value)) return undefined;
+  const seconds = Number(value.slice(0, -1));
+  if (!Number.isFinite(seconds)) return undefined;
+  if (seconds === 604800) return 'seven-days';
+  if (seconds === 3600) return 'one-hour';
+  return 'other';
+}
+
+export function inspectFirestoreRecoveryState(value: unknown, projectId: string): FirestoreRecoveryFacts {
+  const invalid: FirestoreRecoveryFacts = {
+    readable: false,
+    databaseNameMatches: false,
+    deletionProtection: 'unknown',
+    pitr: 'unknown',
+    earliestVersionTimePresent: false,
+    versionRetentionPeriod: 'missing',
+  };
+  if (!isPlainRecord(value)) return invalid;
+  const name = value.name;
+  const deleteProtectionState = value.deleteProtectionState;
+  const pointInTimeRecoveryEnablement = value.pointInTimeRecoveryEnablement;
+  if (typeof name !== 'string') return invalid;
+
+  const deletionProtection: FirestoreDeletionProtectionState = deleteProtectionState === 'DELETE_PROTECTION_ENABLED'
+    ? 'enabled'
+    : deleteProtectionState === 'DELETE_PROTECTION_DISABLED'
+      ? 'disabled'
+      : deleteProtectionState === 'DELETE_PROTECTION_STATE_UNSPECIFIED'
+        ? 'unspecified'
+        : 'unknown';
+  const pitr: FirestorePitrState = pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_ENABLED'
+    ? 'enabled'
+    : pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_DISABLED'
+      ? 'disabled'
+      : 'unknown';
+  const pitrEnumValid = pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_ENABLED'
+    || pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_DISABLED'
+    || pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_ENABLEMENT_UNSPECIFIED';
+  const earliestVersionTimeValid = value.earliestVersionTime === undefined || isProtobufTimestamp(value.earliestVersionTime);
+  const versionRetentionPeriod = inspectVersionRetentionPeriod(value.versionRetentionPeriod);
+  const readable = deletionProtection !== 'unknown'
+    && pitrEnumValid
+    && earliestVersionTimeValid
+    && versionRetentionPeriod !== undefined;
+
+  return {
+    readable,
+    databaseNameMatches: name === `projects/${projectId}/databases/(default)`,
+    deletionProtection,
+    pitr,
+    earliestVersionTimePresent: typeof value.earliestVersionTime === 'string' && earliestVersionTimeValid,
+    versionRetentionPeriod: versionRetentionPeriod ?? 'missing',
+  };
+}
+
+export function inspectFirestoreRestoreEvidence(value: unknown): FirestoreRestoreEvidenceFacts {
+  const invalid: FirestoreRestoreEvidenceFacts = {
+    readable: false,
+    schemaErrors: 1,
+    completed: false,
+    sourceUnchanged: false,
+    isolatedTarget: false,
+    dataVerified: false,
+    applicationVerified: false,
+  };
+  if (!isPlainRecord(value) || !hasExactKeys(value, [
+    'schemaVersion',
+    'evidenceType',
+    'collectedAt',
+    'sourceDatabase',
+    'restoreMethod',
+    'targetIsolation',
+    'status',
+    'sourceUnchanged',
+    'dataVerificationPassed',
+    'applicationVerificationPassed',
+  ])) return invalid;
+  const sourceUnchanged = value.sourceUnchanged;
+  const dataVerificationPassed = value.dataVerificationPassed;
+  const applicationVerificationPassed = value.applicationVerificationPassed;
+  const valid = value.schemaVersion === 1
+    && value.evidenceType === 'firestore-restore-rehearsal'
+    && isProtobufTimestamp(value.collectedAt)
+    && value.sourceDatabase === '(default)'
+    && (value.restoreMethod === 'pitr-clone' || value.restoreMethod === 'firestore-export-import')
+    && (value.targetIsolation === 'separate-database' || value.targetIsolation === 'separate-project')
+    && (value.status === 'passed' || value.status === 'failed')
+    && typeof sourceUnchanged === 'boolean'
+    && typeof dataVerificationPassed === 'boolean'
+    && typeof applicationVerificationPassed === 'boolean'
+    && (value.status === 'failed' || (sourceUnchanged && dataVerificationPassed && applicationVerificationPassed));
+  if (!valid) return invalid;
+  return {
+    readable: true,
+    schemaErrors: 0,
+    completed: value.status === 'passed',
+    sourceUnchanged,
+    isolatedTarget: true,
+    dataVerified: dataVerificationPassed,
+    applicationVerified: applicationVerificationPassed,
+  };
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -608,7 +772,7 @@ export function inspectApiKeyLookup(value: unknown, expectedProjectNumber: strin
     : null;
   if (!match || match[1] !== expectedProjectNumber)
     throw new Error('Configured Firebase browser API key could not be resolved to one key resource.');
-  return name;
+  return match[0];
 }
 
 export function inspectBucketCors(
@@ -1178,6 +1342,24 @@ async function collectAppCheck(projectId: string): Promise<AppCheckFacts> {
   return inspectAppCheck(value);
 }
 
+export async function collectFirestoreRecoveryStateWithExecutor(
+  projectId: string,
+  readJson: (command: string, args: string[]) => Promise<unknown> = (command, args) => runJson(command, args),
+): Promise<FirestoreRecoveryFacts> {
+  return inspectFirestoreRecoveryState(await readJson('gcloud', [
+    'firestore',
+    'databases',
+    'describe',
+    '--database=(default)',
+    `--project=${projectId}`,
+    '--format=json',
+  ]), projectId);
+}
+
+async function collectFirestoreRecoveryState(projectId: string): Promise<FirestoreRecoveryFacts> {
+  return collectFirestoreRecoveryStateWithExecutor(projectId);
+}
+
 function runtimeIdentityInput(activeAdcServiceAccountEmail?: string) {
   return {
     runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
@@ -1374,6 +1556,7 @@ async function collectReport(): Promise<AuditReport> {
     collectBrowserApiKeys(projectId).then(classifyBrowserApiKeys),
     collectBucketCors(storageBucket).then(classifyBucketCors),
     collectAppCheck(projectId).then(classifyAppCheck),
+    collectFirestoreRecoveryState(projectId).then(classifyFirestoreRecoveryState),
     collectIamRoles(projectId).then(classifyIamRoles),
     collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
     collectRuntimeRoleManifest().then(classifyRuntimeRoleManifest),
@@ -1384,7 +1567,7 @@ async function collectReport(): Promise<AuditReport> {
     collectDependencyAudit().then(classifyDependencyAudit),
     collectFirebaseRuleProbes(projectId, storageBucket).then(classifyFirebaseRuleProbes),
   ];
-  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'bucketCors', 'appCheck', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
+  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'bucketCors', 'appCheck', 'firestoreRecovery', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
   const results = await Promise.allSettled(tasks);
   const findings = results.flatMap((result, index) => result.status === 'fulfilled'
     ? result.value
