@@ -32,6 +32,8 @@ import {
   type AuditFinding,
 } from './security-audit';
 
+import * as securityAuditModule from './security-audit';
+
 
 function severities(findings: AuditFinding[]) {
   return findings.map(finding => finding.severity);
@@ -141,16 +143,21 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(classifyServiceAccountKeys({ collectorReady: false, identityCount: 1, total: 0, userManaged: 0, stale: 0, disabled: 0 })[0].severity, 'block');
   });
 
-  test('selects an explicit ADC runtime identity without requiring FIREBASE_CLIENT_EMAIL', () => {
+  test('treats the configured ADC service account as expected, not active identity proof', () => {
     assert.deepEqual(selectRuntimeIdentity([], {
       runtimeServiceAccountEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
     }), {
       credentialSource: 'application-default',
-      identityCount: 1,
-      email: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+      identityCount: 0,
+      email: undefined,
+      expectedEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+      activeEmail: undefined,
       staticKeyFallback: false,
       partialStaticCredentials: false,
       identityExplicit: true,
+      expectedIdentityConfigured: true,
+      activeIdentityVerified: false,
+      activeIdentityMatchesExpected: false,
     });
   });
 
@@ -169,13 +176,18 @@ describe('private Pro security audit classifiers', () => {
       staticKeyFallback: true,
       partialStaticCredentials: false,
       identityExplicit: true,
+      expectedIdentityConfigured: true,
+      activeIdentityVerified: true,
+      activeIdentityMatchesExpected: true,
+      expectedEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+      activeEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
     });
-    assert.deepEqual(severities(classifyRuntimeIdentity(fallback)), ['pass', 'warn', 'pass']);
-    assert.deepEqual(severities(classifyRuntimeIdentity(partial)), ['block', 'pass', 'block']);
+    assert.deepEqual(severities(classifyRuntimeIdentity(fallback)), ['pass', 'pass', 'pass', 'pass', 'warn', 'pass']);
+    assert.deepEqual(severities(classifyRuntimeIdentity(partial)), ['block', 'block', 'block', 'block', 'pass', 'block']);
     assert.doesNotMatch(JSON.stringify(buildAuditReport(classifyRuntimeIdentity(fallback))), /private-key-sentinel|sample-project|iam\.gserviceaccount/);
   });
 
-  test('warns when ADC is selected but the runtime service account cannot be attributed', () => {
+  test('blocks ADC when the expected or active runtime service account cannot be verified', () => {
     const facts = inspectRuntimeIdentity([], {});
 
     assert.deepEqual(facts, {
@@ -184,8 +196,11 @@ describe('private Pro security audit classifiers', () => {
       staticKeyFallback: false,
       partialStaticCredentials: false,
       identityExplicit: false,
+      expectedIdentityConfigured: false,
+      activeIdentityVerified: false,
+      activeIdentityMatchesExpected: false,
     });
-    assert.deepEqual(severities(classifyRuntimeIdentity(facts)), ['warn', 'pass', 'pass']);
+    assert.deepEqual(severities(classifyRuntimeIdentity(facts)), ['block', 'block', 'block', 'block', 'pass', 'pass']);
     assert.deepEqual(severities(classifyIamRoles({
       bindings: 0,
       broadAdmin: 0,
@@ -214,6 +229,7 @@ describe('private Pro security audit classifiers', () => {
 
     assert.deepEqual(facts, {
       readable: true,
+      schemaErrors: 0,
       missingRuntimePermissions: 0,
       unexpectedRuntimePermissions: 0,
       forbiddenRuntimePermissions: 0,
@@ -222,6 +238,196 @@ describe('private Pro security audit classifiers', () => {
       projectSpecificPrincipals: 0,
     });
     assert.equal(classifyRuntimeRoleManifest(facts).every(finding => finding.severity === 'pass'), true);
+  });
+
+  test('rejects malformed runtime manifests instead of coercing their shape', async () => {
+    const valid = JSON.parse(await readFile('infra/private-pro/gcp-runtime-role.yaml', 'utf8')) as Record<string, unknown>;
+    const audit = securityAuditModule as unknown as {
+      inspectRuntimeRoleManifest(value: unknown): RuntimeRoleManifestResult;
+    };
+    type RuntimeRoleManifestResult = ReturnType<typeof inspectRuntimeRoleManifest> & { schemaErrors: number };
+    const mutations: Array<(manifest: Record<string, unknown>) => void> = [
+      manifest => { manifest.extra = true; },
+      manifest => { manifest.schemaVersion = 2; },
+      manifest => { (manifest.runtimeRole as Record<string, unknown>).extra = true; },
+      manifest => { (manifest.runtimeRole as Record<string, unknown>).roleId = 'otherRuntime'; },
+      manifest => { (manifest.runtimeRole as Record<string, unknown>).stage = 'BETA'; },
+      manifest => { ((manifest.runtimeRole as Record<string, unknown>).includedPermissions as unknown[]).push('datastore.entities.get'); },
+      manifest => { ((manifest.runtimeRole as Record<string, unknown>).includedPermissions as unknown[])[0] = { permission: 'datastore.databases.get' }; },
+      manifest => { ((manifest.runtimeRole as Record<string, unknown>).includedPermissions as unknown[]).reverse(); },
+      manifest => { ((manifest.localVerification as Array<Record<string, unknown>>)[0]).extra = true; },
+      manifest => { (manifest.workloadIdentityBinding as Record<string, unknown>).extra = true; },
+      manifest => { (manifest.workloadIdentityBinding as Record<string, unknown>).serviceAccount = 'runtime@example.iam.gserviceaccount.com'; },
+      manifest => { (manifest.workloadIdentityBinding as Record<string, unknown>).members = ['principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/*']; },
+      manifest => { (manifest.signingBinding as Record<string, unknown>).extra = true; },
+      manifest => { (manifest.signingBinding as Record<string, unknown>).member = '${WIF_RUNTIME_PRINCIPAL}'; },
+      manifest => { (manifest.signingBinding as Record<string, unknown>).serviceAccount = '${OTHER_SERVICE_ACCOUNT_EMAIL}'; },
+      manifest => { (manifest.signingBinding as Record<string, unknown>).scope = 'project'; },
+      manifest => { delete (manifest.validation as Record<string, unknown>).liveValidationTask; },
+      manifest => { (manifest.validation as Record<string, unknown>).extra = true; },
+    ];
+
+    for (const mutate of mutations) {
+      const manifest = structuredClone(valid);
+      mutate(manifest);
+      const facts = audit.inspectRuntimeRoleManifest(manifest);
+      assert.equal(facts.readable, false);
+      assert.ok(facts.schemaErrors > 0);
+    }
+    for (const value of [null, [], 'manifest']) {
+      const facts = audit.inspectRuntimeRoleManifest(value);
+      assert.equal(facts.readable, false);
+      assert.ok(facts.schemaErrors > 0);
+    }
+
+    const signBlob = structuredClone(valid);
+    const permissions = (signBlob.runtimeRole as Record<string, unknown>).includedPermissions as string[];
+    permissions.splice(8, 0, 'iam.serviceAccounts.signBlob');
+    const signBlobFacts = audit.inspectRuntimeRoleManifest(signBlob);
+    assert.equal(signBlobFacts.signBlobInRuntimeRole, 1);
+    assert.equal(classifyRuntimeRoleManifest(signBlobFacts).some(finding => finding.severity === 'block'), true);
+  });
+
+  test('compares the deployed custom role with the exact manifest role', async () => {
+    const audit = securityAuditModule as unknown as {
+      inspectDeployedRuntimeRole(value: unknown, projectId: string, manifest: unknown): {
+        readable: boolean;
+        nameMatches: boolean;
+        stageMatches: boolean;
+        active: boolean;
+        missingPermissions: number;
+        unexpectedPermissions: number;
+      };
+      classifyDeployedRuntimeRole(facts: ReturnType<typeof audit.inspectDeployedRuntimeRole>): AuditFinding[];
+    };
+    const manifest = JSON.parse(await readFile('infra/private-pro/gcp-runtime-role.yaml', 'utf8')) as unknown;
+    const deployed = {
+      name: 'projects/sample-project/roles/privateProRuntime',
+      stage: 'GA',
+      deleted: false,
+      includedPermissions: [
+        'datastore.databases.get',
+        'datastore.entities.create',
+        'datastore.entities.delete',
+        'datastore.entities.get',
+        'datastore.entities.list',
+        'datastore.entities.update',
+        'firebaseauth.users.get',
+        'firebaseauth.users.update',
+        'storage.objects.create',
+        'storage.objects.delete',
+        'storage.objects.get',
+      ],
+    };
+
+    const exact = audit.inspectDeployedRuntimeRole(deployed, 'sample-project', manifest);
+    assert.equal(audit.classifyDeployedRuntimeRole(exact).every(finding => finding.severity === 'pass'), true);
+    assert.equal(audit.classifyDeployedRuntimeRole(audit.inspectDeployedRuntimeRole({}, 'sample-project', manifest)).every(finding => finding.severity === 'pass'), false);
+    const drifted = audit.inspectDeployedRuntimeRole({
+      ...deployed,
+      stage: 'BETA',
+      deleted: true,
+      includedPermissions: [...deployed.includedPermissions.slice(1), 'storage.objects.list'],
+    }, 'sample-project', manifest);
+    assert.deepEqual(severities(audit.classifyDeployedRuntimeRole(drifted)), ['pass', 'pass', 'block', 'block', 'block', 'block']);
+  });
+
+  test('allows only the runtime custom role on the runtime service account at project scope', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectProjectRuntimePolicy(value: unknown, projectId: string, runtimeEmail: string): {
+        readable: boolean;
+        runtimeRoleBindings: number;
+        unexpectedRoles: number;
+        projectTokenCreator: number;
+      };
+      classifyProjectRuntimePolicy(facts: ReturnType<typeof audit.inspectProjectRuntimePolicy>): AuditFinding[];
+    };
+    const member = 'serviceAccount:private-pro-runtime@sample-project.iam.gserviceaccount.com';
+    const expected = audit.inspectProjectRuntimePolicy({ bindings: [{
+      role: 'projects/sample-project/roles/privateProRuntime',
+      members: [member],
+    }] }, 'sample-project', member.slice('serviceAccount:'.length));
+    const extra = audit.inspectProjectRuntimePolicy({ bindings: [
+      { role: 'projects/sample-project/roles/privateProRuntime', members: [member] },
+      { role: 'roles/storage.objectAdmin', members: [member] },
+      { role: 'projects/sample-project/roles/otherCustom', members: [member] },
+      { role: 'roles/iam.serviceAccountTokenCreator', members: ['principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel/*'] },
+    ] }, 'sample-project', member.slice('serviceAccount:'.length));
+
+    assert.equal(audit.classifyProjectRuntimePolicy(expected).every(finding => finding.severity === 'pass'), true);
+    assert.equal(extra.unexpectedRoles, 2);
+    assert.equal(extra.projectTokenCreator, 1);
+    assert.deepEqual(severities(audit.classifyProjectRuntimePolicy(extra)), ['pass', 'pass', 'block', 'block']);
+  });
+
+  test('enforces the exact service-account WIF and self-signing policy matrix', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectRuntimeServiceAccountPolicy(value: unknown, runtimeEmail: string, wifPrincipals: ReadonlySet<string>): {
+        readable: boolean;
+        missingWifPrincipals: number;
+        unexpectedWifPrincipals: number;
+        selfTokenCreatorBindings: number;
+        externalTokenCreators: number;
+        unexpectedBindings: number;
+      };
+      classifyRuntimeServiceAccountPolicy(facts: ReturnType<typeof audit.inspectRuntimeServiceAccountPolicy>): AuditFinding[];
+    };
+    const runtimeEmail = 'private-pro-runtime@sample-project.iam.gserviceaccount.com';
+    const runtimeMember = `serviceAccount:${runtimeEmail}`;
+    const wif = 'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel/attribute.repository/org/repo';
+    const expected = audit.inspectRuntimeServiceAccountPolicy({ bindings: [
+      { role: 'roles/iam.workloadIdentityUser', members: [wif] },
+      { role: 'roles/iam.serviceAccountTokenCreator', members: [runtimeMember] },
+    ] }, runtimeEmail, new Set([wif]));
+    const extra = audit.inspectRuntimeServiceAccountPolicy({ bindings: [
+      { role: 'roles/iam.workloadIdentityUser', members: [wif, 'principal://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel/subject/other'] },
+      { role: 'roles/iam.serviceAccountTokenCreator', members: [runtimeMember, wif] },
+      { role: 'roles/iam.serviceAccountUser', members: [wif] },
+    ] }, runtimeEmail, new Set([wif]));
+
+    assert.equal(audit.classifyRuntimeServiceAccountPolicy(expected).every(finding => finding.severity === 'pass'), true);
+    assert.deepEqual(severities(audit.classifyRuntimeServiceAccountPolicy(extra)), ['pass', 'pass', 'block', 'block', 'block', 'block']);
+  });
+
+  test('distinguishes the expected ADC identity from an independently verified active principal', async () => {
+    const audit = securityAuditModule as unknown as {
+      inspectRuntimeIdentity(accounts: unknown, input: {
+        runtimeServiceAccountEmail?: string;
+        staticClientEmail?: string;
+        staticPrivateKey?: string;
+        activeAdcServiceAccountEmail?: string;
+      }): ReturnType<typeof inspectRuntimeIdentity> & {
+        expectedIdentityConfigured: boolean;
+        activeIdentityVerified: boolean;
+        activeIdentityMatchesExpected: boolean;
+      };
+      collectActiveAdcServiceAccountEmail(factory: () => Promise<{
+        getAccessToken(): Promise<string | null | undefined>;
+        getCredentials(): Promise<{ client_email?: string }>;
+      }>): Promise<string | undefined>;
+    };
+    const expectedOnly = audit.inspectRuntimeIdentity([], {
+      runtimeServiceAccountEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+    });
+    const verified = audit.inspectRuntimeIdentity([], {
+      runtimeServiceAccountEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+      activeAdcServiceAccountEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+    });
+    const mismatched = audit.inspectRuntimeIdentity([], {
+      runtimeServiceAccountEmail: 'private-pro-runtime@sample-project.iam.gserviceaccount.com',
+      activeAdcServiceAccountEmail: 'other-runtime@sample-project.iam.gserviceaccount.com',
+    });
+
+    assert.equal(expectedOnly.activeIdentityVerified, false);
+    assert.equal(verified.activeIdentityMatchesExpected, true);
+    assert.equal(mismatched.activeIdentityMatchesExpected, false);
+    assert.equal(classifyRuntimeIdentity(expectedOnly).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyRuntimeIdentity(verified).every(finding => finding.severity !== 'block'), true);
+    assert.equal(classifyRuntimeIdentity(mismatched).some(finding => finding.severity === 'block'), true);
+    assert.equal(await audit.collectActiveAdcServiceAccountEmail(async () => ({
+      async getAccessToken() { return 'access-token'; },
+      async getCredentials() { return { client_email: 'private-pro-runtime@sample-project.iam.gserviceaccount.com' }; },
+    })), 'private-pro-runtime@sample-project.iam.gserviceaccount.com');
   });
 
   test('blocks critical or high production dependency advisories', () => {

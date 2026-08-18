@@ -4,6 +4,8 @@ import { delimiter, dirname, join } from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
+import { GoogleAuth } from 'google-auth-library';
+
 
 const execFile = promisify(execFileCallback);
 const DEFAULT_PROJECT_ID = 'big-agi-243b6';
@@ -159,20 +161,85 @@ export interface RuntimeIdentityFacts {
   staticKeyFallback: boolean;
   partialStaticCredentials: boolean;
   identityExplicit: boolean;
+  expectedIdentityConfigured: boolean;
+  activeIdentityVerified: boolean;
+  activeIdentityMatchesExpected: boolean;
 }
 
 interface RuntimeIdentitySelection extends RuntimeIdentityFacts {
   email?: string;
+  expectedEmail?: string;
+  activeEmail?: string;
 }
 
 export interface RuntimeRoleManifestFacts {
   readable: boolean;
+  schemaErrors: number;
   missingRuntimePermissions: number;
   unexpectedRuntimePermissions: number;
   forbiddenRuntimePermissions: number;
   signBlobInRuntimeRole: number;
   signingBindingValid: boolean;
   projectSpecificPrincipals: number;
+}
+
+export interface DeployedRuntimeRoleFacts {
+  readable: boolean;
+  nameMatches: boolean;
+  stageMatches: boolean;
+  active: boolean;
+  missingPermissions: number;
+  unexpectedPermissions: number;
+}
+
+export interface ProjectRuntimePolicyFacts {
+  readable: boolean;
+  runtimeRoleBindings: number;
+  unexpectedRoles: number;
+  projectTokenCreator: number;
+}
+
+export interface RuntimeServiceAccountPolicyFacts {
+  readable: boolean;
+  missingWifPrincipals: number;
+  unexpectedWifPrincipals: number;
+  selfTokenCreatorBindings: number;
+  externalTokenCreators: number;
+  unexpectedBindings: number;
+}
+
+interface RuntimeRoleManifest {
+  schemaVersion: 1;
+  runtimeRole: {
+    roleId: typeof RUNTIME_ROLE_ID;
+    title: string;
+    description: string;
+    stage: 'GA';
+    includedPermissions: string[];
+  };
+  localVerification: Array<{
+    operation: 'firebase-id-token' | 'firebase-app-check-token';
+    requiredIamPermissions: [];
+  }>;
+  workloadIdentityBinding: {
+    role: 'roles/iam.workloadIdentityUser';
+    serviceAccount: '${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
+    members: ['${WIF_RUNTIME_PRINCIPAL}'];
+    scope: 'runtime-service-account-only';
+  };
+  signingBinding: {
+    permission: 'iam.serviceAccounts.signBlob';
+    role: 'roles/iam.serviceAccountTokenCreator';
+    serviceAccount: '${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
+    member: 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
+    scope: 'runtime-service-account-only';
+  };
+  validation: {
+    status: 'unverified';
+    liveValidationTask: 21;
+    provisioningApprovalTask: 24;
+    notes: string;
+  };
 }
 
 interface DependencyAuditFacts {
@@ -272,11 +339,16 @@ export function classifyIamRoles(facts: IamRoleFacts): AuditFinding[] {
 }
 
 export function classifyRuntimeIdentity(facts: RuntimeIdentityFacts): AuditFinding[] {
-  const identitySeverity: AuditSeverity = facts.identityExplicit && facts.identityCount === 1
+  const identitySeverity: AuditSeverity = facts.credentialSource === 'static-key-fallback' && facts.identityCount === 1
     ? 'pass'
-    : facts.credentialSource === 'application-default' && !facts.partialStaticCredentials ? 'warn' : 'block';
+    : facts.credentialSource === 'application-default' && facts.activeIdentityVerified && facts.activeIdentityMatchesExpected
+      ? 'pass'
+      : 'block';
   return [
     finding('runtimeIdentity', 'selected', identitySeverity, facts.identityCount),
+    booleanFinding('runtimeIdentity', 'expectedIdentityConfigured', facts.expectedIdentityConfigured),
+    booleanFinding('runtimeIdentity', 'activeIdentityVerified', facts.activeIdentityVerified),
+    booleanFinding('runtimeIdentity', 'activeIdentityMatchesExpected', facts.activeIdentityMatchesExpected),
     finding('runtimeIdentity', 'staticKeyFallback', facts.staticKeyFallback ? 'warn' : 'pass', facts.staticKeyFallback ? 1 : 0),
     finding('runtimeIdentity', 'partialStaticCredentials', facts.partialStaticCredentials ? 'block' : 'pass', facts.partialStaticCredentials ? 1 : 0),
   ];
@@ -285,12 +357,44 @@ export function classifyRuntimeIdentity(facts: RuntimeIdentityFacts): AuditFindi
 export function classifyRuntimeRoleManifest(facts: RuntimeRoleManifestFacts): AuditFinding[] {
   return [
     booleanFinding('runtimeRoleManifest', 'readable', facts.readable),
+    finding('runtimeRoleManifest', 'schemaErrors', facts.schemaErrors === 0 ? 'pass' : 'block', facts.schemaErrors),
     finding('runtimeRoleManifest', 'missingRuntimePermissions', facts.missingRuntimePermissions === 0 ? 'pass' : 'block', facts.missingRuntimePermissions),
     finding('runtimeRoleManifest', 'unexpectedRuntimePermissions', facts.unexpectedRuntimePermissions === 0 ? 'pass' : 'block', facts.unexpectedRuntimePermissions),
     finding('runtimeRoleManifest', 'forbiddenRuntimePermissions', facts.forbiddenRuntimePermissions === 0 ? 'pass' : 'block', facts.forbiddenRuntimePermissions),
     finding('runtimeRoleManifest', 'signBlobSeparated', facts.signBlobInRuntimeRole === 0 ? 'pass' : 'block', facts.signBlobInRuntimeRole),
     booleanFinding('runtimeRoleManifest', 'signingBindingValid', facts.signingBindingValid),
     finding('runtimeRoleManifest', 'projectSpecificPrincipals', facts.projectSpecificPrincipals === 0 ? 'pass' : 'block', facts.projectSpecificPrincipals),
+  ];
+}
+
+export function classifyDeployedRuntimeRole(facts: DeployedRuntimeRoleFacts): AuditFinding[] {
+  return [
+    booleanFinding('deployedRuntimeRole', 'readable', facts.readable),
+    booleanFinding('deployedRuntimeRole', 'nameMatches', facts.nameMatches),
+    booleanFinding('deployedRuntimeRole', 'stageMatches', facts.stageMatches),
+    booleanFinding('deployedRuntimeRole', 'active', facts.active),
+    finding('deployedRuntimeRole', 'missingPermissions', facts.missingPermissions === 0 ? 'pass' : 'block', facts.missingPermissions),
+    finding('deployedRuntimeRole', 'unexpectedPermissions', facts.unexpectedPermissions === 0 ? 'pass' : 'block', facts.unexpectedPermissions),
+  ];
+}
+
+export function classifyProjectRuntimePolicy(facts: ProjectRuntimePolicyFacts): AuditFinding[] {
+  return [
+    booleanFinding('projectRuntimePolicy', 'readable', facts.readable),
+    finding('projectRuntimePolicy', 'runtimeRoleBindings', facts.runtimeRoleBindings === 1 ? 'pass' : 'block', facts.runtimeRoleBindings),
+    finding('projectRuntimePolicy', 'unexpectedRoles', facts.unexpectedRoles === 0 ? 'pass' : 'block', facts.unexpectedRoles),
+    finding('projectRuntimePolicy', 'projectTokenCreator', facts.projectTokenCreator === 0 ? 'pass' : 'block', facts.projectTokenCreator),
+  ];
+}
+
+export function classifyRuntimeServiceAccountPolicy(facts: RuntimeServiceAccountPolicyFacts): AuditFinding[] {
+  return [
+    booleanFinding('runtimeServiceAccountPolicy', 'readable', facts.readable),
+    finding('runtimeServiceAccountPolicy', 'missingWifPrincipals', facts.missingWifPrincipals === 0 ? 'pass' : 'block', facts.missingWifPrincipals),
+    finding('runtimeServiceAccountPolicy', 'unexpectedWifPrincipals', facts.unexpectedWifPrincipals === 0 ? 'pass' : 'block', facts.unexpectedWifPrincipals),
+    finding('runtimeServiceAccountPolicy', 'selfTokenCreatorBindings', facts.selfTokenCreatorBindings === 1 ? 'pass' : 'block', facts.selfTokenCreatorBindings),
+    finding('runtimeServiceAccountPolicy', 'externalTokenCreators', facts.externalTokenCreators === 0 ? 'pass' : 'block', facts.externalTokenCreators),
+    finding('runtimeServiceAccountPolicy', 'unexpectedBindings', facts.unexpectedBindings === 0 ? 'pass' : 'block', facts.unexpectedBindings),
   ];
 }
 
@@ -467,14 +571,100 @@ function isServiceAccountEmail(value: string): boolean {
   return /^[a-z0-9][a-z0-9-]{2,62}@[a-z][a-z0-9-]{4,28}[a-z0-9]\.iam\.gserviceaccount\.com$/.test(value);
 }
 
+function isPlainRecord(value: unknown): value is JsonRecord {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) return false;
+  const prototype = Object.getPrototypeOf(value);
+  return prototype === Object.prototype || prototype === null;
+}
+
+function hasExactKeys(value: JsonRecord, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+function exactStringArray(value: unknown): string[] | undefined {
+  return Array.isArray(value) && value.every(item => typeof item === 'string') ? value : undefined;
+}
+
+function parseRuntimeRoleManifest(value: unknown): { manifest?: RuntimeRoleManifest; schemaErrors: number } {
+  let schemaErrors = 0;
+  if (!isPlainRecord(value)) return { schemaErrors: 1 };
+  if (!hasExactKeys(value, ['schemaVersion', 'runtimeRole', 'localVerification', 'workloadIdentityBinding', 'signingBinding', 'validation'])) schemaErrors++;
+  if (value.schemaVersion !== 1) schemaErrors++;
+
+  const role = value.runtimeRole;
+  if (!isPlainRecord(role)) schemaErrors++;
+  else {
+    if (!hasExactKeys(role, ['roleId', 'title', 'description', 'stage', 'includedPermissions'])) schemaErrors++;
+    if (role.roleId !== RUNTIME_ROLE_ID || role.stage !== 'GA' || typeof role.title !== 'string' || typeof role.description !== 'string') schemaErrors++;
+    const permissions = exactStringArray(role.includedPermissions);
+    if (!permissions) schemaErrors++;
+    else {
+      if (new Set(permissions).size !== permissions.length) schemaErrors++;
+      if (permissions.some((permission, index) => permission !== [...permissions].sort()[index])) schemaErrors++;
+    }
+  }
+
+  const localVerification = value.localVerification;
+  if (!Array.isArray(localVerification) || localVerification.length !== 2) schemaErrors++;
+  else {
+    const expectedOperations = ['firebase-app-check-token', 'firebase-id-token'];
+    const operations: string[] = [];
+    for (const item of localVerification) {
+      if (!isPlainRecord(item) || !hasExactKeys(item, ['operation', 'requiredIamPermissions'])) {
+        schemaErrors++;
+        continue;
+      }
+      if (typeof item.operation !== 'string' || !Array.isArray(item.requiredIamPermissions) || item.requiredIamPermissions.length !== 0) schemaErrors++;
+      else operations.push(item.operation);
+    }
+    if (operations.sort().some((operation, index) => operation !== expectedOperations[index])) schemaErrors++;
+  }
+
+  const workload = value.workloadIdentityBinding;
+  if (!isPlainRecord(workload) || !hasExactKeys(workload, ['role', 'serviceAccount', 'members', 'scope'])) schemaErrors++;
+  else if (
+    workload.role !== 'roles/iam.workloadIdentityUser'
+    || workload.serviceAccount !== '${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
+    || workload.scope !== 'runtime-service-account-only'
+    || !Array.isArray(workload.members)
+    || workload.members.length !== 1
+    || workload.members[0] !== '${WIF_RUNTIME_PRINCIPAL}'
+  ) schemaErrors++;
+
+  const signing = value.signingBinding;
+  if (!isPlainRecord(signing) || !hasExactKeys(signing, ['permission', 'role', 'serviceAccount', 'member', 'scope'])) schemaErrors++;
+  else if (
+    signing.permission !== 'iam.serviceAccounts.signBlob'
+    || signing.role !== 'roles/iam.serviceAccountTokenCreator'
+    || signing.serviceAccount !== '${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
+    || signing.member !== 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
+    || signing.scope !== 'runtime-service-account-only'
+  ) schemaErrors++;
+
+  const validation = value.validation;
+  if (!isPlainRecord(validation) || !hasExactKeys(validation, ['status', 'liveValidationTask', 'provisioningApprovalTask', 'notes'])) schemaErrors++;
+  else if (
+    validation.status !== 'unverified'
+    || validation.liveValidationTask !== 21
+    || validation.provisioningApprovalTask !== 24
+    || typeof validation.notes !== 'string'
+  ) schemaErrors++;
+
+  return schemaErrors === 0 ? { manifest: value as unknown as RuntimeRoleManifest, schemaErrors } : { schemaErrors };
+}
+
 function selectRuntimeIdentityForInput(accountsValue: unknown, input: {
   runtimeServiceAccountEmail?: string;
   staticClientEmail?: string;
   staticPrivateKey?: string;
+  activeAdcServiceAccountEmail?: string;
 }): RuntimeIdentitySelection {
   const runtimeServiceAccountEmail = input.runtimeServiceAccountEmail?.trim() ?? '';
   const staticClientEmail = input.staticClientEmail?.trim() ?? '';
   const staticPrivateKey = input.staticPrivateKey ?? '';
+  const activeAdcServiceAccountEmail = input.activeAdcServiceAccountEmail?.trim() ?? '';
   const hasStaticClientEmail = !!staticClientEmail;
   const hasStaticPrivateKey = !!staticPrivateKey.trim();
   if (hasStaticClientEmail !== hasStaticPrivateKey) {
@@ -484,6 +674,9 @@ function selectRuntimeIdentityForInput(accountsValue: unknown, input: {
       staticKeyFallback: false,
       partialStaticCredentials: true,
       identityExplicit: false,
+      expectedIdentityConfigured: false,
+      activeIdentityVerified: false,
+      activeIdentityMatchesExpected: false,
     };
   }
   if (hasStaticClientEmail) {
@@ -494,28 +687,46 @@ function selectRuntimeIdentityForInput(accountsValue: unknown, input: {
       staticKeyFallback: true,
       partialStaticCredentials: false,
       identityExplicit: true,
+      expectedIdentityConfigured: true,
+      activeIdentityVerified: true,
+      activeIdentityMatchesExpected: true,
+      expectedEmail: staticClientEmail,
+      activeEmail: staticClientEmail,
     } : {
       credentialSource: 'invalid',
       identityCount: 0,
       staticKeyFallback: true,
       partialStaticCredentials: false,
       identityExplicit: true,
+      expectedIdentityConfigured: true,
+      activeIdentityVerified: false,
+      activeIdentityMatchesExpected: false,
     };
   }
   if (runtimeServiceAccountEmail) {
-    return isServiceAccountEmail(runtimeServiceAccountEmail) ? {
+    const expectedValid = isServiceAccountEmail(runtimeServiceAccountEmail);
+    const activeValid = isServiceAccountEmail(activeAdcServiceAccountEmail);
+    return expectedValid ? {
       credentialSource: 'application-default',
-      identityCount: 1,
-      email: runtimeServiceAccountEmail,
+      identityCount: activeValid ? 1 : 0,
+      email: activeValid ? activeAdcServiceAccountEmail : undefined,
+      expectedEmail: runtimeServiceAccountEmail,
+      activeEmail: activeValid ? activeAdcServiceAccountEmail : undefined,
       staticKeyFallback: false,
       partialStaticCredentials: false,
       identityExplicit: true,
+      expectedIdentityConfigured: true,
+      activeIdentityVerified: activeValid,
+      activeIdentityMatchesExpected: activeValid && activeAdcServiceAccountEmail === runtimeServiceAccountEmail,
     } : {
       credentialSource: 'invalid',
       identityCount: 0,
       staticKeyFallback: false,
       partialStaticCredentials: false,
       identityExplicit: true,
+      expectedIdentityConfigured: true,
+      activeIdentityVerified: activeValid,
+      activeIdentityMatchesExpected: false,
     };
   }
   const plausible = asRecords(accountsValue)
@@ -528,19 +739,43 @@ function selectRuntimeIdentityForInput(accountsValue: unknown, input: {
     staticKeyFallback: false,
     partialStaticCredentials: false,
     identityExplicit: false,
+    expectedIdentityConfigured: false,
+    activeIdentityVerified: false,
+    activeIdentityMatchesExpected: false,
   } : {
     credentialSource: 'application-default',
     identityCount: plausible.length,
     staticKeyFallback: false,
     partialStaticCredentials: false,
     identityExplicit: false,
+    expectedIdentityConfigured: false,
+    activeIdentityVerified: false,
+    activeIdentityMatchesExpected: false,
   };
+}
+
+export async function collectActiveAdcServiceAccountEmail(
+  factory: () => Promise<{
+    getAccessToken(): Promise<string | null | undefined>;
+    getCredentials(): Promise<{ client_email?: string }>;
+  }> = async () => new GoogleAuth({ scopes: 'https://www.googleapis.com/auth/cloud-platform' }),
+): Promise<string | undefined> {
+  try {
+    const auth = await factory();
+    const accessToken = await auth.getAccessToken();
+    if (!accessToken) return undefined;
+    const email = (await auth.getCredentials()).client_email?.trim();
+    return email && isServiceAccountEmail(email) ? email : undefined;
+  } catch {
+    return undefined;
+  }
 }
 
 export function inspectRuntimeIdentity(accountsValue: unknown, input: {
   runtimeServiceAccountEmail?: string;
   staticClientEmail?: string;
   staticPrivateKey?: string;
+  activeAdcServiceAccountEmail?: string;
 }): RuntimeIdentityFacts {
   const { email: _email, ...facts } = selectRuntimeIdentityForInput(accountsValue, input);
   return facts;
@@ -556,11 +791,13 @@ export function selectRuntimeIdentity(accountsValue: unknown, input: {
   runtimeServiceAccountEmail?: string;
   staticClientEmail?: string;
   staticPrivateKey?: string;
+  activeAdcServiceAccountEmail?: string;
 }): RuntimeIdentitySelection;
 export function selectRuntimeIdentity(accountsValue: unknown, input: string | undefined | {
   runtimeServiceAccountEmail?: string;
   staticClientEmail?: string;
   staticPrivateKey?: string;
+  activeAdcServiceAccountEmail?: string;
 }): { identityCount: number; email?: string } | RuntimeIdentitySelection {
   if (typeof input === 'object') return selectRuntimeIdentityForInput(accountsValue, input);
   const configuredEmail = input;
@@ -583,27 +820,103 @@ function countProjectSpecificPrincipals(value: unknown): number {
 }
 
 export function inspectRuntimeRoleManifest(value: unknown): RuntimeRoleManifestFacts {
-  const root = asRecord(value);
-  const role = asRecord(root.runtimeRole);
-  const signing = asRecord(root.signingBinding);
-  const localVerification = asRecords(root.localVerification);
-  const permissions = asStrings(role.includedPermissions);
+  const parsed = parseRuntimeRoleManifest(value);
+  const permissions = parsed.manifest?.runtimeRole.includedPermissions ?? [];
   const permissionSet = new Set(permissions);
-  const localVerificationValid = ['firebase-id-token', 'firebase-app-check-token'].every(operation => localVerification.some(item => (
-    item.operation === operation && asStrings(item.requiredIamPermissions).length === 0
-  )));
-  const readable = root.schemaVersion === 1 && role.roleId === 'privateProRuntime' && permissions.length > 0 && localVerificationValid;
   return {
-    readable,
+    readable: parsed.schemaErrors === 0,
+    schemaErrors: parsed.schemaErrors,
     missingRuntimePermissions: [...PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS].filter(permission => !permissionSet.has(permission)).length,
     unexpectedRuntimePermissions: permissions.filter(permission => !PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS.has(permission)).length,
     forbiddenRuntimePermissions: permissions.filter(permission => FORBIDDEN_RUNTIME_PERMISSIONS.has(permission)).length,
     signBlobInRuntimeRole: permissions.filter(permission => permission === 'iam.serviceAccounts.signBlob').length,
-    signingBindingValid: signing.permission === 'iam.serviceAccounts.signBlob'
-      && signing.role === 'roles/iam.serviceAccountTokenCreator'
-      && signing.serviceAccount === '${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
-      && signing.member === 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}',
+    signingBindingValid: !!parsed.manifest,
     projectSpecificPrincipals: countProjectSpecificPrincipals(value),
+  };
+}
+
+export function inspectDeployedRuntimeRole(
+  value: unknown,
+  projectId: string,
+  manifestValue: unknown,
+): DeployedRuntimeRoleFacts {
+  const deployed = asRecord(value);
+  const manifest = parseRuntimeRoleManifest(manifestValue).manifest;
+  const deployedPermissions = exactStringArray(deployed.includedPermissions);
+  const expectedPermissions = manifest?.runtimeRole.includedPermissions ?? [];
+  const deployedPermissionSet = new Set(deployedPermissions ?? []);
+  const expectedPermissionSet = new Set(expectedPermissions);
+  return {
+    readable: !!manifest && !!deployedPermissions && typeof deployed.name === 'string' && typeof deployed.stage === 'string' && typeof deployed.deleted === 'boolean',
+    nameMatches: deployed.name === `projects/${projectId}/roles/${RUNTIME_ROLE_ID}`,
+    stageMatches: deployed.stage === manifest?.runtimeRole.stage,
+    active: deployed.deleted === false,
+    missingPermissions: expectedPermissions.filter(permission => !deployedPermissionSet.has(permission)).length,
+    unexpectedPermissions: (deployedPermissions ?? []).filter(permission => !expectedPermissionSet.has(permission)).length,
+  };
+}
+
+function inspectPolicyBindings(value: unknown): { readable: boolean; bindings: Array<{ role: string; members: string[]; exact: boolean }> } {
+  const root = asRecord(value);
+  if (!Array.isArray(root.bindings)) return { readable: false, bindings: [] };
+  const bindings: Array<{ role: string; members: string[]; exact: boolean }> = [];
+  let readable = true;
+  for (const rawBinding of root.bindings) {
+    if (!isPlainRecord(rawBinding) || typeof rawBinding.role !== 'string') {
+      readable = false;
+      continue;
+    }
+    const members = exactStringArray(rawBinding.members);
+    if (!members) {
+      readable = false;
+      continue;
+    }
+    bindings.push({
+      role: rawBinding.role,
+      members,
+      exact: hasExactKeys(rawBinding, ['role', 'members']),
+    });
+  }
+  return { readable, bindings };
+}
+
+export function inspectProjectRuntimePolicy(value: unknown, projectId: string, runtimeEmail: string): ProjectRuntimePolicyFacts {
+  const policy = inspectPolicyBindings(value);
+  const member = `serviceAccount:${runtimeEmail}`;
+  const expectedRole = `projects/${projectId}/roles/${RUNTIME_ROLE_ID}`;
+  const relevant = policy.bindings.filter(binding => binding.members.includes(member));
+  return {
+    readable: policy.readable,
+    runtimeRoleBindings: relevant.filter(binding => binding.role === expectedRole && binding.exact).length,
+    unexpectedRoles: relevant.filter(binding => binding.role !== expectedRole || !binding.exact).length,
+    projectTokenCreator: policy.bindings.filter(binding => binding.role === 'roles/iam.serviceAccountTokenCreator').length,
+  };
+}
+
+export function inspectRuntimeServiceAccountPolicy(
+  value: unknown,
+  runtimeEmail: string,
+  wifPrincipals: ReadonlySet<string>,
+): RuntimeServiceAccountPolicyFacts {
+  const policy = inspectPolicyBindings(value);
+  const selfMember = `serviceAccount:${runtimeEmail}`;
+  const workloadBindings = policy.bindings.filter(binding => binding.role === 'roles/iam.workloadIdentityUser');
+  const tokenCreatorBindings = policy.bindings.filter(binding => binding.role === 'roles/iam.serviceAccountTokenCreator');
+  const actualWifPrincipals = new Set(workloadBindings.flatMap(binding => binding.members));
+  const tokenCreatorMembers = tokenCreatorBindings.flatMap(binding => binding.members);
+  const unexpectedBindingRoles = policy.bindings.filter(binding => ![
+    'roles/iam.workloadIdentityUser',
+    'roles/iam.serviceAccountTokenCreator',
+  ].includes(binding.role)).length;
+  const malformedExpectedBindings = [...workloadBindings, ...tokenCreatorBindings].filter(binding => !binding.exact).length;
+  const duplicateExpectedBindings = Math.max(0, workloadBindings.length - 1) + Math.max(0, tokenCreatorBindings.length - 1);
+  return {
+    readable: policy.readable,
+    missingWifPrincipals: [...wifPrincipals].filter(member => !actualWifPrincipals.has(member)).length,
+    unexpectedWifPrincipals: [...actualWifPrincipals].filter(member => !wifPrincipals.has(member)).length,
+    selfTokenCreatorBindings: tokenCreatorBindings.filter(binding => binding.exact && binding.members.length === 1 && binding.members[0] === selfMember).length,
+    externalTokenCreators: tokenCreatorMembers.filter(member => member !== selfMember).length,
+    unexpectedBindings: unexpectedBindingRoles + malformedExpectedBindings + duplicateExpectedBindings,
   };
 }
 
@@ -733,13 +1046,25 @@ async function collectAppCheck(projectId: string): Promise<AppCheckFacts> {
   return inspectAppCheck(value);
 }
 
-async function collectIamRoles(projectId: string): Promise<IamRoleFacts> {
-  const accounts = asRecords(await runJson('gcloud', ['iam', 'service-accounts', 'list', `--project=${projectId}`, '--format=json']));
-  const identity = selectRuntimeIdentity(accounts, {
+function runtimeIdentityInput(activeAdcServiceAccountEmail?: string) {
+  return {
     runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
     staticClientEmail: process.env.FIREBASE_CLIENT_EMAIL,
     staticPrivateKey: process.env.FIREBASE_PRIVATE_KEY,
-  });
+    activeAdcServiceAccountEmail,
+  };
+}
+
+function configuredWifPrincipals(): ReadonlySet<string> {
+  return new Set((process.env.PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS ?? '')
+    .split(',')
+    .map(value => value.trim())
+    .filter(Boolean));
+}
+
+async function collectIamRoles(projectId: string): Promise<IamRoleFacts> {
+  const accounts = asRecords(await runJson('gcloud', ['iam', 'service-accounts', 'list', `--project=${projectId}`, '--format=json']));
+  const identity = selectRuntimeIdentity(accounts, runtimeIdentityInput(await collectActiveAdcServiceAccountEmail()));
   if (identity.identityCount !== 1 || !identity.email) return {
     bindings: 0,
     broadAdmin: 0,
@@ -760,11 +1085,7 @@ async function collectIamRoles(projectId: string): Promise<IamRoleFacts> {
 
 async function collectServiceAccountKeys(projectId: string): Promise<ServiceAccountKeyFacts> {
   const accounts = asRecords(await runJson('gcloud', ['iam', 'service-accounts', 'list', `--project=${projectId}`, '--format=json']));
-  const identity = selectRuntimeIdentity(accounts, {
-    runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
-    staticClientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    staticPrivateKey: process.env.FIREBASE_PRIVATE_KEY,
-  });
+  const identity = selectRuntimeIdentity(accounts, runtimeIdentityInput(await collectActiveAdcServiceAccountEmail()));
   if (identity.identityCount !== 1 || !identity.email)
     return inspectServiceAccountKeys([], Date.now(), false, identity.identityCount, 90, identity);
   const keys = await runJson('gcloud', ['iam', 'service-accounts', 'keys', 'list', `--iam-account=${identity.email}`, `--project=${projectId}`, '--format=json']);
@@ -773,15 +1094,36 @@ async function collectServiceAccountKeys(projectId: string): Promise<ServiceAcco
 
 async function collectRuntimeIdentity(projectId: string): Promise<RuntimeIdentityFacts> {
   const accounts = asRecords(await runJson('gcloud', ['iam', 'service-accounts', 'list', `--project=${projectId}`, '--format=json']));
-  return inspectRuntimeIdentity(accounts, {
-    runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
-    staticClientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-    staticPrivateKey: process.env.FIREBASE_PRIVATE_KEY,
-  });
+  return inspectRuntimeIdentity(accounts, runtimeIdentityInput(await collectActiveAdcServiceAccountEmail()));
+}
+
+async function readRuntimeRoleManifest(): Promise<unknown> {
+  return JSON.parse(await readFile(RUNTIME_ROLE_MANIFEST_PATH, 'utf8')) as unknown;
 }
 
 async function collectRuntimeRoleManifest(): Promise<RuntimeRoleManifestFacts> {
-  return inspectRuntimeRoleManifest(JSON.parse(await readFile(RUNTIME_ROLE_MANIFEST_PATH, 'utf8')) as unknown);
+  return inspectRuntimeRoleManifest(await readRuntimeRoleManifest());
+}
+
+async function collectDeployedRuntimeRole(projectId: string): Promise<DeployedRuntimeRoleFacts> {
+  const value = await runJson('gcloud', ['iam', 'roles', 'describe', `projects/${projectId}/roles/${RUNTIME_ROLE_ID}`, '--format=json']);
+  return inspectDeployedRuntimeRole(value, projectId, await readRuntimeRoleManifest());
+}
+
+async function collectProjectRuntimePolicy(projectId: string): Promise<ProjectRuntimePolicyFacts> {
+  const runtimeEmail = process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL?.trim();
+  if (!runtimeEmail || !isServiceAccountEmail(runtimeEmail)) throw new Error('Expected runtime identity is missing.');
+  const value = await runJson('gcloud', ['projects', 'get-iam-policy', projectId, '--format=json']);
+  return inspectProjectRuntimePolicy(value, projectId, runtimeEmail);
+}
+
+async function collectRuntimeServiceAccountPolicy(projectId: string): Promise<RuntimeServiceAccountPolicyFacts> {
+  const runtimeEmail = process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL?.trim();
+  const wifPrincipals = configuredWifPrincipals();
+  if (!runtimeEmail || !isServiceAccountEmail(runtimeEmail) || wifPrincipals.size === 0)
+    throw new Error('Expected runtime service-account policy is not configured.');
+  const value = await runJson('gcloud', ['iam', 'service-accounts', 'get-iam-policy', runtimeEmail, `--project=${projectId}`, '--format=json']);
+  return inspectRuntimeServiceAccountPolicy(value, runtimeEmail, wifPrincipals);
 }
 
 async function collectDependencyAudit(): Promise<DependencyAuditFacts> {
@@ -832,11 +1174,14 @@ async function collectReport(): Promise<AuditReport> {
     collectIamRoles(projectId).then(classifyIamRoles),
     collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
     collectRuntimeRoleManifest().then(classifyRuntimeRoleManifest),
+    collectDeployedRuntimeRole(projectId).then(classifyDeployedRuntimeRole),
+    collectProjectRuntimePolicy(projectId).then(classifyProjectRuntimePolicy),
+    collectRuntimeServiceAccountPolicy(projectId).then(classifyRuntimeServiceAccountPolicy),
     collectServiceAccountKeys(projectId).then(classifyServiceAccountKeys),
     collectDependencyAudit().then(classifyDependencyAudit),
     collectFirebaseRuleProbes(projectId, storageBucket).then(classifyFirebaseRuleProbes),
   ];
-  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'appCheck', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
+  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'appCheck', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
   const results = await Promise.allSettled(tasks);
   const findings = results.flatMap((result, index) => result.status === 'fulfilled'
     ? result.value

@@ -60,6 +60,24 @@ gcloud iam service-accounts add-iam-policy-binding $RuntimeServiceAccount --proj
 
 `gcp-runtime-role.yaml` is the machine-tested source of truth. Keep the command permission list identical to its `runtimeRole.includedPermissions` list.
 
+The production security audit verifies deployed state, not only this local manifest. Set the expected identity and exact WIF members:
+
+```dotenv
+PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL=private-pro-runtime@your-project.iam.gserviceaccount.com
+PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS=principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/attribute.repository/ORG/REPOSITORY
+```
+
+The audit then blocks unless all of these are true:
+
+- ADC independently resolves an active service-account email and it exactly matches `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL`. The configured email is only an expectation, not proof of active identity.
+- `projects/PROJECT_ID/roles/privateProRuntime` exists, is active at `GA`, and its deployed permission list exactly matches the manifest.
+- The runtime service account has exactly the custom runtime role at project scope. Any extra project role, including `roles/storage.objectAdmin`, an arbitrary custom role, or project-scoped Token Creator, blocks.
+- Each configured WIF principal has only `roles/iam.workloadIdentityUser` on the runtime service account.
+- The runtime service account is the sole `roles/iam.serviceAccountTokenCreator` member on itself. An external principal with Token Creator blocks.
+- The service-account IAM policy contains no other roles or members.
+
+If active ADC credentials, the deployed role, project policy, service-account policy, or expected WIF principals cannot be read and verified, the audit reports a blocker. `--report-only` still prints the complete report but does not make unreadable state acceptable.
+
 ## App Check
 
 Use reCAPTCHA Enterprise. Do not register a reCAPTCHA v3 provider.
@@ -153,7 +171,7 @@ PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES=268435456
 CRON_SECRET=replace-with-a-long-random-secret
 ```
 
-Firebase browser values and the App Check site key are public by design. In the preferred ADC/WIF mode, omit both `FIREBASE_CLIENT_EMAIL` and `FIREBASE_PRIVATE_KEY`. The Firebase Admin SDK selects `application-default`; the workload identity provider supplies the short-lived runtime credential. Set `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL=private-pro-runtime@YOUR_PROJECT_ID.iam.gserviceaccount.com` only for deterministic security-audit identity selection. It is not a credential.
+Firebase browser values and the App Check site key are public by design. In the preferred ADC/WIF mode, omit both `FIREBASE_CLIENT_EMAIL` and `FIREBASE_PRIVATE_KEY`. The Firebase Admin SDK selects `application-default`; the workload identity provider supplies the short-lived runtime credential. `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL` configures the identity the audit expects. The audit separately resolves the active ADC service-account email and blocks if it cannot verify an exact match.
 
 If WIF is not viable in the deployed Vercel environment, use a dedicated static key only as an explicit fallback:
 

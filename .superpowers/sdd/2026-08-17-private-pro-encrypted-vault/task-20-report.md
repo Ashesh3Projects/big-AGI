@@ -74,3 +74,68 @@ Final focused config, Firebase Admin, App Check, audit, manifest, and docs/confi
 ## Commit
 
 Subject: `Security: use least-privilege Firebase identity`
+
+## Fix round 1
+
+Status: complete.
+
+### Review findings
+
+The first implementation validated the local manifest and selected broad-role names, but it did not verify the deployed custom role or both deployed IAM policy scopes. It also treated the configured ADC service-account email as identity proof and accepted malformed manifest shapes through permissive object/string coercion.
+
+### Changes
+
+- Added deployed custom-role collection with:
+  - `gcloud iam roles describe projects/PROJECT_ID/roles/privateProRuntime --format=json`.
+  - Exact role name, `GA` stage, non-deleted state, and permission equality checks against the manifest.
+- Replaced role-name blocklisting as the primary runtime-service-account policy check with exact allowed sets:
+  - Project scope permits only `projects/PROJECT_ID/roles/privateProRuntime` for the runtime service account.
+  - Any other project role for that service account blocks, including predefined object roles or arbitrary custom roles.
+  - Any project-scoped `roles/iam.serviceAccountTokenCreator` binding blocks, regardless of member.
+- Added service-account policy collection with `gcloud iam service-accounts get-iam-policy` and an exact matrix:
+  - Every configured WIF member receives only `roles/iam.workloadIdentityUser`.
+  - The runtime service account is the sole Token Creator member on itself.
+  - External Token Creator members, extra members, extra roles, malformed bindings, and duplicate expected bindings block.
+- Added `PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS` as the comma-separated exact WIF-member expectation used by the live audit.
+- Split expected identity from verified active identity:
+  - `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL` is only the expected service account.
+  - ADC is resolved independently through the transitive `google-auth-library`: obtain an ADC access token, then read the credential's `client_email`.
+  - Missing, non-service-account, or mismatched ADC identity blocks.
+  - `gcloud auth list` and local gcloud user identity are not used as Vercel ADC proof.
+  - Static fallback remains bound to its explicit paired client email and private key.
+- Replaced permissive manifest coercion with an exact schema check for every relevant object and array:
+  - Exact root, role, local-verification, WIF-binding, signing-binding, and validation keys.
+  - Exact schema version, role ID, stage, placeholders, scopes, roles, permission, task gates, and signing member.
+  - String-only, unique, sorted exact permission list.
+  - Duplicate permissions, object entries, extra keys, wrong order, wrong placeholders/scopes, and `signBlob` in the custom role block.
+- Added production audit collectors for the deployed role, project policy, and service-account policy. Collector failure is a blocker; `--report-only` prints it without changing the result.
+- Updated deployment and environment-variable documentation with the live audit contract and fail-closed behavior.
+
+### TDD
+
+Fix-round RED:
+
+```text
+24 tests: 19 passed, 5 failed
+```
+
+The failures were the missing strict manifest schema, deployed-role comparison, exact project-role allowlist, service-account IAM policy matrix, and independent ADC principal verification.
+
+Fix-round GREEN:
+
+```text
+41 focused config, Firebase Admin, App Check, audit, manifest, and docs tests passed, 0 failed
+```
+
+The adversarial manifest suite covers non-object roots, extra keys at every relevant level, wrong schema version/role/stage/placeholders/scopes, duplicate/non-string/unsorted permissions, missing and extra validation fields, and accidental `iam.serviceAccounts.signBlob` inclusion.
+
+### Verification
+
+- Focused config/Firebase Admin/App Check/audit/manifest/docs tests: 41 passed, 0 failed.
+- `npm run private-pro:security-audit -- --report-only`: exited 0 and printed the report. The strict local manifest passed. Active ADC, deployed role, project policy, and service-account policy remained blockers because this local environment lacks the expected production identity/policy configuration. No cloud state was changed.
+- `git diff --check`: passed.
+- Tools TypeScript remains blocked only by the known cross-worktree duplicate React types: 5 JSX/ReactNode errors in 4 unrelated application files. No Task 20 TypeScript error was reported before that baseline failure.
+
+### Cloud boundary
+
+No IAM role, IAM policy, service account, workload identity provider, credential, deployment, or key was created, updated, disabled, or deleted. Live staging verification and provisioning remain approval-gated for Tasks 21 and 24.

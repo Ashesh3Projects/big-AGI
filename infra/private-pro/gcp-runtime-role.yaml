@@ -29,6 +29,14 @@
       "requiredIamPermissions": []
     }
   ],
+  "workloadIdentityBinding": {
+    "role": "roles/iam.workloadIdentityUser",
+    "serviceAccount": "${RUNTIME_SERVICE_ACCOUNT_EMAIL}",
+    "members": [
+      "${WIF_RUNTIME_PRINCIPAL}"
+    ],
+    "scope": "runtime-service-account-only"
+  },
   "signingBinding": {
     "permission": "iam.serviceAccounts.signBlob",
     "role": "roles/iam.serviceAccountTokenCreator",
@@ -38,7 +46,8 @@
   },
   "validation": {
     "status": "unverified",
-    "requiredTask": 21,
+    "liveValidationTask": 21,
+    "provisioningApprovalTask": 24,
     "notes": "Provisioning and protected staging probes require explicit approval. Do not mutate IAM from this manifest automatically."
   }
 }
