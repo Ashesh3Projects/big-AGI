@@ -10,6 +10,8 @@ This design replaces the earlier explicit exclusion of model configuration, API 
 
 Private Pro is a greenfield application. At launch there are zero existing users, chats, personas, assets, or legacy production records. Every account creates and writes the encrypted vault from first setup. There is no plaintext-to-encrypted migration, compatibility read window, migration journal, or legacy cleanup path in this design.
 
+This premise is a release precondition. If any legacy plaintext user data exists or is introduced before launch, stop rollout. A separate migration design, implementation, test plan, and review must be completed before the encrypted vault can be enabled.
+
 ## Goals
 
 - Recreate the user's portable Big-AGI experience on a new computer after Google sign-in and vault unlock.
@@ -490,6 +492,8 @@ Never display secrets in conflict messages, logs, toast details, or account diag
 - Post-deploy live checks for headers, Firebase rules, App Check, sign-in, unlock, download-before-edit, upload, logout, and recovery.
 
 ## Rollout
+
+Precondition: confirm there are still zero existing plaintext Private Pro users or records. If this is false, stop rollout and complete a separate migration design, implementation, and review before enabling the vault.
 
 1. Land and deploy security hardening with the encrypted vault feature disabled.
 2. Deploy encrypted vault schemas, endpoints, rules, App Check, quotas, and database recovery controls.

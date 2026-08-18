@@ -21,6 +21,7 @@
 - Every production-code change follows test-first red-green-refactor.
 - No reachable critical or high production dependency advisory may remain when credential sync is enabled.
 - Require encrypted vault creation before the first user can persist portable Private Pro data.
+- Treat zero existing plaintext Private Pro users and data as a rollout precondition. If any legacy plaintext data exists or is introduced before launch, stop rollout until a separate migration design, implementation, test plan, and review are complete.
 - Do not push or deploy until the user explicitly approves that action.
 
 ---
@@ -1036,9 +1037,9 @@ Remove migration repository state, operation outcomes, service/router methods, F
 
 Keep encrypted backup import/export, password/recovery flows, encrypted schema evolution, normal Dexie version upgrades, sync database upgrade tests, and logout clearing of decrypted state.
 
-- [ ] **Step 4: Verify and commit**
+- [x] **Step 4: Verify and commit the greenfield correction**
 
-Run focused tests, all Private Pro tests, touched ESLint, `npm run tscheck`, `npm run build`, and `git diff --check`. Commit `Cloud: remove unused vault migration surface`.
+The greenfield correction was verified with focused tests, all Private Pro tests, Firebase emulator rules, touched ESLint, `npm run tscheck`, `npm run build`, and `git diff --check`, then committed as `Cloud: remove unused vault migration surface`. This marks only the superseding removal complete; the discarded plaintext migration task did not run.
 
 ### Task 19: Secure Firebase rules for encrypted vault paths
 
@@ -1237,6 +1238,8 @@ git commit -m "Docs: verify encrypted private vault"
 
 **Interfaces:**
 - Produces a greenfield encrypted production vault that stores portable data encrypted from first user setup.
+
+**Precondition:** Confirm there are zero existing plaintext Private Pro users or records. If any exist or are introduced before launch, stop rollout. A separate migration design, implementation, test plan, and review are required before enabling the encrypted vault.
 
 - [ ] **Step 1: Obtain explicit approval for cloud mutations, push, and deployment**
 

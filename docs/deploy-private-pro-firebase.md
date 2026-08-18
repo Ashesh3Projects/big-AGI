@@ -4,6 +4,8 @@ This branch adds a private hosted layer for a small allowlist of Google accounts
 
 Vercel hosts the application. Firebase Authentication supplies Google sign-in, Firestore stores synchronized records, and Cloud Storage stores attachments. Every approved account receives private Pro access without Stripe or subscription logic.
 
+This deployment is greenfield: launch requires zero existing plaintext Private Pro users or data. If any legacy plaintext user data exists or is introduced before launch, stop rollout. Design, implement, test, and review a separate migration before enabling the encrypted vault.
+
 ## Requirements
 
 - A Vercel project connected to branch `pro`.
@@ -132,7 +134,7 @@ Firebase browser values and the App Check site key are public by design. The pri
 
 Set the App Check site key for Production before enabling `NEXT_PUBLIC_PRIVATE_PRO_ENABLED=true`. Any Vercel Preview that enables private Pro must also set it. Local Development may omit it for emulator work. Do not add `FIREBASE_APPCHECK_DEBUG_TOKEN` to Vercel Production.
 
-Do not put model/provider API keys into the private Pro sync configuration. Model settings and API keys remain browser-local.
+Do not put model/provider API keys into Vercel environment variables or plaintext sync configuration. In the Open/self-hosted build, provider credentials remain browser-local unless the operator adds separate infrastructure. In Private Pro, provider credentials, model settings, and API keys are encrypted in the browser and synchronized only as ciphertext through the encrypted vault. Vercel and Firebase must never receive their plaintext values.
 
 The checked-in `vercel.json` invokes `/api/private-pro/sweep-expired` daily, which is compatible with Vercel Hobby cron limits. Vercel sends `CRON_SECRET` as a bearer token. The job releases expired quota reservations and deletes any unfinalized attachment objects.
 
@@ -182,6 +184,8 @@ npm run test:firebase:exec
 The suite verifies cross-account denial, claim and epoch enforcement, inactive-account denial, read-only Firestore access, direct Storage upload denial, and UID-scoped Storage reads.
 
 ## Deployment
+
+Before step 1, confirm there are zero existing plaintext Private Pro users, chats, personas, assets, credentials, settings, or cloud records. If this is false, stop. A separate migration design, implementation, test plan, and review must finish before encrypted-vault rollout.
 
 1. Push branch `pro` using your normal Git workflow.
 2. Select branch `pro` for the Vercel production project or create a separate Vercel project.

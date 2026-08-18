@@ -57,6 +57,9 @@ beforeEach(async () => {
       uid: 'uid-a', assetId: 'asset-1', contentHash: 'c'.repeat(64), contentType: 'image/png', byteSize: 3,
       objectPath: 'users/uid-a/assets/asset-1', status: 'ready', metadata: {}, createdAtMs: 100, updatedAtMs: 100,
     });
+    await setDoc(doc(firestore, 'users/uid-a/vault/data/migrations/legacy-v1'), {
+      migrationId: 'legacy-v1', phase: 'committed', updatedAtMs: 100,
+    });
     await uploadBytes(ref(context.storage(), 'users/uid-a/assets/asset-1'), new Uint8Array([1, 2, 3]), { contentType: 'image/png' });
   });
 });
@@ -96,6 +99,14 @@ describe('private Pro Firestore rules', () => {
     await assertFails(setDoc(doc(firestore, 'users/uid-a/personas/new-persona'), { revision: 1 }));
     await assertFails(setDoc(doc(firestore, 'users/uid-a/quotaReservations/op-1'), { requestedBytes: 1 }));
     await assertFails(deleteDoc(doc(firestore, 'users/uid-a/chats/chat-1')));
+  });
+
+  test('denies the removed encrypted-vault migration path to every browser caller', async () => {
+    const migration = doc(approvedContext().firestore(), 'users/uid-a/vault/data/migrations/legacy-v1');
+
+    await assertFails(getDoc(migration));
+    await assertFails(setDoc(migration, { migrationId: 'legacy-v1', phase: 'complete', updatedAtMs: 200 }));
+    await assertFails(getDoc(doc(approvedContext('uid-b').firestore(), 'users/uid-a/vault/data/migrations/legacy-v1')));
   });
 });
 
