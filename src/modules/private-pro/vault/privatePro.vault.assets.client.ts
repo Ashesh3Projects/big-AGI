@@ -8,7 +8,9 @@ import {
   decryptPrivateProVaultAssetToSink,
   encodePrivateProVaultAssetChunkObject,
   encryptPrivateProVaultAssetChunks,
+  privateProVaultAssetContentIdentity,
   privateProVaultAssetId,
+  privateProVaultAssetPayloadSha256,
   type PrivateProVaultAssetChunk,
   type PrivateProVaultAssetChunkAADInput,
   type PrivateProVaultAssetManifest,
@@ -94,7 +96,7 @@ export interface PrivateProVaultAssetClientTransport {
     downloadUrl: string;
     signal?: AbortSignal;
   }): Promise<Uint8Array>;
-  hashBytes?(bytes: Uint8Array): Promise<string>;
+  hashBytes?(bytes: Uint8Array, signal?: AbortSignal): Promise<string>;
 }
 
 export interface PrivateProVaultAssetClientDependencies {
@@ -115,6 +117,10 @@ interface PreparedChunk {
 
 function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw new DOMException('The encrypted attachment operation was aborted.', 'AbortError');
+}
+
+function abortError(): DOMException {
+  return new DOMException('The encrypted attachment operation was aborted.', 'AbortError');
 }
 
 function manifestFromAsset(asset: DBlobDBAsset): PrivateProVaultAssetManifest {
@@ -250,21 +256,28 @@ function defaultTransport(): PrivateProVaultAssetClientTransport {
       if (!response.ok) throw new Error(`Encrypted attachment download failed with HTTP ${response.status}.`);
       return new Uint8Array(await response.arrayBuffer());
     },
-    hashBytes: hashBytesInWorker,
+    hashBytes: hashBytesAbortably,
   };
 }
 
-function hashBytesInWorker(bytes: Uint8Array): Promise<string> {
-  if (typeof Worker === 'undefined') return sha256Hex(bytes);
+function hashBytesInWorker(bytes: Uint8Array, signal?: AbortSignal): Promise<string> {
+  if (typeof Worker === 'undefined') return sha256Hex(bytes, signal);
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./privatePro.vault.assets.worker.ts', import.meta.url), {
       name: 'private-pro-vault-assets',
       type: 'module',
     });
+    let settled = false;
     const finish = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', handleAbort);
       worker.terminate();
       action();
     };
+    const handleAbort = () => finish(() => reject(abortError()));
+    signal?.addEventListener('abort', handleAbort, { once: true });
     worker.addEventListener('message', event => {
       const response = event.data as Record<string, unknown> | null;
       if (response?.protocolVersion === 1 && response.kind === 'sha256' && typeof response.digestHex === 'string')
@@ -278,16 +291,34 @@ function hashBytesInWorker(bytes: Uint8Array): Promise<string> {
   });
 }
 
-function encryptChunkInWorker(key: CryptoKey, aad: PrivateProVaultAssetChunkAADInput, plaintext: Uint8Array): Promise<PrivateProVaultAssetChunk> {
+async function hashBytesAbortably(bytes: Uint8Array, signal?: AbortSignal): Promise<string> {
+  if (typeof Worker !== 'undefined') return hashBytesInWorker(bytes, signal);
+  return sha256Hex(bytes, signal);
+}
+
+function encryptChunkInWorker(
+  key: CryptoKey,
+  aad: PrivateProVaultAssetChunkAADInput,
+  plaintext: Uint8Array,
+  nonce: Uint8Array,
+  signal?: AbortSignal,
+): Promise<PrivateProVaultAssetChunk> {
+  throwIfAborted(signal);
   return new Promise((resolve, reject) => {
     const worker = new Worker(new URL('./privatePro.vault.assets.worker.ts', import.meta.url), {
       name: 'private-pro-vault-assets',
       type: 'module',
     });
+    let settled = false;
     const finish = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', handleAbort);
       worker.terminate();
       action();
     };
+    const handleAbort = () => finish(() => reject(abortError()));
+    signal?.addEventListener('abort', handleAbort, { once: true });
     worker.addEventListener('message', event => {
       const response = event.data as Record<string, unknown> | null;
       if (response?.protocolVersion === 1 && response.kind === 'encrypt' && response.chunk)
@@ -297,13 +328,32 @@ function encryptChunkInWorker(key: CryptoKey, aad: PrivateProVaultAssetChunkAADI
     }, { once: true });
     worker.addEventListener('error', () => finish(() => reject(new Error('Encrypted attachment worker failed.'))), { once: true });
     const copy = Uint8Array.from(plaintext);
-    worker.postMessage({ protocolVersion: 1, kind: 'encrypt', key, aad, plaintext: copy }, [copy.buffer]);
+    const nonceCopy = Uint8Array.from(nonce);
+    worker.postMessage({ protocolVersion: 1, kind: 'encrypt', key, aad, plaintext: copy, nonce: nonceCopy }, [copy.buffer, nonceCopy.buffer]);
   });
 }
 
-async function sha256Hex(bytes: Uint8Array): Promise<string> {
+async function encryptChunkAbortably(
+  key: CryptoKey,
+  aad: PrivateProVaultAssetChunkAADInput,
+  plaintext: Uint8Array,
+  nonce: Uint8Array,
+  signal?: AbortSignal,
+): Promise<PrivateProVaultAssetChunk> {
+  if (typeof Worker !== 'undefined') return encryptChunkInWorker(key, aad, plaintext, nonce, signal);
+  return import('./privatePro.vault.assets.crypto').then(({ encryptPrivateProVaultAssetChunk }) =>
+    encryptPrivateProVaultAssetChunk(key, aad, plaintext, nonce, signal));
+}
+
+async function sha256Hex(bytes: Uint8Array, signal?: AbortSignal): Promise<string> {
+  throwIfAborted(signal);
   const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes)));
-  return [...digest].map(value => value.toString(16).padStart(2, '0')).join('');
+  throwIfAborted(signal);
+  try {
+    return [...digest].map(value => value.toString(16).padStart(2, '0')).join('');
+  } finally {
+    digest.fill(0);
+  }
 }
 
 function storedMetadata(chunk: PrivateProVaultAssetChunk): PrivateProVaultAssetStoredChunkMetadata {
@@ -342,29 +392,73 @@ export function collectPrivateProVaultAssetIds(recordType: string, value: unknow
   return [...assetIds];
 }
 
+async function hashAssetSource(
+  local: PrivateProVaultAssetLocalPort,
+  asset: DBlobDBAsset,
+  signal?: AbortSignal,
+): Promise<{ plaintextBytes: number; payloadSha256: string }> {
+  throwIfAborted(signal);
+  const opened = await local.openAssetSource(asset);
+  throwIfAborted(signal);
+  return {
+    plaintextBytes: opened.plaintextBytes,
+    payloadSha256: await privateProVaultAssetPayloadSha256(opened.source, opened.plaintextBytes, signal),
+  };
+}
+
 async function preparedChunks(
   deps: Required<Pick<PrivateProVaultAssetClientDependencies, 'vaultId' | 'masterKey' | 'keyVersion'>>,
   asset: DBlobDBAsset,
   local: PrivateProVaultAssetLocalPort,
-  hashBytes: (bytes: Uint8Array) => Promise<string>,
+  hashBytes: (bytes: Uint8Array, signal?: AbortSignal) => Promise<string>,
+  signal?: AbortSignal,
 ): Promise<{ opaqueAssetId: string; chunks: PreparedChunk[] }> {
+  throwIfAborted(signal);
   const opaqueAssetId = await privateProVaultAssetId(deps.masterKey, asset.id);
-  const source = await local.openAssetSource(asset);
-  const chunks: PreparedChunk[] = [];
-  for await (const chunk of encryptPrivateProVaultAssetChunks({
+  const manifest = manifestFromAsset(asset);
+  const hashed = await hashAssetSource(local, asset, signal);
+  const contentIdentity = await privateProVaultAssetContentIdentity({
     masterKey: deps.masterKey,
     vaultId: deps.vaultId,
     opaqueAssetId,
     keyVersion: deps.keyVersion,
-    manifest: manifestFromAsset(asset),
-    plaintextBytes: source.plaintextBytes,
-    source: source.source,
-    encryptChunk: typeof Worker === 'undefined' ? undefined : encryptChunkInWorker,
-  })) {
-    const object = encodePrivateProVaultAssetChunkObject(chunk);
-    chunks.push({ chunk, object, objectSha256: await hashBytes(object) });
+    manifest,
+    plaintextBytes: hashed.plaintextBytes,
+    payloadSha256: hashed.payloadSha256,
+    signal,
+  });
+  throwIfAborted(signal);
+  const source = await local.openAssetSource(asset);
+  if (source.plaintextBytes !== hashed.plaintextBytes)
+    throw new Error('Encrypted asset source size changed between identity and encryption passes.');
+  const chunks: PreparedChunk[] = [];
+  try {
+    for await (const chunk of encryptPrivateProVaultAssetChunks({
+      masterKey: deps.masterKey,
+      vaultId: deps.vaultId,
+      opaqueAssetId,
+      keyVersion: deps.keyVersion,
+      manifest,
+      plaintextBytes: source.plaintextBytes,
+      source: source.source,
+      contentIdentity,
+      signal,
+      encryptChunk: encryptChunkAbortably,
+    })) {
+      throwIfAborted(signal);
+      const object = encodePrivateProVaultAssetChunkObject(chunk);
+      try {
+        chunks.push({ chunk, object, objectSha256: await hashBytes(object, signal) });
+      } catch (error) {
+        object.fill(0);
+        throw error;
+      }
+    }
+    return { opaqueAssetId, chunks };
+  } catch (error) {
+    for (const chunk of chunks) chunk.object.fill(0);
+    throw error;
   }
-  return { opaqueAssetId, chunks };
 }
 
 export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClientDependencies) {
@@ -372,7 +466,9 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
     throw new Error('Encrypted asset client configuration is invalid.');
   const local = deps.local ?? defaultLocalPort();
   const transport = deps.transport ?? defaultTransport();
-  const hashBytes = transport.hashBytes ? (bytes: Uint8Array) => transport.hashBytes!(bytes) : sha256Hex;
+  const hashBytes = transport.hashBytes
+    ? (bytes: Uint8Array, signal?: AbortSignal) => transport.hashBytes!(bytes, signal)
+    : sha256Hex;
   const createOperationId = deps.createOperationId ?? (() => `asset-${crypto.randomUUID()}`);
   const opaqueIds = new Map<string, string>();
 
@@ -400,7 +496,7 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
   ) => {
     throwIfAborted(signal);
     const object = await transport.downloadChunk({ ...chunk, signal });
-    if (object.byteLength !== chunk.objectBytes || !SHA256_HEX.test(chunk.objectSha256) || await hashBytes(object) !== chunk.objectSha256)
+    if (object.byteLength !== chunk.objectBytes || !SHA256_HEX.test(chunk.objectSha256) || await hashBytes(object, signal) !== chunk.objectSha256)
       throw new Error('Encrypted attachment object hash or size is invalid.');
     return object;
   };
@@ -472,33 +568,36 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
         throwIfAborted(signal);
         const asset = await local.getAsset(assetId);
         if (!asset) throw new Error(`Local encrypted attachment ${assetId} was not found.`);
-        const prepared = await preparedChunks(deps, asset, local, hashBytes);
-        const operationId = createOperationId();
-        const reservation = await transport.reserveUpload({
-          operationId,
-          opaqueAssetId: prepared.opaqueAssetId,
-          chunks: prepared.chunks.map(({ chunk, object, objectSha256 }) => ({
-            opaqueChunkId: chunk.opaqueChunkId,
-            chunkIndex: chunk.chunkIndex,
-            ciphertextBytes: chunk.ciphertextBytes,
-            objectBytes: object.byteLength,
-            objectSha256,
-          })),
-        });
-        if (reservation.status === 'already-uploaded') continue;
+        const prepared = await preparedChunks(deps, asset, local, hashBytes, signal);
         try {
-          for (const upload of reservation.chunks) {
-            throwIfAborted(signal);
-            const preparedChunk = prepared.chunks[upload.chunkIndex];
-            if (!preparedChunk || preparedChunk.chunk.opaqueChunkId !== upload.opaqueChunkId)
-              throw new Error('Encrypted attachment reservation order is invalid.');
-            await transport.uploadChunk({ ...upload, bytes: preparedChunk.object, signal });
-          }
           throwIfAborted(signal);
-          await transport.finalizeUpload(operationId);
-        } catch (error) {
-          await transport.releaseReservation(operationId).catch(() => undefined);
-          throw error;
+          const operationId = createOperationId();
+          const reservation = await transport.reserveUpload({
+            operationId,
+            opaqueAssetId: prepared.opaqueAssetId,
+            chunks: prepared.chunks.map(({ chunk, object, objectSha256 }) => ({
+              opaqueChunkId: chunk.opaqueChunkId,
+              chunkIndex: chunk.chunkIndex,
+              ciphertextBytes: chunk.ciphertextBytes,
+              objectBytes: object.byteLength,
+              objectSha256,
+            })),
+          });
+          if (reservation.status === 'already-uploaded') continue;
+          try {
+            for (const upload of reservation.chunks) {
+              throwIfAborted(signal);
+              const preparedChunk = prepared.chunks[upload.chunkIndex];
+              if (!preparedChunk || preparedChunk.chunk.opaqueChunkId !== upload.opaqueChunkId)
+                throw new Error('Encrypted attachment reservation order is invalid.');
+              await transport.uploadChunk({ ...upload, bytes: preparedChunk.object, signal });
+            }
+            throwIfAborted(signal);
+            await transport.finalizeUpload(operationId);
+          } catch (error) {
+            await transport.releaseReservation(operationId).catch(() => undefined);
+            throw error;
+          }
         } finally {
           for (const chunk of prepared.chunks) chunk.object.fill(0);
         }

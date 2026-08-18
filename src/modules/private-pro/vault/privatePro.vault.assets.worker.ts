@@ -11,6 +11,7 @@ type PrivateProVaultAssetWorkerRequest = {
   key: CryptoKey;
   aad: PrivateProVaultAssetChunkAADInput;
   plaintext: Uint8Array<ArrayBuffer>;
+  nonce: Uint8Array<ArrayBuffer>;
 };
 
 type PrivateProVaultAssetWorkerResponse = {
@@ -45,11 +46,13 @@ workerScope?.addEventListener('message', event => {
     workerScope.postMessage({ protocolVersion: 1, kind: 'failure' });
     return;
   }
-  if (request.kind === 'encrypt' && request.plaintext instanceof Uint8Array) {
-    void encryptPrivateProVaultAssetChunk(request.key, request.aad, request.plaintext).then(chunk => {
-      request.plaintext.fill(0);
+  if (request.kind === 'encrypt' && request.plaintext instanceof Uint8Array && request.nonce instanceof Uint8Array) {
+    void encryptPrivateProVaultAssetChunk(request.key, request.aad, request.plaintext, request.nonce).then(chunk => {
       workerScope.postMessage({ protocolVersion: 1, kind: 'encrypt', chunk });
-    }).catch(() => workerScope.postMessage({ protocolVersion: 1, kind: 'failure' }));
+    }).catch(() => workerScope.postMessage({ protocolVersion: 1, kind: 'failure' })).finally(() => {
+      request.plaintext.fill(0);
+      request.nonce.fill(0);
+    });
     return;
   }
   if (request.kind === 'sha256' && request.bytes instanceof Uint8Array) {

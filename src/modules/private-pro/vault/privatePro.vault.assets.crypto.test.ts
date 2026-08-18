@@ -128,6 +128,51 @@ describe('private Pro vault asset chunk cryptography', () => {
     await assert.rejects(decryptPrivateProVaultAsset({ masterKey, vaultId: VAULT_ID, chunks: duplicate }), /nonce/i);
   });
 
+  test('repeats ciphertext exactly for unchanged payload and manifest', async () => {
+    const { masterKey, plaintext, chunks } = await fixture();
+    const opaqueAssetId = await privateProVaultAssetId(masterKey, MANIFEST.assetId);
+
+    const retried = await encryptPrivateProVaultAsset({
+      masterKey,
+      vaultId: VAULT_ID,
+      opaqueAssetId,
+      keyVersion: 3,
+      manifest: MANIFEST,
+      plaintext,
+    });
+
+    assert.deepEqual(retried, chunks);
+  });
+
+  test('changes ciphertext when payload bytes or encrypted metadata change', async () => {
+    const { masterKey, plaintext, chunks } = await fixture(1024);
+    const opaqueAssetId = await privateProVaultAssetId(masterKey, MANIFEST.assetId);
+    const changedPlaintext = Uint8Array.from(plaintext);
+    changedPlaintext[0] ^= 0x80;
+
+    const payloadChanged = await encryptPrivateProVaultAsset({
+      masterKey,
+      vaultId: VAULT_ID,
+      opaqueAssetId,
+      keyVersion: 3,
+      manifest: MANIFEST,
+      plaintext: changedPlaintext,
+    });
+    const metadataChanged = await encryptPrivateProVaultAsset({
+      masterKey,
+      vaultId: VAULT_ID,
+      opaqueAssetId,
+      keyVersion: 3,
+      manifest: { ...MANIFEST, label: 'renamed-private-photo.png' },
+      plaintext,
+    });
+
+    assert.notDeepEqual(payloadChanged, chunks);
+    assert.notDeepEqual(metadataChanged, chunks);
+    assert.notEqual(payloadChanged[0].nonceBase64, chunks[0].nonceBase64);
+    assert.notEqual(metadataChanged[0].nonceBase64, chunks[0].nonceBase64);
+  });
+
   test('keeps filename, content type, label, and origin inside the encrypted manifest', async () => {
     const { chunks } = await fixture(64);
     const visible = JSON.stringify(chunks);

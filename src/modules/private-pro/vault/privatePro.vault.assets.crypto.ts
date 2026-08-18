@@ -13,6 +13,7 @@ const AES_GCM_NONCE_BYTES = 12;
 const FRAME_HEADER_BYTES = 24;
 const FRAME_MAGIC = Uint8Array.of(0x42, 0x41, 0x56, 0x4c, 0x54, 0x30, 0x30, 0x31); // BAVLT001
 const OPAQUE_ID = /^[A-Za-z0-9_-]{43}$/;
+const SHA256_HEX = /^[a-f0-9]{64}$/;
 const textEncoder = new TextEncoder();
 const textDecoder = new TextDecoder('utf-8', { fatal: true });
 
@@ -100,6 +101,8 @@ export type PrivateProVaultAssetChunkEncryptor = (
   key: CryptoKey,
   aad: PrivateProVaultAssetChunkAADInput,
   plaintext: Uint8Array,
+  nonce: Uint8Array,
+  signal?: AbortSignal,
 ) => Promise<PrivateProVaultAssetChunk>;
 
 export type PrivateProVaultAssetPlaintextSource = Uint8Array | Blob | ReadableStream<Uint8Array> | AsyncIterable<Uint8Array>;
@@ -112,11 +115,27 @@ export interface EncryptPrivateProVaultAssetStreamInput {
   manifest: PrivateProVaultAssetManifest;
   plaintextBytes: number;
   source: PrivateProVaultAssetPlaintextSource;
+  contentIdentity: string;
+  signal?: AbortSignal;
   encryptChunk?: PrivateProVaultAssetChunkEncryptor;
 }
 
-export interface EncryptPrivateProVaultAssetInput extends Omit<EncryptPrivateProVaultAssetStreamInput, 'plaintextBytes' | 'source'> {
+export interface EncryptPrivateProVaultAssetInput extends Omit<
+  EncryptPrivateProVaultAssetStreamInput,
+  'plaintextBytes' | 'source' | 'contentIdentity'
+> {
   plaintext: Uint8Array;
+}
+
+export interface PrivateProVaultAssetContentIdentityInput {
+  masterKey: CryptoKey;
+  vaultId: string;
+  opaqueAssetId: string;
+  keyVersion: number;
+  manifest: PrivateProVaultAssetManifest;
+  plaintextBytes: number;
+  payloadSha256: string;
+  signal?: AbortSignal;
 }
 
 export interface DecryptPrivateProVaultAssetInput {
@@ -198,6 +217,16 @@ function base64ToBytes(value: string, expectedBytes?: number): Uint8Array<ArrayB
   }
 }
 
+async function sha256Hex(bytes: Uint8Array, signal?: AbortSignal): Promise<string> {
+  throwIfAborted(signal);
+  const digest = new Uint8Array(await awaitWithAbort(crypto.subtle.digest('SHA-256', new Uint8Array(bytes)), signal));
+  try {
+    return [...digest].map(value => value.toString(16).padStart(2, '0')).join('');
+  } finally {
+    digest.fill(0);
+  }
+}
+
 function assetChunkAAD(input: PrivateProVaultAssetChunkAADInput): Uint8Array<ArrayBuffer> {
   return lengthPrefixed(
     'big-agi/private-pro/vault/asset-chunk-aad/v1',
@@ -227,6 +256,37 @@ function assertOpaqueId(value: string, label: string): void {
   if (!OPAQUE_ID.test(value)) throw new Error(`${label} must be an opaque identifier.`);
 }
 
+function abortError(): DOMException {
+  return new DOMException('The encrypted attachment operation was aborted.', 'AbortError');
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal, onAbort?: () => void): Promise<T> {
+  if (!signal) return promise;
+  throwIfAborted(signal);
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const finish = (action: () => void) => {
+      if (settled) return;
+      settled = true;
+      signal.removeEventListener('abort', handleAbort);
+      action();
+    };
+    const handleAbort = () => finish(() => {
+      onAbort?.();
+      reject(abortError());
+    });
+    signal.addEventListener('abort', handleAbort, { once: true });
+    promise.then(
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error)),
+    );
+  });
+}
+
 async function assetCipherKey(masterKey: CryptoKey, opaqueAssetId: string, usage: 'encrypt' | 'decrypt') {
   return deriveVaultSubkey(masterKey, 'asset-encryption/v1', opaqueAssetId, [usage]);
 }
@@ -235,8 +295,44 @@ async function assetIdentifierKey(masterKey: CryptoKey, opaqueAssetId: string) {
   return deriveVaultSubkey(masterKey, 'asset-identifiers/v1', opaqueAssetId, ['sign']);
 }
 
+async function assetContentIdentityKey(masterKey: CryptoKey, opaqueAssetId: string) {
+  return deriveVaultSubkey(masterKey, 'asset-content-identities/v1', opaqueAssetId, ['sign']);
+}
+
+async function assetNonceKey(masterKey: CryptoKey, opaqueAssetId: string) {
+  return deriveVaultSubkey(masterKey, 'asset-nonces/v1', opaqueAssetId, ['sign']);
+}
+
 async function chunkId(key: CryptoKey, index: number): Promise<string> {
   return hmacVaultIdentifier(key, 'chunk', String(index));
+}
+
+async function chunkNonce(
+  key: CryptoKey,
+  contentIdentity: string,
+  aad: PrivateProVaultAssetChunkAADInput,
+  signal?: AbortSignal,
+): Promise<Uint8Array<ArrayBuffer>> {
+  const signature = new Uint8Array(await awaitWithAbort(crypto.subtle.sign('HMAC', key, lengthPrefixed(
+    'big-agi/private-pro/vault/asset-nonce/v1',
+    contentIdentity,
+    aad.vaultId,
+    aad.opaqueAssetId,
+    aad.opaqueChunkId,
+    String(aad.chunkIndex),
+    String(aad.chunkCount),
+    String(aad.totalPlaintextBytes),
+    String(aad.plaintextBytes),
+    String(aad.keyVersion),
+    String(aad.schemaVersion),
+    String(aad.formatVersion),
+    PRIVATE_PRO_VAULT_ASSET_CIPHER_SUITE,
+  )), signal));
+  try {
+    return signature.slice(0, AES_GCM_NONCE_BYTES);
+  } finally {
+    signature.fill(0);
+  }
 }
 
 function validateManifest(input: unknown): { manifest: PrivateProVaultAssetManifest; bytes: Uint8Array<ArrayBuffer> } {
@@ -246,6 +342,53 @@ function validateManifest(input: unknown): { manifest: PrivateProVaultAssetManif
   if (bytes.byteLength > PRIVATE_PRO_VAULT_ASSET_MAX_MANIFEST_BYTES)
     throw new Error('Encrypted asset manifest exceeds the size limit.');
   return { manifest, bytes };
+}
+
+export async function privateProVaultAssetContentIdentity(
+  input: PrivateProVaultAssetContentIdentityInput,
+): Promise<string> {
+  assertOpaqueId(input.opaqueAssetId, 'Encrypted asset ID');
+  assertSafePositive(input.keyVersion, 'Encrypted asset key version');
+  assertSafeNonnegative(input.plaintextBytes, 'Encrypted asset plaintext size');
+  if (!input.vaultId || !SHA256_HEX.test(input.payloadSha256))
+    throw new Error('Encrypted asset content identity input is invalid.');
+  throwIfAborted(input.signal);
+  const { manifest, bytes } = validateManifest(input.manifest);
+  try {
+    if (await privateProVaultAssetId(input.masterKey, manifest.assetId) !== input.opaqueAssetId)
+      throw new Error('Encrypted asset identity does not match its manifest.');
+    throwIfAborted(input.signal);
+    const key = await assetContentIdentityKey(input.masterKey, input.opaqueAssetId);
+    throwIfAborted(input.signal);
+    return await hmacVaultIdentifier(key, 'content', JSON.stringify({
+      vaultId: input.vaultId,
+      opaqueAssetId: input.opaqueAssetId,
+      keyVersion: input.keyVersion,
+      plaintextBytes: input.plaintextBytes,
+      payloadSha256: input.payloadSha256,
+      manifest: JSON.parse(textDecoder.decode(bytes)) as unknown,
+    }));
+  } finally {
+    bytes.fill(0);
+  }
+}
+
+export async function privateProVaultAssetPayloadSha256(
+  source: PrivateProVaultAssetPlaintextSource,
+  plaintextBytes: number,
+  signal?: AbortSignal,
+): Promise<string> {
+  const { createSHA256 } = await import('hash-wasm');
+  throwIfAborted(signal);
+  const hasher = await createSHA256();
+  throwIfAborted(signal);
+  hasher.init();
+  await consumePrivateProVaultAssetPlaintextSource(source, plaintextBytes, chunk => {
+    throwIfAborted(signal);
+    hasher.update(chunk);
+  }, signal);
+  throwIfAborted(signal);
+  return hasher.digest('hex');
 }
 
 export function privateProVaultAssetChunkPlan(
@@ -306,32 +449,41 @@ export async function encryptPrivateProVaultAssetChunk(
   key: CryptoKey,
   aad: PrivateProVaultAssetChunkAADInput,
   plaintext: Uint8Array,
+  nonceInput?: Uint8Array,
+  signal?: AbortSignal,
 ): Promise<PrivateProVaultAssetChunk> {
-  const nonce = crypto.getRandomValues(new Uint8Array(AES_GCM_NONCE_BYTES));
-  const ciphertext = new Uint8Array(await crypto.subtle.encrypt({
-    name: 'AES-GCM',
-    iv: nonce,
-    additionalData: assetChunkAAD(aad),
-  }, key, new Uint8Array(plaintext)));
-  if (ciphertext.byteLength > PRIVATE_PRO_VAULT_ASSET_MAX_CIPHERTEXT_CHUNK_BYTES)
-    throw new Error('Encrypted asset chunk exceeds the ciphertext limit.');
-  return {
-    formatVersion: aad.formatVersion,
-    schemaVersion: aad.schemaVersion,
-    keyVersion: aad.keyVersion,
-    opaqueAssetId: aad.opaqueAssetId,
-    opaqueChunkId: aad.opaqueChunkId,
-    chunkIndex: aad.chunkIndex,
-    chunkCount: aad.chunkCount,
-    totalPlaintextBytes: aad.totalPlaintextBytes,
-    plaintextBytes: aad.plaintextBytes,
-    nonceBase64: bytesToBase64(nonce),
-    ciphertextBase64: bytesToBase64(ciphertext),
-    ciphertextBytes: ciphertext.byteLength,
-  };
+  throwIfAborted(signal);
+  const nonce = nonceInput ? Uint8Array.from(nonceInput) : crypto.getRandomValues(new Uint8Array(AES_GCM_NONCE_BYTES));
+  try {
+    if (nonce.byteLength !== AES_GCM_NONCE_BYTES) throw new Error('Encrypted asset nonce length is invalid.');
+    const ciphertext = new Uint8Array(await awaitWithAbort(crypto.subtle.encrypt({
+      name: 'AES-GCM',
+      iv: nonce,
+      additionalData: assetChunkAAD(aad),
+    }, key, new Uint8Array(plaintext)), signal));
+    if (ciphertext.byteLength > PRIVATE_PRO_VAULT_ASSET_MAX_CIPHERTEXT_CHUNK_BYTES)
+      throw new Error('Encrypted asset chunk exceeds the ciphertext limit.');
+    return {
+      formatVersion: aad.formatVersion,
+      schemaVersion: aad.schemaVersion,
+      keyVersion: aad.keyVersion,
+      opaqueAssetId: aad.opaqueAssetId,
+      opaqueChunkId: aad.opaqueChunkId,
+      chunkIndex: aad.chunkIndex,
+      chunkCount: aad.chunkCount,
+      totalPlaintextBytes: aad.totalPlaintextBytes,
+      plaintextBytes: aad.plaintextBytes,
+      nonceBase64: bytesToBase64(nonce),
+      ciphertextBase64: bytesToBase64(ciphertext),
+      ciphertextBytes: ciphertext.byteLength,
+    };
+  } finally {
+    nonce.fill(0);
+  }
 }
 
-async function* sourceChunks(source: PrivateProVaultAssetPlaintextSource): AsyncGenerator<Uint8Array> {
+async function* sourceChunks(source: PrivateProVaultAssetPlaintextSource, signal?: AbortSignal): AsyncGenerator<Uint8Array> {
+  throwIfAborted(signal);
   if (source instanceof Uint8Array) {
     if (source.byteLength) yield source;
     return;
@@ -340,11 +492,13 @@ async function* sourceChunks(source: PrivateProVaultAssetPlaintextSource): Async
     const reader = source.stream().getReader();
     try {
       while (true) {
-        const result = await reader.read();
+        const result = await awaitWithAbort(reader.read(), signal, () => { void reader.cancel().catch(() => undefined); });
         if (result.done) return;
+        throwIfAborted(signal);
         if (result.value.byteLength) yield result.value;
       }
     } finally {
+      if (signal?.aborted) await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
   }
@@ -352,19 +506,36 @@ async function* sourceChunks(source: PrivateProVaultAssetPlaintextSource): Async
     const reader = source.getReader();
     try {
       while (true) {
-        const result = await reader.read();
+        const result = await awaitWithAbort(reader.read(), signal, () => { void reader.cancel().catch(() => undefined); });
         if (result.done) return;
+        throwIfAborted(signal);
         if (result.value.byteLength) yield result.value;
       }
     } finally {
+      if (signal?.aborted) await reader.cancel().catch(() => undefined);
       reader.releaseLock();
     }
   }
   else {
     const iterable = source as AsyncIterable<Uint8Array>;
-    for await (const chunk of iterable) {
-      if (!(chunk instanceof Uint8Array)) throw new Error('Encrypted asset source emitted invalid bytes.');
-      if (chunk.byteLength) yield chunk;
+    const iterator = iterable[Symbol.asyncIterator]();
+    try {
+      while (true) {
+        const result = await awaitWithAbort(iterator.next(), signal, () => {
+          const returned = iterator.return?.();
+          if (returned && typeof (returned as PromiseLike<IteratorResult<Uint8Array>>).then === 'function')
+            void Promise.resolve(returned).catch(() => undefined);
+        });
+        if (result.done) return;
+        throwIfAborted(signal);
+        if (!(result.value instanceof Uint8Array)) throw new Error('Encrypted asset source emitted invalid bytes.');
+        if (result.value.byteLength) yield result.value;
+      }
+    } finally {
+      if (signal?.aborted) {
+        const returned = iterator.return?.();
+        if (returned) await Promise.resolve(returned);
+      }
     }
   }
 }
@@ -373,32 +544,67 @@ class BoundedSourceReader {
   private remainder: Uint8Array | null = null;
   private readonly iterator: AsyncIterator<Uint8Array>;
 
-  constructor(source: PrivateProVaultAssetPlaintextSource) {
-    this.iterator = sourceChunks(source)[Symbol.asyncIterator]();
+  constructor(source: PrivateProVaultAssetPlaintextSource, private readonly signal?: AbortSignal) {
+    this.iterator = sourceChunks(source, signal)[Symbol.asyncIterator]();
   }
 
   async readExactly(size: number): Promise<Uint8Array<ArrayBuffer>> {
     const output = new Uint8Array(size);
     let offset = 0;
-    while (offset < size) {
-      if (!this.remainder) {
-        const next = await this.iterator.next();
-        if (next.done) throw new Error('Encrypted asset source ended before its declared size.');
-        this.remainder = next.value;
+    try {
+      while (offset < size) {
+        throwIfAborted(this.signal);
+        if (!this.remainder) {
+          const next = await this.iterator.next();
+          if (next.done) throw new Error('Encrypted asset source ended before its declared size.');
+          this.remainder = Uint8Array.from(next.value);
+        }
+        const copied = Math.min(size - offset, this.remainder.byteLength);
+        output.set(this.remainder.subarray(0, copied), offset);
+        this.remainder.subarray(0, copied).fill(0);
+        offset += copied;
+        this.remainder = copied === this.remainder.byteLength ? null : this.remainder.subarray(copied);
       }
-      const copied = Math.min(size - offset, this.remainder.byteLength);
-      output.set(this.remainder.subarray(0, copied), offset);
-      offset += copied;
-      this.remainder = copied === this.remainder.byteLength ? null : this.remainder.subarray(copied);
+      return output;
+    } catch (error) {
+      output.fill(0);
+      this.remainder?.fill(0);
+      this.remainder = null;
+      if (this.signal?.aborted) void this.iterator.return?.();
+      throw error;
     }
-    return output;
   }
 
   async assertDone(): Promise<void> {
+    throwIfAborted(this.signal);
     if (this.remainder?.byteLength) throw new Error('Encrypted asset source exceeds its declared size.');
     const next = await this.iterator.next();
     if (!next.done) throw new Error('Encrypted asset source exceeds its declared size.');
   }
+}
+
+export async function consumePrivateProVaultAssetPlaintextSource(
+  source: PrivateProVaultAssetPlaintextSource,
+  plaintextBytes: number,
+  write: (chunk: Uint8Array) => void | Promise<void>,
+  signal?: AbortSignal,
+): Promise<void> {
+  assertSafeNonnegative(plaintextBytes, 'Encrypted asset plaintext size');
+  if (plaintextBytes > PRIVATE_PRO_VAULT_ASSET_MAX_PAYLOAD_BYTES)
+    throw new Error('Attachment exceeds the encrypted asset limit.');
+  const reader = new BoundedSourceReader(source, signal);
+  let remaining = plaintextBytes;
+  while (remaining > 0) {
+    throwIfAborted(signal);
+    const chunk = await reader.readExactly(Math.min(64 * 1024, remaining));
+    try {
+      await write(chunk);
+    } finally {
+      chunk.fill(0);
+    }
+    remaining -= chunk.byteLength;
+  }
+  await reader.assertDone();
 }
 
 export async function privateProVaultAssetId(masterKey: CryptoKey, assetId: string): Promise<string> {
@@ -410,31 +616,37 @@ export async function privateProVaultAssetId(masterKey: CryptoKey, assetId: stri
 export async function* encryptPrivateProVaultAssetChunks(
   input: EncryptPrivateProVaultAssetStreamInput,
 ): AsyncGenerator<PrivateProVaultAssetChunk> {
+  throwIfAborted(input.signal);
   assertOpaqueId(input.opaqueAssetId, 'Encrypted asset ID');
+  assertOpaqueId(input.contentIdentity, 'Encrypted asset content identity');
   assertSafePositive(input.keyVersion, 'Encrypted asset key version');
   if (!input.vaultId) throw new Error('Encrypted assets require a vault ID.');
   const plan = privateProVaultAssetChunkPlan(input.manifest, input.plaintextBytes);
   if (await privateProVaultAssetId(input.masterKey, plan.manifest.assetId) !== input.opaqueAssetId)
     throw new Error('Encrypted asset identity does not match its manifest.');
-  const [key, identifierKey] = await Promise.all([
+  throwIfAborted(input.signal);
+  const [key, identifierKey, nonceKey] = await Promise.all([
     assetCipherKey(input.masterKey, input.opaqueAssetId, 'encrypt'),
     assetIdentifierKey(input.masterKey, input.opaqueAssetId),
+    assetNonceKey(input.masterKey, input.opaqueAssetId),
   ]);
-  const reader = new BoundedSourceReader(input.source);
+  const reader = new BoundedSourceReader(input.source, input.signal);
   const encryptChunk = input.encryptChunk ?? encryptPrivateProVaultAssetChunk;
   try {
     for (let chunkIndex = 0; chunkIndex < plan.chunkPlaintextBytes.length; chunkIndex++) {
+      throwIfAborted(input.signal);
       const payloadBytes = chunkIndex === 0
         ? plan.firstPayloadBytes
         : plan.chunkPlaintextBytes[chunkIndex];
       const payload = await reader.readExactly(payloadBytes);
       const plaintext = chunkIndex === 0 ? framedFirstChunk(plan.manifestBytes, payload, input.plaintextBytes) : payload;
       try {
+        throwIfAborted(input.signal);
         const opaqueChunkId = await chunkId(identifierKey, chunkIndex);
-        yield await encryptChunk(key, {
+        const aad = {
           vaultId: input.vaultId,
-          formatVersion: 1,
-          schemaVersion: 1,
+          formatVersion: 1 as const,
+          schemaVersion: 1 as const,
           keyVersion: input.keyVersion,
           opaqueAssetId: input.opaqueAssetId,
           opaqueChunkId,
@@ -442,7 +654,13 @@ export async function* encryptPrivateProVaultAssetChunks(
           chunkCount: plan.chunkPlaintextBytes.length,
           totalPlaintextBytes: plan.totalFramedPlaintextBytes,
           plaintextBytes: plaintext.byteLength,
-        }, plaintext);
+        };
+        const nonce = await chunkNonce(nonceKey, input.contentIdentity, aad, input.signal);
+        try {
+          yield await encryptChunk(key, aad, plaintext, nonce, input.signal);
+        } finally {
+          nonce.fill(0);
+        }
       } finally {
         plaintext.fill(0);
         if (plaintext !== payload) payload.fill(0);
@@ -457,11 +675,19 @@ export async function* encryptPrivateProVaultAssetChunks(
 export async function encryptPrivateProVaultAsset(
   input: EncryptPrivateProVaultAssetInput,
 ): Promise<PrivateProVaultAssetChunk[]> {
+  throwIfAborted(input.signal);
+  const payloadSha256 = await sha256Hex(input.plaintext, input.signal);
+  const contentIdentity = await privateProVaultAssetContentIdentity({
+    ...input,
+    plaintextBytes: input.plaintext.byteLength,
+    payloadSha256,
+  });
   const chunks: PrivateProVaultAssetChunk[] = [];
   for await (const chunk of encryptPrivateProVaultAssetChunks({
     ...input,
     plaintextBytes: input.plaintext.byteLength,
     source: input.plaintext,
+    contentIdentity,
   })) chunks.push(chunk);
   return chunks;
 }

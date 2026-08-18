@@ -38,6 +38,9 @@ class MemoryLocalPort implements PrivateProVaultAssetLocalPort {
   readonly hydrated = new Map<string, Set<string>>();
   maxPlaintextReadBytes = 0;
   failPut = false;
+  blockNextSourceRead = false;
+  blockedSourceReadStarted: Promise<void> | null = null;
+  private resolveBlockedSourceReadStarted: (() => void) | null = null;
 
   async getAsset(assetId: string) { return structuredClone(this.assets.get(assetId)); }
   async putAsset(value: DBlobDBAsset) {
@@ -56,6 +59,22 @@ class MemoryLocalPort implements PrivateProVaultAssetLocalPort {
   async openAssetSource(value: DBlobDBAsset) {
     const bytes = Uint8Array.from(Buffer.from(value.data.base64, 'base64'));
     let offset = 0;
+    if (this.blockNextSourceRead) {
+      this.blockNextSourceRead = false;
+      this.blockedSourceReadStarted = new Promise(resolve => { this.resolveBlockedSourceReadStarted = resolve; });
+      return {
+        plaintextBytes: bytes.byteLength,
+        source: {
+          [Symbol.asyncIterator]: () => ({
+            next: () => {
+              this.resolveBlockedSourceReadStarted?.();
+              return new Promise<IteratorResult<Uint8Array>>(() => undefined);
+            },
+            return: async () => ({ done: true as const, value: undefined }),
+          }),
+        },
+      };
+    }
     return {
       plaintextBytes: bytes.byteLength,
       source: new ReadableStream<Uint8Array>({
@@ -79,10 +98,26 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
   releases = 0;
   finalized = 0;
   failUploadAt: number | null = null;
+  abortUploadAt: number | null = null;
+  abortController: AbortController | null = null;
+  autoAbortBeforeObjectHash = false;
+  hashCalls = 0;
+  rejectDivergentReady = true;
   private ready: { opaqueAssetId: string; ciphertextBytes: number; chunks: any[] } | null = null;
 
   async reserveUpload(input: { operationId: string; opaqueAssetId: string; chunks: any[] }) {
     this.reservations.push(structuredClone(input));
+    if (this.ready?.opaqueAssetId === input.opaqueAssetId) {
+      const readyDescriptors = this.ready.chunks.map(({ opaqueChunkId, chunkIndex, ciphertextBytes, objectBytes, objectSha256 }) => ({
+        opaqueChunkId, chunkIndex, ciphertextBytes, objectBytes, objectSha256,
+      }));
+      if (JSON.stringify(readyDescriptors) === JSON.stringify(input.chunks)) return {
+        status: 'already-uploaded' as const,
+        opaqueAssetId: input.opaqueAssetId,
+        ciphertextBytes: this.ready.ciphertextBytes,
+      };
+      if (this.rejectDivergentReady) throw new Error('Encrypted asset already exists with different ciphertext descriptors.');
+    }
     const chunks = input.chunks.map((chunk, index) => ({
       ...chunk,
       objectPath: `users/${UID}/vault/assets/${input.opaqueAssetId}/${chunk.opaqueChunkId}`,
@@ -99,6 +134,10 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
 
   async uploadChunk(input: { chunkIndex: number; objectPath: string; bytes: Uint8Array }) {
     this.uploadedIndices.push(input.chunkIndex);
+    if (input.chunkIndex === this.abortUploadAt) {
+      this.abortController?.abort();
+      throw abortErrorForTest();
+    }
     if (input.chunkIndex === this.failUploadAt) throw new Error('injected upload failure');
     this.objects.set(input.objectPath, Uint8Array.from(input.bytes));
   }
@@ -112,6 +151,7 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
   async releaseReservation() {
     this.releases++;
     this.objects.clear();
+    this.ready = null;
   }
 
   async getDownload() {
@@ -128,6 +168,18 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
     if (!bytes) throw new Error('missing object');
     return Uint8Array.from(bytes);
   }
+
+  async hashBytes(bytes: Uint8Array, signal?: AbortSignal) {
+    this.hashCalls++;
+    if (this.autoAbortBeforeObjectHash) this.abortController?.abort();
+    if (signal?.aborted) throw abortErrorForTest();
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', new Uint8Array(bytes)));
+    return [...digest].map(value => value.toString(16).padStart(2, '0')).join('');
+  }
+}
+
+function abortErrorForTest(): DOMException {
+  return new DOMException('The encrypted attachment operation was aborted.', 'AbortError');
 }
 
 async function fixture() {
@@ -219,6 +271,137 @@ describe('private Pro encrypted vault asset client', () => {
     controller.abort();
     await assert.rejects(aborted.client.prepareForUpload([ASSET_ID], controller.signal), /abort/i);
     assert.equal(aborted.transport.finalized, 0);
+  });
+
+  test('aborts promptly during plaintext source preparation without reserving or uploading', async () => {
+    const { client, local, transport } = await fixture();
+    local.blockNextSourceRead = true;
+    const controller = new AbortController();
+    const upload = client.prepareForUpload([ASSET_ID], controller.signal);
+    await local.blockedSourceReadStarted;
+
+    controller.abort();
+
+    await assert.rejects(Promise.race([
+      upload,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('abort timed out')), 250)),
+    ]), error => error instanceof DOMException && error.name === 'AbortError');
+    assert.equal(transport.reservations.length, 0);
+    assert.deepEqual(transport.uploadedIndices, []);
+    assert.equal(transport.finalized, 0);
+  });
+
+  test('aborts promptly during chunk encryption without reserving or leaving stale objects', async () => {
+    const { client, transport } = await fixture();
+    const OriginalWorker = globalThis.Worker;
+    let terminated = false;
+    let messagePosted: (() => void) | null = null;
+    const posted = new Promise<void>(resolve => { messagePosted = resolve; });
+    class BlockingWorker {
+      addEventListener() { /* the synthetic crypto job never resolves */ }
+      postMessage() { messagePosted?.(); }
+      terminate() { terminated = true; }
+    }
+    Object.defineProperty(globalThis, 'Worker', { configurable: true, writable: true, value: BlockingWorker });
+    try {
+      const controller = new AbortController();
+      const upload = client.prepareForUpload([ASSET_ID], controller.signal);
+      await posted;
+
+      controller.abort();
+
+      await assert.rejects(Promise.race([
+        upload,
+        new Promise((_, reject) => setTimeout(() => reject(new Error('abort timed out')), 250)),
+      ]), error => error instanceof DOMException && error.name === 'AbortError');
+      assert.equal(terminated, true);
+      assert.equal(transport.reservations.length, 0);
+      assert.equal(transport.objects.size, 0);
+      assert.equal(transport.finalized, 0);
+    } finally {
+      Object.defineProperty(globalThis, 'Worker', { configurable: true, writable: true, value: OriginalWorker });
+    }
+  });
+
+  test('aborts during descriptor hashing before reservation or stale effects', async () => {
+    const { client, transport } = await fixture();
+    const controller = new AbortController();
+    transport.autoAbortBeforeObjectHash = true;
+    transport.abortController = controller;
+
+    await assert.rejects(client.prepareForUpload([ASSET_ID], controller.signal), /abort/i);
+
+    assert.equal(transport.hashCalls, 1);
+    assert.equal(transport.reservations.length, 0);
+    assert.equal(transport.objects.size, 0);
+    assert.equal(transport.finalized, 0);
+  });
+
+  test('reuses exact descriptors for unchanged chat sync and later backup preparation', async () => {
+    const { client, transport } = await fixture();
+
+    await client.prepareForUpload([ASSET_ID]);
+    const uploaded = [...transport.uploadedIndices];
+    await client.prepareForUpload([ASSET_ID]);
+
+    assert.deepEqual(transport.reservations[1].chunks, transport.reservations[0].chunks);
+    assert.deepEqual(transport.uploadedIndices, uploaded);
+    assert.equal(transport.finalized, 1);
+  });
+
+  test('retries an interrupted upload with the exact same ciphertext descriptors', async () => {
+    const { client, transport } = await fixture();
+    const controller = new AbortController();
+    transport.abortUploadAt = 1;
+    transport.abortController = controller;
+
+    await assert.rejects(client.prepareForUpload([ASSET_ID], controller.signal), /abort/i);
+    const firstDescriptors = structuredClone(transport.reservations[0].chunks);
+    transport.abortUploadAt = null;
+    transport.abortController = null;
+
+    await client.prepareForUpload([ASSET_ID]);
+
+    assert.deepEqual(transport.reservations[1].chunks, firstDescriptors);
+    assert.equal(transport.releases, 1);
+    assert.equal(transport.finalized, 1);
+  });
+
+  test('rejects changed payload or metadata under the immutable logical asset ID', async () => {
+    const payloadChanged = await fixture();
+    await payloadChanged.client.prepareForUpload([ASSET_ID]);
+    const changedBytes = Uint8Array.from(Buffer.from(payloadChanged.original.data.base64, 'base64'));
+    changedBytes[0] ^= 0x80;
+    const changedAsset = structuredClone(payloadChanged.original);
+    changedAsset.data.base64 = Buffer.from(changedBytes).toString('base64');
+    payloadChanged.local.assets.set(ASSET_ID, changedAsset);
+    await assert.rejects(payloadChanged.client.prepareForUpload([ASSET_ID]), /different ciphertext|descriptor/i);
+
+    const metadataChanged = await fixture();
+    await metadataChanged.client.prepareForUpload([ASSET_ID]);
+    metadataChanged.local.assets.set(ASSET_ID, { ...metadataChanged.original, label: 'renamed-private-file.png' });
+    await assert.rejects(metadataChanged.client.prepareForUpload([ASSET_ID]), /different ciphertext|descriptor/i);
+  });
+
+  test('derives the same opaque descriptors on a fresh device with no local vault mapping', async () => {
+    const first = await fixture();
+    await first.client.prepareForUpload([ASSET_ID]);
+    const freshLocal = new MemoryLocalPort();
+    freshLocal.assets.set(ASSET_ID, structuredClone(first.original));
+    const freshClient = createPrivateProVaultAssetClient({
+      vaultId: UID,
+      masterKey: first.masterKey,
+      keyVersion: KEY_VERSION,
+      local: freshLocal,
+      transport: first.transport,
+      createOperationId: () => 'asset-operation-fresh-device',
+    });
+
+    await freshClient.prepareForUpload([ASSET_ID]);
+
+    assert.equal(first.transport.reservations[1].opaqueAssetId, first.transport.reservations[0].opaqueAssetId);
+    assert.deepEqual(first.transport.reservations[1].chunks, first.transport.reservations[0].chunks);
+    assert.equal(first.transport.finalized, 1);
   });
 
   test('exports each encrypted chunk in upload order for the Task 12 backup port', async () => {
