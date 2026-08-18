@@ -22,7 +22,7 @@ This verification was local and read-only except for generated files inside the 
 - Restore audit isolation commit: `e86685620ab4392a60b0af46ca181332cd687662`
 - Acknowledgment verification stabilization: `bf7ff8848`
 - One-shot audit evidence verification: `b9b04d6a1`
-- Final persistence, restore, analytics, recovery, and route fixes: `3f499a60d..ec97c78d5`
+- Final persistence, restore, analytics, recovery, route, and plaintext-backup fixes: `3f499a60d..91cbc2dc6`
 - Verification timezone: Asia/Calcutta, UTC+05:30
 - OS: Windows 10 Pro, 10.0.19045, x64
 - Node.js: `v24.5.0`
@@ -136,6 +136,7 @@ Final-fix commands below supersede the earlier Task 23 counts. All were run from
 - `privateProSync` and the legacy `privateProAssets` namespace are absent. Only four encrypted procedures are mounted under `privateProVaultAssets`.
 - Backup import is a cloud merge: backup-key decryption is staged, assets upload first under the active vault key, records are re-encrypted with active key version and current revisions, existing cloud-only records remain, and cloud reconstruction is downloaded and verified before engine hydration reports success.
 - Private Pro analytics are disabled at mount and source flag boundaries even if analytics environment variables are present.
+- The generic unencrypted Flash backup/restore UI is not rendered in Private Pro; only the encrypted cloud-merge flow is exposed.
 - Password/recovery rotation records one bounded server security event in the same keyset transaction and prompts for immediate revocation of other remembered devices.
 
 The rows below this note are the historical Task 23 matrix from 2026-08-18 UTC+05:30. They are retained as earlier evidence and are superseded by the final-fix table above where counts or audit state changed.
