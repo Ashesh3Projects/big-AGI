@@ -658,8 +658,10 @@ async function createFlashObject(backupType: 'full' | 'partial' | 'auto-before-r
  * Saves and fully restores localStorage and IndexedDB data.
  */
 export function FlashRestore(props: { unlockRestore?: boolean }) {
+  return privateProClientConfig.enabled ? null : <FlashRestoreOpen {...props} />;
+}
 
-  if (privateProClientConfig.enabled) return null;
+function FlashRestoreOpen(props: { unlockRestore?: boolean }) {
 
   // state
   const [restoreState, setRestoreState] = React.useState<'idle' | 'processing' | 'confirm' | 'success' | 'error'>('idle');
@@ -973,8 +975,12 @@ export function FlashRestore(props: { unlockRestore?: boolean }) {
 export function FlashBackup(props: {
   onStartedBackup?: () => void;
 }) {
+  return privateProClientConfig.enabled ? null : <FlashBackupOpen {...props} />;
+}
 
-  if (privateProClientConfig.enabled) return null;
+function FlashBackupOpen(props: {
+  onStartedBackup?: () => void;
+}) {
 
   // state
   const [includeImages, setIncludeImages] = React.useState(false);
