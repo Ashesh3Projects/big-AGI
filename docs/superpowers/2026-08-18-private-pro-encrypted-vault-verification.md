@@ -4,7 +4,7 @@
 
 **NOT READY FOR PRODUCTION.**
 
-Local residual-fix verification completed through code commit `f47f82f3b` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch is ready for Pro branch integration, but production still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
+Local final residual verification completed through code commit `af4211c3f` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch is ready for Pro branch integration, but production still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
 
 This verification was local and read-only except for generated files inside the isolated worktree. It did not:
 
@@ -24,6 +24,7 @@ This verification was local and read-only except for generated files inside the 
 - One-shot audit evidence verification: `b9b04d6a1`
 - Final persistence, restore, analytics, recovery, route, and plaintext-backup fixes: `3f499a60d..91cbc2dc6`
 - Residual persistence, atomic restore, build analytics, recovery prompt, rules, and reconciliation fixes: `5c504abaa..f47f82f3b`
+- Final residual persistence classification, folder reconstruction, tRPC transport classification, and resumable large restore: `a95511a12..af4211c3f`
 - Verification timezone: Asia/Calcutta, UTC+05:30
 - OS: Windows 10 Pro, 10.0.19045, x64
 - Node.js: `v24.5.0`
@@ -112,30 +113,32 @@ TDD and stress evidence:
 
 ## Command matrix
 
-Residual-fix commands below supersede the earlier final-fix counts. All were run through `f47f82f3b` unless noted.
+Final residual commands below supersede the earlier residual-fix counts. All were run through `af4211c3f` unless noted.
 
 | Status | Command | Result |
 |---|---|---|
-| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 269 passed, 0 failed. Includes exhaustive durable-store inventory, real Storage prototype cleanup, portable PC A/B reconstruction, atomic backup merge, exact verification, ambiguous-commit replay, committed-failure recovery, PostHog isolation source boundaries, and visible recovery action. |
+| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 276 passed, 0 failed. Includes sensitive-device persistence gating, physical sentinel cleanup, `enableFolders` reconstruction, realistic tRPC transport classification, resumable restore sessions, 1,001-record chunking, conflict resume, exact whole-restore verification, and the prior vault/security coverage. |
 | PASS | `npm run test:private-pro-tools` | 63 passed, 0 failed. Includes executable Private Pro production-build proof that PostHog tooling is not imported or applied with dummy credentials. |
-| PASS | `npm run test:firebase:exec` with Microsoft JDK 21 | 36 passed, 0 failed. Expected permission-denied lines asserted browser denial, including the new backup-merge receipt path. |
+| PASS | `npm run test:firebase:exec` with Microsoft JDK 21 | 38 passed, 0 failed. Expected permission-denied lines asserted browser denial, including backup-merge, restore-session, and restore-completion paths. |
 | PASS | `npm run tscheck` | Root and tools projects passed. |
 | PASS | `npm run lint` | Passed. |
 | PASS | Private Pro production build with analytics environment variables set and non-secret placeholder deployment config | Compiled, linted, type-checked, generated 17 static pages, and completed trace collection. Analytics source and mount contract tests prove Private Pro excludes GA, PostHog, Vercel Analytics, and Speed Insights. |
 | PASS | `npm audit --omit=dev --audit-level=high --json` | 0 critical, 0 high, 8 reviewed moderate findings. |
 | KNOWN UNRELATED BASELINE | `npm test` with ambient live-vendor environment | Private Pro tools passed. Repository result: 275 passed, 18 skipped, 1 failed. Only failure: live Groq catalog drift for three stale curated IDs. No Private Pro test failed. |
-| PASS | Key-free `npm test` with all live-vendor and local-host opt-in variables cleared | Private Pro tools: 63 passed. Source: 289 passed, 19 skipped, 0 failed. |
+| PASS | Key-free `npm test` with all live-vendor and local-host opt-in variables cleared | Private Pro tools: 63 passed. Source: 297 passed, 19 skipped, 0 failed. |
 | PASS WITH LIVE BLOCKERS | `npm run private-pro:security-audit -- --report-only` | Exit 0 by report-only contract: 47 pass, 8 warn, 43 block; clean-worktree check passed. |
 | EXPECTED BLOCKING FAILURE | `npm run private-pro:security-audit` | Exit 1 with the same 47 pass, 8 warn, 43 block live findings. |
 
 ### Final-fix coverage
 
-- Every persisted Zustand store and every direct durable browser owner is machine-inventoried and classified. Every spec-portable Zustand/localStorage key and the chat IndexedDB cells use the central build-activated volatile adapter. Open behavior remains durable.
-- Portable settings include chat, call, Beam, image/T2I, speech, browsing, Google integration, AI preferences, UI, theme, UX labs, purposes, sharing secrets, models, folders, personas, chats, and Scratch Clip. Transient pane state, Beam-open state, UI inspector/panel state, logs, metrics, device identity, file handles, analytics opt-out, and V1 markers stay excluded.
+- Every persisted Zustand store and every direct durable browser owner is machine-inventoried and classified. Both portable and sensitive-device stores use an explicit Private Pro volatile adapter. Open behavior remains durable.
+- `app-state`, pane history, logs, metrics, live-file metadata, workspace identifiers, and the browser device identifier are volatile and physically cleared in Private Pro. They are not uploaded to the vault. Composer startup text is discarded as transient state.
+- Portable settings include chat, call, Beam, image/T2I, speech, browsing, Google integration, AI preferences, UI, theme, UX labs, purposes, sharing secrets, models, folders, personas, chats, and Scratch Clip. `enableFolders` is a dedicated encrypted settings group and reconstructs independently from folder records.
 - Setup/logout clear only the explicit portable key/cell list plus the dedicated `Big-AGI/largeAssets` plaintext table and volatile DBlob map. Cleanup uses the captured native Storage method, so the active prototype gate cannot intercept physical deletion.
 - DBlobs stay runtime-available in memory; new referenced assets finalize encrypted cloud storage before the record outbox reference becomes durable. Reload is blocked while an asset is pending.
 - `privateProSync` and the legacy `privateProAssets` namespace are absent. Only four encrypted procedures are mounted under `privateProVaultAssets`.
-- Backup import is one bounded atomic cloud merge: backup-key decryption is staged, assets finalize first under the active vault key, every base revision is validated before any record write, records are re-encrypted with the active key version, existing cloud-only records remain, exact canonical reconstruction is downloaded and compared, and committed-but-unhydrated failures block ready state until restart/reconcile.
+- Backup import uses a recoverable restore session. Each Firestore transaction is bounded to 200 records and 4 MiB, while an authenticated backup may contain up to the format's 100,000-record and 128 MiB limits. A marker blocks normal index reads and mutations until all deterministic chunks commit and finalization records a completion receipt. The restoring client can resume through session-authorized status, index, and record endpoints. A conflicting chunk writes nothing for that chunk, keeps the marker, and resumes from the same index. Cancellation does not delete the marker because previously committed chunks cannot be rolled back safely; the supported recovery is resume or reconcile.
+- Ambiguous tRPC fetch failures are wrapped as `PrivateProVaultAmbiguousTransportError` and replay the exact same operation ID once while online. Server validation and conflict errors are never retried.
 - Private Pro analytics are disabled at mount and source flag boundaries. The Next production-build phase also returns before importing the PostHog source-map wrapper, even when server credentials are present.
 - The generic unencrypted Flash backup/restore UI is not rendered in Private Pro; only the encrypted cloud-merge flow is exposed.
 - Password/recovery rotation records one bounded server security event in the same keyset transaction and renders an immediate ready-state revocation prompt outside the account modal.

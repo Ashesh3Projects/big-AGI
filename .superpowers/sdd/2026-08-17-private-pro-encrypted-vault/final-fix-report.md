@@ -2,7 +2,7 @@
 
 Status: LOCAL RESIDUAL FIXES COMPLETE. READY FOR PRO BRANCH INTEGRATION. NOT READY FOR PRODUCTION DEPLOYMENT.
 
-Code HEAD before this report commit: `f47f82f3b`
+Code HEAD before this report commit: `af4211c3f`
 
 ## Fixes
 
@@ -34,6 +34,14 @@ Code HEAD before this report commit: `f47f82f3b`
    - Ready-state provider UI renders a visible warning and `Revoke other devices now` action without requiring the account modal.
    - Revocation remains confirmation-driven and is never automatic.
 
+5. Final residual persistence and restore corrections
+   - Added an enforced `sensitive-device` persistence class. App state, pane history, logs, metrics, live-file metadata, workspace identifiers, and the browser device identifier are volatile and physically cleared in Private Pro without being synchronized.
+   - Kept composer startup text transient and discarded. Added `enableFolders` as its own encrypted settings record so a clean PC reconstructs both true and false independently of folder records.
+   - Added a tRPC-aware ambiguous transport classifier. Only wrapped fetch/network failures replay the exact same operation; server validation and conflict responses do not retry.
+   - Replaced the single 200-record backup merge with resumable restore sessions. Each chunk remains atomic at 200 records and 4 MiB, while the authenticated backup format remains bounded at 100,000 records and 128 MiB.
+   - The active restore marker blocks normal vault reads and mutations. Session-authorized progress, index, record, chunk, and finalization procedures support exact resume and verification. A middle conflict leaves the marker and prior chunks intact, and finalization clears the marker only after all declared chunks and records commit.
+   - Added 1,001-record client and service tests, active-session restart coverage, realistic `TRPCClientError` tests, and Firebase denial coverage for restore session/completion receipts.
+
 ## Commits
 
 - `5c504abaa` Cloud: complete portable vault persistence
@@ -43,15 +51,17 @@ Code HEAD before this report commit: `f47f82f3b`
 - `e139075e8` Test: inventory durable browser storage
 - `e8bcc2195` Security: deny backup merge receipts
 - `f47f82f3b` Cloud: reconcile ambiguous backup commits
+- `a95511a12` Cloud: protect sensitive local persistence
+- `af4211c3f` Cloud: resume large encrypted restores
 
 ## Verification
 
-- Private Pro source, DBlob, and encrypted-backup tests: 269 passed, 0 failed.
+- Private Pro source, DBlob, and encrypted-backup tests: 276 passed, 0 failed.
 - Private Pro tools: 63 passed, 0 failed.
-- Firebase emulator with Microsoft OpenJDK 21.0.4: 36 passed, 0 failed.
+- Firebase emulator with Microsoft OpenJDK 21.0.4: 38 passed, 0 failed.
 - `npm run tscheck`: passed.
 - `npm run lint`: passed.
-- Key-free `npm test`: tools 63 passed; source 289 passed, 19 skipped, 0 failed.
+- Key-free `npm test`: tools 63 passed; source 297 passed, 19 skipped, 0 failed.
 - Private Pro production build with dummy PostHog and GA values: compiled, linted, type-checked, generated 17 static pages, and completed trace collection without loading the PostHog source-map wrapper.
 - `npm audit --omit=dev --audit-level=high --json`: 0 critical, 0 high, 8 reviewed moderate findings.
 - Security audit report-only: 47 pass, 8 warn, 43 block.
