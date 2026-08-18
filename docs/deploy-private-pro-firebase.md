@@ -19,7 +19,7 @@ This deployment is greenfield: launch requires zero existing plaintext Private P
 1. Create a Firebase project.
 2. Upgrade the project to Blaze.
 3. Open Authentication, enable Google, and choose a support email.
-4. Add the production Vercel domain and any custom domain to Authentication - Settings - Authorized domains.
+4. Set Authentication - Settings - Authorized domains to exactly `chatgpt.ashesh.dev` and `big-agi-243b6.firebaseapp.com`. Production must not retain localhost, stale Vercel aliases, or wildcard domains.
 5. Create a Firestore database in Native mode.
 6. Create the default Cloud Storage bucket in an eligible region if no-cost quotas are important.
 7. Add a Web App and copy its public browser configuration.
@@ -115,16 +115,16 @@ Rollback order:
 
 ## Storage CORS
 
-Signed attachment uploads are direct browser `PUT` requests. Apply a bucket CORS policy for your exact domains. Save this locally as `cors.json`, replacing the example origins:
+Signed attachment uploads are direct browser `PUT` requests. Downloads are direct browser `GET` requests. Apply this exact production bucket CORS policy:
 
 ```json
 [
   {
     "origin": [
-      "https://your-project.vercel.app",
-      "https://chat.example.com"
+      "https://chatgpt.ashesh.dev",
+      "https://big-agi-243b6.firebaseapp.com"
     ],
-    "method": ["GET", "HEAD", "PUT"],
+    "method": ["GET", "PUT"],
     "responseHeader": [
       "Content-Type",
       "x-goog-meta-sha256"
@@ -140,7 +140,21 @@ Apply it with Google Cloud CLI:
 gcloud storage buckets update gs://YOUR_BUCKET --cors-file=cors.json
 ```
 
-Do not use `*` for production origins.
+The mounted upload paths send `Content-Type` and `x-goog-meta-sha256`. Mounted downloads do not use `HEAD`, `Range`, or exposed `ETag`. Do not add unused methods or headers. Do not use `*` for origins, methods, or headers.
+
+## Production browser restrictions
+
+The accepted production state is defined in `infra/private-pro/firebase-origin-restrictions.md`. The security audit blocks unless:
+
+- Firebase Auth authorized domains are exactly `chatgpt.ashesh.dev` and `big-agi-243b6.firebaseapp.com`.
+- The production deployment is ready, targets production, and has exactly the `chatgpt.ashesh.dev` alias. A Vercel alias may exist only as a separately approved conditional rollback target, not accepted current state.
+- The configured Firebase browser API key referrers are exactly `https://chatgpt.ashesh.dev/*` and `https://big-agi-243b6.firebaseapp.com/*`.
+- That key targets exactly `firebaseappcheck.googleapis.com`, `firebaseinstallations.googleapis.com`, `identitytoolkit.googleapis.com`, and `securetoken.googleapis.com`.
+- Bucket CORS is readable and exactly matches the policy above.
+
+Task 19 denies all browser Firestore and Storage SDK access. `firebase/firestore` is referenced only by the unmounted legacy plaintext sync transport. Mounted browser code uses Firebase Auth, App Check, and signed Storage URLs. Therefore `firestore.googleapis.com` and `firebasestorage.googleapis.com` are not browser-key targets. Firebase Admin APIs use server credentials and are unrelated to browser API-key restrictions.
+
+Save redacted before and after snapshots using the schema in the restriction plan. Unreadable state blocks rollout. Cloud changes, alias removal, and deployment still require explicit user approval.
 
 ## Rules and indexes
 
@@ -263,7 +277,7 @@ Before step 1, confirm there are zero existing plaintext Private Pro users, chat
 5. Add all environment variables.
 6. Register reCAPTCHA Enterprise App Check in metrics-only mode.
 7. Deploy Firebase rules and indexes.
-8. Apply Storage CORS.
+8. Obtain separate approval for the exact browser-key, authorized-domain, deployment-alias, and Storage CORS changes in `infra/private-pro/firebase-origin-restrictions.md`. Save a redacted before snapshot, apply only the approved commands, and save a redacted after snapshot.
 9. Deploy Vercel and verify valid App Check metrics and request headers.
 10. Enable Firestore and Storage App Check enforcement in that order.
 11. Sign in with one allowlisted Google account.
@@ -281,6 +295,7 @@ Before step 1, confirm there are zero existing plaintext Private Pro users, chat
 - Deleting a chat propagates to another device.
 - Concurrent edits preserve a conflict copy.
 - Direct Firestore writes and direct Storage uploads fail.
+- The security audit reports no blockers for the exact custom-domain deployment alias, Firebase Auth domains, browser API-key referrers/API targets, or bucket CORS.
 - Removing an email and running access sync blocks its server mutations.
 - Missing or invalid `x-firebase-appcheck` blocks every private Pro procedure.
 

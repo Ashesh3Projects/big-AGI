@@ -14,13 +14,14 @@ const EXPECTED_BROWSER_REFERRERS = new Set(['https://chatgpt.ashesh.dev/*', 'htt
 const REQUIRED_BROWSER_API_SERVICES = new Set([
   'firebaseappcheck.googleapis.com',
   'firebaseinstallations.googleapis.com',
-  'firebasestorage.googleapis.com',
-  'firestore.googleapis.com',
   'identitytoolkit.googleapis.com',
   'securetoken.googleapis.com',
 ]);
 const REQUIRED_APP_CHECK_SERVICES = new Set(['firebaseauth.googleapis.com', 'firestore.googleapis.com', 'storage.googleapis.com']);
 const ALLOWED_AUTH_DOMAINS = new Set(['chatgpt.ashesh.dev', 'big-agi-243b6.firebaseapp.com']);
+const ALLOWED_BUCKET_CORS_ORIGINS = new Set(['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com']);
+const ALLOWED_BUCKET_CORS_METHODS = new Set(['GET', 'PUT']);
+const ALLOWED_BUCKET_CORS_HEADERS = new Set(['content-type', 'x-goog-meta-sha256']);
 const BROAD_ADMIN_ROLES = new Set([
   'roles/owner',
   'roles/editor',
@@ -123,6 +124,25 @@ interface BrowserApiKeyFacts {
   broadReferrers: number;
   missingRequiredApiTargets: number;
   unrelatedApiTargets: number;
+  duplicateReferrers: number;
+  duplicateApiTargets: number;
+}
+
+interface BucketCorsFacts {
+  readable: boolean;
+  rules: number;
+  missingOrigins: number;
+  staleOrigins: number;
+  wildcardOrigins: number;
+  missingMethods: number;
+  extraMethods: number;
+  wildcardMethods: number;
+  missingHeaders: number;
+  extraHeaders: number;
+  wildcardHeaders: number;
+  duplicateOrigins: number;
+  duplicateMethods: number;
+  duplicateHeaders: number;
 }
 
 interface AppCheckFacts {
@@ -287,7 +307,7 @@ export function classifyHeaders(facts: HeaderFacts): AuditFinding[] {
 
 export function classifyAuthorizedDomains(facts: AuthorizedDomainFacts): AuditFinding[] {
   return [
-    finding('authorizedDomains', 'exact', facts.exactMatches > 0 ? 'pass' : 'block', facts.exactMatches),
+    finding('authorizedDomains', 'exact', facts.exactMatches === ALLOWED_AUTH_DOMAINS.size ? 'pass' : 'block', facts.exactMatches),
     finding('authorizedDomains', 'missing', facts.missing === 0 ? 'pass' : 'block', facts.missing),
     finding('authorizedDomains', 'stale', facts.stale === 0 ? 'pass' : 'block', facts.stale),
     finding('authorizedDomains', 'wildcard', facts.wildcard === 0 ? 'pass' : 'block', facts.wildcard),
@@ -298,20 +318,41 @@ export function classifyDeployment(facts: DeploymentFacts): AuditFinding[] {
   return [
     booleanFinding('deployment', 'ready', facts.ready),
     booleanFinding('deployment', 'production', facts.production),
-    finding('deployment', 'exactAliases', facts.exactAliases > 0 ? 'pass' : 'block', facts.exactAliases),
+    finding('deployment', 'exactAliases', facts.exactAliases === 1 ? 'pass' : 'block', facts.exactAliases),
     finding('deployment', 'staleAliases', facts.staleAliases === 0 ? 'pass' : 'block', facts.staleAliases),
   ];
 }
 
 export function classifyBrowserApiKeys(facts: BrowserApiKeyFacts): AuditFinding[] {
   return [
-    finding('browserApiKeys', 'present', facts.total > 0 ? 'pass' : 'block', facts.total),
+    finding('browserApiKeys', 'present', facts.total === 1 ? 'pass' : 'block', facts.total),
     finding('browserApiKeys', 'restricted', facts.unrestricted === 0 ? 'pass' : 'block', facts.unrestricted),
     finding('browserApiKeys', 'missingExpectedReferrers', facts.missingExpectedReferrers === 0 ? 'pass' : 'block', facts.missingExpectedReferrers),
     finding('browserApiKeys', 'staleReferrers', facts.staleReferrers === 0 ? 'pass' : 'block', facts.staleReferrers),
     finding('browserApiKeys', 'broadReferrers', facts.broadReferrers === 0 ? 'pass' : 'block', facts.broadReferrers),
     finding('browserApiKeys', 'missingRequiredApiTargets', facts.missingRequiredApiTargets === 0 ? 'pass' : 'block', facts.missingRequiredApiTargets),
     finding('browserApiKeys', 'unrelatedApiTargets', facts.unrelatedApiTargets === 0 ? 'pass' : 'block', facts.unrelatedApiTargets),
+    finding('browserApiKeys', 'duplicateReferrers', facts.duplicateReferrers === 0 ? 'pass' : 'block', facts.duplicateReferrers),
+    finding('browserApiKeys', 'duplicateApiTargets', facts.duplicateApiTargets === 0 ? 'pass' : 'block', facts.duplicateApiTargets),
+  ];
+}
+
+export function classifyBucketCors(facts: BucketCorsFacts): AuditFinding[] {
+  return [
+    booleanFinding('bucketCors', 'readable', facts.readable),
+    finding('bucketCors', 'exactRule', facts.rules === 1 ? 'pass' : 'block', facts.rules),
+    finding('bucketCors', 'missingOrigins', facts.missingOrigins === 0 ? 'pass' : 'block', facts.missingOrigins),
+    finding('bucketCors', 'staleOrigins', facts.staleOrigins === 0 ? 'pass' : 'block', facts.staleOrigins),
+    finding('bucketCors', 'wildcardOrigins', facts.wildcardOrigins === 0 ? 'pass' : 'block', facts.wildcardOrigins),
+    finding('bucketCors', 'missingMethods', facts.missingMethods === 0 ? 'pass' : 'block', facts.missingMethods),
+    finding('bucketCors', 'extraMethods', facts.extraMethods === 0 ? 'pass' : 'block', facts.extraMethods),
+    finding('bucketCors', 'wildcardMethods', facts.wildcardMethods === 0 ? 'pass' : 'block', facts.wildcardMethods),
+    finding('bucketCors', 'missingHeaders', facts.missingHeaders === 0 ? 'pass' : 'block', facts.missingHeaders),
+    finding('bucketCors', 'extraHeaders', facts.extraHeaders === 0 ? 'pass' : 'block', facts.extraHeaders),
+    finding('bucketCors', 'wildcardHeaders', facts.wildcardHeaders === 0 ? 'pass' : 'block', facts.wildcardHeaders),
+    finding('bucketCors', 'duplicateOrigins', facts.duplicateOrigins === 0 ? 'pass' : 'block', facts.duplicateOrigins),
+    finding('bucketCors', 'duplicateMethods', facts.duplicateMethods === 0 ? 'pass' : 'block', facts.duplicateMethods),
+    finding('bucketCors', 'duplicateHeaders', facts.duplicateHeaders === 0 ? 'pass' : 'block', facts.duplicateHeaders),
   ];
 }
 
@@ -529,19 +570,79 @@ export function inspectBrowserApiKeys(
   let broadReferrers = 0;
   let missingRequiredApiTargets = 0;
   let unrelatedApiTargets = 0;
+  let duplicateReferrers = 0;
+  let duplicateApiTargets = 0;
   for (const key of keys) {
     const restrictions = asRecord(key.restrictions);
     const browser = asRecord(restrictions.browserKeyRestrictions);
-    const referrers = asStrings(browser.allowedReferrers);
-    const targetServices = asRecords(restrictions.apiTargets).map(target => typeof target.service === 'string' ? target.service : '').filter(Boolean);
+    const referrers = asStrings(browser.allowedReferrers).map(referrer => referrer.trim().toLowerCase()).filter(Boolean);
+    const targetServices = asRecords(restrictions.apiTargets)
+      .map(target => typeof target.service === 'string' ? target.service.trim().toLowerCase() : '')
+      .filter(Boolean);
     if (Object.keys(restrictions).length === 0) unrestricted += 1;
     missingExpectedReferrers += [...expectedReferrers].filter(referrer => !referrers.includes(referrer)).length;
     staleReferrers += referrers.filter(referrer => !expectedReferrers.has(referrer)).length;
     broadReferrers += referrers.filter(isBroadReferrer).length;
     missingRequiredApiTargets += [...requiredApiServices].filter(service => !targetServices.includes(service)).length;
     unrelatedApiTargets += targetServices.filter(service => !requiredApiServices.has(service)).length;
+    duplicateReferrers += referrers.length - new Set(referrers).size;
+    duplicateApiTargets += targetServices.length - new Set(targetServices).size;
   }
-  return { total: keys.length, unrestricted, missingExpectedReferrers, staleReferrers, broadReferrers, missingRequiredApiTargets, unrelatedApiTargets };
+  return { total: keys.length, unrestricted, missingExpectedReferrers, staleReferrers, broadReferrers, missingRequiredApiTargets, unrelatedApiTargets, duplicateReferrers, duplicateApiTargets };
+}
+
+export function inspectApiKeyLookup(value: unknown): string {
+  const name = asRecord(value).name;
+  if (typeof name !== 'string' || !/^projects\/\d+\/locations\/[a-z0-9-]+\/keys\/[A-Za-z0-9_-]+$/.test(name))
+    throw new Error('Configured Firebase browser API key could not be resolved to one key resource.');
+  return name;
+}
+
+export function inspectBucketCors(
+  value: unknown,
+  allowedOrigins = ALLOWED_BUCKET_CORS_ORIGINS,
+  allowedMethods = ALLOWED_BUCKET_CORS_METHODS,
+  allowedHeaders = ALLOWED_BUCKET_CORS_HEADERS,
+): BucketCorsFacts {
+  const bucket = asRecord(value);
+  const rawCors = Array.isArray(bucket.cors) ? bucket.cors : bucket.cors_config;
+  if (!Array.isArray(rawCors)) return {
+    readable: false,
+    rules: 0,
+    missingOrigins: allowedOrigins.size,
+    staleOrigins: 0,
+    wildcardOrigins: 0,
+    missingMethods: allowedMethods.size,
+    extraMethods: 0,
+    wildcardMethods: 0,
+    missingHeaders: allowedHeaders.size,
+    extraHeaders: 0,
+    wildcardHeaders: 0,
+    duplicateOrigins: 0,
+    duplicateMethods: 0,
+    duplicateHeaders: 0,
+  };
+
+  const rules = asRecords(rawCors);
+  const origins = rules.flatMap(rule => asStrings(rule.origin)).map(origin => origin.trim().toLowerCase()).filter(Boolean);
+  const methods = rules.flatMap(rule => asStrings(rule.method)).map(method => method.trim().toUpperCase()).filter(Boolean);
+  const headers = rules.flatMap(rule => asStrings(rule.responseHeader)).map(header => header.trim().toLowerCase()).filter(Boolean);
+  return {
+    readable: true,
+    rules: rules.length,
+    missingOrigins: [...allowedOrigins].filter(origin => !origins.includes(origin)).length,
+    staleOrigins: origins.filter(origin => !allowedOrigins.has(origin) && !origin.includes('*')).length,
+    wildcardOrigins: origins.filter(origin => origin.includes('*')).length,
+    missingMethods: [...allowedMethods].filter(method => !methods.includes(method)).length,
+    extraMethods: methods.filter(method => !allowedMethods.has(method) && !method.includes('*')).length,
+    wildcardMethods: methods.filter(method => method.includes('*')).length,
+    missingHeaders: [...allowedHeaders].filter(header => !headers.includes(header)).length,
+    extraHeaders: headers.filter(header => !allowedHeaders.has(header) && !header.includes('*')).length,
+    wildcardHeaders: headers.filter(header => header.includes('*')).length,
+    duplicateOrigins: origins.length - new Set(origins).size,
+    duplicateMethods: methods.length - new Set(methods).size,
+    duplicateHeaders: headers.length - new Set(headers).size,
+  };
 }
 
 export function inspectAppCheck(value: unknown, requiredServices = REQUIRED_APP_CHECK_SERVICES): AppCheckFacts {
@@ -1038,7 +1139,14 @@ async function collectDeployment(origin: string): Promise<DeploymentFacts> {
 }
 
 async function collectBrowserApiKeys(projectId: string): Promise<BrowserApiKeyFacts> {
-  return inspectBrowserApiKeys(await runJson('gcloud', ['services', 'api-keys', 'list', `--project=${projectId}`, '--format=json']));
+  const keyString = process.env.NEXT_PUBLIC_FIREBASE_API_KEY?.trim();
+  if (!keyString) throw new Error('NEXT_PUBLIC_FIREBASE_API_KEY is required for browser API key audit.');
+  const resourceName = inspectApiKeyLookup(await runJson('gcloud', ['services', 'api-keys', 'lookup', keyString, `--project=${projectId}`, '--format=json']));
+  return inspectBrowserApiKeys([await runJson('gcloud', ['services', 'api-keys', 'describe', resourceName, `--project=${projectId}`, '--format=json'])]);
+}
+
+async function collectBucketCors(storageBucket: string): Promise<BucketCorsFacts> {
+  return inspectBucketCors(await runJson('gcloud', ['storage', 'buckets', 'describe', `gs://${storageBucket}`, '--format=json']));
 }
 
 async function collectAppCheck(projectId: string): Promise<AppCheckFacts> {
@@ -1240,6 +1348,7 @@ async function collectReport(): Promise<AuditReport> {
     collectDeployment(deploymentOrigin).then(classifyDeployment),
     collectAuthorizedDomains(projectId).then(classifyAuthorizedDomains),
     collectBrowserApiKeys(projectId).then(classifyBrowserApiKeys),
+    collectBucketCors(storageBucket).then(classifyBucketCors),
     collectAppCheck(projectId).then(classifyAppCheck),
     collectIamRoles(projectId).then(classifyIamRoles),
     collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
@@ -1251,7 +1360,7 @@ async function collectReport(): Promise<AuditReport> {
     collectDependencyAudit().then(classifyDependencyAudit),
     collectFirebaseRuleProbes(projectId, storageBucket).then(classifyFirebaseRuleProbes),
   ];
-  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'appCheck', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
+  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'bucketCors', 'appCheck', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
   const results = await Promise.allSettled(tasks);
   const findings = results.flatMap((result, index) => result.status === 'fulfilled'
     ? result.value

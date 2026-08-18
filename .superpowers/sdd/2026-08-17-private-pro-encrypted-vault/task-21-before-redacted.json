@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "phase": "before",
+  "collectedAt": "2026-08-18T17:11:46+05:30",
+  "projectId": "big-agi-243b6",
+  "browserApiKey": {
+    "resolved": false,
+    "configuredInShell": false,
+    "keyCount": 0,
+    "referrerCount": 0,
+    "missingReferrerCount": 2,
+    "staleReferrerCount": 0,
+    "broadReferrerCount": 0,
+    "duplicateReferrerCount": 0,
+    "apiTargetCount": 0,
+    "missingApiTargetCount": 4,
+    "unrelatedApiTargetCount": 0,
+    "duplicateApiTargetCount": 0
+  },
+  "authorizedDomains": {
+    "readable": false,
+    "httpStatusClass": 4,
+    "domainCount": 0,
+    "missingCount": 2,
+    "staleCount": 0,
+    "wildcardCount": 0
+  },
+  "deploymentAliases": {
+    "ready": true,
+    "production": true,
+    "exactAliasCount": 1,
+    "staleAliasCount": 2
+  },
+  "bucketCors": {
+    "readable": true,
+    "ruleCount": 1,
+    "missingOriginCount": 1,
+    "staleOriginCount": 2,
+    "wildcardOriginCount": 0,
+    "missingMethodCount": 0,
+    "extraMethodCount": 1,
+    "wildcardMethodCount": 0,
+    "missingHeaderCount": 0,
+    "extraHeaderCount": 0,
+    "wildcardHeaderCount": 0,
+    "duplicateOriginCount": 0,
+    "duplicateMethodCount": 0,
+    "duplicateHeaderCount": 0
+  },
+  "appCheck": {
+    "readable": false,
+    "httpStatusClass": 4
+  },
+  "cloudMutationsPerformed": false
+}

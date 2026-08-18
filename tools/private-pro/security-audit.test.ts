@@ -8,6 +8,7 @@ import {
   classifyAppCheck,
   classifyAuthorizedDomains,
   classifyBrowserApiKeys,
+  classifyBucketCors,
   classifyDependencyAudit,
   classifyDeployment,
   classifyFirebaseRuleProbes,
@@ -22,9 +23,11 @@ import {
   inspectAppCheck,
   inspectAuthorizedDomains,
   inspectBrowserApiKeys,
+  inspectBucketCors,
   inspectDependencyAudit,
   inspectDeployment,
   inspectIamRoles,
+  inspectApiKeyLookup,
   inspectRuntimeIdentity,
   inspectRuntimeRoleManifest,
   inspectServiceAccountKeys,
@@ -79,16 +82,47 @@ describe('private Pro security audit classifiers', () => {
     ]);
   });
 
+  test('passes only the exact two production Firebase Auth domains', () => {
+    const exact = inspectAuthorizedDomains({ authorizedDomains: ['chatgpt.ashesh.dev', 'big-agi-243b6.firebaseapp.com'] });
+    const localAndStale = inspectAuthorizedDomains({ authorizedDomains: ['chatgpt.ashesh.dev', 'localhost', 'old.vercel.app'] });
+    const empty = inspectAuthorizedDomains({ authorizedDomains: [] });
+
+    assert.equal(classifyAuthorizedDomains(exact).every(finding => finding.severity === 'pass'), true);
+    assert.equal(classifyAuthorizedDomains(localAndStale).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyAuthorizedDomains(empty).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyAuthorizedDomains(inspectAuthorizedDomains({
+      authorizedDomains: ['chatgpt.ashesh.dev', 'big-agi-243b6.firebaseapp.com', 'chatgpt.ashesh.dev'],
+    })).some(finding => finding.severity === 'block'), true);
+  });
+
   test('blocks a non-ready deployment and stale production aliases', () => {
     const findings = classifyDeployment({ ready: false, production: true, exactAliases: 1, staleAliases: 2 });
 
     assert.deepEqual(severities(findings), ['block', 'pass', 'pass', 'block']);
   });
 
-  test('blocks an unrestricted browser API key', () => {
-    const findings = classifyBrowserApiKeys({ total: 1, unrestricted: 1, missingExpectedReferrers: 2, staleReferrers: 0, broadReferrers: 1, missingRequiredApiTargets: 2, unrelatedApiTargets: 0 });
+  test('passes only one exact production deployment alias', () => {
+    assert.equal(classifyDeployment(inspectDeployment({
+      readyState: 'READY',
+      target: 'production',
+      aliases: ['chatgpt.ashesh.dev'],
+    })).every(finding => finding.severity === 'pass'), true);
+    assert.equal(classifyDeployment(inspectDeployment({
+      readyState: 'READY',
+      target: 'production',
+      aliases: ['chatgpt.ashesh.dev', 'private-pro.vercel.app'],
+    })).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyDeployment(inspectDeployment({
+      readyState: 'READY',
+      target: 'production',
+      aliases: ['chatgpt.ashesh.dev', 'chatgpt.ashesh.dev'],
+    })).some(finding => finding.severity === 'block'), true);
+  });
 
-    assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'pass', 'block', 'block', 'pass']);
+  test('blocks an unrestricted browser API key', () => {
+    const findings = classifyBrowserApiKeys({ total: 1, unrestricted: 1, missingExpectedReferrers: 2, staleReferrers: 0, broadReferrers: 1, missingRequiredApiTargets: 2, unrelatedApiTargets: 0, duplicateReferrers: 0, duplicateApiTargets: 0 });
+
+    assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'pass', 'block', 'block', 'pass', 'pass', 'pass']);
   });
 
   test('requires exact browser referrers and only explicit API services', () => {
@@ -103,7 +137,109 @@ describe('private Pro security audit classifiers', () => {
       broadReferrers: 1,
       missingRequiredApiTargets: 1,
       unrelatedApiTargets: 1,
+      duplicateReferrers: 0,
+      duplicateApiTargets: 0,
     });
+  });
+
+  test('passes the exact mounted browser Firebase API restriction', () => {
+    const facts = inspectBrowserApiKeys([{ restrictions: {
+      browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] },
+      apiTargets: [
+        { service: 'firebaseappcheck.googleapis.com' },
+        { service: 'firebaseinstallations.googleapis.com' },
+        { service: 'identitytoolkit.googleapis.com' },
+        { service: 'securetoken.googleapis.com' },
+      ],
+    } }]);
+
+    assert.equal(classifyBrowserApiKeys(facts).every(finding => finding.severity === 'pass'), true);
+    assert.equal(classifyBrowserApiKeys(inspectBrowserApiKeys([
+      { restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] }, apiTargets: [
+        { service: 'firebaseappcheck.googleapis.com' }, { service: 'firebaseinstallations.googleapis.com' },
+        { service: 'identitytoolkit.googleapis.com' }, { service: 'securetoken.googleapis.com' },
+      ] } },
+      { restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] }, apiTargets: [
+        { service: 'firebaseappcheck.googleapis.com' }, { service: 'firebaseinstallations.googleapis.com' },
+        { service: 'identitytoolkit.googleapis.com' }, { service: 'securetoken.googleapis.com' },
+      ] } },
+    ])).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyBrowserApiKeys(inspectBrowserApiKeys([{ restrictions: {
+      browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] },
+      apiTargets: [
+        { service: 'firebaseappcheck.googleapis.com' }, { service: 'firebaseappcheck.googleapis.com' },
+        { service: 'firebaseinstallations.googleapis.com' }, { service: 'identitytoolkit.googleapis.com' },
+        { service: 'securetoken.googleapis.com' },
+      ],
+    } }])).some(finding => finding.severity === 'block'), true);
+  });
+
+  test('accepts one API key resource lookup without exposing the browser key string', () => {
+    assert.equal(inspectApiKeyLookup({ name: 'projects/123/locations/global/keys/browser-key-id' }), 'projects/123/locations/global/keys/browser-key-id');
+    assert.throws(() => inspectApiKeyLookup({}));
+    assert.throws(() => inspectApiKeyLookup({ name: 'not-a-key-resource' }));
+  });
+
+  test('blocks empty, missing, stale, broad, and unrelated browser API key restrictions', () => {
+    const empty = inspectBrowserApiKeys([{ restrictions: {} }]);
+    const wrong = inspectBrowserApiKeys([{ restrictions: {
+      browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://*.ashesh.dev/*', 'http://localhost:3000/*'] },
+      apiTargets: [
+        { service: 'identitytoolkit.googleapis.com' },
+        { service: 'firestore.googleapis.com' },
+        { service: 'firebasestorage.googleapis.com' },
+      ],
+    } }]);
+
+    assert.equal(classifyBrowserApiKeys(empty).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyBrowserApiKeys(wrong).some(finding => finding.severity === 'block'), true);
+    assert.equal(wrong.missingRequiredApiTargets, 3);
+    assert.equal(wrong.unrelatedApiTargets, 2);
+  });
+
+  test('passes only minimum signed URL bucket CORS', () => {
+    const exact = inspectBucketCors({ cors: [{
+      origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
+      method: ['GET', 'PUT'],
+      responseHeader: ['Content-Type', 'x-goog-meta-sha256'],
+      maxAgeSeconds: 3600,
+    }] });
+
+    assert.equal(classifyBucketCors(exact).every(finding => finding.severity === 'pass'), true);
+    assert.equal(classifyBucketCors(inspectBucketCors({ cors_config: [{
+      origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
+      method: ['GET', 'PUT'],
+      responseHeader: ['Content-Type', 'x-goog-meta-sha256'],
+    }] })).every(finding => finding.severity === 'pass'), true);
+  });
+
+  test('blocks empty, wildcard, broad, stale, and missing-header bucket CORS', () => {
+    const unreadable = inspectBucketCors({});
+    const empty = inspectBucketCors({ cors_config: [] });
+    const broad = inspectBucketCors({ cors: [{
+      origin: ['https://*.ashesh.dev', 'https://old.vercel.app'],
+      method: ['GET', 'HEAD', 'PUT', 'POST'],
+      responseHeader: ['x-goog-*', 'Content-Type'],
+    }] });
+    const missingUploadHeader = inspectBucketCors({ cors: [{
+      origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
+      method: ['GET', 'PUT'],
+      responseHeader: ['Content-Type'],
+    }] });
+    const duplicates = inspectBucketCors({ cors: [{
+      origin: ['https://chatgpt.ashesh.dev', 'https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
+      method: ['GET', 'GET', 'PUT'],
+      responseHeader: ['Content-Type', 'Content-Type', 'x-goog-meta-sha256'],
+    }] });
+
+    assert.equal(classifyBucketCors(unreadable)[0].severity, 'block');
+    assert.equal(empty.readable, true);
+    assert.equal(classifyBucketCors(empty).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyBucketCors(broad).some(finding => finding.severity === 'block'), true);
+    assert.equal(broad.wildcardOrigins, 1);
+    assert.equal(broad.wildcardHeaders, 1);
+    assert.equal(classifyBucketCors(missingUploadHeader).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyBucketCors(duplicates).some(finding => finding.severity === 'block'), true);
   });
 
   test('blocks disabled App Check enforcement', () => {
@@ -554,6 +690,8 @@ describe('private Pro security audit classifiers', () => {
       broadReferrers: 0,
       missingRequiredApiTargets: 1,
       unrelatedApiTargets: 0,
+      duplicateReferrers: 0,
+      duplicateApiTargets: 0,
     });
     assert.deepEqual(inspectAppCheck({ services: [{ name: 'projects/1/services/a', enforcementMode: 'ENFORCED' }, { name: 'projects/1/services/b', enforcementMode: 'UNENFORCED' }, { name: 'projects/1/services/c' }] }, new Set(['a', 'b', 'c', 'd'])), {
       required: 4,
