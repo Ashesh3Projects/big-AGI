@@ -332,6 +332,50 @@ describe('private Pro security audit classifiers', () => {
     assert.deepEqual(severities(audit.classifyDeployedRuntimeRole(drifted)), ['pass', 'pass', 'block', 'block', 'block', 'block']);
   });
 
+  test('uses the supported gcloud custom-role describe argument vector', async () => {
+    const audit = securityAuditModule as unknown as {
+      collectDeployedRuntimeRoleWithExecutor(
+        projectId: string,
+        manifest: unknown,
+        execute: (command: string, args: string[]) => Promise<unknown>,
+      ): Promise<{
+        readable: boolean;
+        nameMatches: boolean;
+        stageMatches: boolean;
+        active: boolean;
+        missingPermissions: number;
+        unexpectedPermissions: number;
+      }>;
+    };
+    const manifest = JSON.parse(await readFile('infra/private-pro/gcp-runtime-role.yaml', 'utf8')) as {
+      runtimeRole: { includedPermissions: string[] };
+    };
+    const calls: Array<{ command: string; args: string[] }> = [];
+
+    const facts = await audit.collectDeployedRuntimeRoleWithExecutor('sample-project', manifest, async (command, args) => {
+      calls.push({ command, args });
+      return {
+        name: 'projects/sample-project/roles/privateProRuntime',
+        stage: 'GA',
+        deleted: false,
+        includedPermissions: manifest.runtimeRole.includedPermissions,
+      };
+    });
+
+    assert.deepEqual(calls, [{
+      command: 'gcloud',
+      args: ['iam', 'roles', 'describe', 'privateProRuntime', '--project=sample-project', '--format=json'],
+    }]);
+    assert.deepEqual(facts, {
+      readable: true,
+      nameMatches: true,
+      stageMatches: true,
+      active: true,
+      missingPermissions: 0,
+      unexpectedPermissions: 0,
+    });
+  });
+
   test('allows only the runtime custom role on the runtime service account at project scope', () => {
     const audit = securityAuditModule as unknown as {
       inspectProjectRuntimePolicy(value: unknown, projectId: string, runtimeEmail: string): {
@@ -387,6 +431,47 @@ describe('private Pro security audit classifiers', () => {
 
     assert.equal(audit.classifyRuntimeServiceAccountPolicy(expected).every(finding => finding.severity === 'pass'), true);
     assert.deepEqual(severities(audit.classifyRuntimeServiceAccountPolicy(extra)), ['pass', 'pass', 'block', 'block', 'block', 'block']);
+  });
+
+  test('accepts only exact bounded WIF subject, attribute, and group members from one pool', () => {
+    const audit = securityAuditModule as unknown as {
+      parseConfiguredWifPrincipals(raw: string): ReadonlySet<string>;
+    };
+    const subject = 'principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/vercel-prod/subject/repo:example-org/example-repo:environment:production';
+    const attribute = 'principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/vercel-prod/attribute.repository/example-org/example-repo';
+    const group = 'principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/vercel-prod/group/deployers@example.com';
+
+    assert.deepEqual([...audit.parseConfiguredWifPrincipals(`${subject}, ${attribute}, ${group}`)], [subject, attribute, group]);
+
+    const invalid = [
+      'user:owner@example.com',
+      'serviceAccount:runtime@example.iam.gserviceaccount.com',
+      'domain:example.com',
+      'allUsers',
+      'allAuthenticatedUsers',
+      'principal://iam.googleapis.com/projects/project-id/locations/global/workloadIdentityPools/vercel-prod/subject/repo:org/repo',
+      'principal://iam.googleapis.com/projects/123/locations/us-central1/workloadIdentityPools/vercel-prod/subject/repo:org/repo',
+      'principal://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/x/subject/repo:org/repo',
+      'principal://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod/subject/',
+      'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod/*',
+      'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod/attribute.repository/*',
+      'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod/attribute./org/repo',
+      'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod/group/',
+      'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod/subject/repo:org/repo',
+      'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod',
+      'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel-prod/attribute.repository/org/repo?broad=true',
+    ];
+    for (const member of invalid)
+      assert.throws(() => audit.parseConfiguredWifPrincipals(member), /WIF runtime principal/i, member);
+
+    assert.throws(
+      () => audit.parseConfiguredWifPrincipals(`${subject},principalSet://iam.googleapis.com/projects/999/locations/global/workloadIdentityPools/vercel-prod/group/deployers`),
+      /same project number and pool/i,
+    );
+    assert.throws(
+      () => audit.parseConfiguredWifPrincipals(`${subject},principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/other-pool/group/deployers`),
+      /same project number and pool/i,
+    );
   });
 
   test('distinguishes the expected ADC identity from an independently verified active principal', async () => {

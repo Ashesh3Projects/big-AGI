@@ -181,7 +181,7 @@ See [Private Pro Firebase deployment](deploy-private-pro-firebase.md) for the co
 | `PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES`  | Maximum requested upload bytes per UID and window. Defaults to 268435456 bytes.                    |
 | `CRON_SECRET`                        | Secret Vercel sends to the scheduled expired-reservation cleanup endpoint. Server-only.             |
 | `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL` | Expected dedicated runtime service-account email for live ADC and IAM-policy audit. Not proof of active identity and not a credential. |
-| `PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS` | Comma-separated exact WIF `principal://` or `principalSet://` members expected on the runtime service account. Required for live IAM-policy audit. |
+| `PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS` | Comma-separated exact WIF subject, attribute, or group principals from one numeric project and workload identity pool. Wildcards and other IAM member types are rejected. |
 | `FIREBASE_CLIENT_EMAIL`              | Optional static-key fallback service-account email. Server-only. Must be paired with `FIREBASE_PRIVATE_KEY`. |
 | `FIREBASE_PRIVATE_KEY`               | Optional static-key fallback private key. Server-only. Must be paired with `FIREBASE_CLIENT_EMAIL`; supports escaped `\n`. |
 

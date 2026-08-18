@@ -1055,11 +1055,62 @@ function runtimeIdentityInput(activeAdcServiceAccountEmail?: string) {
   };
 }
 
+const WIF_PRINCIPAL_PREFIX = 'iam.googleapis.com/projects/';
+const WIF_COMPONENT = /^[A-Za-z0-9._~:@%+=,-]+$/;
+const WIF_POOL_ID = /^[a-z][a-z0-9-]{2,30}[a-z0-9]$/;
+
+function validateWifValuePath(value: string): boolean {
+  return value.length <= 256
+    && !value.includes('*')
+    && value.split('/').every(component => component.length > 0 && component.length <= 127 && WIF_COMPONENT.test(component));
+}
+
+export function parseConfiguredWifPrincipals(raw: string): ReadonlySet<string> {
+  const members = raw.split(',').map(value => value.trim()).filter(Boolean);
+  if (members.length === 0 || members.length > 16 || new Set(members).size !== members.length)
+    throw new Error('WIF runtime principals must contain one to sixteen unique exact members.');
+
+  let expectedProjectNumber: string | undefined;
+  let expectedPoolId: string | undefined;
+  for (const member of members) {
+    if (member.length > 512) throw new Error('WIF runtime principal is invalid.');
+    const scheme = member.startsWith('principal://')
+      ? 'principal'
+      : member.startsWith('principalSet://') ? 'principalSet' : undefined;
+    if (!scheme) throw new Error('WIF runtime principal is invalid.');
+    const resource = member.slice(`${scheme}://`.length);
+    if (!resource.startsWith(WIF_PRINCIPAL_PREFIX)) throw new Error('WIF runtime principal is invalid.');
+    const segments = resource.slice(WIF_PRINCIPAL_PREFIX.length).split('/');
+    const [projectNumber, locations, location, pools, poolId, selector, ...valueSegments] = segments;
+    if (
+      !projectNumber || !/^[1-9]\d{0,19}$/.test(projectNumber)
+      || locations !== 'locations'
+      || location !== 'global'
+      || pools !== 'workloadIdentityPools'
+      || !poolId || !WIF_POOL_ID.test(poolId)
+      || !selector
+    ) throw new Error('WIF runtime principal is invalid.');
+
+    const value = valueSegments.join('/');
+    const selectorValid = scheme === 'principal'
+      ? selector === 'subject' && validateWifValuePath(value)
+      : selector === 'group'
+        ? validateWifValuePath(value)
+        : /^attribute\.[a-z][a-z0-9_]{0,31}$/.test(selector) && validateWifValuePath(value);
+    if (!selectorValid) throw new Error('WIF runtime principal is invalid.');
+
+    if (expectedProjectNumber === undefined) {
+      expectedProjectNumber = projectNumber;
+      expectedPoolId = poolId;
+    } else if (projectNumber !== expectedProjectNumber || poolId !== expectedPoolId) {
+      throw new Error('WIF runtime principals must use the same project number and pool.');
+    }
+  }
+  return new Set(members);
+}
+
 function configuredWifPrincipals(): ReadonlySet<string> {
-  return new Set((process.env.PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS ?? '')
-    .split(',')
-    .map(value => value.trim())
-    .filter(Boolean));
+  return parseConfiguredWifPrincipals(process.env.PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS ?? '');
 }
 
 async function collectIamRoles(projectId: string): Promise<IamRoleFacts> {
@@ -1105,9 +1156,28 @@ async function collectRuntimeRoleManifest(): Promise<RuntimeRoleManifestFacts> {
   return inspectRuntimeRoleManifest(await readRuntimeRoleManifest());
 }
 
+export async function collectDeployedRuntimeRoleWithExecutor(
+  projectId: string,
+  manifest: unknown,
+  execute: (command: string, args: string[]) => Promise<unknown>,
+): Promise<DeployedRuntimeRoleFacts> {
+  const value = await execute('gcloud', [
+    'iam',
+    'roles',
+    'describe',
+    RUNTIME_ROLE_ID,
+    `--project=${projectId}`,
+    '--format=json',
+  ]);
+  return inspectDeployedRuntimeRole(value, projectId, manifest);
+}
+
 async function collectDeployedRuntimeRole(projectId: string): Promise<DeployedRuntimeRoleFacts> {
-  const value = await runJson('gcloud', ['iam', 'roles', 'describe', `projects/${projectId}/roles/${RUNTIME_ROLE_ID}`, '--format=json']);
-  return inspectDeployedRuntimeRole(value, projectId, await readRuntimeRoleManifest());
+  return collectDeployedRuntimeRoleWithExecutor(
+    projectId,
+    await readRuntimeRoleManifest(),
+    (command, args) => runJson(command, args),
+  );
 }
 
 async function collectProjectRuntimePolicy(projectId: string): Promise<ProjectRuntimePolicyFacts> {

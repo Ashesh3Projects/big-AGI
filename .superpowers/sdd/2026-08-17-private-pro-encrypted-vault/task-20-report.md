@@ -139,3 +139,57 @@ The adversarial manifest suite covers non-object roots, extra keys at every rele
 ### Cloud boundary
 
 No IAM role, IAM policy, service account, workload identity provider, credential, deployment, or key was created, updated, disabled, or deleted. Live staging verification and provisioning remain approval-gated for Tasks 21 and 24.
+
+## Fix round 2
+
+Status: complete.
+
+### Review findings
+
+The deployed custom-role collector passed the full role resource name to `gcloud iam roles describe`. The supported project custom-role form uses the role ID plus `--project`. The WIF principal configuration also accepted arbitrary comma-separated IAM members without validating external-principal syntax or preventing pool-wide/wildcard grants.
+
+### Changes
+
+- Added an injectable deployed-role collector and changed the exact command to:
+
+```text
+gcloud iam roles describe privateProRuntime --project=PROJECT_ID --format=json
+```
+
+- The collector still validates actual-shaped output whose `name` is `projects/PROJECT_ID/roles/privateProRuntime`.
+- Added an executable argument-vector test. Replacing the role ID plus project flag with a full resource argument now fails the test.
+- Added strict `PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS` parsing:
+  - Accepts only exact `principal://.../subject/...` identities.
+  - Accepts only exact `principalSet://.../attribute.NAME/...` or `principalSet://.../group/...` sets.
+  - Requires a numeric project number, `locations/global`, a bounded workload identity pool ID, and nonempty bounded selector values.
+  - Requires all entries to use one project number and one workload identity pool.
+  - Rejects duplicate entries, wildcards, pool-wide sets, non-global locations, malformed paths, empty components, excessive lengths/counts, query syntax, and `user:`, `serviceAccount:`, `domain:`, `allUsers`, or `allAuthenticatedUsers` members.
+- Updated the deployment example to a syntactically valid placeholder value and documented all accepted/rejected forms.
+
+### TDD
+
+RED:
+
+```text
+26 audit tests: 24 passed, 2 failed
+```
+
+The failures were the missing supported gcloud argument-vector collector and missing WIF parser.
+
+GREEN:
+
+```text
+26 audit tests: 26 passed, 0 failed
+```
+
+Combined focused config, Firebase Admin, App Check, audit, manifest, and docs run:
+
+```text
+43 tests: 43 passed, 0 failed
+```
+
+`npm run private-pro:security-audit -- --report-only` exited 0 and printed the fail-closed report. The checked-in manifest passed; unconfigured live identity and deployed IAM collectors remained blockers. `git diff --check` passed.
+
+### Cloud boundary
+
+No gcloud IAM write command ran. Tests used an injected command executor, and report-only remained read-only.

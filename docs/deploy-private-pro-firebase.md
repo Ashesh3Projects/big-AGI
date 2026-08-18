@@ -64,7 +64,7 @@ The production security audit verifies deployed state, not only this local manif
 
 ```dotenv
 PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL=private-pro-runtime@your-project.iam.gserviceaccount.com
-PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS=principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/attribute.repository/ORG/REPOSITORY
+PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS=principalSet://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/vercel-prod/attribute.repository/example-org/example-repository
 ```
 
 The audit then blocks unless all of these are true:
@@ -77,6 +77,14 @@ The audit then blocks unless all of these are true:
 - The service-account IAM policy contains no other roles or members.
 
 If active ADC credentials, the deployed role, project policy, service-account policy, or expected WIF principals cannot be read and verified, the audit reports a blocker. `--report-only` still prints the complete report but does not make unreadable state acceptable.
+
+Every WIF entry must be an exact Google IAM external principal. Accepted forms are:
+
+- `principal://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/subject/SUBJECT`
+- `principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/attribute.ATTRIBUTE_NAME/ATTRIBUTE_VALUE`
+- `principalSet://iam.googleapis.com/projects/PROJECT_NUMBER/locations/global/workloadIdentityPools/POOL_ID/group/GROUP_ID`
+
+All configured entries must use the same numeric project number and workload identity pool. Wildcards, pool-wide principals, non-global locations, empty components, and IAM member types such as `user:`, `serviceAccount:`, `domain:`, `allUsers`, or `allAuthenticatedUsers` are rejected.
 
 ## App Check
 
