@@ -90,6 +90,10 @@ test('portable serializer registry includes only explicit portable state', async
     import('../../trade/link/store-share-link'),
   ]);
 
+  const { setPrivateProEncryptedPersistenceActive, privateProPortableLocalStorage } = await import('../persistence/privatePro.persistence');
+  setPrivateProEncryptedPersistenceActive(true);
+  privateProPortableLocalStorage.setItem('joy-mode', INCLUDED.theme);
+
   useModelsStore.setState({
     sources: [{
       id: 'openai',

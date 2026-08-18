@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 
 import { agiUuid } from '~/common/util/idUtils';
 import { useShallow } from 'zustand/react/shallow';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 // constraint the max number of saved prompts, to stay below localStorage quota
@@ -90,6 +91,7 @@ const useAppPersonasStore = create<AppPersonasStore>()(persist(
   }),
   {
     name: 'app-app-personas',
+    ...createPrivateProPortableLocalStorageOptions<AppPersonasStore>(),
     version: 1,
   },
 ));

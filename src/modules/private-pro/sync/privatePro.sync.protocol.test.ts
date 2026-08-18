@@ -11,7 +11,6 @@ import { createDConversation, type DConversation } from '~/common/stores/chat/ch
 import { createDMessageTextContent } from '~/common/stores/chat/chat.message';
 import { chatSyncDelete, chatSyncSnapshot, chatSyncUpsert, useChatStore } from '~/common/stores/chat/store-chats';
 
-import { joinSyncChunks, privateProHash, splitSyncPayload } from './privatePro.sync.chunk';
 import {
   parseSyncConversation,
   parseSyncPersona,
@@ -91,7 +90,6 @@ describe('private Pro sync serialization', () => {
     assert.deepEqual(parseSyncPersona(serialized), PERSONA);
   });
 });
-
 describe('private Pro store adapters', () => {
   test('exposes only eligible chat snapshots and explicit remote mutations', () => {
     const eligible = createConversation();
@@ -123,26 +121,5 @@ describe('private Pro store adapters', () => {
 
     personaSyncDelete(PERSONA.id);
     assert.equal(personaSyncSnapshot().some(persona => persona.id === PERSONA.id), false);
-  });
-});
-
-describe('private Pro sync chunks', () => {
-  test('round-trips Unicode without exceeding the byte limit', async () => {
-    const payload = `${'🙂漢字'.repeat(6000)}\n${'plain text '.repeat(5000)}`;
-    const chunks = await splitSyncPayload(payload, 8 * 1024);
-
-    assert.equal(chunks.length > 1, true);
-    assert.equal(chunks.every(chunk => chunk.byteLength <= 8 * 1024), true);
-    assert.equal(await joinSyncChunks(chunks), payload);
-  });
-
-  test('hashes equal input equally and detects one-byte changes', async () => {
-    const hashA = await privateProHash('payload-a');
-    const hashA2 = await privateProHash('payload-a');
-    const hashB = await privateProHash('payload-b');
-
-    assert.equal(hashA, hashA2);
-    assert.notEqual(hashA, hashB);
-    assert.match(hashA, /^[a-f0-9]{64}$/);
   });
 });

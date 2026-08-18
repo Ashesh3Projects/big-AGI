@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 
 import type { DConversationId } from '~/common/stores/chat/chat.conversation';
 import { agiUuid } from '~/common/util/idUtils';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 export interface DFolder {
@@ -122,6 +123,7 @@ export const useFolderStore = create<FolderStore>()(/*devtools(*/
     }),
     {
       name: 'app-folders',
+      ...createPrivateProPortableLocalStorageOptions<FolderStore>(),
     },
   ),
 );

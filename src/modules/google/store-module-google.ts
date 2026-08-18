@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 interface ModuleGoogleSearchStore {
@@ -35,6 +36,7 @@ export const useGoogleSearchStore = create<ModuleGoogleSearchStore>()(
     }),
     {
       name: 'app-module-google-search',
+      ...createPrivateProPortableLocalStorageOptions<ModuleGoogleSearchStore>(),
     }),
 );
 

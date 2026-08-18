@@ -3,27 +3,11 @@ import { TRPCError } from '@trpc/server';
 
 import { createTRPCRouter } from '~/server/trpc/trpc.server';
 
-import { privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
-import { createPrivateProVaultProcedure } from '../auth/privatePro.auth.procedures.server';
-import { getPrivateProServerConfig } from '../config/privatePro.config.server';
+import { createPrivateProVaultProcedure, privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
 import { getFirebasePrivateProVaultService } from '../vault/privatePro.vault.repository.firebase';
 import { getFirebasePrivateProVaultAssetsService } from '../vault/privatePro.vault.assets.firebase';
 import { PrivateProVaultAssetRateLimitError } from '../vault/privatePro.vault.assets.service';
 
-import { getFirebasePrivateProAssetsService } from './privatePro.assets.firebase';
-import { PrivateProUploadRateLimitError } from './privatePro.assets.service';
-
-
-const idSchema = z.string().min(1).max(200);
-
-const metadataSchema = z.object({
-  assetType: z.string().min(1).max(40),
-  label: z.string().max(500),
-  origin: z.json(),
-  metadata: z.json(),
-  createdAt: z.string(),
-  updatedAt: z.string(),
-});
 
 const opaqueIdSchema = z.string().regex(/^[A-Za-z0-9_-]{43}$/);
 const operationIdSchema = z.string().regex(/^[A-Za-z0-9._:-]{8,160}$/);
@@ -72,42 +56,5 @@ export const privateProAssetsRouter = createTRPCRouter({
   releaseEncryptedReservation: vaultProcedure
     .input(z.object({ operationId: operationIdSchema }).strict())
     .mutation(({ ctx, input }) => getFirebasePrivateProVaultAssetsService().releaseReservation(ctx.privateProIdentity.uid, input.operationId)),
-
-  reserveUpload: privateProNodePremiumProcedure
-    .input(z.object({
-      operationId: z.string().min(8).max(160),
-      assetId: idSchema,
-      contentHash: sha256Schema,
-      contentType: z.enum(['image/png', 'image/jpeg', 'image/webp', 'audio/mpeg', 'audio/wav']),
-      requestedBytes: z.number().int().positive(),
-      metadata: metadataSchema,
-    }))
-    .mutation(async ({ ctx, input }) => {
-      const config = getPrivateProServerConfig();
-      if (input.requestedBytes > config.maxFileBytes) throw new Error('Attachment exceeds the configured file-size limit.');
-      try {
-        return await getFirebasePrivateProAssetsService().reserveUpload(ctx.privateProIdentity.uid, input);
-      } catch (error) {
-        if (error instanceof PrivateProUploadRateLimitError)
-          throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: error.message });
-        throw error;
-      }
-    }),
-
-  finalizeUpload: privateProNodePremiumProcedure
-    .input(z.object({ operationId: z.string().min(8).max(160) }))
-    .mutation(({ ctx, input }) => getFirebasePrivateProAssetsService().finalizeUpload(ctx.privateProIdentity.uid, input.operationId)),
-
-  getDownload: privateProNodePremiumProcedure
-    .input(z.object({ assetId: idSchema }))
-    .query(({ ctx, input }) => getFirebasePrivateProAssetsService().getDownload(ctx.privateProIdentity.uid, input.assetId)),
-
-  releaseExpired: privateProNodePremiumProcedure
-    .input(z.object({ operationId: z.string().min(8).max(160) }))
-    .mutation(({ ctx, input }) => getFirebasePrivateProAssetsService().releaseExpiredReservation(ctx.privateProIdentity.uid, input.operationId)),
-
-  releaseReservation: privateProNodePremiumProcedure
-    .input(z.object({ operationId: z.string().min(8).max(160) }))
-    .mutation(({ ctx, input }) => getFirebasePrivateProAssetsService().releaseReservation(ctx.privateProIdentity.uid, input.operationId)),
 
 });

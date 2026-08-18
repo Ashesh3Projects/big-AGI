@@ -4,6 +4,7 @@ import { persist } from 'zustand/middleware';
 import { agiUuid } from '~/common/util/idUtils';
 import { useShallow } from 'zustand/react/shallow';
 import { supportsClipboardRead } from '~/common/util/clipboardUtils';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 // configuration
@@ -93,6 +94,7 @@ const useScratchClipStore = create<ScratchClipStore>()(persist(
   {
 
     name: 'agi-scratch-clip',
+    ...createPrivateProPortableLocalStorageOptions<Pick<ScratchClipStore, 'history'>>(),
 
     partialize: ({ history }) => ({
       history, // only persist history

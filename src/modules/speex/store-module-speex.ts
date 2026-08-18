@@ -11,6 +11,7 @@ import { useModelsStore } from '~/common/stores/llms/store-llms';
 import type { DSpeexCredentialsAny, DSpeexEngine, DSpeexEngineAny, DSpeexVendorType, SpeexEngineId } from './speex.types';
 import { speexFindByVendorPriorityAsc, speexFindVendor, speexFindVendorForLLMVendor } from './speex.vendors-registry';
 import { webspeechHBestVoiceDeferred, webspeechIsSupported } from './protocols/webspeech/webspeech.client';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 interface SpeexStoreState {
@@ -239,6 +240,7 @@ export const useSpeexStore = create<SpeexStore>()(persist(
 
   }), {
     name: 'app-module-speex',
+    ...createPrivateProPortableLocalStorageOptions<SpeexStore>(),
     version: 1,
 
     // Performs the business logic here

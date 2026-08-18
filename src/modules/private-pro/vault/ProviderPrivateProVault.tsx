@@ -33,6 +33,11 @@ import { createPrivateProVaultTransport } from './privatePro.vault.transport';
 import type { PrivateProVaultDeviceMetadata, PrivateProVaultKeyset } from './privatePro.vault.types';
 import { clearPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
 import { signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
+import {
+  clearPrivateProPlaintextPortablePersistence,
+  clearPrivateProVolatilePortableState,
+  setPrivateProEncryptedPersistenceActive,
+} from '../persistence/privatePro.persistence';
 
 
 export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'error';
@@ -107,6 +112,8 @@ async function clearPrivateProVaultRuntime(
   runtime.keyset = null;
   runtime.assets = null;
   runtime.devices = [];
+  await clearPrivateProPlaintextPortablePersistence();
+  clearPrivateProVolatilePortableState();
   port.clearDeviceId(uid);
 }
 
@@ -398,6 +405,7 @@ function createProductionDependencies(
       return result.status === 'conflict' ? 'conflict' : 'committed';
     },
     async setup(password) {
+      await clearPrivateProPlaintextPortablePersistence();
       const created = await createPrivateProVaultKeyset(password, user.uid);
       runtime.keyset = created.keyset;
       runtime.masterKey = created.masterKey;
@@ -486,6 +494,7 @@ export function ProviderPrivateProVault(props: { children: React.ReactNode }) {
 }
 
 function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
+  setPrivateProEncryptedPersistenceActive(true);
   const auth = usePrivateProAuth();
   const [state, setState] = React.useState<PrivateProVaultPublicState>(INITIAL_STATE);
   const lifecycleRef = React.useRef<PrivateProVaultLifecycle | null>(null);

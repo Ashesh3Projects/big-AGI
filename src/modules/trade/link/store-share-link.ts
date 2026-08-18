@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { persist } from 'zustand/middleware';
 import { useShallow } from 'zustand/react/shallow';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 export interface SharedChatLinkItem {
@@ -46,6 +47,7 @@ const useShareLinkStore = create<LinkStore>()(
     }),
     {
       name: 'app-sharing',
+      ...createPrivateProPortableLocalStorageOptions<LinkStore>(),
     },
   ),
 );

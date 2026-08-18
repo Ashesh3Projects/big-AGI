@@ -19,6 +19,7 @@ import { DModelParameterId, DModelParameterRegistry, DModelParameterValues, LLMI
 import { createLlmsAssignmentsSlice, LlmsAssignmentsActions, LlmsAssignmentsSlice, LlmsAssignmentsState, llmsAssignmentsPruneStale } from './store-llms-domains_slice';
 import { getDomainModelConfiguration } from './hooks/useModelDomain';
 import { portModelPricingV2toV3 } from './llms.pricing';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 /// ModelsStore - a store for configured LLMs and configured services
@@ -449,6 +450,7 @@ export const useModelsStore = create<LlmsStore>()(persist(
   }),
   {
     name: 'app-models',
+    ...createPrivateProPortableLocalStorageOptions<LlmsStore>(),
 
     /* versioning:
      *  1: adds maxOutputTokens (default to half of contextTokens)

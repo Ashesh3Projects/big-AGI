@@ -9,6 +9,7 @@ import { useModelsStore } from '~/common/stores/llms/store-llms';
 
 import type { DASRxEngineId, DASRxCredentialsAny, DASRxEngine, DASRxEngineAny, DASRxVendorType } from './asrx.types';
 import { asrxFindByVendorPriorityAsc, asrxFindVendor, asrxFindVendorForLLMVendor } from './asrx.vendors-registry';
+import { createPrivateProPortableLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 interface ASRxStoreState {
@@ -190,6 +191,7 @@ export const useASRxStore = create<ASRxStore>()(persist(
 
   }), {
     name: 'app-module-asrx',
+    ...createPrivateProPortableLocalStorageOptions<unknown>(),
     version: 2,
 
     // 2: auto-link now requires a client-side key (CSF-only) - force one re-sync so
