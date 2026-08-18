@@ -8,6 +8,7 @@ Code HEAD before this report commit: `af4211c3f`
 
 - Classified every durable Zustand store as portable, sensitive-device, or safe-device. Portable and sensitive-device stores now fail the source inventory unless they use their assigned Private Pro volatile adapter.
 - Made `app-state`, panes, logs, metrics, live-file metadata, workspace identifiers, and the browser device identifier volatile and part of physical plaintext cleanup. These excluded stores are never synchronized.
+- Verified the client logger does not provide a general secret sanitizer: it accepts arbitrary message/details. It is therefore classified as sensitive-device, its durable sink is disabled and cleared in Private Pro, and all analytics reporting is disabled by the existing Private Pro build/runtime gates.
 - Kept composer prefill transient. Added encrypted `settings/folders` persistence for `enableFolders`, including reset and PC A-to-PC B reconstruction.
 - Added realistic tRPC fetch-failure classification and exact-operation retry. Validation and conflict errors do not retry.
 - Added resumable encrypted restore sessions with deterministic 200-record/4 MiB atomic chunks, a blocking active marker, per-chunk receipts, completion receipts, session-authorized resume/verification, and exact canonical whole-restore verification.
