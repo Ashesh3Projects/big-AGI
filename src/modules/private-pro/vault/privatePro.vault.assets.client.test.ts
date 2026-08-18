@@ -297,24 +297,27 @@ describe('private Pro encrypted vault asset client', () => {
 
   test('aborts promptly when iterator cleanup never settles', async () => {
     const { client, local, transport } = await fixture();
-    local.blockNextSourceRead = true;
-    const originalOpen = local.openAssetSource.bind(local);
-    local.openAssetSource = async value => {
-      const opened = await originalOpen(value);
-      if (!('getReader' in opened.source) && !(opened.source instanceof Uint8Array) && !(opened.source instanceof Blob)) {
-        const iterator = opened.source[Symbol.asyncIterator]();
-        opened.source = {
-          [Symbol.asyncIterator]: () => ({
-            next: () => iterator.next(),
-            return: () => new Promise<IteratorResult<Uint8Array>>(() => undefined),
-          }),
-        } as PrivateProVaultAssetPlaintextSource;
-      }
-      return opened;
-    };
+    let returnCalls = 0;
+    let sourceReadStarted: (() => void) | null = null;
+    const readStarted = new Promise<void>(resolve => { sourceReadStarted = resolve; });
+    local.openAssetSource = async () => ({
+      plaintextBytes: 1,
+      source: {
+        [Symbol.asyncIterator]: () => ({
+          next: () => {
+            sourceReadStarted?.();
+            return new Promise<IteratorResult<Uint8Array>>(() => undefined);
+          },
+          return: () => {
+            returnCalls++;
+            return new Promise<IteratorResult<Uint8Array>>(() => undefined);
+          },
+        }),
+      },
+    });
     const controller = new AbortController();
     const upload = client.prepareForUpload([ASSET_ID], controller.signal);
-    await local.blockedSourceReadStarted;
+    await readStarted;
 
     controller.abort();
 
@@ -322,9 +325,157 @@ describe('private Pro encrypted vault asset client', () => {
       upload,
       new Promise((_, reject) => setTimeout(() => reject(new Error('abort timed out')), 250)),
     ]), error => error instanceof DOMException && error.name === 'AbortError');
+    assert.equal(returnCalls, 1);
     assert.equal(transport.reservations.length, 0);
+    assert.deepEqual(transport.uploadedIndices, []);
     assert.equal(transport.objects.size, 0);
     assert.equal(transport.finalized, 0);
+  });
+
+  test('aborts promptly when iterator cleanup throws synchronously', async () => {
+    const { client, local, transport } = await fixture();
+    let returnCalls = 0;
+    let sourceReadStarted: (() => void) | null = null;
+    const readStarted = new Promise<void>(resolve => { sourceReadStarted = resolve; });
+    local.openAssetSource = async () => ({
+      plaintextBytes: 1,
+      source: {
+        [Symbol.asyncIterator]: () => ({
+          next: () => {
+            sourceReadStarted?.();
+            return new Promise<IteratorResult<Uint8Array>>(() => undefined);
+          },
+          return: () => {
+            returnCalls++;
+            throw new Error('injected synchronous iterator cleanup failure');
+          },
+        }),
+      },
+    });
+    const controller = new AbortController();
+    const upload = client.prepareForUpload([ASSET_ID], controller.signal);
+    await readStarted;
+
+    controller.abort();
+
+    await assert.rejects(Promise.race([
+      upload,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('abort timed out')), 250)),
+    ]), error => error instanceof DOMException && error.name === 'AbortError');
+    assert.equal(returnCalls, 1);
+    assert.equal(transport.reservations.length, 0);
+    assert.deepEqual(transport.uploadedIndices, []);
+    assert.equal(transport.objects.size, 0);
+    assert.equal(transport.finalized, 0);
+  });
+
+  test('keeps AbortError primary when stream cancel and release cleanup throw synchronously', async () => {
+    const { client, local, transport } = await fixture();
+    let cancelCalls = 0;
+    let releaseCalls = 0;
+    let sourceReadStarted: (() => void) | null = null;
+    const readStarted = new Promise<void>(resolve => { sourceReadStarted = resolve; });
+    local.openAssetSource = async () => ({
+      plaintextBytes: 1,
+      source: {
+        getReader: () => ({
+          read: () => {
+            sourceReadStarted?.();
+            return new Promise<ReadableStreamReadResult<Uint8Array>>(() => undefined);
+          },
+          cancel: () => {
+            cancelCalls++;
+            throw new Error('injected synchronous stream cancel failure');
+          },
+          releaseLock: () => {
+            releaseCalls++;
+            throw new Error('injected synchronous stream release failure');
+          },
+        }),
+      } as unknown as ReadableStream<Uint8Array>,
+    });
+    const controller = new AbortController();
+    const upload = client.prepareForUpload([ASSET_ID], controller.signal);
+    await readStarted;
+
+    controller.abort();
+
+    await assert.rejects(Promise.race([
+      upload,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('abort timed out')), 250)),
+    ]), error => error instanceof DOMException && error.name === 'AbortError');
+    assert.equal(cancelCalls, 1);
+    assert.equal(releaseCalls, 1);
+    assert.equal(transport.reservations.length, 0);
+    assert.deepEqual(transport.uploadedIndices, []);
+    assert.equal(transport.objects.size, 0);
+    assert.equal(transport.finalized, 0);
+  });
+
+  test('suppresses a rejected ReadableStream controller cleanup without duplicate cancellation or upload effects', async () => {
+    const { client, local, transport } = await fixture();
+    let cancelCalls = 0;
+    let sourceReadStarted: (() => void) | null = null;
+    const readStarted = new Promise<void>(resolve => { sourceReadStarted = resolve; });
+    local.openAssetSource = async () => ({
+      plaintextBytes: 1,
+      source: new ReadableStream<Uint8Array>({
+        pull: () => {
+          sourceReadStarted?.();
+          return new Promise<void>(() => undefined);
+        },
+        cancel: () => {
+          cancelCalls++;
+          throw new Error('injected rejected stream cleanup');
+        },
+      }, { highWaterMark: 0 }),
+    });
+    const controller = new AbortController();
+    const upload = client.prepareForUpload([ASSET_ID], controller.signal);
+    await readStarted;
+
+    controller.abort();
+
+    await assert.rejects(Promise.race([
+      upload,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('abort timed out')), 250)),
+    ]), error => error instanceof DOMException && error.name === 'AbortError');
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(cancelCalls, 1);
+    assert.equal(transport.reservations.length, 0);
+    assert.deepEqual(transport.uploadedIndices, []);
+    assert.equal(transport.objects.size, 0);
+    assert.equal(transport.finalized, 0);
+  });
+
+  test('releases a normally completed stream once without cancellation', async () => {
+    const { client, local, transport } = await fixture();
+    const bytes = Uint8Array.of(1, 2, 3);
+    let emitted = false;
+    let cancelCalls = 0;
+    let releaseCalls = 0;
+    local.openAssetSource = async () => ({
+      plaintextBytes: bytes.byteLength,
+      source: {
+        getReader: () => ({
+          read: async () => {
+            if (emitted) return { done: true as const, value: undefined };
+            emitted = true;
+            return { done: false as const, value: bytes };
+          },
+          cancel: async () => { cancelCalls++; },
+          releaseLock: () => { releaseCalls++; },
+        }),
+      } as unknown as ReadableStream<Uint8Array>,
+    });
+
+    await client.prepareForUpload([ASSET_ID]);
+
+    assert.equal(cancelCalls, 0);
+    assert.equal(releaseCalls, 1);
+    assert.equal(transport.reservations.length, 1);
+    assert.deepEqual(transport.uploadedIndices, [0]);
+    assert.equal(transport.finalized, 1);
   });
 
   test('aborts promptly during chunk encryption without reserving or leaving stale objects', async () => {

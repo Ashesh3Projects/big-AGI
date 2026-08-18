@@ -256,9 +256,26 @@ function throwIfAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw abortError();
 }
 
+function bestEffortCleanup(cleanup: () => unknown): () => void {
+  let invoked = false;
+  return () => {
+    if (invoked) return;
+    invoked = true;
+    try {
+      void Promise.resolve(cleanup()).catch(() => undefined);
+    } catch {
+      // Cleanup is best effort and must never replace the primary result.
+    }
+  };
+}
+
 function awaitWithAbort<T>(promise: Promise<T>, signal?: AbortSignal, onAbort?: () => void): Promise<T> {
   if (!signal) return promise;
-  throwIfAborted(signal);
+  if (signal.aborted) {
+    void promise.catch(() => undefined);
+    onAbort?.();
+    throw abortError();
+  }
   return new Promise<T>((resolve, reject) => {
     let settled = false;
     const finish = (action: () => void) => {
@@ -422,53 +439,50 @@ async function* sourceChunks(source: PrivateProVaultAssetPlaintextSource, signal
   }
   if (typeof Blob !== 'undefined' && source instanceof Blob) {
     const reader = source.stream().getReader();
+    const cancel = bestEffortCleanup(() => reader.cancel());
+    const release = bestEffortCleanup(() => reader.releaseLock());
     try {
       while (true) {
-        const result = await awaitWithAbort(reader.read(), signal, () => { void reader.cancel().catch(() => undefined); });
+        const result = await awaitWithAbort(reader.read(), signal, cancel);
         if (result.done) return;
         throwIfAborted(signal);
         if (result.value.byteLength) yield result.value;
       }
     } finally {
-      if (signal?.aborted) void reader.cancel().catch(() => undefined);
-      reader.releaseLock();
+      if (signal?.aborted) cancel();
+      release();
     }
   }
   else if ('getReader' in source) {
     const reader = source.getReader();
+    const cancel = bestEffortCleanup(() => reader.cancel());
+    const release = bestEffortCleanup(() => reader.releaseLock());
     try {
       while (true) {
-        const result = await awaitWithAbort(reader.read(), signal, () => { void reader.cancel().catch(() => undefined); });
+        const result = await awaitWithAbort(reader.read(), signal, cancel);
         if (result.done) return;
         throwIfAborted(signal);
         if (result.value.byteLength) yield result.value;
       }
     } finally {
-      if (signal?.aborted) void reader.cancel().catch(() => undefined);
-      reader.releaseLock();
+      if (signal?.aborted) cancel();
+      release();
     }
   }
   else {
     const iterable = source as AsyncIterable<Uint8Array>;
     const iterator = iterable[Symbol.asyncIterator]();
+    const close = bestEffortCleanup(() => iterator.return?.());
     try {
       while (true) {
-        const result = await awaitWithAbort(iterator.next(), signal, () => {
-          const returned = iterator.return?.();
-          if (returned && typeof (returned as PromiseLike<IteratorResult<Uint8Array>>).then === 'function')
-            void Promise.resolve(returned).catch(() => undefined);
-        });
+        const result = await awaitWithAbort(iterator.next(), signal, close);
         if (result.done) return;
         throwIfAborted(signal);
         if (!(result.value instanceof Uint8Array)) throw new Error('Encrypted asset source emitted invalid bytes.');
         if (result.value.byteLength) yield result.value;
       }
     } finally {
-      if (signal?.aborted) {
-        const returned = iterator.return?.();
-        if (returned && typeof (returned as PromiseLike<IteratorResult<Uint8Array>>).then === 'function')
-          void Promise.resolve(returned).catch(() => undefined);
-      }
+      if (signal?.aborted) close();
     }
   }
 }
@@ -476,9 +490,11 @@ async function* sourceChunks(source: PrivateProVaultAssetPlaintextSource, signal
 class BoundedSourceReader {
   private remainder: Uint8Array | null = null;
   private readonly iterator: AsyncIterator<Uint8Array>;
+  private readonly close: () => void;
 
   constructor(source: PrivateProVaultAssetPlaintextSource, private readonly signal?: AbortSignal) {
     this.iterator = sourceChunks(source, signal)[Symbol.asyncIterator]();
+    this.close = bestEffortCleanup(() => this.iterator.return?.());
   }
 
   async readExactly(size: number): Promise<Uint8Array<ArrayBuffer>> {
@@ -503,7 +519,7 @@ class BoundedSourceReader {
       output.fill(0);
       this.remainder?.fill(0);
       this.remainder = null;
-      if (this.signal?.aborted) void this.iterator.return?.();
+      if (this.signal?.aborted) this.close();
       throw error;
     }
   }
