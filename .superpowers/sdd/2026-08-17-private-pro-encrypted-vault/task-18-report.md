@@ -43,3 +43,27 @@
 ## Commit
 
 - `Cloud: migrate private data into encrypted vaults`
+
+## Fix round 1
+
+### Review findings resolved
+
+- Added write-ahead encrypted-journal checkpoints for every upload, server commit, local cleanup, cloud cleanup, and completion effect. Retries reuse stable operation IDs and item cursors, including crashes immediately after an effect but before its completion checkpoint.
+- Froze the exact local and cloud source sets plus asset byte length, content SHA-256, encrypted-manifest SHA-256, and source references. Commit and cleanup relist both source sets and re-describe assets, blocking late additions, edits, newly referenced assets, and shared-asset deletion.
+- Added an activation-owned provider epoch and one idempotent stop barrier. Logout, full wipe, UID/provider teardown, and failed activation invalidate and unsubscribe before joining the same migration stop, suppressing stale progress and preventing engine startup after cancellation.
+- Added a Firestore cleanup receipt keyed by the stable migration cleanup operation. Canonical deletion and receipt creation are atomic; exact frozen chunks advance a persisted cursor transactionally; revision deletion and completion are resumable.
+- Split encrypted export creation from explicit user acknowledgement. The confirmation is bound to migration ID, frozen inventory digest, and the materialized export SHA-256, and a separate acknowledgement action opens the destructive gate.
+
+### Fix verification
+
+- Focused migration/provider/assets/cleanup/service regression: `97` passed, `0` failed.
+- All Private Pro source tests: `300` passed, `0` failed.
+- Touched ESLint: passed with `0` errors and `0` warnings.
+- `npm run tscheck`: passed.
+- `npm run build`: passed. Next.js emitted only the existing multi-lockfile and edge-runtime static-generation warnings.
+- `git diff --check`: passed.
+- Full `npm test`: tools `20/20` passed; source tests `333` passed, `18` skipped, `1` failed. The only failure remains the known live Groq catalog drift baseline: stale definitions `minimaxai/minimax-m2.7`, `llama-3.3-70b-versatile`, and `llama-3.1-8b-instant`.
+
+### Remaining limitation
+
+- Live Firebase/Storage mutation and a real browser download acknowledgement were not exercised. Repository ports, crash-injection tests, typecheck, and the production build cover the implementation paths without deployment or server startup.
