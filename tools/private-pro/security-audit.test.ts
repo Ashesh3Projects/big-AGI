@@ -51,6 +51,9 @@ describe('private Pro security audit classifiers', () => {
       inspectFirestoreRecoveryState(value: unknown, projectId: string): {
         readable: boolean;
         databaseNameMatches: boolean;
+        nativeMode: boolean;
+        standardEdition: boolean;
+        locationPresent: boolean;
         deletionProtection: 'enabled' | 'disabled' | 'unspecified' | 'unknown';
         pitr: 'enabled' | 'disabled' | 'unknown';
         earliestVersionTimePresent: boolean;
@@ -60,6 +63,9 @@ describe('private Pro security audit classifiers', () => {
     };
     const enabled = audit.inspectFirestoreRecoveryState({
       name: 'projects/sample-project/databases/(default)',
+      type: 'FIRESTORE_NATIVE',
+      databaseEdition: 'STANDARD',
+      locationId: 'us-central1',
       deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
       pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
       earliestVersionTime: '2026-08-18T00:00:00.123456Z',
@@ -67,6 +73,9 @@ describe('private Pro security audit classifiers', () => {
     }, 'sample-project');
     const disabled = audit.inspectFirestoreRecoveryState({
       name: 'projects/sample-project/databases/(default)',
+      type: 'FIRESTORE_NATIVE',
+      databaseEdition: 'STANDARD',
+      locationId: 'us-central1',
       deleteProtectionState: 'DELETE_PROTECTION_DISABLED',
       pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_DISABLED',
       earliestVersionTime: '2026-08-18T00:00:00Z',
@@ -74,13 +83,21 @@ describe('private Pro security audit classifiers', () => {
     }, 'sample-project');
     const unspecified = audit.inspectFirestoreRecoveryState({
       name: 'projects/sample-project/databases/(default)',
+      type: 'FIRESTORE_NATIVE',
+      databaseEdition: 'STANDARD',
+      locationId: 'us-central1',
       deleteProtectionState: 'DELETE_PROTECTION_STATE_UNSPECIFIED',
       pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLEMENT_UNSPECIFIED',
+      earliestVersionTime: '2026-08-18T00:00:00Z',
+      versionRetentionPeriod: '3600s',
     }, 'sample-project');
 
     assert.deepEqual(enabled, {
       readable: true,
       databaseNameMatches: true,
+      nativeMode: true,
+      standardEdition: true,
+      locationPresent: true,
       deletionProtection: 'enabled',
       pitr: 'enabled',
       earliestVersionTimePresent: true,
@@ -89,6 +106,9 @@ describe('private Pro security audit classifiers', () => {
     assert.deepEqual(disabled, {
       readable: true,
       databaseNameMatches: true,
+      nativeMode: true,
+      standardEdition: true,
+      locationPresent: true,
       deletionProtection: 'disabled',
       pitr: 'disabled',
       earliestVersionTimePresent: true,
@@ -97,14 +117,17 @@ describe('private Pro security audit classifiers', () => {
     assert.deepEqual(unspecified, {
       readable: true,
       databaseNameMatches: true,
+      nativeMode: true,
+      standardEdition: true,
+      locationPresent: true,
       deletionProtection: 'unspecified',
       pitr: 'unknown',
-      earliestVersionTimePresent: false,
-      versionRetentionPeriod: 'missing',
+      earliestVersionTimePresent: true,
+      versionRetentionPeriod: 'one-hour',
     });
-    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(enabled)), ['pass', 'pass', 'pass', 'pass', 'pass', 'pass']);
-    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(disabled)), ['pass', 'pass', 'block', 'pass', 'pass', 'warn']);
-    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(unspecified)), ['pass', 'pass', 'block', 'block', 'pass', 'block']);
+    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(enabled)), ['pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass']);
+    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(disabled)), ['pass', 'pass', 'pass', 'pass', 'pass', 'block', 'pass', 'pass', 'warn']);
+    assert.deepEqual(severities(audit.classifyFirestoreRecoveryState(unspecified)), ['pass', 'pass', 'pass', 'pass', 'pass', 'block', 'block', 'pass', 'block']);
     assert.doesNotMatch(JSON.stringify(buildAuditReport(audit.classifyFirestoreRecoveryState(enabled))), /sample-project|projects\//);
   });
 
@@ -113,6 +136,9 @@ describe('private Pro security audit classifiers', () => {
       inspectFirestoreRecoveryState(value: unknown, projectId: string): {
         readable: boolean;
         databaseNameMatches: boolean;
+        nativeMode: boolean;
+        standardEdition: boolean;
+        locationPresent: boolean;
         deletionProtection: 'enabled' | 'disabled' | 'unspecified' | 'unknown';
         pitr: 'enabled' | 'disabled' | 'unknown';
         earliestVersionTimePresent: boolean;
@@ -120,39 +146,52 @@ describe('private Pro security audit classifiers', () => {
       };
       classifyFirestoreRecoveryState(facts: ReturnType<typeof audit.inspectFirestoreRecoveryState>): AuditFinding[];
     };
+    const complete = {
+      name: 'projects/sample-project/databases/(default)',
+      type: 'FIRESTORE_NATIVE',
+      databaseEdition: 'STANDARD',
+      locationId: 'us-central1',
+      deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+      pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+      earliestVersionTime: '2026-08-18T00:00:00Z',
+      versionRetentionPeriod: '604800s',
+    };
+    const partialValues = Object.keys(complete).map(key => {
+      const value = structuredClone(complete) as Record<string, unknown>;
+      delete value[key];
+      return value;
+    });
     const invalidValues = [
       null,
       [],
       'database',
       {},
       {
-        name: 'projects/sample-project/databases/(default)',
+        ...complete,
         deleteProtectionState: 'DELETE_PROTECTION_MAGIC',
-        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
       },
       {
-        name: 'projects/sample-project/databases/(default)',
-        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
+        ...complete,
         pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_MAGIC',
       },
       {
-        name: 'projects/sample-project/databases/(default)',
-        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
-        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+        ...complete,
         earliestVersionTime: 'not-a-timestamp',
       },
       {
-        name: 'projects/sample-project/databases/(default)',
-        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
-        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+        ...complete,
         earliestVersionTime: '2026-02-30T00:00:00Z',
       },
       {
-        name: 'projects/sample-project/databases/(default)',
-        deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
-        pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_ENABLED',
+        ...complete,
         versionRetentionPeriod: 604800,
       },
+      { ...complete, type: 'DATASTORE_MODE' },
+      { ...complete, databaseEdition: 'DATABASE_EDITION_UNSPECIFIED' },
+      { ...complete, locationId: '' },
+      { ...complete, pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_DISABLED' },
+      { ...complete, versionRetentionPeriod: '3600s' },
+      ...partialValues,
     ];
 
     for (const value of invalidValues) {
@@ -161,10 +200,14 @@ describe('private Pro security audit classifiers', () => {
       assert.equal(audit.classifyFirestoreRecoveryState(facts).some(finding => finding.severity === 'block'), true);
     }
 
+    const missingEarliest = structuredClone(complete) as Record<string, unknown>;
+    delete missingEarliest.earliestVersionTime;
+    const missingEarliestFindings = audit.classifyFirestoreRecoveryState(audit.inspectFirestoreRecoveryState(missingEarliest, 'sample-project'));
+    assert.equal(missingEarliestFindings.find(finding => finding.check === 'earliestVersionTimePresent')?.severity, 'block');
+
     const wrongDatabase = audit.inspectFirestoreRecoveryState({
+      ...complete,
       name: 'projects/other-project/databases/(default)',
-      deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
-      pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_DISABLED',
     }, 'sample-project');
     assert.equal(wrongDatabase.readable, true);
     assert.equal(wrongDatabase.databaseNameMatches, false);
@@ -184,6 +227,9 @@ describe('private Pro security audit classifiers', () => {
       calls.push({ command, args });
       return {
         name: 'projects/sample-project/databases/(default)',
+        type: 'FIRESTORE_NATIVE',
+        databaseEdition: 'STANDARD',
+        locationId: 'us-central1',
         deleteProtectionState: 'DELETE_PROTECTION_ENABLED',
         pointInTimeRecoveryEnablement: 'POINT_IN_TIME_RECOVERY_DISABLED',
         earliestVersionTime: '2026-08-18T00:00:00Z',
@@ -198,14 +244,22 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(facts.readable, true);
   });
 
-  test('accepts only strict redacted Firestore restore rehearsal evidence', () => {
+  test('accepts only fresh complete redacted Firestore restore rehearsal evidence', () => {
     const audit = securityAuditModule as unknown as {
-      inspectFirestoreRestoreEvidence(value: unknown): {
+      inspectFirestoreRestoreEvidence(value: unknown, nowMs?: number): {
         readable: boolean;
         schemaErrors: number;
         completed: boolean;
+        stale: boolean;
         sourceUnchanged: boolean;
         isolatedTarget: boolean;
+        targetNotDefault: boolean;
+        targetInitiallyEmpty: boolean;
+        indexesVerified: boolean;
+        rulesVerified: boolean;
+        configVerified: boolean;
+        documentCountsVerified: boolean;
+        documentHashesVerified: boolean;
         dataVerified: boolean;
         applicationVerified: boolean;
       };
@@ -217,18 +271,33 @@ describe('private Pro security audit classifiers', () => {
       sourceDatabase: '(default)',
       restoreMethod: 'pitr-clone',
       targetIsolation: 'separate-database',
+      targetDatabaseDefault: false,
       status: 'passed',
       sourceUnchanged: true,
+      targetInitiallyEmpty: true,
+      indexesVerified: true,
+      rulesVerified: true,
+      configVerified: true,
+      documentCountsVerified: true,
+      documentHashesVerified: true,
       dataVerificationPassed: true,
       applicationVerificationPassed: true,
     };
 
-    assert.deepEqual(audit.inspectFirestoreRestoreEvidence(evidence), {
+    assert.deepEqual(audit.inspectFirestoreRestoreEvidence(evidence, Date.parse('2026-08-18T12:00:00Z')), {
       readable: true,
       schemaErrors: 0,
       completed: true,
+      stale: false,
       sourceUnchanged: true,
       isolatedTarget: true,
+      targetNotDefault: true,
+      targetInitiallyEmpty: true,
+      indexesVerified: true,
+      rulesVerified: true,
+      configVerified: true,
+      documentCountsVerified: true,
+      documentHashesVerified: true,
       dataVerified: true,
       applicationVerified: true,
     });
@@ -240,19 +309,94 @@ describe('private Pro security audit classifiers', () => {
       value => { value.sourceDatabase = 'projects/sample-project/databases/(default)'; },
       value => { value.restoreMethod = 'overwrite-production'; },
       value => { value.targetIsolation = 'same-database'; },
+      value => { value.targetDatabaseDefault = true; },
       value => { value.status = 'unknown'; },
       value => { value.sourceUnchanged = 'yes'; },
-      value => { value.dataVerificationPassed = false; },
       value => { value.rawPayload = { secret: true }; },
       value => { delete value.applicationVerificationPassed; },
     ];
     for (const mutate of mutations) {
       const changed = structuredClone(evidence) as Record<string, unknown>;
       mutate(changed);
-      const facts = audit.inspectFirestoreRestoreEvidence(changed);
+      const facts = audit.inspectFirestoreRestoreEvidence(changed, Date.parse('2026-08-18T12:00:00Z'));
       assert.equal(facts.readable, false);
       assert.ok(facts.schemaErrors > 0);
     }
+    const stale = audit.inspectFirestoreRestoreEvidence({ ...evidence, collectedAt: '2026-05-01T00:00:00Z' }, Date.parse('2026-08-18T12:00:00Z'));
+    assert.equal(stale.readable, true);
+    assert.equal(stale.stale, true);
+    const nativeBackup = audit.inspectFirestoreRestoreEvidence({ ...evidence, restoreMethod: 'native-backup-restore' }, Date.parse('2026-08-18T12:00:00Z'));
+    assert.equal(nativeBackup.readable, true);
+  });
+
+  test('classifies restore evidence as a release gate', () => {
+    const audit = securityAuditModule as unknown as {
+      inspectFirestoreRestoreEvidence(value: unknown, nowMs?: number): {
+        readable: boolean;
+        schemaErrors: number;
+        completed: boolean;
+        stale: boolean;
+        sourceUnchanged: boolean;
+        isolatedTarget: boolean;
+        targetNotDefault: boolean;
+        targetInitiallyEmpty: boolean;
+        indexesVerified: boolean;
+        rulesVerified: boolean;
+        configVerified: boolean;
+        documentCountsVerified: boolean;
+        documentHashesVerified: boolean;
+        dataVerified: boolean;
+        applicationVerified: boolean;
+      };
+      classifyFirestoreRestoreEvidence(facts: ReturnType<typeof audit.inspectFirestoreRestoreEvidence>): AuditFinding[];
+    };
+
+    assert.equal(audit.classifyFirestoreRestoreEvidence(audit.inspectFirestoreRestoreEvidence(undefined))[0].severity, 'block');
+    const failed = audit.inspectFirestoreRestoreEvidence({
+      schemaVersion: 1,
+      evidenceType: 'firestore-restore-rehearsal',
+      collectedAt: '2026-08-18T00:00:00Z',
+      sourceDatabase: '(default)',
+      restoreMethod: 'firestore-export-import',
+      targetIsolation: 'separate-project',
+      targetDatabaseDefault: false,
+      status: 'failed',
+      sourceUnchanged: true,
+      targetInitiallyEmpty: true,
+      indexesVerified: true,
+      rulesVerified: true,
+      configVerified: true,
+      documentCountsVerified: false,
+      documentHashesVerified: false,
+      dataVerificationPassed: false,
+      applicationVerificationPassed: false,
+    }, Date.parse('2026-08-18T12:00:00Z'));
+    assert.deepEqual(severities(audit.classifyFirestoreRestoreEvidence(failed)), [
+      'pass', 'pass', 'block', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass', 'block', 'block', 'block', 'block',
+    ]);
+  });
+
+  test('collects canonical restore evidence locally and fails closed when it is missing', async () => {
+    const audit = securityAuditModule as unknown as {
+      collectFirestoreRestoreEvidenceWithReader(
+        path: string,
+        nowMs: number,
+        readText: (path: string) => Promise<string>,
+      ): Promise<{ readable: boolean; completed: boolean }>;
+    };
+    const paths: string[] = [];
+    const missing = await audit.collectFirestoreRestoreEvidenceWithReader(
+      'infra/private-pro/firestore-restore-evidence.json',
+      Date.parse('2026-08-18T12:00:00Z'),
+      async path => {
+        paths.push(path);
+        throw new Error('missing');
+      },
+    );
+
+    assert.deepEqual(paths, ['infra/private-pro/firestore-restore-evidence.json']);
+    assert.equal(missing.readable, false);
+    assert.equal(missing.completed, false);
   });
 
   test('passes shell metacharacters as one argument without executing them', async () => {

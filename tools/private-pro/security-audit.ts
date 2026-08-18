@@ -10,6 +10,8 @@ import { GoogleAuth } from 'google-auth-library';
 const execFile = promisify(execFileCallback);
 const DEFAULT_PROJECT_ID = 'big-agi-243b6';
 const DEFAULT_DEPLOYMENT_ORIGIN = 'https://chatgpt.ashesh.dev';
+const DEFAULT_FIRESTORE_RESTORE_EVIDENCE_PATH = 'infra/private-pro/firestore-restore-evidence.json';
+const FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS = 90;
 const EXPECTED_BROWSER_REFERRERS = new Set(['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*']);
 const REQUIRED_BROWSER_API_SERVICES = new Set([
   'firebaseappcheck.googleapis.com',
@@ -286,6 +288,9 @@ type FirestoreVersionRetentionPeriod = 'seven-days' | 'one-hour' | 'other' | 'mi
 export interface FirestoreRecoveryFacts {
   readable: boolean;
   databaseNameMatches: boolean;
+  nativeMode: boolean;
+  standardEdition: boolean;
+  locationPresent: boolean;
   deletionProtection: FirestoreDeletionProtectionState;
   pitr: FirestorePitrState;
   earliestVersionTimePresent: boolean;
@@ -296,8 +301,16 @@ export interface FirestoreRestoreEvidenceFacts {
   readable: boolean;
   schemaErrors: number;
   completed: boolean;
+  stale: boolean;
   sourceUnchanged: boolean;
   isolatedTarget: boolean;
+  targetNotDefault: boolean;
+  targetInitiallyEmpty: boolean;
+  indexesVerified: boolean;
+  rulesVerified: boolean;
+  configVerified: boolean;
+  documentCountsVerified: boolean;
+  documentHashesVerified: boolean;
   dataVerified: boolean;
   applicationVerified: boolean;
 }
@@ -512,15 +525,38 @@ export function classifyFirestoreRecoveryState(facts: FirestoreRecoveryFacts): A
   return [
     booleanFinding('firestoreRecovery', 'readable', facts.readable),
     booleanFinding('firestoreRecovery', 'databaseNameMatches', facts.databaseNameMatches),
+    booleanFinding('firestoreRecovery', 'nativeMode', facts.nativeMode),
+    booleanFinding('firestoreRecovery', 'standardEdition', facts.standardEdition),
+    booleanFinding('firestoreRecovery', 'locationPresent', facts.locationPresent),
     booleanFinding('firestoreRecovery', 'deletionProtectionEnabled', facts.deletionProtection === 'enabled'),
     booleanFinding('firestoreRecovery', 'retentionConsistent', facts.readable && retentionConsistent),
-    finding('firestoreRecovery', 'earliestVersionTimePresent', 'pass', facts.earliestVersionTimePresent ? 1 : 0),
+    finding('firestoreRecovery', 'earliestVersionTimePresent', facts.earliestVersionTimePresent ? 'pass' : 'block', facts.earliestVersionTimePresent ? 1 : 0),
     finding(
       'firestoreRecovery',
       facts.pitr === 'enabled' ? 'pitrEnabled' : facts.pitr === 'disabled' ? 'pitrDecisionPending' : 'pitrUnknown',
       facts.pitr === 'enabled' ? 'pass' : facts.pitr === 'disabled' ? 'warn' : 'block',
       facts.pitr === 'enabled' ? 0 : 1,
     ),
+  ];
+}
+
+export function classifyFirestoreRestoreEvidence(facts: FirestoreRestoreEvidenceFacts): AuditFinding[] {
+  return [
+    booleanFinding('firestoreRestoreEvidence', 'readable', facts.readable),
+    finding('firestoreRestoreEvidence', 'schemaErrors', facts.schemaErrors === 0 ? 'pass' : 'block', facts.schemaErrors),
+    booleanFinding('firestoreRestoreEvidence', 'completed', facts.completed),
+    booleanFinding('firestoreRestoreEvidence', 'fresh', !facts.stale),
+    booleanFinding('firestoreRestoreEvidence', 'sourceUnchanged', facts.sourceUnchanged),
+    booleanFinding('firestoreRestoreEvidence', 'isolatedTarget', facts.isolatedTarget),
+    booleanFinding('firestoreRestoreEvidence', 'targetNotDefault', facts.targetNotDefault),
+    booleanFinding('firestoreRestoreEvidence', 'targetInitiallyEmpty', facts.targetInitiallyEmpty),
+    booleanFinding('firestoreRestoreEvidence', 'indexesVerified', facts.indexesVerified),
+    booleanFinding('firestoreRestoreEvidence', 'rulesVerified', facts.rulesVerified),
+    booleanFinding('firestoreRestoreEvidence', 'configVerified', facts.configVerified),
+    booleanFinding('firestoreRestoreEvidence', 'documentCountsVerified', facts.documentCountsVerified),
+    booleanFinding('firestoreRestoreEvidence', 'documentHashesVerified', facts.documentHashesVerified),
+    booleanFinding('firestoreRestoreEvidence', 'dataVerified', facts.dataVerified),
+    booleanFinding('firestoreRestoreEvidence', 'applicationVerified', facts.applicationVerified),
   ];
 }
 
@@ -565,6 +601,9 @@ export function inspectFirestoreRecoveryState(value: unknown, projectId: string)
   const invalid: FirestoreRecoveryFacts = {
     readable: false,
     databaseNameMatches: false,
+    nativeMode: false,
+    standardEdition: false,
+    locationPresent: false,
     deletionProtection: 'unknown',
     pitr: 'unknown',
     earliestVersionTimePresent: false,
@@ -572,9 +611,19 @@ export function inspectFirestoreRecoveryState(value: unknown, projectId: string)
   };
   if (!isPlainRecord(value)) return invalid;
   const name = value.name;
+  const type = value.type;
+  const databaseEdition = value.databaseEdition;
+  const locationId = value.locationId;
   const deleteProtectionState = value.deleteProtectionState;
   const pointInTimeRecoveryEnablement = value.pointInTimeRecoveryEnablement;
-  if (typeof name !== 'string') return invalid;
+  if (typeof name !== 'string'
+    || typeof type !== 'string'
+    || typeof databaseEdition !== 'string'
+    || typeof locationId !== 'string'
+    || !locationId.trim()
+    || value.earliestVersionTime === undefined
+    || value.versionRetentionPeriod === undefined
+  ) return invalid;
 
   const deletionProtection: FirestoreDeletionProtectionState = deleteProtectionState === 'DELETE_PROTECTION_ENABLED'
     ? 'enabled'
@@ -591,16 +640,27 @@ export function inspectFirestoreRecoveryState(value: unknown, projectId: string)
   const pitrEnumValid = pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_ENABLED'
     || pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_DISABLED'
     || pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_ENABLEMENT_UNSPECIFIED';
-  const earliestVersionTimeValid = value.earliestVersionTime === undefined || isProtobufTimestamp(value.earliestVersionTime);
+  const earliestVersionTimeValid = isProtobufTimestamp(value.earliestVersionTime);
   const versionRetentionPeriod = inspectVersionRetentionPeriod(value.versionRetentionPeriod);
+  const retentionMatchesPitr = pitr === 'enabled'
+    ? versionRetentionPeriod === 'seven-days'
+    : pitr === 'disabled' || pointInTimeRecoveryEnablement === 'POINT_IN_TIME_RECOVERY_ENABLEMENT_UNSPECIFIED'
+      ? versionRetentionPeriod === 'one-hour'
+      : false;
   const readable = deletionProtection !== 'unknown'
     && pitrEnumValid
+    && type === 'FIRESTORE_NATIVE'
+    && databaseEdition === 'STANDARD'
     && earliestVersionTimeValid
-    && versionRetentionPeriod !== undefined;
+    && versionRetentionPeriod !== undefined
+    && retentionMatchesPitr;
 
   return {
     readable,
     databaseNameMatches: name === `projects/${projectId}/databases/(default)`,
+    nativeMode: type === 'FIRESTORE_NATIVE',
+    standardEdition: databaseEdition === 'STANDARD',
+    locationPresent: locationId.trim().length > 0,
     deletionProtection,
     pitr,
     earliestVersionTimePresent: typeof value.earliestVersionTime === 'string' && earliestVersionTimeValid,
@@ -608,13 +668,21 @@ export function inspectFirestoreRecoveryState(value: unknown, projectId: string)
   };
 }
 
-export function inspectFirestoreRestoreEvidence(value: unknown): FirestoreRestoreEvidenceFacts {
+export function inspectFirestoreRestoreEvidence(value: unknown, nowMs = Date.now()): FirestoreRestoreEvidenceFacts {
   const invalid: FirestoreRestoreEvidenceFacts = {
     readable: false,
     schemaErrors: 1,
     completed: false,
+    stale: true,
     sourceUnchanged: false,
     isolatedTarget: false,
+    targetNotDefault: false,
+    targetInitiallyEmpty: false,
+    indexesVerified: false,
+    rulesVerified: false,
+    configVerified: false,
+    documentCountsVerified: false,
+    documentHashesVerified: false,
     dataVerified: false,
     applicationVerified: false,
   };
@@ -625,32 +693,77 @@ export function inspectFirestoreRestoreEvidence(value: unknown): FirestoreRestor
     'sourceDatabase',
     'restoreMethod',
     'targetIsolation',
+    'targetDatabaseDefault',
     'status',
     'sourceUnchanged',
+    'targetInitiallyEmpty',
+    'indexesVerified',
+    'rulesVerified',
+    'configVerified',
+    'documentCountsVerified',
+    'documentHashesVerified',
     'dataVerificationPassed',
     'applicationVerificationPassed',
   ])) return invalid;
   const sourceUnchanged = value.sourceUnchanged;
+  const targetDatabaseDefault = value.targetDatabaseDefault;
+  const targetInitiallyEmpty = value.targetInitiallyEmpty;
+  const indexesVerified = value.indexesVerified;
+  const rulesVerified = value.rulesVerified;
+  const configVerified = value.configVerified;
+  const documentCountsVerified = value.documentCountsVerified;
+  const documentHashesVerified = value.documentHashesVerified;
   const dataVerificationPassed = value.dataVerificationPassed;
   const applicationVerificationPassed = value.applicationVerificationPassed;
   const valid = value.schemaVersion === 1
     && value.evidenceType === 'firestore-restore-rehearsal'
     && isProtobufTimestamp(value.collectedAt)
     && value.sourceDatabase === '(default)'
-    && (value.restoreMethod === 'pitr-clone' || value.restoreMethod === 'firestore-export-import')
+    && (value.restoreMethod === 'pitr-clone'
+      || value.restoreMethod === 'native-backup-restore'
+      || value.restoreMethod === 'firestore-export-import')
     && (value.targetIsolation === 'separate-database' || value.targetIsolation === 'separate-project')
+    && typeof targetDatabaseDefault === 'boolean'
     && (value.status === 'passed' || value.status === 'failed')
     && typeof sourceUnchanged === 'boolean'
+    && typeof targetInitiallyEmpty === 'boolean'
+    && typeof indexesVerified === 'boolean'
+    && typeof rulesVerified === 'boolean'
+    && typeof configVerified === 'boolean'
+    && typeof documentCountsVerified === 'boolean'
+    && typeof documentHashesVerified === 'boolean'
     && typeof dataVerificationPassed === 'boolean'
     && typeof applicationVerificationPassed === 'boolean'
-    && (value.status === 'failed' || (sourceUnchanged && dataVerificationPassed && applicationVerificationPassed));
+    && (value.status === 'failed' || (
+      !targetDatabaseDefault
+      && sourceUnchanged
+      && targetInitiallyEmpty
+      && indexesVerified
+      && rulesVerified
+      && configVerified
+      && documentCountsVerified
+      && documentHashesVerified
+      && dataVerificationPassed
+      && applicationVerificationPassed
+    ));
   if (!valid) return invalid;
+  const collectedAtMs = Date.parse(value.collectedAt as string);
   return {
     readable: true,
     schemaErrors: 0,
     completed: value.status === 'passed',
+    stale: !Number.isFinite(nowMs)
+      || nowMs < collectedAtMs
+      || nowMs - collectedAtMs > FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000,
     sourceUnchanged,
     isolatedTarget: true,
+    targetNotDefault: !targetDatabaseDefault,
+    targetInitiallyEmpty,
+    indexesVerified,
+    rulesVerified,
+    configVerified,
+    documentCountsVerified,
+    documentHashesVerified,
     dataVerified: dataVerificationPassed,
     applicationVerified: applicationVerificationPassed,
   };
@@ -1360,6 +1473,23 @@ async function collectFirestoreRecoveryState(projectId: string): Promise<Firesto
   return collectFirestoreRecoveryStateWithExecutor(projectId);
 }
 
+export async function collectFirestoreRestoreEvidenceWithReader(
+  path: string,
+  nowMs = Date.now(),
+  readText: (path: string) => Promise<string> = path => readFile(path, 'utf8'),
+): Promise<FirestoreRestoreEvidenceFacts> {
+  try {
+    return inspectFirestoreRestoreEvidence(JSON.parse(await readText(path)) as unknown, nowMs);
+  } catch {
+    return inspectFirestoreRestoreEvidence(undefined, nowMs);
+  }
+}
+
+async function collectFirestoreRestoreEvidence(): Promise<FirestoreRestoreEvidenceFacts> {
+  const configuredPath = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE?.trim();
+  return collectFirestoreRestoreEvidenceWithReader(configuredPath || DEFAULT_FIRESTORE_RESTORE_EVIDENCE_PATH);
+}
+
 function runtimeIdentityInput(activeAdcServiceAccountEmail?: string) {
   return {
     runtimeServiceAccountEmail: process.env.PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL,
@@ -1557,6 +1687,7 @@ async function collectReport(): Promise<AuditReport> {
     collectBucketCors(storageBucket).then(classifyBucketCors),
     collectAppCheck(projectId).then(classifyAppCheck),
     collectFirestoreRecoveryState(projectId).then(classifyFirestoreRecoveryState),
+    collectFirestoreRestoreEvidence().then(classifyFirestoreRestoreEvidence),
     collectIamRoles(projectId).then(classifyIamRoles),
     collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
     collectRuntimeRoleManifest().then(classifyRuntimeRoleManifest),
@@ -1567,7 +1698,7 @@ async function collectReport(): Promise<AuditReport> {
     collectDependencyAudit().then(classifyDependencyAudit),
     collectFirebaseRuleProbes(projectId, storageBucket).then(classifyFirebaseRuleProbes),
   ];
-  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'bucketCors', 'appCheck', 'firestoreRecovery', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
+  const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'bucketCors', 'appCheck', 'firestoreRecovery', 'firestoreRestoreEvidence', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
   const results = await Promise.allSettled(tasks);
   const findings = results.flatMap((result, index) => result.status === 'fulfilled'
     ? result.value

@@ -274,16 +274,18 @@ Before production approval, follow `infra/private-pro/firestore-recovery-control
 
 The read-only Task 22 collection on 2026-08-18 found Firestore deletion protection disabled. This is a deployment blocker. Enabling it is a cloud mutation and still requires explicit approval for the exact command in the recovery runbook.
 
-PITR is also disabled. Do not enable PITR or provision scheduled exports until the product owner selects an RPO/RTO and the cost approver accepts the current location, edition, storage, operation, runtime, and retention estimate. The Task 12 password-encrypted archive is interactive and must not be described or implemented as a server-scheduled backup without a separate safe noninteractive key design. A managed Firestore export preserves stored ciphertext and metadata, but it is an infrastructure restore artifact rather than the user-facing encrypted archive.
+PITR is also disabled. Do not enable PITR, native scheduled backups, or scheduled exports until the product owner selects an RPO/RTO and the cost approver accepts the current location, edition, storage, operation, runtime, and retention estimate. The Task 12 password-encrypted archive is interactive and must not be described or implemented as a server-scheduled backup without a separate safe noninteractive key design.
 
-No restore rehearsal may target `(default)`. Use a separate database or approved separate project, verify the application against it, and delete rehearsal resources only with separate cleanup approval.
+Native scheduled backups are consistent point-in-time copies with data and index configurations, daily or weekly recurrence, up to 14 weeks retention, and restore to a new database. Managed Firestore exports are different: they preserve stored ciphertext documents, but normal exports are not exact start-time snapshots, can include changes made during the export, and omit index definitions. Imports overwrite matching IDs and retain unrelated target documents. Every export/import rehearsal must use a freshly created empty isolated non-default target, deploy the exact current indexes, rules, TTL policies, and required configuration separately, then validate counts, keyed ciphertext hashes, and application reconstruction.
+
+No restore rehearsal may target `(default)`. The audit requires fresh complete evidence at `infra/private-pro/firestore-restore-evidence.json`, or the path configured by `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE`. Missing, older-than-90-day, failed, non-isolated, default-target, non-empty-target, index/rule/config, count/hash, data, or application validation evidence blocks production release. Delete rehearsal resources only with separate cleanup approval.
 
 ## Deployment
 
 Before step 1, confirm there are zero existing plaintext Private Pro users, chats, personas, assets, credentials, settings, or cloud records. If this is false, stop. A separate migration design, implementation, test plan, and review must finish before encrypted-vault rollout.
 
 1. Clear the Firestore deletion-protection blocker using the separately approved command in the recovery runbook, then save a redacted verification snapshot.
-2. Record the approved RPO/RTO and cost decision for PITR, scheduled Firestore ciphertext exports, both, or explicit acceptance of the remaining recovery risk. Do not infer approval from deletion-protection approval.
+2. Record the approved RPO/RTO and cost decision for PITR, native scheduled backups, scheduled Firestore ciphertext exports, a combination, or explicit acceptance of the remaining recovery risk. Do not infer approval from deletion-protection approval.
 3. Obtain approval for IAM provisioning. Create the dedicated runtime identity, WIF provider or static fallback, custom project role, and runtime-service-account-scoped Token Creator binding outside production first.
 4. Validate every manifest permission with a staging identity and protected endpoint probes. This Task 20 implementation has not performed that live validation.
 5. Push branch `pro` using your normal Git workflow.
@@ -311,8 +313,8 @@ Before step 1, confirm there are zero existing plaintext Private Pro users, chat
 - Concurrent edits preserve a conflict copy.
 - Direct Firestore writes and direct Storage uploads fail.
 - Firestore deletion protection is enabled and the security audit reports no recovery-state blocker.
-- The approved PITR or export recovery control matches the recorded RPO/RTO and current cost decision.
-- The latest restore rehearsal used an isolated target, left `(default)` unchanged, and produced only redacted evidence.
+- The approved PITR, native backup, or export recovery control matches the recorded RPO/RTO and current cost decision.
+- The latest restore rehearsal used a fresh empty isolated non-default target, left `(default)` unchanged, verified current indexes/rules/configuration plus counts/hashes/application reconstruction, and produced current strict redacted evidence.
 - The security audit reports no blockers for the exact custom-domain deployment alias, Firebase Auth domains, browser API-key referrers/API targets, or bucket CORS.
 - Removing an email and running access sync blocks its server mutations.
 - Missing or invalid `x-firebase-appcheck` blocks every private Pro procedure.

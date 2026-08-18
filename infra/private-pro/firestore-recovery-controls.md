@@ -31,7 +31,9 @@ gcloud firestore databases describe --database='(default)' --project=$ProjectId 
 npm run private-pro:security-audit -- --report-only
 ```
 
-The security audit uses the exact `gcloud firestore databases describe` command, validates the current API enum values, and fails closed when the command or resource shape is unreadable. It blocks when deletion protection is disabled or unspecified. It warns when PITR is explicitly disabled because the paid-control decision is pending, and blocks an unknown PITR value.
+The security audit uses the exact `gcloud firestore databases describe` command and requires the complete current resource shape: name, database type, edition, location, deletion protection, PITR enablement, earliest version time, and retention period. It accepts only the exact current combinations of disabled PITR with `3600s` or enabled PITR with `604800s`. Missing, malformed, unknown, or inconsistent fields block.
+
+The audit also reads restore rehearsal evidence from `infra/private-pro/firestore-restore-evidence.json`, or from the path in `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE`. Missing evidence blocks. Valid evidence must be no older than 90 days. The canonical evidence file does not exist because no restore rehearsal has run.
 
 ## Options
 
@@ -39,7 +41,7 @@ The security audit uses the exact `gcloud firestore databases describe` command,
 
 PITR extends the readable version-retention window from one hour to seven days. Reads, exports, and clones select a whole-minute timestamp not earlier than `earliestVersionTime`. The full seven-day window accumulates only after PITR has been enabled long enough. A PITR recovery clone creates a new database in the same location and does not overwrite the source database.
 
-Firestore charges PITR storage separately from normal database storage. The official pricing model measures database size daily, averages it over the month, and applies the location-specific PITR GiB-month SKU. Google states that many customers will find PITR storage cost similar to database storage cost, but that is not a project estimate. Clone operations are also billable and have no free usage.
+Firestore charges PITR storage separately from normal database storage. Public `us-central1` Standard edition list pricing is $0.15 per GiB-month of PITR data and $0.20 per GiB cloned. There is no free quota for PITR or clone operations. Billing-account currency, contracts, credits, and discounts can change the effective price.
 
 Operational characteristics:
 
@@ -50,17 +52,36 @@ Operational characteristics:
 - Application owner: validates encrypted vault records, indexes, attachment metadata, entitlement records, and a clean-profile application bootstrap against the clone.
 - Key ownership: unchanged. Firestore stores application ciphertext, but a cloned database does not make ciphertext decryptable without the user's vault key or recovery material.
 
+### Native scheduled backups
+
+Firestore native scheduled backups are consistent point-in-time copies. A backup contains all data and index configurations at the backup time. It does not contain database TTL policies. Backups remain in the source database location and restore to a new database.
+
+Each database supports at most one daily schedule and one weekly schedule. The exact execution time cannot be selected. Weekly schedules allow a day of week. Retention is configurable up to 14 weeks.
+
+Public `us-central1` Standard edition list pricing is $0.03 per GiB-month of retained backup data and $0.20 per GiB restored. The billable retained fraction depends on backup size and retention days. There is no free quota for backup data or restores. Billing-account terms can change effective cost.
+
+Operational characteristics:
+
+- RPO: backup cadence plus the provider-selected execution time and backup completion time.
+- Retention: up to 14 weeks.
+- Restore target: a new database in the backup's location.
+- Restore owner: Firestore operator with backup schedule, backup, and restore permissions.
+- Application owner: validates restored data, current security rules, TTL policies, other database configuration, and application reconstruction.
+- Key ownership: unchanged. Native backups contain stored application ciphertext and do not escrow user vault keys.
+
 ### Scheduled Firestore exports of application ciphertext
 
 The Task 12 archive format is client-side, password-encrypted, authenticated, and interactive. It requires a user password or recovery key to unwrap the vault key. It is not server-schedulable without a separately approved noninteractive key-management design. Do not put a user's password, recovery key, vault master key, or export-unwrapping secret into Cloud Scheduler, Cloud Run, Cloud Functions, Vercel, or Firebase configuration.
 
-A server-triggered Firestore managed export is different. It copies Firestore documents to Cloud Storage. For Private Pro, encrypted vault records remain ciphertext because ciphertext is what Firestore stores. The export also preserves Firestore document structure and operational metadata. It is an infrastructure restore artifact, not the Task 12 user-facing archive, and it does not prove that a user can decrypt or import the data through the application.
+A server-triggered Firestore managed export is different. It copies Firestore documents to Cloud Storage. For Private Pro, encrypted vault records remain ciphertext because ciphertext is what Firestore stores. It is an infrastructure restore artifact, not the Task 12 user-facing archive, and it does not prove that a user can decrypt or import the data through the application.
+
+A normal managed export is not an exact database snapshot at export start. It can include changes made while the operation runs. Only an export that explicitly uses a supported PITR `--snapshot-time` selects a whole-minute point in time. Exports do not contain index definitions. On import, Firestore uses the target database's current index definitions, overwrites documents with matching IDs, and leaves unrelated target documents intact. Therefore an import rehearsal must use a freshly created, empty, isolated non-default database or separate project. Deploy the exact current indexes, security rules, TTL policies, and other required database configuration separately before application validation.
 
 Scheduled exports require an execution service, schedule, destination bucket, least-privilege IAM, retention lifecycle, monitoring, failure alerts, and periodic import rehearsals. The official solution uses Cloud Scheduler plus a function that calls Firestore Admin `exportDocuments`. Each exported document is billed as a document read. Other cost inputs include Cloud Storage class and retained bytes, storage operations, scheduler jobs, function or Cloud Run execution, logging, network transfer if locations differ, and import document writes during rehearsal.
 
 Operational characteristics:
 
-- RPO: selected schedule interval plus export completion time.
+- RPO: selected schedule interval plus export duration, with the consistency caveat above unless a PITR snapshot time is used.
 - Retention: bucket lifecycle policy selected by the operator.
 - Restore target: a separate Firestore database, or a separate project when export/import IAM and bucket access are configured.
 - Restore owner: infrastructure operator owns scheduler, export job, bucket, retention, import, alerts, and cleanup.
@@ -69,27 +90,44 @@ Operational characteristics:
 
 ### Decision table
 
-| Decision input | Firestore PITR | Scheduled Firestore export |
-| --- | --- | --- |
-| Primary incident | Recent accidental write or deletion | Longer retention, project isolation, or durable snapshots |
-| RPO | One minute | Schedule interval plus completion time |
-| Retention | Fixed seven-day window | Operator-defined bucket retention |
-| Restore path | Clone to a new same-location database | Import to a separate database or project |
-| Direct production overwrite | No | Import must target the explicitly selected database |
-| Routine ownership | Firestore/database operator | Scheduler, runtime, bucket, IAM, and monitoring owner |
-| Cost dimensions | PITR GiB-month and clone size | Export reads, object storage, scheduler/runtime/logging, import writes, possible transfer |
-| User-friendly encrypted archive | No | No |
-| Safe noninteractive user-key design required | No | Not for ciphertext export; yes if attempting to generate the Task 12 archive server-side |
+| Decision input | Firestore PITR | Native scheduled backups | Scheduled Firestore export |
+| --- | --- | --- | --- |
+| Primary incident | Recent accidental write or deletion | Consistent retained restore points | Longer custom retention or cross-project artifact |
+| RPO | One minute within accumulated window | Daily/weekly cadence plus provider-selected start/completion | Schedule interval plus export duration; cross-time unless PITR snapshot-time is used |
+| Retention | Fixed seven-day window | Configurable up to 14 weeks | Operator-defined bucket retention |
+| Restore path | Clone to new same-location database | Restore to new database in backup location | Import into fresh empty separate database or project |
+| Index definitions | Clone includes indexes | Backup includes index configurations | Export omits index definitions; deploy current indexes separately |
+| Target merge risk | New database | New database | Matching IDs overwrite and unrelated target docs remain, so target must start empty |
+| Routine ownership | Firestore/database operator | Firestore backup operator | Scheduler, runtime, bucket, IAM, and monitoring owner |
+| Public list-price dimensions | $0.15/GiB-month PITR; $0.20/GiB clone | $0.03/GiB-month backup; $0.20/GiB restore | $0.03/100k export reads; $0.09/100k import writes; $0.02/GiB-month regional Standard storage; scheduler/runtime/logging/transfer |
+| User-friendly encrypted archive | No | No | No |
+| Safe noninteractive user-key design required | No | No | Not for ciphertext export; yes if attempting to generate the Task 12 archive server-side |
 
 ## Exact estimate
 
-Do not approve a paid control from a generic dollar figure. The exact estimate needs:
+Public list prices below are for Firestore Standard edition and regional Cloud Storage Standard in `us-central1`, accessed 2026-08-18. They are not a project estimate:
+
+| Item | Public list price |
+| --- | --- |
+| Firestore document reads | $0.03 per 100,000 documents |
+| Firestore document writes | $0.09 per 100,000 documents |
+| Firestore PITR data | $0.15 per GiB-month |
+| Firestore native backup data | $0.03 per GiB-month |
+| Firestore restore operation | $0.20 per GiB |
+| Firestore clone operation | $0.20 per GiB |
+| Cloud Storage regional Standard in `us-central1` | $0.02 per GiB-month |
+| Cloud Scheduler | 3 free jobs per billing account, then $0.10 per job per month |
+
+Managed export bills one read per exported document. Import bills one write per imported document. Export objects also incur Cloud Storage charges. Cloud Scheduler charges by defined job, not executions. Runtime, logging, storage operations, network transfer, and account-specific billing still require the calculator or billing price table.
+
+Do not approve a paid control from the list prices alone. The exact estimate needs:
 
 1. Firestore location `us-central1` and Standard edition.
 2. Average database stored GiB, including indexes and metadata.
 3. For PITR: expected average database size and clone rehearsal frequency/size.
-4. For exports: document count per run, export frequency, average export bytes, storage class, retention days, bucket location, scheduler job count, runtime duration/memory, log volume, import rehearsal frequency, and possible network transfer.
-5. Billing-account-specific contract pricing, currency, and discounts.
+4. For native backups: schedule count, retained backup sizes, retention days, and restore rehearsal size/frequency.
+5. For exports: document count per run, export frequency/duration, average export bytes, storage class, retention days, bucket location, scheduler job count, runtime duration/memory, log volume, import rehearsal frequency, and possible network transfer.
+6. Billing-account-specific contract pricing, currency, credits, and discounts.
 
 The operator should use the Firestore, Cloud Storage, Cloud Scheduler, and chosen runtime pricing pages with the actual measurements. For account-specific prices, use the Google Cloud Console billing pricing table or the Cloud Billing Pricing API with a principal allowed to view the billing account. Save the estimate and selected RPO/RTO with the approval record. Do not commit billing account IDs or contract price exports.
 
@@ -161,6 +199,30 @@ No export bucket, scheduler, runtime, service account, IAM binding, lifecycle po
 
 Do not add an endpoint, cron job, or stored secret that attempts to generate the Task 12 password-encrypted archive noninteractively.
 
+## Approval-required native scheduled backup
+
+Not executed. Select exactly one daily and/or one weekly schedule plus retention no longer than 14 weeks. Example only after explicit cost and mutation approval:
+
+```powershell
+$ProjectId='big-agi-243b6'
+
+npx firebase --project $ProjectId firestore:backups:schedules:create --database='(default)' --recurrence='DAILY' --retention='14w'
+npx firebase --project $ProjectId firestore:backups:schedules:create --database='(default)' --recurrence='WEEKLY' --day-of-week='SUNDAY' --retention='14w'
+```
+
+Read-only verification:
+
+```powershell
+npx firebase --project $ProjectId firestore:backups:schedules:list --database='(default)'
+npx firebase --project $ProjectId firestore:backups:list --location='us-central1'
+```
+
+Rollback deletes only the explicitly selected schedule resource and requires separate approval:
+
+```powershell
+npx firebase --project $ProjectId firestore:backups:schedules:delete 'BACKUP_SCHEDULE_RESOURCE_NAME'
+```
+
 ## Restore rehearsal
 
 Every command below is a cloud mutation and was not executed.
@@ -177,9 +239,21 @@ $DestinationDatabase='private-pro-restore-YYYYMMDD'
 gcloud firestore databases clone --source-database="projects/$ProjectId/databases/(default)" --snapshot-time=$SnapshotTime --destination-database=$DestinationDatabase --project=$ProjectId
 ```
 
+### Native backup restore
+
+Select one verified backup resource and restore it to a new non-default database. Never use `(default)` as the destination.
+
+```powershell
+$ProjectId='big-agi-243b6'
+$SourceBackup='projects/PROJECT_ID/locations/us-central1/backups/BACKUP_ID'
+$DestinationDatabase='private-pro-restore-YYYYMMDD'
+
+gcloud firestore databases restore --source-backup=$SourceBackup --destination-database=$DestinationDatabase --project=$ProjectId
+```
+
 ### Firestore export import
 
-For a managed Firestore export, import into an explicitly created and isolated target database. A separate project is preferred when the tested IAM and bucket path support it.
+For a managed Firestore export, import into a freshly created empty isolated non-default target database. A separate project is preferred when the tested IAM and bucket path support it. Never import a rehearsal into a target containing documents: matching IDs are overwritten and unrelated documents survive.
 
 ```powershell
 $DestinationProjectId='APPROVED_REHEARSAL_PROJECT_ID'
@@ -193,13 +267,14 @@ Rehearsal checks:
 
 1. Confirm the source default database remains unchanged.
 2. Confirm the target is isolated from production traffic, rules deployment, scheduled sweep, and production credentials.
-3. Compare redacted document and collection-group counts. Do not save document IDs or raw records.
-4. Verify required indexes and operational metadata separately. Export/import and backup products differ in which database-level configuration they preserve.
-5. Point a non-production application deployment at the target.
-6. Use a clean browser profile and approved test user. Unlock with test recovery material, hydrate encrypted vault records, and verify a sentinel chat, setting, credential, and attachment metadata.
-7. Verify ciphertext remains unreadable without the correct vault key.
-8. Record the elapsed recovery time, achieved RPO, validation result, and owner sign-off.
-9. Delete the rehearsal database, bucket objects, or project only under separate explicit cleanup approval.
+3. Before import, prove the isolated target has zero documents. Record a boolean only.
+4. Deploy and verify the exact current indexes, security rules, TTL policies, and required database configuration separately. Managed exports do not contain index definitions. Native backups include index configurations but not TTL policies.
+5. Compare redacted document and collection-group counts and keyed ciphertext hashes. Do not save document IDs, raw records, or hash keys.
+6. Point a non-production application deployment at the target.
+7. Use a clean browser profile and approved test user. Unlock with test recovery material, hydrate encrypted vault records, and verify a sentinel chat, setting, credential, and attachment metadata.
+8. Verify ciphertext remains unreadable without the correct vault key.
+9. Record the elapsed recovery time, achieved RPO, consistency mode, validation result, and owner sign-off.
+10. Delete the rehearsal database, bucket objects, or project only under separate explicit cleanup approval.
 
 ## Restore evidence
 
@@ -213,14 +288,21 @@ Commit only the redacted structure below. The audit exposes a strict validator f
   "sourceDatabase": "(default)",
   "restoreMethod": "pitr-clone",
   "targetIsolation": "separate-database",
+  "targetDatabaseDefault": false,
   "status": "passed",
   "sourceUnchanged": true,
+  "targetInitiallyEmpty": true,
+  "indexesVerified": true,
+  "rulesVerified": true,
+  "configVerified": true,
+  "documentCountsVerified": true,
+  "documentHashesVerified": true,
   "dataVerificationPassed": true,
   "applicationVerificationPassed": true
 }
 ```
 
-Allowed `restoreMethod` values are `pitr-clone` and `firestore-export-import`. Allowed `targetIsolation` values are `separate-database` and `separate-project`. Never include project numbers, billing account IDs, backup IDs, export URIs, database resource names, document IDs, user IDs, tokens, keys, raw records, IAM policies, or raw command output.
+Allowed `restoreMethod` values are `pitr-clone`, `native-backup-restore`, and `firestore-export-import`. Allowed `targetIsolation` values are `separate-database` and `separate-project`. Never include project numbers, billing account IDs, backup IDs, export URIs, database resource names, document IDs, user IDs, tokens, keys, raw records, IAM policies, or raw command output.
 
 ## RTO and RPO approval
 
@@ -228,7 +310,7 @@ Allowed `restoreMethod` values are `pitr-clone` and `firestore-export-import`. A
 | --- | --- | --- |
 | Maximum acceptable recent data loss | One minute, one hour, one day, or another explicit value | Product owner |
 | Maximum acceptable recovery duration | Exact RTO in minutes or hours | Product owner and incident commander |
-| Recovery control | PITR, scheduled export, both, or documented acceptance of the remaining risk | Product owner and cost approver |
+| Recovery control | PITR, native scheduled backups, scheduled export, a combination, or documented acceptance of remaining risk | Product owner and cost approver |
 | Restore execution | Named database operator | Operations owner |
 | Application validation | Named Private Pro application owner | Engineering owner |
 | Billing and alerts | Named billing owner and monthly ceiling | Cost approver |
@@ -238,9 +320,10 @@ Allowed `restoreMethod` values are `pitr-clone` and `firestore-export-import`. A
 
 1. Approve enabling Firestore deletion protection on `(default)` now using the exact command above? This is required to clear the current blocker.
 2. What RPO and RTO must Private Pro meet?
-3. Accept Firestore PITR cost after reviewing the `us-central1` Standard edition estimate, or select scheduled Firestore ciphertext exports for a separate design?
-4. If exports are selected, approve the schedule, retention, bucket location/class, runtime, IAM, monitoring owner, rehearsal target, and measured cost ceiling?
-5. Approve a non-destructive restore rehearsal only after the target database or project and cleanup plan are reviewed?
+3. After reviewing measured costs, select PITR, native scheduled backups, scheduled Firestore ciphertext exports, a combination, or explicit risk acceptance?
+4. If native backups are selected, approve daily and/or weekly recurrence, retention, restore owner, rehearsal cadence, and cost ceiling?
+5. If exports are selected, approve the schedule, consistency mode, retention, bucket location/class, runtime, IAM, monitoring owner, fresh empty rehearsal target, and measured cost ceiling?
+6. Approve a non-destructive restore rehearsal only after the fresh empty target database or project and cleanup plan are reviewed?
 
 ## Sources
 
@@ -252,6 +335,8 @@ Official sources accessed 2026-08-18:
 - `gcloud firestore databases update`: <https://cloud.google.com/sdk/gcloud/reference/firestore/databases/update>
 - Firestore PITR behavior and clone workflow: <https://firebase.google.com/docs/firestore/use-pitr>
 - `gcloud firestore databases clone`: <https://cloud.google.com/sdk/gcloud/reference/firestore/databases/clone>
+- Native scheduled backups: <https://firebase.google.com/docs/firestore/backups>
+- `gcloud firestore databases restore`: <https://cloud.google.com/sdk/gcloud/reference/firestore/databases/restore>
 - Firestore export/import: <https://firebase.google.com/docs/firestore/manage-data/export-import>
 - Scheduled Firestore export solution: <https://firebase.google.com/docs/firestore/solutions/schedule-export>
 - Firestore Standard edition pricing: <https://cloud.google.com/firestore/pricing>

@@ -131,3 +131,72 @@ Official sources accessed 2026-08-18:
 ## Cloud boundary
 
 All approval-required commands in the runbook are documentation only. No mutation occurred.
+
+## Fix round 1
+
+Status: complete. No cloud mutation occurred.
+
+### Review findings
+
+The first implementation overstated normal managed export consistency, allowed partial Firestore database resources to pass, did not make restore evidence part of the security audit, omitted native scheduled backups, and did not list the current official `us-central1` public rates.
+
+### Changes
+
+- Corrected managed export/import semantics:
+  - A normal export is not an exact snapshot at export start and can include changes made while it runs.
+  - A whole-minute PITR `--snapshot-time` is the explicit point-in-time export path where supported.
+  - Exports omit index definitions.
+  - Imports use current target index definitions, overwrite matching IDs, and retain unrelated target documents.
+  - Export/import rehearsals now require a freshly created empty isolated non-default target, separate index/rule/TTL/config deployment, redacted document counts, keyed ciphertext hashes, and application reconstruction.
+- Tightened Firestore database collection to require exact name, `FIRESTORE_NATIVE`, `STANDARD`, nonempty location, deletion protection, PITR enablement, earliest version time, and retention period. Only disabled PITR plus `3600s` or enabled PITR plus `604800s` is readable. Missing, malformed, unknown, or inconsistent fields block.
+- Changed `earliestVersionTimePresent` from a constant pass to a real blocker when absent.
+- Added a canonical restore evidence gate at `infra/private-pro/firestore-restore-evidence.json`, with `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE` as an explicit path override.
+- Missing, malformed, failed, older-than-90-day, changed-source, non-isolated, default-target, non-empty-target, index/rule/config, count/hash, data, or application evidence now blocks the audit.
+- Added `native-backup-restore` evidence support.
+- Added native scheduled backups as a third option: consistent point-in-time data plus index configurations, one daily and one weekly schedule per database, provider-selected execution time, up to 14 weeks retention, same-location restore to a new database, and TTL policy exclusion.
+- Added current public `us-central1` Standard list rates from official pages:
+  - Firestore reads: $0.03 per 100,000 documents.
+  - Firestore writes: $0.09 per 100,000 documents.
+  - PITR data: $0.15 per GiB-month.
+  - Native backup data: $0.03 per GiB-month.
+  - Restore and clone: $0.20 per GiB.
+  - Regional Cloud Storage Standard: $0.02 per GiB-month.
+  - Cloud Scheduler: 3 free jobs per billing account, then $0.10 per job per month.
+- Kept calculator/billing-table requirements for runtime, logging, operations, network transfer, currency, credits, contracts, and discounts.
+
+### TDD
+
+RED:
+
+```text
+41 tests: 36 passed, 5 failed
+```
+
+The failures covered missing complete database facts, permissive partial resources, the expanded restore evidence schema, the absent restore evidence classifier, and the absent local evidence collector.
+
+GREEN:
+
+```text
+41 focused audit tests: 41 passed, 0 failed
+46 Private Pro tool tests: 46 passed, 0 failed
+```
+
+Focused Task 22 TypeScript passed. The temporary project file was deleted and is not committed.
+
+All Private Pro tool tests passed. The tools-wide TypeScript project remained blocked only by the known 5 duplicate-React JSX/ReactNode errors in 4 unrelated application files. Focused ESLint remained blocked before file analysis by the existing `@rushstack/eslint-patch` caller-recognition error.
+
+### Report-only state
+
+`npm run private-pro:security-audit -- --report-only` exited 0. The report had 45 pass, 8 warn, and 40 block findings across the existing audit.
+
+The `firestoreRecovery` resource was complete and readable. Deletion protection remained a blocker, retention was the exact disabled-PITR `3600s` state, and the PITR decision remained a warning.
+
+The new `firestoreRestoreEvidence` area blocked because the canonical evidence file is absent. This is expected: no restore rehearsal has been approved or run, and no evidence was fabricated.
+
+The report-only JSON parsed successfully and asserted the deletion-protection blocker, restore-evidence blocker, empty-target evidence blocker, and PITR decision warning. The docs/source contract assertions passed.
+
+Final verification reran focused TypeScript, all 46 Private Pro tool tests, report-only JSON assertions, the zero-mutation snapshot assertion, docs/source contracts, Task 22 artifact secret scan, and `git diff --check` against the final fix. All passed.
+
+### Sources
+
+All pricing and product semantics in this fix round use the official sources already listed above, accessed 2026-08-18. Account-specific effective prices still require the billing price table or Pricing API.
