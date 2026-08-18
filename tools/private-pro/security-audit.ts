@@ -1,6 +1,6 @@
 import { execFile as execFileCallback } from 'node:child_process';
-import { createHmac, timingSafeEqual } from 'node:crypto';
-import { access, readFile, realpath } from 'node:fs/promises';
+import { createPublicKey, verify } from 'node:crypto';
+import { access, lstat, open, readFile, realpath } from 'node:fs/promises';
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import { promisify } from 'node:util';
 import { pathToFileURL } from 'node:url';
@@ -12,7 +12,10 @@ const execFile = promisify(execFileCallback);
 const DEFAULT_PROJECT_ID = 'big-agi-243b6';
 const DEFAULT_DEPLOYMENT_ORIGIN = 'https://chatgpt.ashesh.dev';
 const DEFAULT_FIRESTORE_RESTORE_EVIDENCE_PATH = 'infra/private-pro/firestore-restore-evidence.json';
+const FIRESTORE_RESTORE_TRUST_PATH = 'infra/private-pro/firestore-restore-attestor-trust.json';
 const FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS = 90;
+const FIRESTORE_RESTORE_ATTESTATION_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
+const FIRESTORE_RESTORE_FUTURE_SKEW_MS = 5 * 60 * 1000;
 const FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES = 1024 * 1024;
 const FIRESTORE_RESTORE_FAMILIES = [
   'accounts',
@@ -331,14 +334,19 @@ export interface FirestoreRestoreEvidenceFacts {
   documentHashesVerified: boolean;
   dataVerified: boolean;
   applicationVerified: boolean;
-  macVerified: boolean;
+  signatureVerified: boolean;
   releaseCommitMatches: boolean;
+  trustConfigured: boolean;
+  provenanceMatches: boolean;
+  worktreeClean: boolean;
 }
 
 interface FirestoreRestoreEvidenceInput {
   nowMs: number;
-  expectedCommitSha: string;
-  hmacKeyBase64: string;
+  actualHeadSha: string;
+  worktreeClean?: boolean;
+  additionalExpectedCommitSha?: string;
+  trustDescriptor: unknown;
 }
 
 interface FirestoreRestoreEvidenceCollectorInput extends FirestoreRestoreEvidenceInput {
@@ -587,8 +595,11 @@ export function classifyFirestoreRestoreEvidence(facts: FirestoreRestoreEvidence
     booleanFinding('firestoreRestoreEvidence', 'documentHashesVerified', facts.documentHashesVerified),
     booleanFinding('firestoreRestoreEvidence', 'dataVerified', facts.dataVerified),
     booleanFinding('firestoreRestoreEvidence', 'applicationVerified', facts.applicationVerified),
-    booleanFinding('firestoreRestoreEvidence', 'macVerified', facts.macVerified),
+    booleanFinding('firestoreRestoreEvidence', 'signatureVerified', facts.signatureVerified),
     booleanFinding('firestoreRestoreEvidence', 'releaseCommitMatches', facts.releaseCommitMatches),
+    booleanFinding('firestoreRestoreEvidence', 'trustConfigured', facts.trustConfigured),
+    booleanFinding('firestoreRestoreEvidence', 'provenanceMatches', facts.provenanceMatches),
+    booleanFinding('firestoreRestoreEvidence', 'worktreeClean', facts.worktreeClean),
   ];
 }
 
@@ -637,22 +648,85 @@ function canonicalJson(value: unknown): string {
   return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`;
 }
 
-function decodeHmacKey(value: string): Buffer | undefined {
-  if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length % 4 !== 0) return undefined;
-  const key = Buffer.from(value, 'base64');
-  return key.length >= 32 && key.length <= 64 && key.toString('base64') === value ? key : undefined;
+interface FirestoreRestoreTrustPolicy {
+  keyId: string;
+  publicKeyJwk: { kty: 'OKP'; crv: 'Ed25519'; x: string };
+  issuer: string;
+  allowedClaims: {
+    repository: string;
+    workflowPath: string;
+    workflowRef: string;
+    environment: string;
+  };
+  activatedAtMs: number;
+  expiresAtMs: number;
 }
 
-function verifyEvidenceMac(value: JsonRecord, hmacKeyBase64: string): boolean {
-  const macBase64 = value.macBase64;
-  const key = decodeHmacKey(hmacKeyBase64);
-  if (!key || typeof macBase64 !== 'string' || !/^[A-Za-z0-9+/]{43}=$/.test(macBase64)) return false;
-  const provided = Buffer.from(macBase64, 'base64');
-  if (provided.length !== 32) return false;
+function inspectFirestoreRestoreTrust(value: unknown, nowMs: number): FirestoreRestoreTrustPolicy | undefined {
+  if (!isPlainRecord(value) || !hasExactKeys(value, [
+    'schemaVersion', 'status', 'algorithm', 'keyId', 'publicKeyJwk', 'issuer', 'allowedClaims',
+    'activatedAt', 'expiresAt', 'revokedAt',
+  ])) return undefined;
+  if (value.schemaVersion !== 1 || value.algorithm !== 'Ed25519' || value.revokedAt !== null) return undefined;
+  const jwk = isPlainRecord(value.publicKeyJwk) ? value.publicKeyJwk : {};
+  const claims = isPlainRecord(value.allowedClaims) ? value.allowedClaims : {};
+  if (value.status === 'unconfigured') {
+    const validUnconfigured = value.keyId === 'unconfigured'
+      && value.publicKeyJwk === null
+      && value.issuer === 'unconfigured'
+      && value.activatedAt === null
+      && value.expiresAt === null
+      && hasExactKeys(claims, ['repository', 'workflowPath', 'workflowRef', 'environment'])
+      && claims.repository === 'big-agi/big-agi-private'
+      && claims.workflowPath === '.github/workflows/private-pro-restore-attest.yml'
+      && claims.workflowRef === 'refs/heads/dev'
+      && claims.environment === 'production-recovery';
+    return validUnconfigured ? undefined : undefined;
+  }
+  if (value.status !== 'active') return undefined;
+  if (!hasExactKeys(jwk, ['kty', 'crv', 'x']) || jwk.kty !== 'OKP' || jwk.crv !== 'Ed25519'
+    || !isBoundedString(jwk.x, 43, 43, /^[A-Za-z0-9_-]{43}$/)
+    || !hasExactKeys(claims, ['repository', 'workflowPath', 'workflowRef', 'environment'])
+    || !isBoundedString(value.keyId, 3, 100, /^[A-Za-z0-9._-]+$/)
+    || !isBoundedString(value.issuer, 3, 100, /^[A-Za-z0-9._:-]+$/)
+    || !isBoundedString(claims.repository, 3, 160, /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/)
+    || !isBoundedString(claims.workflowPath, 3, 240, /^\.github\/workflows\/[A-Za-z0-9._/-]+\.ya?ml$/)
+    || !isBoundedString(claims.workflowRef, 3, 240, /^refs\/(?:heads|tags)\/[A-Za-z0-9._/-]+$/)
+    || !isBoundedString(claims.environment, 1, 100, /^[A-Za-z0-9._-]+$/)
+    || !isProtobufTimestamp(value.activatedAt)
+    || !isProtobufTimestamp(value.expiresAt)
+  ) return undefined;
+  const activatedAtMs = Date.parse(value.activatedAt);
+  const expiresAtMs = Date.parse(value.expiresAt);
+  if (activatedAtMs > nowMs + FIRESTORE_RESTORE_FUTURE_SKEW_MS || expiresAtMs <= nowMs || expiresAtMs <= activatedAtMs) return undefined;
+  return {
+    keyId: value.keyId,
+    publicKeyJwk: { kty: 'OKP', crv: 'Ed25519', x: jwk.x },
+    issuer: value.issuer,
+    allowedClaims: {
+      repository: claims.repository,
+      workflowPath: claims.workflowPath,
+      workflowRef: claims.workflowRef,
+      environment: claims.environment,
+    },
+    activatedAtMs,
+    expiresAtMs,
+  };
+}
+
+function verifyEvidenceSignature(value: JsonRecord, trust: FirestoreRestoreTrustPolicy | undefined): boolean {
+  const signatureBase64 = value.signatureBase64;
+  if (!trust || value.attestorKeyId !== trust.keyId || typeof signatureBase64 !== 'string' || !/^[A-Za-z0-9+/]{86}==$/.test(signatureBase64)) return false;
+  const signature = Buffer.from(signatureBase64, 'base64');
+  if (signature.length !== 64) return false;
   const unsigned = { ...value };
-  delete unsigned.macBase64;
-  const expected = createHmac('sha256', key).update(canonicalJson(unsigned)).digest();
-  return timingSafeEqual(provided, expected);
+  delete unsigned.signatureBase64;
+  try {
+    const publicKey = createPublicKey({ key: trust.publicKeyJwk, format: 'jwk' });
+    return verify(null, Buffer.from(canonicalJson(unsigned)), publicKey, signature);
+  } catch {
+    return false;
+  }
 }
 
 function hasDuplicateJsonObjectKeys(text: string): boolean {
@@ -742,6 +816,31 @@ function pathWithin(root: string, path: string): boolean {
   return child === '' || (!child.startsWith('..') && !isAbsolute(child));
 }
 
+async function readBoundedRegularFile(path: string): Promise<string> {
+  const before = await lstat(path, { bigint: true });
+  if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES))
+    throw new Error('Evidence file is not a bounded regular file.');
+  const handle = await open(path, 'r');
+  try {
+    const opened = await handle.stat({ bigint: true });
+    if (!opened.isFile()
+      || opened.size !== before.size
+      || opened.dev !== before.dev
+      || opened.ino !== before.ino
+      || opened.size > BigInt(FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES)
+    ) throw new Error('Evidence file changed before read.');
+    const buffer = Buffer.alloc(FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES + 1);
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    if (bytesRead > FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES) throw new Error('Evidence file is too large.');
+    const after = await handle.stat({ bigint: true });
+    if (after.size !== opened.size || after.dev !== opened.dev || after.ino !== opened.ino)
+      throw new Error('Evidence file changed during read.');
+    return buffer.subarray(0, bytesRead).toString('utf8');
+  } finally {
+    await handle.close();
+  }
+}
+
 function inspectVersionRetentionPeriod(value: unknown): FirestoreVersionRetentionPeriod | undefined {
   if (value === undefined) return 'missing';
   if (typeof value !== 'string' || !/^\d+(?:\.\d{1,9})?s$/.test(value)) return undefined;
@@ -824,6 +923,7 @@ export function inspectFirestoreRecoveryState(value: unknown, projectId: string)
 }
 
 export function inspectFirestoreRestoreEvidence(value: unknown, input: FirestoreRestoreEvidenceInput): FirestoreRestoreEvidenceFacts {
+  const trust = inspectFirestoreRestoreTrust(input.trustDescriptor, input.nowMs);
   const invalid: FirestoreRestoreEvidenceFacts = {
     readable: false,
     schemaErrors: 1,
@@ -840,8 +940,11 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
     documentHashesVerified: false,
     dataVerified: false,
     applicationVerified: false,
-    macVerified: false,
+    signatureVerified: false,
     releaseCommitMatches: false,
+    trustConfigured: !!trust,
+    provenanceMatches: false,
+    worktreeClean: input.worktreeClean !== false,
   };
   if (!isPlainRecord(value) || !hasExactKeys(value, [
     'schemaVersion',
@@ -866,7 +969,10 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
     'applicationAcceptance',
     'cleanup',
     'approverAttestation',
-    'macBase64',
+    'ciProvenance',
+    'attestorKeyId',
+    'attestorIssuer',
+    'signatureBase64',
   ])) return invalid;
   const tool = isPlainRecord(value.tool) ? value.tool : {};
   const manifests = isPlainRecord(value.manifests) ? value.manifests : {};
@@ -874,6 +980,7 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
   const applicationAcceptance = isPlainRecord(value.applicationAcceptance) ? value.applicationAcceptance : {};
   const cleanup = isPlainRecord(value.cleanup) ? value.cleanup : {};
   const attestation = isPlainRecord(value.approverAttestation) ? value.approverAttestation : {};
+  const provenance = isPlainRecord(value.ciProvenance) ? value.ciProvenance : {};
   const familyKeys = Object.keys(collectionFamilies);
   const familyShapesValid = familyKeys.length === FIRESTORE_RESTORE_FAMILIES.length
     && familyKeys.every(family => FIRESTORE_RESTORE_FAMILY_SET.has(family))
@@ -911,8 +1018,23 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
     && SHA256_HEX.test(cleanup.evidenceSha256);
   const releaseCommitMatches = typeof value.testSuiteCommitSha === 'string'
     && GIT_SHA.test(value.testSuiteCommitSha)
-    && value.testSuiteCommitSha === input.expectedCommitSha;
-  const macVerified = verifyEvidenceMac(value, input.hmacKeyBase64);
+    && GIT_SHA.test(input.actualHeadSha)
+    && value.testSuiteCommitSha === input.actualHeadSha
+    && input.worktreeClean !== false
+    && (!input.additionalExpectedCommitSha
+      || (GIT_SHA.test(input.additionalExpectedCommitSha) && value.testSuiteCommitSha === input.additionalExpectedCommitSha));
+  const provenanceMatches = !!trust
+    && value.attestorIssuer === trust.issuer
+    && hasExactKeys(provenance, ['repository', 'workflowPath', 'workflowRef', 'workflowRunId', 'workflowRunAttempt', 'environment'])
+    && provenance.repository === trust.allowedClaims.repository
+    && provenance.workflowPath === trust.allowedClaims.workflowPath
+    && provenance.workflowRef === trust.allowedClaims.workflowRef
+    && provenance.environment === trust.allowedClaims.environment
+    && isBoundedString(provenance.workflowRunId, 1, 30, /^[1-9]\d*$/)
+    && Number.isSafeInteger(provenance.workflowRunAttempt)
+    && (provenance.workflowRunAttempt as number) >= 1
+    && (provenance.workflowRunAttempt as number) <= 1000;
+  const signatureVerified = verifyEvidenceSignature(value, trust);
   const valid = value.schemaVersion === 1
     && value.evidenceVersion === 1
     && typeof value.runId === 'string'
@@ -931,6 +1053,13 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
     && artifactAtMs <= startedAtMs
     && startedAtMs <= completedAtMs
     && completedAtMs <= attestedAtMs
+    && attestedAtMs - completedAtMs <= FIRESTORE_RESTORE_ATTESTATION_MAX_DELAY_MS
+    && !!trust
+    && attestedAtMs >= trust.activatedAtMs
+    && attestedAtMs <= trust.expiresAtMs
+    && artifactAtMs >= startedAtMs - FIRESTORE_RESTORE_FUTURE_SKEW_MS
+    && completedAtMs <= input.nowMs + FIRESTORE_RESTORE_FUTURE_SKEW_MS
+    && attestedAtMs <= input.nowMs + FIRESTORE_RESTORE_FUTURE_SKEW_MS
     && typeof value.sourceDatabaseIdentitySha256 === 'string'
     && SHA256_HEX.test(value.sourceDatabaseIdentitySha256)
     && typeof value.sourcePreFingerprintSha256 === 'string'
@@ -962,7 +1091,8 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
     && isBoundedString(attestation.role, 3, 80, /^[A-Za-z0-9._-]+$/)
     && typeof attestation.statementSha256 === 'string'
     && SHA256_HEX.test(attestation.statementSha256)
-    && macVerified;
+    && provenanceMatches
+    && signatureVerified;
   if (!valid) return {
     ...invalid,
     sourceUnchanged,
@@ -975,16 +1105,21 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
     documentHashesVerified,
     dataVerified: familyShapesValid,
     applicationVerified,
-    macVerified,
+    signatureVerified,
     releaseCommitMatches,
+    trustConfigured: !!trust,
+    provenanceMatches,
+    worktreeClean: input.worktreeClean !== false,
   };
   return {
     readable: true,
     schemaErrors: 0,
     completed: true,
     stale: !Number.isFinite(input.nowMs)
-      || input.nowMs < attestedAtMs
-      || input.nowMs - attestedAtMs > FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000,
+      || input.nowMs < completedAtMs
+      || input.nowMs - completedAtMs > FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000
+      || input.nowMs < artifactAtMs
+      || input.nowMs - artifactAtMs > FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS * 24 * 60 * 60 * 1000,
     sourceUnchanged,
     isolatedTarget: true,
     targetNotDefault: true,
@@ -996,8 +1131,11 @@ export function inspectFirestoreRestoreEvidence(value: unknown, input: Firestore
     documentHashesVerified,
     dataVerified: true,
     applicationVerified,
-    macVerified,
+    signatureVerified,
     releaseCommitMatches,
+    trustConfigured: true,
+    provenanceMatches,
+    worktreeClean: true,
   };
 }
 
@@ -1708,7 +1846,7 @@ async function collectFirestoreRecoveryState(projectId: string): Promise<Firesto
 export async function collectFirestoreRestoreEvidenceWithReader(
   path: string,
   input: FirestoreRestoreEvidenceCollectorInput,
-  readText: (path: string) => Promise<string> = path => readFile(path, 'utf8'),
+  readText: (path: string) => Promise<string> = readBoundedRegularFile,
   canonicalizePath: (path: string) => Promise<string> = realpath,
 ): Promise<FirestoreRestoreEvidenceFacts> {
   try {
@@ -1719,27 +1857,54 @@ export async function collectFirestoreRestoreEvidenceWithReader(
     ]);
     const underRepo = pathWithin(repoRoot, absolutePath);
     if (!underRepo) throw new Error('Evidence path is not approved.');
-    return inspectFirestoreRestoreEvidence(parseStrictEvidenceJson(await readText(absolutePath)), input);
+    return inspectFirestoreRestoreEvidence(parseStrictEvidenceJson(await readText(path)), input);
   } catch {
     return inspectFirestoreRestoreEvidence(undefined, input);
   }
+}
+
+export async function collectGitReleaseStateWithExecutor(
+  execute: (command: string, args: string[]) => Promise<{ stdout: string }> = runCommand,
+): Promise<{ headSha: string; clean: boolean }> {
+  const [{ stdout: headOutput }, { stdout: statusOutput }] = await Promise.all([
+    execute('git', ['rev-parse', 'HEAD']),
+    execute('git', ['status', '--porcelain', '--untracked-files=normal']),
+  ]);
+  const head = headOutput.trim().toLowerCase();
+  if (!GIT_SHA.test(head)) throw new Error('Current git HEAD could not be read.');
+  return { headSha: head, clean: statusOutput.trim().length === 0 };
 }
 
 async function collectFirestoreRestoreEvidence(): Promise<FirestoreRestoreEvidenceFacts> {
   const repoRoot = process.cwd();
   const configuredPath = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE?.trim();
   const approvedOperatorRoot = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_ROOT?.trim();
-  const expectedCommitSha = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim() ?? '';
-  const hmacKeyBase64 = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY?.trim() ?? '';
+  const additionalExpectedCommitSha = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim();
   const path = configuredPath || resolve(repoRoot, DEFAULT_FIRESTORE_RESTORE_EVIDENCE_PATH);
-  if (configuredPath && (!isAbsolute(configuredPath) || !approvedOperatorRoot || !isAbsolute(approvedOperatorRoot)))
-    return inspectFirestoreRestoreEvidence(undefined, { nowMs: Date.now(), expectedCommitSha, hmacKeyBase64 });
-  return collectFirestoreRestoreEvidenceWithReader(path, {
+  const invalidInput = {
     nowMs: Date.now(),
-    expectedCommitSha,
-    hmacKeyBase64,
-    repoRoot: configuredPath ? approvedOperatorRoot! : repoRoot,
-  });
+    actualHeadSha: '',
+    trustDescriptor: undefined,
+    ...(additionalExpectedCommitSha ? { additionalExpectedCommitSha } : {}),
+  };
+  if (configuredPath && (!isAbsolute(configuredPath) || !approvedOperatorRoot || !isAbsolute(approvedOperatorRoot)))
+    return inspectFirestoreRestoreEvidence(undefined, invalidInput);
+  try {
+    const [releaseState, trustDescriptor] = await Promise.all([
+      collectGitReleaseStateWithExecutor(),
+      readBoundedRegularFile(resolve(repoRoot, FIRESTORE_RESTORE_TRUST_PATH)).then(parseStrictEvidenceJson),
+    ]);
+    return collectFirestoreRestoreEvidenceWithReader(path, {
+      nowMs: Date.now(),
+      actualHeadSha: releaseState.headSha,
+      worktreeClean: releaseState.clean,
+      trustDescriptor,
+      ...(additionalExpectedCommitSha ? { additionalExpectedCommitSha } : {}),
+      repoRoot: configuredPath ? approvedOperatorRoot! : repoRoot,
+    });
+  } catch {
+    return inspectFirestoreRestoreEvidence(undefined, invalidInput);
+  }
 }
 
 function runtimeIdentityInput(activeAdcServiceAccountEmail?: string) {

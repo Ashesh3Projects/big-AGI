@@ -280,3 +280,81 @@ The restore evidence gate remains blocked because no approved rehearsal evidence
 ### Cloud boundary
 
 No restore, backup, export, import, database, schedule, IAM, storage, deployment, cleanup, key, or evidence mutation ran.
+
+## Fix round 3
+
+Status: complete. No cloud mutation occurred. No real trust key, private key, or restore evidence was created.
+
+### Review finding
+
+Fix round 2 authenticated evidence with a shared HMAC. Anyone holding the shared key could author and attest a fabricated record. That trust model did not establish independent attestation.
+
+### Changes
+
+- Superseded the shared-HMAC attestation model with independent Ed25519 signatures.
+- Added strict `infra/private-pro/firestore-restore-attestor-trust.json` parsing for:
+  - schema/status/algorithm;
+  - key ID and Ed25519 public JWK;
+  - issuer;
+  - exact repository, workflow path, workflow ref, and protected environment claims;
+  - activation, expiry, and revocation state.
+- Checked in only an explicit `unconfigured` descriptor with no public or private production key. It blocks by design.
+- Evidence now includes exact CI repository/workflow/ref/run ID/run attempt/environment, attestor key ID, attestor issuer, and `signatureBase64`.
+- Signature verification uses Node Ed25519 over recursively key-sorted canonical JSON excluding only `signatureBase64`.
+- The rehearsal author/operator cannot satisfy the gate without the independent private key.
+- The audit collects actual release state through:
+
+  ```text
+  git rev-parse HEAD
+  git status --porcelain --untracked-files=normal
+  ```
+
+  Evidence must match actual HEAD and the checkout must be clean. An optional environment commit can only add another equality constraint.
+- Tightened timing:
+  - recovery artifact time is within five minutes before run start or later;
+  - artifact <= start <= completion <= attestation;
+  - completion-to-attestation is at most 24 hours;
+  - completion and attestation cannot be more than five minutes in the future;
+  - completion and artifact must be within 90 days;
+  - attestation must fall within the trust key activation window.
+- Replaced default `readFile` use with a bounded regular-file reader:
+  - reject symlinks through `lstat`;
+  - reject non-files and files over 1 MiB before open;
+  - open by handle, compare size/device/inode, read at most cap plus one byte, and re-check file identity/size after read;
+  - retain realpath root-containment checks.
+- Kept keyed per-family ciphertext HMAC comparisons only as data equality measurements. They are not the evidence attestation mechanism.
+
+### TDD
+
+RED:
+
+```text
+42 audit tests: 38 passed, 4 failed
+```
+
+The failures covered valid Ed25519 trust/signature, wrong signer/key/provenance/release, timing/provenance, and bounded-file collection.
+
+GREEN:
+
+```text
+44 focused audit tests: 44 passed, 0 failed
+49 Private Pro tool tests: 49 passed, 0 failed
+```
+
+Coverage includes ephemeral test-only Ed25519 keys, unconfigured production trust, valid signature, unsigned evidence, wrong signer/key ID/issuer, tamper, wrong actual HEAD/additional commit, dirty checkout, wrong repository/workflow/ref/environment/run, stale completion, excessive delay, future time, invalid family/count/digest/application, actual oversized file, actual symlink, duplicate JSON keys, traversal, and simulated realpath escape.
+
+### Approval boundary
+
+Activating trust requires a separately reviewed and approved public trust descriptor. The independent CI/KMS attestor must fetch immutable artifacts and verify or re-run measurements before signing. Never commit the private key or give it to the rehearsal author/operator.
+
+### Cloud boundary
+
+No restore, backup, export, import, database, schedule, IAM, storage, deployment, cleanup, trust activation, key, or evidence mutation ran.
+
+### Verification
+
+- Focused Task 22 TypeScript: passed. The temporary project file was deleted and is not committed.
+- Private Pro tools: 49 passed, 0 failed.
+- Checked-in trust descriptor JSON parsed and remained `unconfigured` with no public key.
+- Report-only JSON parsed and blocked `signatureVerified`, `trustConfigured`, `provenanceMatches`, `releaseCommitMatches`, and `worktreeClean` during the intentionally dirty pre-commit run.
+- `git diff --check`: passed.

@@ -1,0 +1,17 @@
+{
+  "schemaVersion": 1,
+  "status": "unconfigured",
+  "algorithm": "Ed25519",
+  "keyId": "unconfigured",
+  "publicKeyJwk": null,
+  "issuer": "unconfigured",
+  "allowedClaims": {
+    "repository": "big-agi/big-agi-private",
+    "workflowPath": ".github/workflows/private-pro-restore-attest.yml",
+    "workflowRef": "refs/heads/dev",
+    "environment": "production-recovery"
+  },
+  "activatedAt": null,
+  "expiresAt": null,
+  "revokedAt": null
+}

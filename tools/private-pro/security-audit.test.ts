@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
-import { createHmac } from 'node:crypto';
+import { generateKeyPairSync, sign } from 'node:crypto';
 import { describe, test } from 'node:test';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
@@ -58,9 +58,26 @@ const RESTORE_EVIDENCE_FAMILIES = [
   'vaultRegistrationChallenges',
   'vaultTombstones',
 ] as const;
-const TEST_EVIDENCE_KEY = Buffer.alloc(32, 0x42);
-const TEST_EVIDENCE_KEY_BASE64 = TEST_EVIDENCE_KEY.toString('base64');
 const TEST_RELEASE_COMMIT = 'a'.repeat(40);
+const TEST_ATTESTOR = generateKeyPairSync('ed25519');
+const TEST_PUBLIC_JWK = TEST_ATTESTOR.publicKey.export({ format: 'jwk' }) as { kty: string; crv: string; x: string };
+const TEST_TRUST = {
+  schemaVersion: 1,
+  status: 'active',
+  algorithm: 'Ed25519',
+  keyId: 'private-pro-restore-attestor-2026-01',
+  publicKeyJwk: TEST_PUBLIC_JWK,
+  issuer: 'github-actions',
+  allowedClaims: {
+    repository: 'big-agi/big-agi-private',
+    workflowPath: '.github/workflows/private-pro-restore-attest.yml',
+    workflowRef: 'refs/heads/dev',
+    environment: 'production-recovery',
+  },
+  activatedAt: '2026-01-01T00:00:00Z',
+  expiresAt: '2027-01-01T00:00:00Z',
+  revokedAt: null,
+};
 
 function canonicalJsonForTest(value: unknown): string {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return JSON.stringify(value);
@@ -118,13 +135,23 @@ function unsignedRestoreEvidence() {
       attestedAt: '2026-08-18T00:35:00Z',
       statementSha256: 'b'.repeat(64),
     },
+    ciProvenance: {
+      repository: TEST_TRUST.allowedClaims.repository,
+      workflowPath: TEST_TRUST.allowedClaims.workflowPath,
+      workflowRef: TEST_TRUST.allowedClaims.workflowRef,
+      workflowRunId: '1234567890',
+      workflowRunAttempt: 1,
+      environment: TEST_TRUST.allowedClaims.environment,
+    },
+    attestorKeyId: TEST_TRUST.keyId,
+    attestorIssuer: TEST_TRUST.issuer,
   };
 }
 
-function signedRestoreEvidence(value = unsignedRestoreEvidence(), key = TEST_EVIDENCE_KEY) {
+function signedRestoreEvidence(value = unsignedRestoreEvidence(), privateKey = TEST_ATTESTOR.privateKey) {
   return {
     ...value,
-    macBase64: createHmac('sha256', key).update(canonicalJsonForTest(value)).digest('base64'),
+    signatureBase64: sign(null, Buffer.from(canonicalJsonForTest(value)), privateKey).toString('base64'),
   };
 }
 
@@ -327,12 +354,14 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(facts.readable, true);
   });
 
-  test('accepts only fresh provenance-bound MAC-verified restore rehearsal evidence', () => {
+  test('accepts only independently attested Ed25519 restore evidence', () => {
     const audit = securityAuditModule as unknown as {
       inspectFirestoreRestoreEvidence(value: unknown, input: {
         nowMs: number;
-        expectedCommitSha: string;
-        hmacKeyBase64: string;
+        actualHeadSha: string;
+        worktreeClean?: boolean;
+        additionalExpectedCommitSha?: string;
+        trustDescriptor: unknown;
       }): {
         readable: boolean;
         schemaErrors: number;
@@ -349,14 +378,17 @@ describe('private Pro security audit classifiers', () => {
         documentHashesVerified: boolean;
         dataVerified: boolean;
         applicationVerified: boolean;
-        macVerified: boolean;
+        signatureVerified: boolean;
         releaseCommitMatches: boolean;
+        trustConfigured: boolean;
+        provenanceMatches: boolean;
+        worktreeClean: boolean;
       };
     };
     const input = {
       nowMs: Date.parse('2026-08-18T12:00:00Z'),
-      expectedCommitSha: TEST_RELEASE_COMMIT,
-      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
+      actualHeadSha: TEST_RELEASE_COMMIT,
+      trustDescriptor: TEST_TRUST,
     };
 
     assert.deepEqual(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), input), {
@@ -375,48 +407,76 @@ describe('private Pro security audit classifiers', () => {
       documentHashesVerified: true,
       dataVerified: true,
       applicationVerified: true,
-      macVerified: true,
+      signatureVerified: true,
       releaseCommitMatches: true,
+      trustConfigured: true,
+      provenanceMatches: true,
+      worktreeClean: true,
     });
   });
 
-  test('rejects unsigned, wrongly signed, tampered, wrong-release, and changed-source evidence', () => {
+  test('rejects unsigned, wrong signer, wrong key ID, tampered, and wrong release evidence', () => {
     const audit = securityAuditModule as unknown as {
       inspectFirestoreRestoreEvidence(value: unknown, input: {
         nowMs: number;
-        expectedCommitSha: string;
-        hmacKeyBase64: string;
+        actualHeadSha: string;
+        worktreeClean?: boolean;
+        additionalExpectedCommitSha?: string;
+        trustDescriptor: unknown;
       }): {
         readable: boolean;
         sourceUnchanged: boolean;
-        macVerified: boolean;
+        signatureVerified: boolean;
         releaseCommitMatches: boolean;
+        trustConfigured: boolean;
       };
     };
     const input = {
       nowMs: Date.parse('2026-08-18T12:00:00Z'),
-      expectedCommitSha: TEST_RELEASE_COMMIT,
-      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
+      actualHeadSha: TEST_RELEASE_COMMIT,
+      trustDescriptor: TEST_TRUST,
     };
     const unsigned = audit.inspectFirestoreRestoreEvidence(unsignedRestoreEvidence(), input);
     assert.equal(unsigned.readable, false);
-    assert.equal(unsigned.macVerified, false);
+    assert.equal(unsigned.signatureVerified, false);
 
-    const missingKey = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), { ...input, hmacKeyBase64: '' });
-    assert.equal(missingKey.readable, false);
-    assert.equal(missingKey.macVerified, false);
+    const unconfigured = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), {
+      ...input,
+      trustDescriptor: { ...TEST_TRUST, status: 'unconfigured', publicKeyJwk: null },
+    });
+    assert.equal(unconfigured.readable, false);
+    assert.equal(unconfigured.trustConfigured, false);
 
-    const wrongMac = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(unsignedRestoreEvidence(), Buffer.alloc(32, 0x24)), input);
-    assert.equal(wrongMac.readable, false);
-    assert.equal(wrongMac.macVerified, false);
+    const other = generateKeyPairSync('ed25519');
+    const wrongSigner = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(unsignedRestoreEvidence(), other.privateKey), input);
+    assert.equal(wrongSigner.readable, false);
+    assert.equal(wrongSigner.signatureVerified, false);
+
+    const wrongKeyIdValue = unsignedRestoreEvidence();
+    wrongKeyIdValue.attestorKeyId = 'other-key';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(wrongKeyIdValue), input).readable, false);
+
+    const wrongIssuerValue = unsignedRestoreEvidence();
+    wrongIssuerValue.attestorIssuer = 'other-issuer';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(wrongIssuerValue), input).readable, false);
 
     const tampered = signedRestoreEvidence();
     tampered.destinationDatabaseId = 'private-pro-restore-tampered';
-    assert.equal(audit.inspectFirestoreRestoreEvidence(tampered, input).macVerified, false);
+    assert.equal(audit.inspectFirestoreRestoreEvidence(tampered, input).signatureVerified, false);
 
-    const wrongCommit = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), { ...input, expectedCommitSha: 'c'.repeat(40) });
+    const wrongCommit = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), { ...input, actualHeadSha: 'c'.repeat(40) });
     assert.equal(wrongCommit.releaseCommitMatches, false);
     assert.equal(wrongCommit.readable, false);
+
+    const additionalMismatch = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), {
+      ...input,
+      additionalExpectedCommitSha: 'c'.repeat(40),
+    });
+    assert.equal(additionalMismatch.readable, false);
+
+    const dirty = audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(), { ...input, worktreeClean: false });
+    assert.equal(dirty.releaseCommitMatches, false);
+    assert.equal(dirty.readable, false);
 
     const changedSourceValue = unsignedRestoreEvidence();
     changedSourceValue.sourcePostFingerprintSha256 = 'c'.repeat(64);
@@ -425,18 +485,18 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(changedSource.readable, false);
   });
 
-  test('rejects stale, reversed-time, invalid family, and malformed provenance evidence', () => {
+  test('rejects wrong CI provenance, stale completion, excessive attestation delay, future times, and malformed evidence', () => {
     const audit = securityAuditModule as unknown as {
       inspectFirestoreRestoreEvidence(value: unknown, input: {
         nowMs: number;
-        expectedCommitSha: string;
-        hmacKeyBase64: string;
+        actualHeadSha: string;
+        trustDescriptor: unknown;
       }): { readable: boolean; stale: boolean; schemaErrors: number };
     };
     const input = {
       nowMs: Date.parse('2026-08-18T12:00:00Z'),
-      expectedCommitSha: TEST_RELEASE_COMMIT,
-      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
+      actualHeadSha: TEST_RELEASE_COMMIT,
+      trustDescriptor: TEST_TRUST,
     };
     const staleValue = unsignedRestoreEvidence();
     staleValue.startedAt = '2026-04-01T00:00:00Z';
@@ -447,9 +507,33 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(stale.readable, true);
     assert.equal(stale.stale, true);
 
+    for (const [field, value] of [
+      ['repository', 'other/repo'],
+      ['workflowPath', '.github/workflows/other.yml'],
+      ['workflowRef', 'refs/heads/main'],
+      ['environment', 'unprotected'],
+    ] as const) {
+      const wrongClaim = unsignedRestoreEvidence();
+      wrongClaim.ciProvenance[field] = value;
+      assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(wrongClaim), input).readable, false);
+    }
+
+    const badRun = unsignedRestoreEvidence();
+    badRun.ciProvenance.workflowRunId = '0';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(badRun), input).readable, false);
+
     const reversed = unsignedRestoreEvidence();
     reversed.completedAt = '2026-08-17T23:00:00Z';
     assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(reversed), input).readable, false);
+
+    const delayed = unsignedRestoreEvidence();
+    delayed.approverAttestation.attestedAt = '2026-08-20T00:31:00Z';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(delayed), input).readable, false);
+
+    const future = unsignedRestoreEvidence();
+    future.completedAt = '2026-08-18T12:06:00Z';
+    future.approverAttestation.attestedAt = '2026-08-18T12:07:00Z';
+    assert.equal(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(future), input).readable, false);
 
     const extraFamily = unsignedRestoreEvidence() as ReturnType<typeof unsignedRestoreEvidence> & { collectionFamilies: Record<string, unknown> };
     extraFamily.collectionFamilies.unapprovedFamily = {
@@ -473,26 +557,26 @@ describe('private Pro security audit classifiers', () => {
     assert.ok(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(malformed), input).schemaErrors > 0);
   });
 
-  test('collects strict authenticated evidence and rejects unsafe paths and raw JSON attacks', async () => {
+  test('collects signed evidence with actual HEAD and rejects unsafe or unbounded files', async () => {
     const audit = securityAuditModule as unknown as {
       collectFirestoreRestoreEvidenceWithReader(
         path: string,
         input: {
           nowMs: number;
-          expectedCommitSha: string;
-          hmacKeyBase64: string;
+          actualHeadSha: string;
+          trustDescriptor: unknown;
           repoRoot: string;
         },
-        readText: (path: string) => Promise<string>,
+        readText?: (path: string) => Promise<string>,
         canonicalizePath?: (path: string) => Promise<string>,
-      ): Promise<{ readable: boolean; completed: boolean; macVerified: boolean }>;
+      ): Promise<{ readable: boolean; completed: boolean; signatureVerified: boolean }>;
     };
     const repoRoot = resolve('F:/repo');
     const canonicalPath = join(repoRoot, 'infra/private-pro/firestore-restore-evidence.json');
     const input = {
       nowMs: Date.parse('2026-08-18T12:00:00Z'),
-      expectedCommitSha: TEST_RELEASE_COMMIT,
-      hmacKeyBase64: TEST_EVIDENCE_KEY_BASE64,
+      actualHeadSha: TEST_RELEASE_COMMIT,
+      trustDescriptor: TEST_TRUST,
       repoRoot,
     };
     const paths: string[] = [];
@@ -503,7 +587,7 @@ describe('private Pro security audit classifiers', () => {
     }, canonicalize);
     assert.deepEqual(paths, [canonicalPath]);
     assert.equal(accepted.readable, true);
-    assert.equal(accepted.macVerified, true);
+    assert.equal(accepted.signatureVerified, true);
 
     for (const path of ['infra/private-pro/firestore-restore-evidence.json', join(repoRoot, '../escape/evidence.json')]) {
       const result = await audit.collectFirestoreRestoreEvidenceWithReader(path, input, async () => JSON.stringify(signedRestoreEvidence()), canonicalize);
@@ -530,6 +614,63 @@ describe('private Pro security audit classifiers', () => {
       async () => JSON.stringify(signedRestoreEvidence()),
       symlinkEscape,
     )).readable, false);
+
+    const directory = await mkdtemp(join(tmpdir(), 'restore-evidence-files-'));
+    const oversized = join(directory, 'oversized.json');
+    await writeFile(oversized, 'x'.repeat(1024 * 1024 + 1), 'utf8');
+    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(oversized, { ...input, repoRoot: directory })).readable, false);
+
+    const target = join(directory, 'target.json');
+    const link = join(directory, 'link.json');
+    await writeFile(target, JSON.stringify(signedRestoreEvidence()), 'utf8');
+    await symlink(target, link, 'file');
+    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(link, { ...input, repoRoot: directory })).readable, false);
+  });
+
+  test('collects the audited release commit from actual git HEAD', async () => {
+    const audit = securityAuditModule as unknown as {
+      collectGitReleaseStateWithExecutor(execute: (command: string, args: string[]) => Promise<{ stdout: string }>): Promise<{
+        headSha: string;
+        clean: boolean;
+      }>;
+    };
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const release = await audit.collectGitReleaseStateWithExecutor(async (command, args) => {
+      calls.push({ command, args });
+      return { stdout: args[0] === 'rev-parse' ? `${TEST_RELEASE_COMMIT}\n` : '' };
+    });
+
+    assert.deepEqual(release, { headSha: TEST_RELEASE_COMMIT, clean: true });
+    assert.deepEqual(calls, [
+      { command: 'git', args: ['rev-parse', 'HEAD'] },
+      { command: 'git', args: ['status', '--porcelain', '--untracked-files=normal'] },
+    ]);
+    const dirty = await audit.collectGitReleaseStateWithExecutor(async (_command, args) => ({
+      stdout: args[0] === 'rev-parse' ? `${TEST_RELEASE_COMMIT}\n` : ' M tracked.ts\n',
+    }));
+    assert.deepEqual(dirty, { headSha: TEST_RELEASE_COMMIT, clean: false });
+    await assert.rejects(() => audit.collectGitReleaseStateWithExecutor(async () => ({ stdout: 'not-a-commit\n' })));
+  });
+
+  test('ships an explicitly unconfigured restore attestor trust descriptor', async () => {
+    const trust = JSON.parse(await readFile('infra/private-pro/firestore-restore-attestor-trust.json', 'utf8')) as Record<string, unknown>;
+    assert.deepEqual(trust, {
+      schemaVersion: 1,
+      status: 'unconfigured',
+      algorithm: 'Ed25519',
+      keyId: 'unconfigured',
+      publicKeyJwk: null,
+      issuer: 'unconfigured',
+      allowedClaims: {
+        repository: 'big-agi/big-agi-private',
+        workflowPath: '.github/workflows/private-pro-restore-attest.yml',
+        workflowRef: 'refs/heads/dev',
+        environment: 'production-recovery',
+      },
+      activatedAt: null,
+      expiresAt: null,
+      revokedAt: null,
+    });
   });
 
   test('passes shell metacharacters as one argument without executing them', async () => {
