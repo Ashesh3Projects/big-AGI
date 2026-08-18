@@ -9,6 +9,7 @@ import { useUXLabsStore } from '~/common/stores/store-ux-labs';
 import { useModuleBeamStore } from '~/modules/beam/store-module-beam';
 import { useBrowseStore } from '~/modules/browse/store-module-browsing';
 import { useT2IStore } from '~/modules/t2i/store-module-t2i';
+import { useFolderStore } from '~/common/stores/folders/store-chat-folders';
 
 
 export const PRIVATE_PRO_VAULT_SETTINGS_CALL_ID = 'call';
@@ -20,6 +21,7 @@ export const PRIVATE_PRO_VAULT_SETTINGS_UX_LABS_ID = 'ux-labs';
 export const PRIVATE_PRO_VAULT_SETTINGS_BEAM_ID = 'beam';
 export const PRIVATE_PRO_VAULT_SETTINGS_BROWSING_ID = 'browsing';
 export const PRIVATE_PRO_VAULT_SETTINGS_IMAGE_ID = 'image';
+export const PRIVATE_PRO_VAULT_SETTINGS_FOLDERS_ID = 'folders';
 
 const CallSettingsSchema = z.object({
   group: z.literal(PRIVATE_PRO_VAULT_SETTINGS_CALL_ID),
@@ -165,6 +167,11 @@ const ImageSettingsSchema = z.object({
   activeEngineId: z.string().min(1).max(256).nullable(),
 }).strict();
 
+const FoldersSettingsSchema = z.object({
+  group: z.literal(PRIVATE_PRO_VAULT_SETTINGS_FOLDERS_ID),
+  enableFolders: z.boolean(),
+}).strict();
+
 export const PrivateProPortableAppSettingsSchema = z.discriminatedUnion('group', [
   CallSettingsSchema,
   ChatSettingsSchema,
@@ -175,6 +182,7 @@ export const PrivateProPortableAppSettingsSchema = z.discriminatedUnion('group',
   BeamSettingsSchema,
   BrowsingSettingsSchema,
   ImageSettingsSchema,
+  FoldersSettingsSchema,
 ]);
 
 export type PrivateProPortableAppSettings = z.infer<typeof PrivateProPortableAppSettingsSchema>;
@@ -275,6 +283,7 @@ const imageState = (state: ReturnType<typeof useT2IStore.getState>) => ({
   engines: state.engines,
   activeEngineId: state.activeEngineId,
 });
+const foldersState = (state: ReturnType<typeof useFolderStore.getState>) => ({ enableFolders: state.enableFolders });
 
 export function privateProPortableAppSettingsSnapshot(): PrivateProPortableAppSettings[] {
   return PrivateProPortableAppSettingsSchema.array().parse([
@@ -287,6 +296,7 @@ export function privateProPortableAppSettingsSnapshot(): PrivateProPortableAppSe
     { group: PRIVATE_PRO_VAULT_SETTINGS_BEAM_ID, ...beamState(useModuleBeamStore.getState()) },
     { group: PRIVATE_PRO_VAULT_SETTINGS_BROWSING_ID, ...browsingState(useBrowseStore.getState()) },
     { group: PRIVATE_PRO_VAULT_SETTINGS_IMAGE_ID, ...imageState(useT2IStore.getState()) },
+    { group: PRIVATE_PRO_VAULT_SETTINGS_FOLDERS_ID, ...foldersState(useFolderStore.getState()) },
   ]);
 }
 
@@ -338,6 +348,11 @@ export function privateProPortableAppSettingsApply(value: PrivateProPortableAppS
       useT2IStore.setState({ ...state, hasInitializedLlms: true });
       return;
     }
+    case PRIVATE_PRO_VAULT_SETTINGS_FOLDERS_ID: {
+      const { group: _group, ...state } = parsed;
+      useFolderStore.setState(state);
+      return;
+    }
   }
 }
 
@@ -352,6 +367,7 @@ export function privateProPortableAppSettingsReset(group: PrivateProPortableAppS
     case PRIVATE_PRO_VAULT_SETTINGS_BEAM_ID: useModuleBeamStore.setState(beamState(useModuleBeamStore.getInitialState())); return;
     case PRIVATE_PRO_VAULT_SETTINGS_BROWSING_ID: useBrowseStore.setState(browsingState(useBrowseStore.getInitialState())); return;
     case PRIVATE_PRO_VAULT_SETTINGS_IMAGE_ID: useT2IStore.setState({ ...imageState(useT2IStore.getInitialState()), hasInitializedLlms: false }); return;
+    case PRIVATE_PRO_VAULT_SETTINGS_FOLDERS_ID: useFolderStore.setState(foldersState(useFolderStore.getInitialState())); return;
   }
 }
 
@@ -366,6 +382,7 @@ export function privateProPortableAppSettingsSubscribe(listener: () => void): ()
     subscribeProjected(useModuleBeamStore, beamState, listener),
     subscribeProjected(useBrowseStore, browsingState, listener),
     subscribeProjected(useT2IStore, imageState, listener),
+    subscribeProjected(useFolderStore, foldersState, listener),
   ];
   return () => unsubscribers.forEach(unsubscribe => unsubscribe());
 }

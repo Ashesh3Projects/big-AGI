@@ -3,6 +3,7 @@ import { persist } from 'zustand/middleware';
 
 import { agiId } from '~/common/util/idUtils';
 import { generateDeviceName, isBrowser, isPwa } from '~/common/util/pwaUtils';
+import { createPrivateProSensitiveLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 /// Store ///
@@ -26,6 +27,7 @@ const useDeviceStore = create<PerClientStore>()(persist(
   {
     name: 'app-device',
     version: 1,
+    ...createPrivateProSensitiveLocalStorageOptions<PerClientStore>(),
   },
 ));
 

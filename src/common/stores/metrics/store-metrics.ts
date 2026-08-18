@@ -6,6 +6,7 @@ import type { DModelsServiceId } from '~/common/stores/llms/llms.service.types';
 
 import type { MetricsChatGenerateCost_Md } from './metrics.chatgenerate';
 import { createServiceMetricsSlice, fallbackEmptyServiceMetricsAggregate, ServiceMetricsSlice } from './metrics.modelservice';
+import { createPrivateProSensitiveLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 // Store: single per-app, using the slices pattern for aggregations
@@ -14,6 +15,7 @@ const useMetricsStore = create<ServiceMetricsSlice>()(persist((...a) => ({
   ...createServiceMetricsSlice(...a),
 }), {
   name: 'app-metrics',
+  ...createPrivateProSensitiveLocalStorageOptions<ServiceMetricsSlice>(),
 }));
 
 

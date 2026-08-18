@@ -79,7 +79,7 @@ test('portable serializer registry reconstructs every explicit portable group on
     { useModelsStore },
     { chatSyncResetAll, chatSyncUpsert },
     { personaSyncResetAll, personaSyncUpsert },
-    { folderVaultApply, folderVaultResetAll },
+    { folderVaultApply, folderVaultResetAll, useFolderStore },
     { scratchClipVaultApply, scratchClipVaultReset },
     { googleVaultApply },
     { useASRxStore },
@@ -224,6 +224,7 @@ test('portable serializer registry reconstructs every explicit portable group on
 
   folderVaultResetAll();
   folderVaultApply({ id: 'folder-portable', title: INCLUDED.folder, conversationIds: ['chat-portable'], color: '#123456' });
+  useFolderStore.setState({ enableFolders: true });
   scratchClipVaultReset();
   scratchClipVaultApply({ history: [{ id: 'clip-portable', text: INCLUDED.scratch, timestamp: 1, source: 'textarea' }] });
   googleVaultApply({ googleCloudApiKey: INCLUDED.googleKey, googleCSEId: 'sentinel-cse', restrictToDomain: 'example.com' });
@@ -377,12 +378,14 @@ test('portable serializer registry reconstructs every explicit portable group on
   const removedJson = JSON.stringify(await Promise.all(serializers.map(serializer => serializer.snapshot())));
   for (const sentinel of Object.values(INCLUDED))
     assert.equal(removedJson.includes(sentinel), false, `removed portable sentinel ${sentinel}`);
+  assert.equal(useFolderStore.getState().enableFolders, false);
   for (let index = 0; index < serializers.length; index++) {
     const serializer = serializers[index];
     const records = roundTripRecords[index];
     for (const record of records)
       await serializer.apply(record.recordId, structuredClone(record.value));
   }
+  assert.equal(useFolderStore.getState().enableFolders, true);
   for (let index = 0; index < serializers.length; index++) {
     const serializer = serializers[index];
     const records = roundTripRecords[index];

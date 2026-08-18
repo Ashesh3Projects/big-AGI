@@ -6,6 +6,7 @@ import { Release } from '~/common/app.release';
 import { estimatePersistentStorageOrThrow, requestPersistentStorageSafe } from '~/common/util/storageUtils';
 import { gcAttachmentDBlobs } from '~/common/attachment-drafts/attachment.dblobs';
 import { isBrowser } from '~/common/util/pwaUtils';
+import { createPrivateProSensitiveLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 import { reconfigureBackendModels } from './reconfigureBackendModels';
 
@@ -43,6 +44,7 @@ export const useLogicSherpaStore = create<SherpaStore>()(
     }),
     {
       name: 'app-state',
+      ...createPrivateProSensitiveLocalStorageOptions<SherpaStore>(),
     },
   ),
 );

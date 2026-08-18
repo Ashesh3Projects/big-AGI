@@ -6,6 +6,7 @@ import { useShallow } from 'zustand/react/shallow';
 import { DConversationId } from '~/common/stores/chat/chat.conversation';
 import { agiUuid } from '~/common/util/idUtils';
 import { useChatStore } from '~/common/stores/chat/store-chats';
+import { createPrivateProSensitiveLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 // change this to increase/decrease the number history steps per pane
@@ -373,6 +374,7 @@ const useAppChatPanesStore = create<AppChatPanesState & AppChatPanesActions>()(p
   }), {
     // note: added the '-2' suffix on 20240308 to invalidate the persisted state, as we are adding a paneId
     name: 'app-app-chat-panes-2',
+    ...createPrivateProSensitiveLocalStorageOptions<AppChatPanesState & AppChatPanesActions>(),
   },
 ));
 

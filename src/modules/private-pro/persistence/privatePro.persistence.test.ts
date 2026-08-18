@@ -10,6 +10,7 @@ import { get, set } from 'idb-keyval';
 
 import {
   PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS,
+  PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS,
   clearPrivateProPlaintextPortablePersistence,
   createPrivateProPortableLocalStorage,
   isPrivateProEncryptedPersistenceActive,
@@ -91,29 +92,38 @@ describe('private Pro portable persistence gate', () => {
       'joy-color-scheme-light',
       'joy-mode',
     ]);
+    assert.deepEqual([...PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS].sort(), [
+      'agi-client-workspace',
+      'agi-live-file',
+      'agi-logger-log',
+      'app-app-chat-panes-2',
+      'app-device',
+      'app-metrics',
+      'app-state',
+    ]);
   });
 
   test('registers every durable source store and routes every included store through the private Pro adapter', () => {
     const sourceRoot = join(process.cwd(), 'src');
     const persistedStores = [
       ['apps/call/state/store-app-call.ts', 'app-app-call', 'portable'],
-      ['apps/chat/components/panes/store-panes-manager.ts', 'app-app-chat-panes-2', 'transient'],
+      ['apps/chat/components/panes/store-panes-manager.ts', 'app-app-chat-panes-2', 'sensitive-device'],
       ['apps/chat/components/persona-selector/store-purposes.ts', 'app-purpose', 'portable'],
       ['apps/chat/store-app-chat.ts', 'app-app-chat', 'portable'],
       ['apps/personas/store-app-personas.ts', 'app-app-personas', 'portable'],
       ['common/layout/optima/scratchclip/store-scratchclip.ts', 'agi-scratch-clip', 'portable'],
-      ['common/livefile/store-live-file.ts', 'agi-live-file', 'device-only'],
-      ['common/logger/store-logger.ts', 'agi-logger-log', 'excluded'],
-      ['common/logic/store-logic-sherpa.ts', 'app-state', 'transient'],
+      ['common/livefile/store-live-file.ts', 'agi-live-file', 'sensitive-device'],
+      ['common/logger/store-logger.ts', 'agi-logger-log', 'sensitive-device'],
+      ['common/logic/store-logic-sherpa.ts', 'app-state', 'sensitive-device'],
       ['common/stores/chat/store-chats.ts', 'app-chats', 'portable-idb'],
       ['common/stores/folders/store-chat-folders.ts', 'app-folders', 'portable'],
       ['common/stores/llms/store-llms.ts', 'app-models', 'portable'],
-      ['common/stores/metrics/store-metrics.ts', 'app-metrics', 'excluded'],
+      ['common/stores/metrics/store-metrics.ts', 'app-metrics', 'sensitive-device'],
       ['common/stores/store-ai.ts', 'app-ai-preferences', 'portable'],
-      ['common/stores/store-client.ts', 'app-device', 'device-only'],
+      ['common/stores/store-client.ts', 'app-device', 'sensitive-device'],
       ['common/stores/store-ui.ts', 'app-ui', 'portable'],
       ['common/stores/store-ux-labs.ts', 'app-ux-labs', 'portable'],
-      ['common/stores/workspace/store-client-workspace.ts', 'agi-client-workspace', 'device-only'],
+      ['common/stores/workspace/store-client-workspace.ts', 'agi-client-workspace', 'sensitive-device'],
       ['modules/asrx/store-module-asrx.ts', 'app-module-asrx', 'portable'],
       ['modules/beam/store-module-beam.tsx', 'app-module-beam', 'portable'],
       ['modules/browse/store-module-browsing.tsx', 'app-module-browse', 'portable'],
@@ -138,10 +148,16 @@ describe('private Pro portable persistence gate', () => {
     visit(sourceRoot);
     assert.deepEqual([...actual].sort(), persistedStores.map(([file, key]) => [file, key]).sort());
     for (const [file, key, classification] of persistedStores) {
-      if (classification !== 'portable') continue;
+      if (classification !== 'portable' && classification !== 'sensitive-device') continue;
       const source = readFileSync(join(sourceRoot, file), 'utf8');
-      assert.match(source, /createPrivateProPortableLocalStorageOptions/, `${file} must use the volatile adapter`);
-      assert.equal(PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS.has(key as never), true, `${key} must be allowlisted`);
+      const expectedAdapter = classification === 'portable'
+        ? /createPrivateProPortableLocalStorageOptions/
+        : /createPrivateProSensitiveLocalStorageOptions/;
+      assert.match(source, expectedAdapter, `${file} must use its private Pro volatile adapter`);
+      const expectedKeys = classification === 'portable'
+        ? PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS
+        : PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS;
+      assert.equal(expectedKeys.has(key as never), true, `${key} must be classified`);
     }
   });
 
@@ -204,6 +220,10 @@ describe('private Pro portable persistence gate', () => {
     const durable = new MemoryStorage();
     Object.defineProperty(globalThis, 'window', { configurable: true, value: { localStorage: durable } });
     durable.setItem('app-models', 'sentinel-provider-api-key');
+    durable.setItem('app-state', 'sentinel-composer-prefill');
+    durable.setItem('app-app-chat-panes-2', 'sentinel-conversation-id');
+    durable.setItem('agi-logger-log', 'sentinel-logger-detail');
+    durable.setItem('app-metrics', 'sentinel-service-id');
     durable.setItem('unrelated-feature', 'keep-me');
     await set('app-chats', 'sentinel-chat');
     await set('unrelated-cell', 'keep-me');
@@ -211,6 +231,10 @@ describe('private Pro portable persistence gate', () => {
     await clearPrivateProPlaintextPortablePersistence();
 
     assert.equal(durable.getItem('app-models'), null);
+    assert.equal(durable.getItem('app-state'), null);
+    assert.equal(durable.getItem('app-app-chat-panes-2'), null);
+    assert.equal(durable.getItem('agi-logger-log'), null);
+    assert.equal(durable.getItem('app-metrics'), null);
     assert.equal(durable.getItem('unrelated-feature'), 'keep-me');
     assert.equal(await get('app-chats'), undefined);
     assert.equal(await get('unrelated-cell'), 'keep-me');

@@ -7,6 +7,7 @@ import { agiUuid } from '~/common/util/idUtils';
 import { Is } from '~/common/util/pwaUtils';
 
 import type { LiveFile, LiveFileId, LiveFileMetadata } from './liveFile.types';
+import { createPrivateProSensitiveLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 // configuration
@@ -245,6 +246,7 @@ export const useLiveFileStore = create<LiveFileState & LiveFileActions>()(persis
   {
 
     name: 'agi-live-file',
+    ...createPrivateProSensitiveLocalStorageOptions<LiveFileState & LiveFileActions>(),
     // getStorage: () => ...?
 
     onRehydrateStorage: () => (state) => {

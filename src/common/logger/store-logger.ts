@@ -5,6 +5,7 @@ import { Release } from '~/common/app.release';
 import { agiUuid } from '~/common/util/idUtils';
 
 import type { LogEntry } from './logger.types';
+import { createPrivateProSensitiveLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 //
 // Note: right now it's not persisted - to persist uncomment the persistence code below
@@ -209,6 +210,7 @@ export const useLoggerStore = create<LoggerState & LoggerActions>()(
     {
 
       name: 'agi-logger-log',
+      ...createPrivateProSensitiveLocalStorageOptions<LoggerState & LoggerActions>(),
 
       // persist non-debug, non-dismissed entries, or those with pending actions
       partialize: (state) => ({

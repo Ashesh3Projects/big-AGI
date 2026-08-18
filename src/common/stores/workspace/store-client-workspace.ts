@@ -7,6 +7,7 @@ import { isAttachmentFragment } from '~/common/stores/chat/chat.fragments';
 import { liveFileGetAllValidIDs } from '~/common/livefile/store-live-file';
 
 import type { DWorkspaceId } from './workspace.types';
+import { createPrivateProSensitiveLocalStorageOptions } from '~/modules/private-pro/persistence/privatePro.persistence';
 
 
 /**
@@ -127,6 +128,7 @@ export const useClientWorkspaceStore = create<WorkspaceState & WorkspaceActions>
   }),
   {
     name: 'agi-client-workspace',
+    ...createPrivateProSensitiveLocalStorageOptions<WorkspaceState & WorkspaceActions>(),
 
     onRehydrateStorage: () => (state) => {
       if (!state) return;
