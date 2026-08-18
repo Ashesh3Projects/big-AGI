@@ -3,8 +3,10 @@ import { convertToHtml, images } from 'mammoth';
 
 export async function convertDocxToHTML(input: ArrayBuffer): Promise<{ html: string }> {
   try {
-    // Dynamically import mammoth
-    const result = await convertToHtml({ arrayBuffer: input }, {
+    const mammothInput = typeof window === 'undefined'
+      ? { buffer: Buffer.from(input) }
+      : { arrayBuffer: input };
+    const result = await convertToHtml(mammothInput, {
       convertImage: images.imgElement(function ignoreImage(image) {
         throw new Error('Images are not supported in DOCX to Markdown conversion');
       }),

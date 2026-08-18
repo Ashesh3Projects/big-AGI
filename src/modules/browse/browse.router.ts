@@ -341,7 +341,7 @@ function _shortError(error: any): string {
 }
 
 
-function cleanHtml(html: string): string {
+export function cleanHtml(html: string): string {
   try {
     const _C = cheerioLoad(html);
 
