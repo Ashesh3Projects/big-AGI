@@ -43,6 +43,8 @@ import {
 } from './privatePro.vault.migration';
 import { createPrivateProLegacyMigrationTransport } from '../sync/privatePro.sync.transport';
 import { privateProVaultRecordId } from './privatePro.vault.recordIds';
+import { collectLiveDBlobAssetIds } from '~/common/stores/chat/chat.gc';
+import { getDBAsset } from '~/common/stores/blob/dblobs-portability';
 
 
 export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'migrating' | 'error';
@@ -83,6 +85,7 @@ export interface PrivateProVaultLifecycle {
   unlockWithPassword(password: string): Promise<void>;
   unlockWithRecovery(recoveryKey: string, newPassword: string): Promise<void>;
   logout(): Promise<void>;
+  stopAndWait(): Promise<void>;
   destroy(): void;
 }
 
@@ -282,65 +285,84 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
   let pendingSetup: { keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; recoveryKey: string; operationId: string } | null = null;
   let confirmation: Promise<void> | null = null;
   let destroyed = false;
+  let lifecycleEpoch = 0;
+  let activeAttempt: Promise<void> | null = null;
   let unsubscribeRuntime: (() => void) | undefined;
   const listeners = new Set<(state: PrivateProVaultPublicState) => void>();
 
-  const setState = (patch: Partial<PrivateProVaultPublicState>) => {
-    if (destroyed) return;
+  const setState = (patch: Partial<PrivateProVaultPublicState>, epoch?: number) => {
+    if (destroyed || (epoch !== undefined && epoch !== lifecycleEpoch)) return;
     state = { ...state, ...patch };
     deps.onState?.(state);
     listeners.forEach(listener => listener(state));
   };
 
-  const bindRuntime = () => {
+  const runAttempt = (operation: (epoch: number) => Promise<void>): Promise<void> => {
+    const epoch = ++lifecycleEpoch;
+    const attempt = operation(epoch).finally(() => {
+      if (activeAttempt === attempt) activeAttempt = null;
+    });
+    activeAttempt = attempt;
+    return attempt;
+  };
+
+  const assertCurrent = (epoch: number) => {
+    if (destroyed || epoch !== lifecycleEpoch) throw new DOMException('Vault lifecycle attempt was cancelled.', 'AbortError');
+  };
+
+  const bindRuntime = (epoch?: number) => {
     unsubscribeRuntime?.();
     unsubscribeRuntime = deps.subscribeRuntime(phase => setState({
       phase,
       busy: false,
       error: phase === 'error' ? errorForPhase('error') : phase === 'reconnecting' ? errorForPhase('reconnecting') : null,
-    }));
+    }, epoch));
   };
 
-  const activate = async (nextMasterKey: TMasterKey, nextKeyset: TKeyset) => {
+  const activate = async (nextMasterKey: TMasterKey, nextKeyset: TKeyset, epoch: number) => {
+    assertCurrent(epoch);
     activationReady = false;
     masterKey = nextMasterKey;
     keyset = nextKeyset;
-    setState({ phase: 'hydrating', busy: true, error: null });
-    bindRuntime();
+    setState({ phase: 'hydrating', busy: true, error: null }, epoch);
+    bindRuntime(epoch);
     try {
       await deps.activate(nextMasterKey, nextKeyset);
+      assertCurrent(epoch);
       activationReady = true;
-      setState({ phase: 'ready', busy: false, error: null });
+      setState({ phase: 'ready', busy: false, error: null }, epoch);
     } catch {
-      setState({ phase: 'error', busy: false, error: errorForPhase('error') });
+      setState({ phase: 'error', busy: false, error: errorForPhase('error') }, epoch);
     }
   };
 
-  const start = async () => {
+  const startAttempt = async (epoch: number) => {
     if (!deps.isOnline()) {
-      setState({ phase: 'reconnecting', busy: false, error: errorForPhase('reconnecting') });
+      setState({ phase: 'reconnecting', busy: false, error: errorForPhase('reconnecting') }, epoch);
       return;
     }
-    setState({ phase: 'hydrating', busy: true, error: null, recoveryKey: null });
+    setState({ phase: 'hydrating', busy: true, error: null, recoveryKey: null }, epoch);
     try {
       const bootstrap = await deps.bootstrap();
+      assertCurrent(epoch);
       keyset = bootstrap.keyset;
       if (!keyset) {
-        setState({ phase: 'setup', busy: false, error: null });
+        setState({ phase: 'setup', busy: false, error: null }, epoch);
         return;
       }
       if (!bootstrap.rememberedDeviceKnown) {
-        setState({ phase: 'locked', busy: false, error: null });
+        setState({ phase: 'locked', busy: false, error: null }, epoch);
         return;
       }
       const remembered = await deps.restoreRemembered(keyset);
+      assertCurrent(epoch);
       if (!remembered) {
-        setState({ phase: 'locked', busy: false, error: null });
+        setState({ phase: 'locked', busy: false, error: null }, epoch);
         return;
       }
-      await activate(remembered, keyset);
+      await activate(remembered, keyset, epoch);
     } catch {
-      setState({ phase: deps.isOnline() ? 'error' : 'reconnecting', busy: false, error: errorForPhase(deps.isOnline() ? 'error' : 'reconnecting') });
+      setState({ phase: deps.isOnline() ? 'error' : 'reconnecting', busy: false, error: errorForPhase(deps.isOnline() ? 'error' : 'reconnecting') }, epoch);
     }
   };
 
@@ -350,10 +372,10 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-    start,
+    start: () => runAttempt(startAttempt),
     retry: async () => {
-      if (keyset && masterKey) return activate(masterKey, keyset);
-      return start();
+      if (keyset && masterKey) return runAttempt(epoch => activate(masterKey!, keyset!, epoch));
+      return runAttempt(startAttempt);
     },
     async setup(password) {
       if (!privateProVaultPasswordStrength(password).acceptable) {
@@ -403,37 +425,52 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
       return confirmation;
     },
     async unlockWithPassword(password) {
-      if (!keyset) return start();
-      setState({ phase: 'locked', busy: true, error: null });
-      try {
-        const unlocked = await deps.unlockPassword(keyset, password);
-        await deps.remember(unlocked.masterKey, keyset);
-        await deps.register(keyset, unlocked.enrollmentKey);
-        await activate(unlocked.masterKey, keyset);
-      } catch {
-        setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
-      }
+      if (!keyset) return runAttempt(startAttempt);
+      const currentKeyset = keyset;
+      return runAttempt(async epoch => {
+        setState({ phase: 'locked', busy: true, error: null }, epoch);
+        try {
+          const unlocked = await deps.unlockPassword(currentKeyset, password);
+          assertCurrent(epoch);
+          await deps.remember(unlocked.masterKey, currentKeyset);
+          assertCurrent(epoch);
+          await deps.register(currentKeyset, unlocked.enrollmentKey);
+          assertCurrent(epoch);
+          await activate(unlocked.masterKey, currentKeyset, epoch);
+        } catch {
+          setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS }, epoch);
+        }
+      });
     },
     async unlockWithRecovery(recoveryKey, newPassword) {
-      if (!keyset) return start();
+      if (!keyset) return runAttempt(startAttempt);
       if (!privateProVaultPasswordStrength(newPassword).acceptable) {
         setState({ phase: 'locked', busy: false, error: 'Use at least 14 characters for the new password.' });
         return;
       }
-      setState({ phase: 'locked', busy: true, error: null });
-      try {
-        const unlocked = await deps.unlockRecovery(keyset, recoveryKey, newPassword);
-        const commit = await deps.commitRecovery(keyset, unlocked.keyset);
-        if (commit === 'conflict') throw new Error('Vault keyset changed.');
-        keyset = unlocked.keyset;
-        await deps.remember(unlocked.masterKey, unlocked.keyset);
-        await deps.register(unlocked.keyset, unlocked.enrollmentKey);
-        await activate(unlocked.masterKey, unlocked.keyset);
-      } catch {
-        setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
-      }
+      const currentKeyset = keyset;
+      return runAttempt(async epoch => {
+        setState({ phase: 'locked', busy: true, error: null }, epoch);
+        try {
+          const unlocked = await deps.unlockRecovery(currentKeyset, recoveryKey, newPassword);
+          assertCurrent(epoch);
+          const commit = await deps.commitRecovery(currentKeyset, unlocked.keyset);
+          assertCurrent(epoch);
+          if (commit === 'conflict') throw new Error('Vault keyset changed.');
+          keyset = unlocked.keyset;
+          await deps.remember(unlocked.masterKey, unlocked.keyset);
+          assertCurrent(epoch);
+          await deps.register(unlocked.keyset, unlocked.enrollmentKey);
+          assertCurrent(epoch);
+          await activate(unlocked.masterKey, unlocked.keyset, epoch);
+        } catch {
+          setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS }, epoch);
+        }
+      });
     },
     async logout() {
+      lifecycleEpoch++;
+      await activeAttempt?.catch(() => undefined);
       unsubscribeRuntime?.();
       unsubscribeRuntime = undefined;
       masterKey = null;
@@ -443,8 +480,20 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
       await deps.logout();
       setState({ phase: 'locked', busy: false, error: null, recoveryKey: null });
     },
+    async stopAndWait() {
+      destroyed = true;
+      lifecycleEpoch++;
+      unsubscribeRuntime?.();
+      unsubscribeRuntime = undefined;
+      listeners.clear();
+      await activeAttempt?.catch(() => undefined);
+      masterKey = null;
+      keyset = null;
+      pendingSetup = null;
+    },
     destroy() {
       destroyed = true;
+      lifecycleEpoch++;
       unsubscribeRuntime?.();
       listeners.clear();
       masterKey = null;
@@ -572,8 +621,13 @@ function createProductionDependencies(
           },
           assets: {
             describe: (assetIds, signal) => assets.describe(assetIds, signal),
-            prepareForUpload: (assetIds, signal) => assets.prepareForUpload(assetIds, signal),
+            prepareForUpload: (assetIds, operationIds, signal) => assets.prepareForUpload(assetIds, signal, operationIds),
             verifyCloud: (frozenAssets, signal) => assets.verifyCloud(frozenAssets, signal),
+            async canDeleteFrozenAsset(assetId) {
+              const asset = await getDBAsset(assetId);
+              if (!asset || asset.scopeId !== 'app-chat') return false;
+              return !collectLiveDBlobAssetIds().has(assetId);
+            },
             deleteLocal: (asset, signal) => assets.deleteLocal(asset, signal),
           },
           server: {
@@ -663,10 +717,12 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     void lifecycle.start();
     return () => {
       unsubscribe();
-      void stopPrivateProVaultMigrationActivation(runtime);
-      runtime.engine?.stop();
-      lifecycle.destroy();
       lifecycleRef.current = null;
+      void (async () => {
+        await lifecycle.stopAndWait();
+        await stopPrivateProVaultMigrationActivation(runtime);
+        runtime.engine?.stop();
+      })();
     };
   }, [auth.signOut, auth.user]);
 

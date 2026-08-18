@@ -106,6 +106,10 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
   autoAbortBeforeObjectHash = false;
   hashCalls = 0;
   rejectDivergentReady = true;
+  failAfterReserve = false;
+  failAfterFinalize = false;
+  failAfterUploadAt: number | null = null;
+  private reservedByOperation = new Map<string, { opaqueAssetId: string; ciphertextBytes: number; chunks: any[] }>();
   private ready: { opaqueAssetId: string; ciphertextBytes: number; chunks: any[] } | null = null;
 
   async reserveUpload(input: { operationId: string; opaqueAssetId: string; chunks: any[] }) {
@@ -121,6 +125,11 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
       };
       if (this.rejectDivergentReady) throw new Error('Encrypted asset already exists with different ciphertext descriptors.');
     }
+    const replay = this.reservedByOperation.get(input.operationId);
+    if (replay) {
+      this.ready = replay;
+      return { status: 'upload-required' as const, operationId: input.operationId, opaqueAssetId: replay.opaqueAssetId, expiresAtMs: Date.now() + 60_000, chunks: replay.chunks };
+    }
     const chunks = input.chunks.map((chunk, index) => ({
       ...chunk,
       objectPath: `users/${UID}/vault/assets/${input.opaqueAssetId}/${chunk.opaqueChunkId}`,
@@ -131,7 +140,16 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
         'x-goog-meta-sha256': chunk.objectSha256,
       },
     }));
+    this.reservedByOperation.set(input.operationId, {
+      opaqueAssetId: input.opaqueAssetId,
+      ciphertextBytes: input.chunks.reduce((sum, chunk) => sum + chunk.ciphertextBytes, 0),
+      chunks,
+    });
     this.ready = { opaqueAssetId: input.opaqueAssetId, ciphertextBytes: input.chunks.reduce((sum, chunk) => sum + chunk.ciphertextBytes, 0), chunks };
+    if (this.failAfterReserve) {
+      this.failAfterReserve = false;
+      throw new Error('injected crash after reservation');
+    }
     return { status: 'upload-required' as const, operationId: input.operationId, opaqueAssetId: input.opaqueAssetId, expiresAtMs: Date.now() + 60_000, chunks };
   }
 
@@ -143,17 +161,26 @@ class MemoryTransport implements PrivateProVaultAssetClientTransport {
     }
     if (input.chunkIndex === this.failUploadAt) throw new Error('injected upload failure');
     this.objects.set(input.objectPath, Uint8Array.from(input.bytes));
+    if (input.chunkIndex === this.failAfterUploadAt) {
+      this.failAfterUploadAt = null;
+      throw new Error(`injected crash after object ${input.chunkIndex}`);
+    }
   }
 
   async finalizeUpload() {
     this.finalized++;
     if (!this.ready) throw new Error('not reserved');
+    if (this.failAfterFinalize) {
+      this.failAfterFinalize = false;
+      throw new Error('injected crash after finalize');
+    }
     return { status: 'ready' as const, opaqueAssetId: this.ready.opaqueAssetId, ciphertextBytes: this.ready.ciphertextBytes };
   }
 
   async releaseReservation() {
     this.releases++;
     this.objects.clear();
+    this.reservedByOperation.clear();
     this.ready = null;
   }
 
@@ -553,6 +580,27 @@ describe('private Pro encrypted vault asset client', () => {
     assert.equal(transport.releases, 1);
     assert.equal(transport.finalized, 1);
   });
+
+  for (const crash of ['reservation', 'object-0', 'object-1', 'finalize'] as const) {
+    test(`reuses a caller-supplied operation ID after a crash following ${crash}`, async () => {
+      const { client, transport } = await fixture();
+      if (crash === 'reservation') transport.failAfterReserve = true;
+      else if (crash === 'finalize') transport.failAfterFinalize = true;
+      else transport.failAfterUploadAt = Number(crash.slice(-1));
+
+      await assert.rejects(
+        client.prepareForUpload([ASSET_ID], undefined, { [ASSET_ID]: 'migration-asset-stable-op' }),
+        /injected crash/,
+      );
+      await client.prepareForUpload([ASSET_ID], undefined, { [ASSET_ID]: 'migration-asset-stable-op' });
+
+      assert.deepEqual(transport.reservations.map(reservation => reservation.operationId), [
+        'migration-asset-stable-op',
+        'migration-asset-stable-op',
+      ]);
+      assert.equal(crash === 'reservation' ? transport.reservations.length === 2 : transport.finalized >= 1, true);
+    });
+  }
 
   test('rejects changed payload or metadata under the immutable logical asset ID', async () => {
     const payloadChanged = await fixture();

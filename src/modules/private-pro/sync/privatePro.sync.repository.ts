@@ -93,6 +93,9 @@ export interface PrivateProSyncRepository {
     entityType: PrivateProEntityType;
     entityId: string;
     sourceVersion: string;
+    frozenRevisionPath: string | null;
+    frozenChunkIds: string[];
+    expiresAtMs: number;
   }): Promise<'deleted' | 'already-deleted' | 'conflict'>;
 }
 
@@ -105,7 +108,15 @@ export interface PrivateProLegacyCleanupReceipt {
   revisionPath: string | null;
   chunkIds: string[];
   chunkCursor: number;
-  status: 'children' | 'complete';
+  status: 'children';
+  expiresAtMs: number;
+}
+
+export interface PrivateProLegacyCleanupTombstone {
+  uid: string;
+  operationId: string;
+  status: 'complete';
+  expiresAtMs: number;
 }
 
 export interface PrivateProLegacyCleanupPort {
@@ -115,9 +126,12 @@ export interface PrivateProLegacyCleanupPort {
     entityType: PrivateProEntityType;
     entityId: string;
     sourceVersion: string;
+    frozenRevisionPath: string | null;
+    frozenChunkIds: string[];
+    expiresAtMs: number;
   }): Promise<
     | { status: 'ready'; receipt: PrivateProLegacyCleanupReceipt }
-    | { status: 'complete'; receipt: PrivateProLegacyCleanupReceipt }
+    | { status: 'complete'; tombstone: PrivateProLegacyCleanupTombstone }
     | { status: 'already-deleted' }
     | { status: 'conflict' }
   >;
@@ -127,7 +141,41 @@ export interface PrivateProLegacyCleanupPort {
     expectedCursor: number;
   }): Promise<PrivateProLegacyCleanupReceipt>;
   listUnexpectedChunks(receipt: PrivateProLegacyCleanupReceipt): Promise<string[]>;
-  finalize(input: { receipt: PrivateProLegacyCleanupReceipt }): Promise<PrivateProLegacyCleanupReceipt>;
+  finalize(input: { receipt: PrivateProLegacyCleanupReceipt }): Promise<PrivateProLegacyCleanupTombstone>;
+}
+
+export function createPrivateProLegacyCleanupReceipt(
+  input: Parameters<PrivateProLegacyCleanupPort['prepare']>[0],
+  revisionPath: string | null,
+  chunkIds: readonly string[],
+): PrivateProLegacyCleanupReceipt {
+  if (!Number.isSafeInteger(input.expiresAtMs) || input.expiresAtMs <= 0)
+    throw new Error('Legacy cleanup expiry is invalid.');
+  if (input.entityType === 'chat') {
+    const expectedPrefix = `users/${input.uid}/chats/${input.entityId}/revisions/`;
+    if (!revisionPath?.startsWith(expectedPrefix)) throw new Error('Legacy cleanup revision path is invalid.');
+  } else if (revisionPath !== null || chunkIds.length) {
+    throw new Error('Persona cleanup cannot carry chat revision children.');
+  }
+  return {
+    uid: input.uid,
+    operationId: input.operationId,
+    entityType: input.entityType,
+    entityId: input.entityId,
+    sourceVersion: input.sourceVersion,
+    revisionPath,
+    chunkIds: [...chunkIds],
+    chunkCursor: 0,
+    status: 'children',
+    expiresAtMs: input.expiresAtMs,
+  };
+}
+
+export function completePrivateProLegacyCleanupReceipt(
+  receipt: PrivateProLegacyCleanupReceipt,
+): PrivateProLegacyCleanupTombstone {
+  if (receipt.chunkCursor !== receipt.chunkIds.length) throw new Error('Legacy cleanup children are incomplete.');
+  return { uid: receipt.uid, operationId: receipt.operationId, status: 'complete', expiresAtMs: receipt.expiresAtMs };
 }
 
 export async function resumePrivateProLegacyMigrationCleanup(

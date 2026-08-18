@@ -33,5 +33,12 @@
       ]
     }
   ],
-  "fieldOverrides": []
+  "fieldOverrides": [
+    {
+      "collectionGroup": "legacyCleanupReceipts",
+      "fieldPath": "expiresAtMs",
+      "ttl": true,
+      "indexes": []
+    }
+  ]
 }

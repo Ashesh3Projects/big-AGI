@@ -104,6 +104,8 @@ async function createHarness(t: TestContext) {
   let cloudCleanup = 0;
   let verifyCount = 0;
   let uploadEffects = 0;
+  let assetUploadEffects = 0;
+  let deletedAssets = 0;
   let operationSequence = 0;
   let assetDescriptor: PrivateProVaultMigrationAssetDescriptor = {
     assetId: 'asset-private', plaintextBytes: 32, contentSha256: 'a'.repeat(64), manifestSha256: 'b'.repeat(64),
@@ -114,6 +116,10 @@ async function createHarness(t: TestContext) {
   const uploadReceipts = new Set<string>();
   const localCleanupReceipts = new Set<string>();
   const cloudCleanupReceipts = new Set<string>();
+  const assetUploadReceipts = new Set<string>();
+  let assetDeletionAllowed = true;
+  let beforeLocalDelete: (() => void) | null = null;
+  let beforeAssetDelete: (() => void) | null = null;
 
   const create = () => createPrivateProVaultMigration({
     uid: UID,
@@ -146,9 +152,17 @@ async function createHarness(t: TestContext) {
     },
     assets: {
       async describe() { return [structuredClone(assetDescriptor)]; },
-      async prepareForUpload() {},
+      async prepareForUpload(_assetIds, operationIds) {
+        const operationId = operationIds['asset-private'];
+        if (!operationId) throw new Error('asset upload operation ID missing');
+        if (!assetUploadReceipts.has(operationId)) {
+          assetUploadReceipts.add(operationId);
+          assetUploadEffects++;
+        }
+      },
       async verifyCloud() { verifyCount++; },
-      async deleteLocal() {},
+      async canDeleteFrozenAsset() { beforeAssetDelete?.(); beforeAssetDelete = null; return assetDeletionAllowed; },
+      async deleteLocal() { deletedAssets++; },
     },
     server: {
       async commit(input) {
@@ -163,6 +177,10 @@ async function createHarness(t: TestContext) {
     },
     cleanup: {
       async local(_item, operationId) {
+        beforeLocalDelete?.();
+        beforeLocalDelete = null;
+        if ([...localItems, ...cloudItems].find(candidate => candidate.source === _item.source && candidate.sourceId === _item.sourceId)?.sourceVersion !== _item.sourceVersion)
+          throw new Error('A plaintext source changed immediately before cleanup. Cleanup was blocked.');
         if (localCleanupReceipts.has(operationId)) return;
         localCleanupReceipts.add(operationId);
         localCleanup++;
@@ -194,6 +212,9 @@ async function createHarness(t: TestContext) {
     setLocalItems(items: PrivateProVaultMigrationLegacyItem[]) { localItems = items; },
     setCloudItems(items: PrivateProVaultMigrationLegacyItem[]) { cloudItems = items; },
     setAssetDescriptor(next: PrivateProVaultMigrationAssetDescriptor) { assetDescriptor = next; },
+    setAssetDeletionAllowed(next: boolean) { assetDeletionAllowed = next; },
+    beforeNextLocalDelete(callback: () => void) { beforeLocalDelete = callback; },
+    beforeNextAssetDelete(callback: () => void) { beforeAssetDelete = callback; },
     injectFault(point: string) { faultPoint = point; faultThrown = false; },
     setExportConfirmed(next: boolean) { exportConfirmed = next; },
     get committed() { return committed; },
@@ -201,6 +222,8 @@ async function createHarness(t: TestContext) {
     get cloudCleanup() { return cloudCleanup; },
     get verifyCount() { return verifyCount; },
     get uploadEffects() { return uploadEffects; },
+    get assetUploadEffects() { return assetUploadEffects; },
+    get deletedAssets() { return deletedAssets; },
   };
 }
 
@@ -340,6 +363,39 @@ describe('private Pro plaintext-to-encrypted migration', () => {
       assert.equal(harness.cloudCleanup, 1);
       if (point === 'cleanup-local') assert.equal(before.localCleanup, 1);
       if (point === 'cleanup-cloud') assert.equal(before.cloudCleanup, 1);
+    });
+  }
+
+  test('checkpoints a stable asset upload operation before upload and resumes it once', async (t) => {
+    const harness = await createHarness(t);
+    const migration = harness.create();
+    harness.injectFault('asset-upload');
+
+    await assert.rejects(migration.run(), /injected fault after asset-upload/);
+    assert.equal(harness.assetUploadEffects, 1);
+    await harness.create().run();
+    assert.equal(harness.assetUploadEffects, 1);
+  });
+
+  test('rechecks the exact local item immediately before deletion', async (t) => {
+    const harness = await createHarness(t);
+    harness.beforeNextLocalDelete(() => harness.setLocalItems([{
+      source: 'local', sourceId: 'local-chat-1', sourceVersion: 'local-v2', recordType: 'chat', recordId: RECORD_ID,
+      schemaVersion: 1, value: { ...harness.value, body: 'racing edit' }, assetIds: ['asset-private'],
+    }]));
+
+    await assert.rejects(harness.create().run(), /changed.*cleanup|cleanup.*changed|inventory changed/i);
+    assert.equal(harness.localCleanup, 0);
+  });
+
+  for (const liveReference of ['incognito', 'incomplete', 'draft'] as const) {
+    test(`preserves an asset with a live ${liveReference} reference at the final delete check`, async (t) => {
+      const harness = await createHarness(t);
+      harness.beforeNextAssetDelete(() => harness.setAssetDeletionAllowed(false));
+
+      await harness.create().run();
+
+      assert.equal(harness.deletedAssets, 0);
     });
   }
 

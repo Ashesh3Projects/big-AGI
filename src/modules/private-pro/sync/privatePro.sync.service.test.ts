@@ -124,7 +124,7 @@ class MemorySyncRepository implements PrivateProSyncRepository {
     return { status: 'committed' as const, revision };
   }
 
-  async cleanupMigratedEntity(input: { uid: string; operationId: string; entityType: 'chat' | 'persona'; entityId: string; sourceVersion: string }) {
+  async cleanupMigratedEntity(input: { uid: string; operationId: string; entityType: 'chat' | 'persona'; entityId: string; sourceVersion: string; frozenRevisionPath: string | null; frozenChunkIds: string[]; expiresAtMs: number }) {
     const [revisionText, contentHash] = input.sourceVersion.split(':');
     const revision = Number(revisionText);
     const current = input.entityType === 'chat'
@@ -252,9 +252,10 @@ describe('private Pro revisioned sync service', () => {
     });
     const service = createPrivateProSyncService(repository, () => 1000);
 
-    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { operationId: 'cleanup-1', entityType: 'chat', entityId: 'chat-1', sourceVersion: `2:${'a'.repeat(64)}` }), 'conflict');
+    const frozen = { frozenRevisionPath: 'users/uid-owner/chats/chat-1/revisions/3-legacy', frozenChunkIds: [] };
+    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { operationId: 'cleanup-1', entityType: 'chat', entityId: 'chat-1', sourceVersion: `2:${'a'.repeat(64)}`, ...frozen }), 'conflict');
     assert.equal(repository.chats.has('uid-owner:chat-1'), true);
-    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { operationId: 'cleanup-2', entityType: 'chat', entityId: 'chat-1', sourceVersion: `3:${'a'.repeat(64)}` }), 'deleted');
-    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { operationId: 'cleanup-2', entityType: 'chat', entityId: 'chat-1', sourceVersion: `3:${'a'.repeat(64)}` }), 'already-deleted');
+    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { operationId: 'cleanup-2', entityType: 'chat', entityId: 'chat-1', sourceVersion: `3:${'a'.repeat(64)}`, ...frozen }), 'deleted');
+    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { operationId: 'cleanup-2', entityType: 'chat', entityId: 'chat-1', sourceVersion: `3:${'a'.repeat(64)}`, ...frozen }), 'already-deleted');
   });
 });

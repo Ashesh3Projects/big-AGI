@@ -33,6 +33,7 @@ export interface PrivateProVaultSerializer<T> {
   validate(recordId: string, value: unknown): Promise<T>;
   apply(recordId: string, value: T): Promise<void>;
   remove(recordId: string): Promise<void>;
+  removeIfVersion?(recordId: string, expectedVersion: string): Promise<boolean>;
   createConflictCopy?(value: T): Promise<{ recordId: string; value: T }>;
   subscribe(listener: (mutation: PrivateProPortableMutation) => void): () => void;
 }

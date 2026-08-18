@@ -19,16 +19,17 @@ export class ConversationsManager {
   private constructor() {
     // Register a GC collector to protect DBlob assets referenced in active Beam stores.
     // Uses inversion of control to avoid circular dependency (chat/ -> chat-overlay/).
-    gcRegisterAssetCollector(() => this._collectBeamAssetIds());
+    gcRegisterAssetCollector(() => this._collectOverlayAssetIds());
   }
 
   /**
    * Collect DBlob asset IDs from all active Beam stores (rays, fusions, follow-ups).
    */
-  private _collectBeamAssetIds(): DBlobAssetId[] {
+  private _collectOverlayAssetIds(): DBlobAssetId[] {
     const assetIds = new Set<DBlobAssetId>();
     for (const handler of this.handlers.values()) {
-      const { rays, fusions } = handler.getBeamStore().getState();
+      const { inputHistory, rays, fusions } = handler.getBeamStore().getState();
+      for (const message of inputHistory ?? []) collectFragmentAssetIds(message.fragments, assetIds);
 
       // Scatter rays + their follow-up messages
       for (const ray of rays) {
@@ -46,6 +47,9 @@ export class ConversationsManager {
         //   for (const msg of fusion.followUpMessages)
         //     collectFragmentAssetIds(msg.fragments, assetIds);
       }
+      for (const draft of handler.conversationOverlayStore.getState().attachmentDrafts)
+        for (const fragment of draft.outputFragments)
+          collectFragmentAssetIds([fragment], assetIds);
     }
     return Array.from(assetIds);
   }

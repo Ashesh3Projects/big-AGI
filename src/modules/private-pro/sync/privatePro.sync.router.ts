@@ -79,6 +79,8 @@ export const privateProSyncRouter = createTRPCRouter({
       entityType: z.enum(['chat', 'persona']),
       entityId: entityIdSchema,
       sourceVersion: z.string().regex(/^\d+:[a-f0-9]{64}$/),
+      frozenRevisionPath: z.string().min(1).max(600).nullable(),
+      frozenChunkIds: z.array(z.string().min(1).max(80)).max(400),
     }).strict())
     .mutation(({ ctx, input }) => privateProSyncService().cleanupMigratedEntity(ctx.privateProIdentity, input)),
 });
