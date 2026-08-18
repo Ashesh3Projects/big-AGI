@@ -145,6 +145,35 @@ describe('private Pro portable persistence gate', () => {
     }
   });
 
+  test('inventories every direct durable browser owner outside Zustand persistence', () => {
+    const durableOwners = [
+      ['common/from-v1/from-v1.ts', 'unrelated'],
+      ['common/components/3rdparty/PostHogAnalytics.tsx', 'excluded'],
+      ['common/util/idbUtils.ts', 'portable-idb-infrastructure'],
+      ['modules/dblobs/dblobs.db.ts', 'portable-asset-legacy'],
+      ['modules/private-pro/vault/privatePro.vault.db.ts', 'encrypted-vault'],
+      ['modules/private-pro/vault/privatePro.vault.device.ts', 'device-only'],
+      ['modules/private-pro/persistence/privatePro.persistence.ts', 'portable-gate'],
+      ['modules/trade/BackupRestore.tsx', 'manual-export-only'],
+    ] as const;
+    const sourceRoot = join(process.cwd(), 'src');
+    const actual = new Set<string>();
+    const visit = (directory: string) => {
+      for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const absolute = join(directory, entry.name);
+        if (entry.isDirectory()) visit(absolute);
+        else if (/\.tsx?$/.test(entry.name) && !entry.name.includes('.test.')) {
+          const source = readFileSync(absolute, 'utf8');
+          const active = source.replace(/^\s*\/\/.*$/gm, '');
+          if (/\blocalStorage\.(?:getItem|setItem|removeItem|clear)|typeof\s+localStorage|\bindexedDB\.(?:open|deleteDatabase|databases)|new\s+\w*Dexie\s*\(|extends\s+Dexie\b/.test(active))
+            actual.add(relative(sourceRoot, absolute).split(sep).join('/'));
+        }
+      }
+    };
+    visit(sourceRoot);
+    assert.deepEqual([...actual].sort(), durableOwners.map(([file]) => file).sort());
+  });
+
   test('physically removes allowlisted keys through a real patched Storage prototype while private Pro is active', () => {
     const directory = mkdtempSync(join(tmpdir(), 'big-agi-private-pro-storage-'));
     const storageFile = join(directory, 'local-storage.json');
