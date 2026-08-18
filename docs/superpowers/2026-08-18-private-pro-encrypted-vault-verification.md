@@ -4,7 +4,7 @@
 
 **NOT READY FOR PRODUCTION.**
 
-Local residual-fix verification completed through code commit `e8bcc2195` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch is ready for Pro branch integration, but production still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
+Local residual-fix verification completed through code commit `f47f82f3b` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch is ready for Pro branch integration, but production still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
 
 This verification was local and read-only except for generated files inside the isolated worktree. It did not:
 
@@ -23,7 +23,7 @@ This verification was local and read-only except for generated files inside the 
 - Acknowledgment verification stabilization: `bf7ff8848`
 - One-shot audit evidence verification: `b9b04d6a1`
 - Final persistence, restore, analytics, recovery, route, and plaintext-backup fixes: `3f499a60d..91cbc2dc6`
-- Residual persistence, atomic restore, build analytics, recovery prompt, and rules fixes: `5c504abaa..e8bcc2195`
+- Residual persistence, atomic restore, build analytics, recovery prompt, rules, and reconciliation fixes: `5c504abaa..f47f82f3b`
 - Verification timezone: Asia/Calcutta, UTC+05:30
 - OS: Windows 10 Pro, 10.0.19045, x64
 - Node.js: `v24.5.0`
@@ -112,11 +112,11 @@ TDD and stress evidence:
 
 ## Command matrix
 
-Residual-fix commands below supersede the earlier final-fix counts. All were run from `e8bcc2195` unless noted.
+Residual-fix commands below supersede the earlier final-fix counts. All were run through `f47f82f3b` unless noted.
 
 | Status | Command | Result |
 |---|---|---|
-| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 268 passed, 0 failed. Includes exhaustive durable-store inventory, real Storage prototype cleanup, portable PC A/B reconstruction, atomic backup merge, exact verification, committed-failure recovery, PostHog isolation source boundaries, and visible recovery action. |
+| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 269 passed, 0 failed. Includes exhaustive durable-store inventory, real Storage prototype cleanup, portable PC A/B reconstruction, atomic backup merge, exact verification, ambiguous-commit replay, committed-failure recovery, PostHog isolation source boundaries, and visible recovery action. |
 | PASS | `npm run test:private-pro-tools` | 63 passed, 0 failed. Includes executable Private Pro production-build proof that PostHog tooling is not imported or applied with dummy credentials. |
 | PASS | `npm run test:firebase:exec` with Microsoft JDK 21 | 36 passed, 0 failed. Expected permission-denied lines asserted browser denial, including the new backup-merge receipt path. |
 | PASS | `npm run tscheck` | Root and tools projects passed. |
