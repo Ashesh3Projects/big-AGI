@@ -1,9 +1,9 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { describe, test } from 'node:test';
-import { mkdtemp, readFile, symlink, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join } from 'node:path';
 
 import {
   classifyAppCheck,
@@ -153,6 +153,10 @@ function signedRestoreEvidence(value = unsignedRestoreEvidence(), privateKey = T
     ...value,
     signatureBase64: sign(null, Buffer.from(canonicalJsonForTest(value)), privateKey).toString('base64'),
   };
+}
+
+function restoreEvidenceBase64(value = signedRestoreEvidence()) {
+  return Buffer.from(canonicalJsonForTest(value), 'utf8').toString('base64');
 }
 
 describe('private Pro security audit classifiers', () => {
@@ -557,74 +561,69 @@ describe('private Pro security audit classifiers', () => {
     assert.ok(audit.inspectFirestoreRestoreEvidence(signedRestoreEvidence(malformed), input).schemaErrors > 0);
   });
 
-  test('collects signed evidence with actual HEAD and rejects unsafe or unbounded files', async () => {
+  test('collects signed evidence only from strict bounded canonical base64 environment input', () => {
     const audit = securityAuditModule as unknown as {
-      collectFirestoreRestoreEvidenceWithReader(
-        path: string,
+      collectFirestoreRestoreEvidenceFromBase64(
+        value: string | undefined,
         input: {
           nowMs: number;
           actualHeadSha: string;
           trustDescriptor: unknown;
-          repoRoot: string;
         },
-        readText?: (path: string) => Promise<string>,
-        canonicalizePath?: (path: string) => Promise<string>,
-      ): Promise<{ readable: boolean; completed: boolean; signatureVerified: boolean }>;
+      ): { readable: boolean; completed: boolean; signatureVerified: boolean };
     };
-    const repoRoot = resolve('F:/repo');
-    const canonicalPath = join(repoRoot, 'infra/private-pro/firestore-restore-evidence.json');
     const input = {
       nowMs: Date.parse('2026-08-18T12:00:00Z'),
       actualHeadSha: TEST_RELEASE_COMMIT,
       trustDescriptor: TEST_TRUST,
-      repoRoot,
     };
-    const paths: string[] = [];
-    const canonicalize = async (path: string) => resolve(path);
-    const accepted = await audit.collectFirestoreRestoreEvidenceWithReader(canonicalPath, input, async path => {
-      paths.push(path);
-      return JSON.stringify(signedRestoreEvidence());
-    }, canonicalize);
-    assert.deepEqual(paths, [canonicalPath]);
+    const encoded = restoreEvidenceBase64();
+    const accepted = audit.collectFirestoreRestoreEvidenceFromBase64(encoded, input);
     assert.equal(accepted.readable, true);
+    assert.equal(accepted.completed, true);
     assert.equal(accepted.signatureVerified, true);
 
-    for (const path of ['infra/private-pro/firestore-restore-evidence.json', join(repoRoot, '../escape/evidence.json')]) {
-      const result = await audit.collectFirestoreRestoreEvidenceWithReader(path, input, async () => JSON.stringify(signedRestoreEvidence()), canonicalize);
-      assert.equal(result.readable, false);
-    }
+    const withoutPadding = encoded.endsWith('==') ? encoded.slice(0, -2) : encoded.endsWith('=') ? encoded.slice(0, -1) : `${encoded}=`;
+    const aliasBytes = Buffer.from([0xff]);
+    const canonicalAlias = aliasBytes.toString('base64');
+    const trailingBitAlias = `${canonicalAlias.slice(0, 1)}${canonicalAlias[1] === 'w' ? 'x' : 'w'}==`;
+    const duplicateKey = Buffer.from('{"schemaVersion":1,"schemaVersion":1}', 'utf8').toString('base64');
+    const invalidUtf8 = Buffer.from([0xc3, 0x28]).toString('base64');
+    const noncanonicalJson = Buffer.from(JSON.stringify(signedRestoreEvidence()), 'utf8').toString('base64');
+    const oversized = Buffer.alloc(16 * 1024 + 1, 0x20).toString('base64');
+    for (const value of [
+      undefined,
+      '',
+      'not-base64',
+      `${encoded}\n`,
+      withoutPadding,
+      trailingBitAlias,
+      noncanonicalJson,
+      duplicateKey,
+      invalidUtf8,
+      oversized,
+    ]) assert.equal(audit.collectFirestoreRestoreEvidenceFromBase64(value, input).readable, false);
+  });
 
-    const duplicateKey = `{"schemaVersion":1,"schemaVersion":1}`;
-    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(canonicalPath, input, async () => duplicateKey, canonicalize)).readable, false);
-    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(canonicalPath, input, async () => 'x'.repeat(1024 * 1024 + 1), canonicalize)).readable, false);
+  test('has no restore evidence filesystem transport left', async () => {
+    const source = await readFile('tools/private-pro/security-audit.ts', 'utf8');
+    const docs = `${await readFile('infra/private-pro/firestore-recovery-controls.md', 'utf8')}\n${await readFile('docs/deploy-private-pro-firebase.md', 'utf8')}`;
+    const evidenceSource = source.slice(source.indexOf('function decodeCanonicalRestoreEvidenceBase64'), source.indexOf('function runtimeIdentityInput'));
 
-    const operatorRoot = resolve('F:/operator-evidence');
-    const operatorPath = join(operatorRoot, 'run-123.json');
-    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(
-      operatorPath,
-      { ...input, repoRoot: operatorRoot },
-      async () => JSON.stringify(signedRestoreEvidence()),
-      canonicalize,
-    )).readable, true);
+    assert.match(source, /PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64/);
+    assert.doesNotMatch(evidenceSource, /(?:lstat|realpath|readText|canonicalizePath|repoRoot|configuredPath|approvedOperatorRoot)/);
+    assert.doesNotMatch(evidenceSource, /PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE\?\.trim|PRIVATE_PRO_RESTORE_EVIDENCE_ROOT/);
+    assert.doesNotMatch(docs, /PRIVATE_PRO_RESTORE_EVIDENCE_ROOT|firestore-restore-evidence\.json/);
+  });
 
-    const symlinkEscape = async (path: string) => path === canonicalPath ? resolve('F:/escape/evidence.json') : resolve(path);
-    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(
-      canonicalPath,
-      input,
-      async () => JSON.stringify(signedRestoreEvidence()),
-      symlinkEscape,
-    )).readable, false);
+  test('loads restore evidence from only the audit base64 environment variable', async () => {
+    const source = await readFile('tools/private-pro/security-audit.ts', 'utf8');
+    const evidenceEnvironmentReads = source.match(/process\.env\.PRIVATE_PRO_(?:FIRESTORE_)?RESTORE_EVIDENCE[A-Z0-9_]*/g) ?? [];
 
-    const directory = await mkdtemp(join(tmpdir(), 'restore-evidence-files-'));
-    const oversized = join(directory, 'oversized.json');
-    await writeFile(oversized, 'x'.repeat(1024 * 1024 + 1), 'utf8');
-    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(oversized, { ...input, repoRoot: directory })).readable, false);
-
-    const target = join(directory, 'target.json');
-    const link = join(directory, 'link.json');
-    await writeFile(target, JSON.stringify(signedRestoreEvidence()), 'utf8');
-    await symlink(target, link, 'file');
-    assert.equal((await audit.collectFirestoreRestoreEvidenceWithReader(link, { ...input, repoRoot: directory })).readable, false);
+    assert.deepEqual([...new Set(evidenceEnvironmentReads)].sort(), [
+      'process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64',
+      'process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA',
+    ]);
   });
 
   test('collects the audited release commit from actual git HEAD', async () => {

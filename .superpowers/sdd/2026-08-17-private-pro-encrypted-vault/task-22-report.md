@@ -150,7 +150,7 @@ The first implementation overstated normal managed export consistency, allowed p
   - Export/import rehearsals now require a freshly created empty isolated non-default target, separate index/rule/TTL/config deployment, redacted document counts, keyed ciphertext hashes, and application reconstruction.
 - Tightened Firestore database collection to require exact name, `FIRESTORE_NATIVE`, `STANDARD`, nonempty location, deletion protection, PITR enablement, earliest version time, and retention period. Only disabled PITR plus `3600s` or enabled PITR plus `604800s` is readable. Missing, malformed, unknown, or inconsistent fields block.
 - Changed `earliestVersionTimePresent` from a constant pass to a real blocker when absent.
-- Added a canonical restore evidence gate at `infra/private-pro/firestore-restore-evidence.json`, with `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE` as an explicit path override.
+- Added a restore evidence release gate. Its initial transport was superseded in fix round 4.
 - Missing, malformed, failed, older-than-90-day, changed-source, non-isolated, default-target, non-empty-target, index/rule/config, count/hash, data, or application evidence now blocks the audit.
 - Added `native-backup-restore` evidence support.
 - Added native scheduled backups as a third option: consistent point-in-time data plus index configurations, one daily and one weekly schedule per database, provider-selected execution time, up to 14 weeks retention, same-location restore to a new database, and TTL policy exclusion.
@@ -191,7 +191,7 @@ All Private Pro tool tests passed. The tools-wide TypeScript project remained bl
 
 The `firestoreRecovery` resource was complete and readable. Deletion protection remained a blocker, retention was the exact disabled-PITR `3600s` state, and the PITR decision remained a warning.
 
-The new `firestoreRestoreEvidence` area blocked because the canonical evidence file is absent. This is expected: no restore rehearsal has been approved or run, and no evidence was fabricated.
+The new `firestoreRestoreEvidence` area blocked because restore evidence is absent. This is expected: no restore rehearsal has been approved or run, and no evidence was fabricated.
 
 The report-only JSON parsed successfully and asserted the deletion-protection blocker, restore-evidence blocker, empty-target evidence blocker, and PITR decision warning. The docs/source contract assertions passed.
 
@@ -229,7 +229,7 @@ The previous restore evidence schema consisted of self-asserted booleans. A hand
 - Added HMAC-SHA256 authentication over recursively key-sorted canonical JSON excluding only `macBase64`.
 - The audit reads `PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY` only at audit time. The key must be canonical base64 decoding to 32-64 bytes and is never stored in evidence, docs, reports, or normal application config.
 - The audit binds evidence to `PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA`. A wrong or missing release SHA blocks.
-- The canonical repository evidence path is absolute. Overrides require an absolute evidence path and absolute `PRIVATE_PRO_RESTORE_EVIDENCE_ROOT`; both are resolved through real paths, and the evidence must remain below the approved root. Relative paths, traversal, and symlink escapes block.
+- The initial filesystem transport was superseded and removed in fix round 4.
 - Added a 1 MiB evidence cap and duplicate JSON object-key rejection before `JSON.parse`.
 - Kept the report redacted: the audit emits only booleans/counts, including `macVerified` and `releaseCommitMatches`.
 
@@ -241,7 +241,7 @@ RED:
 42 audit tests: 38 passed, 4 failed
 ```
 
-The four failures covered valid authenticated evidence, unsigned/wrong-MAC/tampered/wrong-release/changed-source evidence, stale/reversed/invalid-family provenance, and path/duplicate-key/oversized JSON collection.
+The four failures covered valid authenticated evidence, unsigned/wrong-MAC/tampered/wrong-release/changed-source evidence, stale/reversed/invalid-family provenance, and transport/duplicate-key/oversized JSON validation.
 
 GREEN:
 
@@ -272,9 +272,7 @@ The restore evidence gate remains blocked because no approved rehearsal evidence
 - unapproved collection family;
 - count or keyed digest mismatch;
 - failed application acceptance;
-- relative path and traversal;
-- realpath/symlink escape;
-- oversized file;
+- oversized evidence;
 - duplicate JSON keys.
 
 ### Cloud boundary
@@ -317,11 +315,7 @@ Fix round 2 authenticated evidence with a shared HMAC. Anyone holding the shared
   - completion and attestation cannot be more than five minutes in the future;
   - completion and artifact must be within 90 days;
   - attestation must fall within the trust key activation window.
-- Replaced default `readFile` use with a bounded regular-file reader:
-  - reject symlinks through `lstat`;
-  - reject non-files and files over 1 MiB before open;
-  - open by handle, compare size/device/inode, read at most cap plus one byte, and re-check file identity/size after read;
-  - retain realpath root-containment checks.
+- Added transport hardening that was later superseded and removed in fix round 4.
 - Kept keyed per-family ciphertext HMAC comparisons only as data equality measurements. They are not the evidence attestation mechanism.
 
 ### TDD
@@ -341,7 +335,7 @@ GREEN:
 49 Private Pro tool tests: 49 passed, 0 failed
 ```
 
-Coverage includes ephemeral test-only Ed25519 keys, unconfigured production trust, valid signature, unsigned evidence, wrong signer/key ID/issuer, tamper, wrong actual HEAD/additional commit, dirty checkout, wrong repository/workflow/ref/environment/run, stale completion, excessive delay, future time, invalid family/count/digest/application, actual oversized file, actual symlink, duplicate JSON keys, traversal, and simulated realpath escape.
+Coverage includes ephemeral test-only Ed25519 keys, unconfigured production trust, valid signature, unsigned evidence, wrong signer/key ID/issuer, tamper, wrong actual HEAD/additional commit, dirty checkout, wrong repository/workflow/ref/environment/run, stale completion, excessive delay, future time, invalid family/count/digest/application, oversized evidence, and duplicate JSON keys.
 
 ### Approval boundary
 
@@ -358,3 +352,65 @@ No restore, backup, export, import, database, schedule, IAM, storage, deployment
 - Checked-in trust descriptor JSON parsed and remained `unconfigured` with no public key.
 - Report-only JSON parsed and blocked `signatureVerified`, `trustConfigured`, `provenanceMatches`, `releaseCommitMatches`, and `worktreeClean` during the intentionally dirty pre-commit run.
 - `git diff --check`: passed.
+
+## Fix round 4
+
+Status: complete. No cloud mutation occurred. No real trust key, private key, or restore evidence was created.
+
+### Review findings
+
+The filesystem evidence transport had two independent defects. On Windows, validating the final path could not prevent an ancestor directory junction or reparse-point swap between validation and read. The default checked-in evidence path also contradicted the release rule that the audited tree must be clean and evidence must bind the committed HEAD.
+
+### Ruling
+
+Restore evidence is no longer read from the filesystem. The audit accepts it only from `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64`, while the independently pinned Ed25519 trust descriptor remains the sole fixed repository file. CI or the release attestor stores the immutable signed evidence artifact externally and injects its exact canonical base64 only into the audit process environment.
+
+### Changes
+
+- Removed the default evidence path, evidence path override, approved-root override, path containment, realpath, symlink, bounded-file reader, and evidence-file collector.
+- Added strict in-memory transport validation:
+  - canonical padded RFC 4648 base64 alphabet only;
+  - no whitespace, missing padding, alternate trailing bits, or base64 aliases;
+  - encoded-length rejection before allocation and a 16 KiB decoded ceiling;
+  - fatal UTF-8 decoding;
+  - duplicate JSON object-key rejection;
+  - exact canonical JSON byte equality before schema or signature verification.
+- Kept strict schema, independent Ed25519 verification, trust claims, timing, actual `git rev-parse HEAD`, and clean-tree checks unchanged.
+- Anchored the fixed trust descriptor read to `import.meta.url`, capped it at 16 KiB, and decoded it as strict UTF-8.
+- Kept `PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA` only as an optional additional equality constraint. It does not replace actual HEAD.
+- Updated the runbook and deployment guide for external immutable artifact storage, audit-only environment injection, PowerShell in-memory base64 conversion, immediate environment cleanup, and the prohibition on saving or reporting the encoded value.
+
+### TDD
+
+RED:
+
+```text
+45 audit tests: 43 passed, 2 failed
+```
+
+The failures were the missing base64 collector and the residual filesystem transport contract.
+
+GREEN:
+
+```text
+46 focused audit tests: 46 passed, 0 failed
+```
+
+Coverage includes valid canonical environment evidence with an ephemeral Ed25519 key; missing, empty, malformed, whitespace-bearing, unpadded, trailing-bit-alias, invalid-UTF-8, noncanonical-JSON, duplicate-key, and oversized input; unconfigured trust; signature tamper and wrong signer/claims/HEAD; dirty tree; and a source/docs assertion that no evidence filesystem transport remains.
+
+### Approval and cloud boundary
+
+The checked-in trust descriptor remains `unconfigured`. Activating a public trust key, creating or accessing production evidence, running a rehearsal, or mutating Firestore still requires separate explicit approval. No restore, backup, export, import, database, schedule, IAM, storage, deployment, cleanup, trust activation, key, or evidence mutation ran.
+
+### Verification
+
+- Focused Task 22 TypeScript: passed. The temporary project file was deleted and is not committed.
+- Focused security-audit tests: 46 passed, 0 failed.
+- All Private Pro tool tests: 51 passed, 0 failed.
+- Report-only audit: exited 0 with 45 pass, 8 warn, and 45 block findings across the existing audit. With no evidence environment value and the intentionally unconfigured trust descriptor, `readable`, `signatureVerified`, `trustConfigured`, `provenanceMatches`, `releaseCommitMatches`, and `worktreeClean` all blocked as expected.
+- Post-commit report-only audit: exited 0 with 46 pass, 8 warn, and 44 block findings. The clean-tree check passed; absent evidence, unconfigured trust, signature, provenance, and release binding remained blocked as designed.
+- Focused ESLint remained blocked before file analysis by the existing `@rushstack/eslint-patch` caller-recognition error.
+- Residual transport scan: no evidence path/root environment variable, canonical evidence JSON path, path collector, path containment, realpath, symlink reader, or bounded evidence file reader remains in operational code or docs.
+- Checked-in trust descriptor remains `unconfigured` with no production public or private key.
+- `git diff --check`: passed.
+- Added-diff credential-pattern scan: no credential-like values. The checked-in trust descriptor remained `unconfigured` with no public key.

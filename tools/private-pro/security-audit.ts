@@ -1,8 +1,8 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createPublicKey, verify } from 'node:crypto';
-import { access, lstat, open, readFile, realpath } from 'node:fs/promises';
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { promisify } from 'node:util';
+import { access, readFile } from 'node:fs/promises';
+import { delimiter, dirname, join } from 'node:path';
+import { promisify, TextDecoder } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { GoogleAuth } from 'google-auth-library';
@@ -11,12 +11,13 @@ import { GoogleAuth } from 'google-auth-library';
 const execFile = promisify(execFileCallback);
 const DEFAULT_PROJECT_ID = 'big-agi-243b6';
 const DEFAULT_DEPLOYMENT_ORIGIN = 'https://chatgpt.ashesh.dev';
-const DEFAULT_FIRESTORE_RESTORE_EVIDENCE_PATH = 'infra/private-pro/firestore-restore-evidence.json';
-const FIRESTORE_RESTORE_TRUST_PATH = 'infra/private-pro/firestore-restore-attestor-trust.json';
+const FIRESTORE_RESTORE_TRUST_URL = new URL('../../infra/private-pro/firestore-restore-attestor-trust.json', import.meta.url);
 const FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS = 90;
 const FIRESTORE_RESTORE_ATTESTATION_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
 const FIRESTORE_RESTORE_FUTURE_SKEW_MS = 5 * 60 * 1000;
-const FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES = 1024 * 1024;
+const FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES = 16 * 1024;
+const FIRESTORE_RESTORE_EVIDENCE_MAX_BASE64_CHARS = Math.ceil(FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES / 3) * 4;
+const FIRESTORE_RESTORE_TRUST_MAX_BYTES = 16 * 1024;
 const FIRESTORE_RESTORE_FAMILIES = [
   'accounts',
   'vaultAssetRateWindows',
@@ -347,10 +348,6 @@ interface FirestoreRestoreEvidenceInput {
   worktreeClean?: boolean;
   additionalExpectedCommitSha?: string;
   trustDescriptor: unknown;
-}
-
-interface FirestoreRestoreEvidenceCollectorInput extends FirestoreRestoreEvidenceInput {
-  repoRoot: string;
 }
 
 interface JsonRecord {
@@ -805,40 +802,23 @@ function hasDuplicateJsonObjectKeys(text: string): boolean {
   return false;
 }
 
-function parseStrictEvidenceJson(text: string): unknown {
-  if (Buffer.byteLength(text, 'utf8') > FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES) throw new Error('Evidence file is too large.');
+function parseStrictEvidenceJson(text: string, maximumBytes = FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES): unknown {
+  if (Buffer.byteLength(text, 'utf8') > maximumBytes) throw new Error('Evidence JSON is too large.');
   if (hasDuplicateJsonObjectKeys(text)) throw new Error('Evidence JSON contains duplicate keys.');
   return JSON.parse(text) as unknown;
 }
 
-function pathWithin(root: string, path: string): boolean {
-  const child = relative(resolve(root), resolve(path));
-  return child === '' || (!child.startsWith('..') && !isAbsolute(child));
-}
-
-async function readBoundedRegularFile(path: string): Promise<string> {
-  const before = await lstat(path, { bigint: true });
-  if (!before.isFile() || before.isSymbolicLink() || before.size > BigInt(FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES))
-    throw new Error('Evidence file is not a bounded regular file.');
-  const handle = await open(path, 'r');
-  try {
-    const opened = await handle.stat({ bigint: true });
-    if (!opened.isFile()
-      || opened.size !== before.size
-      || opened.dev !== before.dev
-      || opened.ino !== before.ino
-      || opened.size > BigInt(FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES)
-    ) throw new Error('Evidence file changed before read.');
-    const buffer = Buffer.alloc(FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES + 1);
-    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
-    if (bytesRead > FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES) throw new Error('Evidence file is too large.');
-    const after = await handle.stat({ bigint: true });
-    if (after.size !== opened.size || after.dev !== opened.dev || after.ino !== opened.ino)
-      throw new Error('Evidence file changed during read.');
-    return buffer.subarray(0, bytesRead).toString('utf8');
-  } finally {
-    await handle.close();
-  }
+function decodeCanonicalRestoreEvidenceBase64(value: string): string {
+  if (value.length === 0 || value.length > FIRESTORE_RESTORE_EVIDENCE_MAX_BASE64_CHARS) throw new Error('Evidence base64 is missing or too large.');
+  if (!/^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/.test(value))
+    throw new Error('Evidence base64 is malformed.');
+  const paddingBytes = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+  const decodedLength = value.length / 4 * 3 - paddingBytes;
+  if (decodedLength > FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES) throw new Error('Evidence base64 is too large.');
+  const bytes = Buffer.from(value, 'base64');
+  if (bytes.length > FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES || bytes.toString('base64') !== value)
+    throw new Error('Evidence base64 is noncanonical or too large.');
+  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
 }
 
 function inspectVersionRetentionPeriod(value: unknown): FirestoreVersionRetentionPeriod | undefined {
@@ -1843,21 +1823,16 @@ async function collectFirestoreRecoveryState(projectId: string): Promise<Firesto
   return collectFirestoreRecoveryStateWithExecutor(projectId);
 }
 
-export async function collectFirestoreRestoreEvidenceWithReader(
-  path: string,
-  input: FirestoreRestoreEvidenceCollectorInput,
-  readText: (path: string) => Promise<string> = readBoundedRegularFile,
-  canonicalizePath: (path: string) => Promise<string> = realpath,
-): Promise<FirestoreRestoreEvidenceFacts> {
+export function collectFirestoreRestoreEvidenceFromBase64(
+  value: string | undefined,
+  input: FirestoreRestoreEvidenceInput,
+): FirestoreRestoreEvidenceFacts {
   try {
-    if (!isAbsolute(path)) throw new Error('Evidence path is not absolute.');
-    const [absolutePath, repoRoot] = await Promise.all([
-      canonicalizePath(path),
-      canonicalizePath(input.repoRoot),
-    ]);
-    const underRepo = pathWithin(repoRoot, absolutePath);
-    if (!underRepo) throw new Error('Evidence path is not approved.');
-    return inspectFirestoreRestoreEvidence(parseStrictEvidenceJson(await readText(path)), input);
+    if (value === undefined) throw new Error('Evidence base64 is missing.');
+    const text = decodeCanonicalRestoreEvidenceBase64(value);
+    const evidence = parseStrictEvidenceJson(text);
+    if (canonicalJson(evidence) !== text) throw new Error('Evidence JSON is not canonical.');
+    return inspectFirestoreRestoreEvidence(evidence, input);
   } catch {
     return inspectFirestoreRestoreEvidence(undefined, input);
   }
@@ -1876,31 +1851,28 @@ export async function collectGitReleaseStateWithExecutor(
 }
 
 async function collectFirestoreRestoreEvidence(): Promise<FirestoreRestoreEvidenceFacts> {
-  const repoRoot = process.cwd();
-  const configuredPath = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE?.trim();
-  const approvedOperatorRoot = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_ROOT?.trim();
+  const evidenceBase64 = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64;
   const additionalExpectedCommitSha = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim();
-  const path = configuredPath || resolve(repoRoot, DEFAULT_FIRESTORE_RESTORE_EVIDENCE_PATH);
   const invalidInput = {
     nowMs: Date.now(),
     actualHeadSha: '',
     trustDescriptor: undefined,
     ...(additionalExpectedCommitSha ? { additionalExpectedCommitSha } : {}),
   };
-  if (configuredPath && (!isAbsolute(configuredPath) || !approvedOperatorRoot || !isAbsolute(approvedOperatorRoot)))
-    return inspectFirestoreRestoreEvidence(undefined, invalidInput);
   try {
     const [releaseState, trustDescriptor] = await Promise.all([
       collectGitReleaseStateWithExecutor(),
-      readBoundedRegularFile(resolve(repoRoot, FIRESTORE_RESTORE_TRUST_PATH)).then(parseStrictEvidenceJson),
+      readFile(FIRESTORE_RESTORE_TRUST_URL).then(bytes => {
+        if (bytes.length > FIRESTORE_RESTORE_TRUST_MAX_BYTES) throw new Error('Restore trust descriptor is too large.');
+        return parseStrictEvidenceJson(new TextDecoder('utf-8', { fatal: true }).decode(bytes), FIRESTORE_RESTORE_TRUST_MAX_BYTES);
+      }),
     ]);
-    return collectFirestoreRestoreEvidenceWithReader(path, {
+    return collectFirestoreRestoreEvidenceFromBase64(evidenceBase64, {
       nowMs: Date.now(),
       actualHeadSha: releaseState.headSha,
       worktreeClean: releaseState.clean,
       trustDescriptor,
       ...(additionalExpectedCommitSha ? { additionalExpectedCommitSha } : {}),
-      repoRoot: configuredPath ? approvedOperatorRoot! : repoRoot,
     });
   } catch {
     return inspectFirestoreRestoreEvidence(undefined, invalidInput);
