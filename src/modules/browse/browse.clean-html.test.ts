@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { cleanHtml } from './browse.router';
+import { cleanHtml } from './browse.clean-html';
 
 
 test('removes executable and tracking content from browsed HTML', () => {

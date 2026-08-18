@@ -44,6 +44,7 @@
     "@googleworkspace/drive-picker-react": "^0.2.0",
     "@mui/icons-material": "^5.18",
     "@mui/joy": "5.0.0-beta.52",
+    "@next/bundle-analyzer": "~15.5.23",
     "@prisma/client": "~5.22.0",
     "@tanstack/react-query": "^5.101.2",
     "@tanstack/react-virtual": "^3.14.6",
@@ -96,7 +97,6 @@
   },
   "devDependencies": {
     "@firebase/rules-unit-testing": "^5.0.1",
-    "@next/bundle-analyzer": "~15.5.23",
     "@posthog/nextjs-config": "~1.6",
     "@types/node": "^22",
     "@types/nprogress": "^0.2.3",

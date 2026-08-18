@@ -1,5 +1,6 @@
 import type { NextConfig } from 'next';
 import type { WebpackConfigContext } from 'next/dist/server/config-shared';
+import { PHASE_PRODUCTION_BUILD } from 'next/constants';
 import { execSync } from 'node:child_process';
 import { readFileSync } from 'node:fs';
 
@@ -141,11 +142,19 @@ let nextConfig: NextConfig = {
 import { env as validateEnv } from '~/server/env.server';
 void validateEnv; // Triggers env validation - throws if required vars are missing
 
-// PostHog error reporting with source maps for production builds
-import { withPostHogConfig } from '@posthog/nextjs-config';
-if (process.env.POSTHOG_API_KEY && process.env.POSTHOG_ENV_ID) {
+// conditionally enable the nextjs bundle analyzer
+import withBundleAnalyzer from '@next/bundle-analyzer';
+if (process.env.ANALYZE_BUNDLE) {
+  nextConfig = withBundleAnalyzer({ openAnalyzer: true })(nextConfig) as NextConfig;
+}
+
+export default async function buildNextConfig(phase: string): Promise<NextConfig> {
+  if (phase !== PHASE_PRODUCTION_BUILD || !process.env.POSTHOG_API_KEY || !process.env.POSTHOG_ENV_ID)
+    return nextConfig;
+
+  const { withPostHogConfig } = await import('@posthog/nextjs-config');
   console.log(' 🧠 \x1b[1mbig-AGI\x1b[0m: building with PostHog issue reporting and source maps...');
-  nextConfig = withPostHogConfig(nextConfig, {
+  return withPostHogConfig(nextConfig, {
     personalApiKey: process.env.POSTHOG_API_KEY,
     envId: process.env.POSTHOG_ENV_ID,
     host: 'https://us.i.posthog.com', // backtrace upload host
@@ -158,11 +167,3 @@ if (process.env.POSTHOG_API_KEY && process.env.POSTHOG_ENV_ID) {
     },
   });
 }
-
-// conditionally enable the nextjs bundle analyzer
-import withBundleAnalyzer from '@next/bundle-analyzer';
-if (process.env.ANALYZE_BUNDLE) {
-  nextConfig = withBundleAnalyzer({ openAnalyzer: true })(nextConfig) as NextConfig;
-}
-
-export default nextConfig;
