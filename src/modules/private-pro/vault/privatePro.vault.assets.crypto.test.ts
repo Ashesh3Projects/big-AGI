@@ -173,6 +173,40 @@ describe('private Pro vault asset chunk cryptography', () => {
     assert.notEqual(metadataChanged[0].nonceBase64, chunks[0].nonceBase64);
   });
 
+  test('binds deterministic nonces to chunk layout, vault, and key version', async () => {
+    const { masterKey, plaintext, chunks } = await fixture(PRIVATE_PRO_VAULT_ASSET_MAX_CIPHERTEXT_CHUNK_BYTES + 257);
+    const opaqueAssetId = await privateProVaultAssetId(masterKey, MANIFEST.assetId);
+    const shorter = plaintext.slice(0, 1024);
+    const changedLayout = await encryptPrivateProVaultAsset({
+      masterKey,
+      vaultId: VAULT_ID,
+      opaqueAssetId,
+      keyVersion: 3,
+      manifest: MANIFEST,
+      plaintext: shorter,
+    });
+    const changedVault = await encryptPrivateProVaultAsset({
+      masterKey,
+      vaultId: `${VAULT_ID}-other`,
+      opaqueAssetId,
+      keyVersion: 3,
+      manifest: MANIFEST,
+      plaintext,
+    });
+    const changedKeyVersion = await encryptPrivateProVaultAsset({
+      masterKey,
+      vaultId: VAULT_ID,
+      opaqueAssetId,
+      keyVersion: 4,
+      manifest: MANIFEST,
+      plaintext,
+    });
+
+    assert.notEqual(changedLayout[0].nonceBase64, chunks[0].nonceBase64);
+    assert.notEqual(changedVault[0].nonceBase64, chunks[0].nonceBase64);
+    assert.notEqual(changedKeyVersion[0].nonceBase64, chunks[0].nonceBase64);
+  });
+
   test('keeps filename, content type, label, and origin inside the encrypted manifest', async () => {
     const { chunks } = await fixture(64);
     const visible = JSON.stringify(chunks);

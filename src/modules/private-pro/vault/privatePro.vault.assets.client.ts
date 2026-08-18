@@ -8,9 +8,7 @@ import {
   decryptPrivateProVaultAssetToSink,
   encodePrivateProVaultAssetChunkObject,
   encryptPrivateProVaultAssetChunks,
-  privateProVaultAssetContentIdentity,
   privateProVaultAssetId,
-  privateProVaultAssetPayloadSha256,
   type PrivateProVaultAssetChunk,
   type PrivateProVaultAssetChunkAADInput,
   type PrivateProVaultAssetManifest,
@@ -392,20 +390,6 @@ export function collectPrivateProVaultAssetIds(recordType: string, value: unknow
   return [...assetIds];
 }
 
-async function hashAssetSource(
-  local: PrivateProVaultAssetLocalPort,
-  asset: DBlobDBAsset,
-  signal?: AbortSignal,
-): Promise<{ plaintextBytes: number; payloadSha256: string }> {
-  throwIfAborted(signal);
-  const opened = await local.openAssetSource(asset);
-  throwIfAborted(signal);
-  return {
-    plaintextBytes: opened.plaintextBytes,
-    payloadSha256: await privateProVaultAssetPayloadSha256(opened.source, opened.plaintextBytes, signal),
-  };
-}
-
 async function preparedChunks(
   deps: Required<Pick<PrivateProVaultAssetClientDependencies, 'vaultId' | 'masterKey' | 'keyVersion'>>,
   asset: DBlobDBAsset,
@@ -416,21 +400,8 @@ async function preparedChunks(
   throwIfAborted(signal);
   const opaqueAssetId = await privateProVaultAssetId(deps.masterKey, asset.id);
   const manifest = manifestFromAsset(asset);
-  const hashed = await hashAssetSource(local, asset, signal);
-  const contentIdentity = await privateProVaultAssetContentIdentity({
-    masterKey: deps.masterKey,
-    vaultId: deps.vaultId,
-    opaqueAssetId,
-    keyVersion: deps.keyVersion,
-    manifest,
-    plaintextBytes: hashed.plaintextBytes,
-    payloadSha256: hashed.payloadSha256,
-    signal,
-  });
-  throwIfAborted(signal);
   const source = await local.openAssetSource(asset);
-  if (source.plaintextBytes !== hashed.plaintextBytes)
-    throw new Error('Encrypted asset source size changed between identity and encryption passes.');
+  throwIfAborted(signal);
   const chunks: PreparedChunk[] = [];
   try {
     for await (const chunk of encryptPrivateProVaultAssetChunks({
@@ -441,7 +412,6 @@ async function preparedChunks(
       manifest,
       plaintextBytes: source.plaintextBytes,
       source: source.source,
-      contentIdentity,
       signal,
       encryptChunk: encryptChunkAbortably,
     })) {

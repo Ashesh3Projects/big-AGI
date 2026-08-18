@@ -10,6 +10,7 @@ import {
   type PrivateProVaultAssetLocalPort,
 } from './privatePro.vault.assets.client';
 import { PRIVATE_PRO_VAULT_ASSET_MAX_CIPHERTEXT_CHUNK_BYTES } from './privatePro.vault.assets.crypto';
+import type { PrivateProVaultAssetPlaintextSource } from './privatePro.vault.assets.crypto';
 
 
 const UID = 'uid-vault-asset-client';
@@ -37,6 +38,7 @@ class MemoryLocalPort implements PrivateProVaultAssetLocalPort {
   readonly assets = new Map<string, DBlobDBAsset>();
   readonly hydrated = new Map<string, Set<string>>();
   maxPlaintextReadBytes = 0;
+  sourceOpenCount = 0;
   failPut = false;
   blockNextSourceRead = false;
   blockedSourceReadStarted: Promise<void> | null = null;
@@ -56,7 +58,8 @@ class MemoryLocalPort implements PrivateProVaultAssetLocalPort {
     this.hydrated.set(uid, ids);
   }
   async unmarkHydratedAsset(uid: string, assetId: string) { this.hydrated.get(uid)?.delete(assetId); }
-  async openAssetSource(value: DBlobDBAsset) {
+  async openAssetSource(value: DBlobDBAsset): Promise<{ plaintextBytes: number; source: PrivateProVaultAssetPlaintextSource }> {
+    this.sourceOpenCount++;
     const bytes = Uint8Array.from(Buffer.from(value.data.base64, 'base64'));
     let offset = 0;
     if (this.blockNextSourceRead) {
@@ -214,6 +217,7 @@ describe('private Pro encrypted vault asset client', () => {
     assert.equal(visible.includes('image/png'), false);
     assert.equal(visible.includes('secret description'), false);
     assert.equal(transport.reservations[0].chunks.every(chunk => chunk.objectBytes === Number(chunk.ciphertextBytes) + 12), true);
+    assert.equal(local.sourceOpenCount, 1, 'upload preparation must consume exactly one source snapshot');
   });
 
   test('downloads, verifies, decrypts, and restores a missing DBlob in server order', async () => {
@@ -288,6 +292,38 @@ describe('private Pro encrypted vault asset client', () => {
     ]), error => error instanceof DOMException && error.name === 'AbortError');
     assert.equal(transport.reservations.length, 0);
     assert.deepEqual(transport.uploadedIndices, []);
+    assert.equal(transport.finalized, 0);
+  });
+
+  test('aborts promptly when iterator cleanup never settles', async () => {
+    const { client, local, transport } = await fixture();
+    local.blockNextSourceRead = true;
+    const originalOpen = local.openAssetSource.bind(local);
+    local.openAssetSource = async value => {
+      const opened = await originalOpen(value);
+      if (!('getReader' in opened.source) && !(opened.source instanceof Uint8Array) && !(opened.source instanceof Blob)) {
+        const iterator = opened.source[Symbol.asyncIterator]();
+        opened.source = {
+          [Symbol.asyncIterator]: () => ({
+            next: () => iterator.next(),
+            return: () => new Promise<IteratorResult<Uint8Array>>(() => undefined),
+          }),
+        } as PrivateProVaultAssetPlaintextSource;
+      }
+      return opened;
+    };
+    const controller = new AbortController();
+    const upload = client.prepareForUpload([ASSET_ID], controller.signal);
+    await local.blockedSourceReadStarted;
+
+    controller.abort();
+
+    await assert.rejects(Promise.race([
+      upload,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('abort timed out')), 250)),
+    ]), error => error instanceof DOMException && error.name === 'AbortError');
+    assert.equal(transport.reservations.length, 0);
+    assert.equal(transport.objects.size, 0);
     assert.equal(transport.finalized, 0);
   });
 
@@ -381,6 +417,36 @@ describe('private Pro encrypted vault asset client', () => {
     await metadataChanged.client.prepareForUpload([ASSET_ID]);
     metadataChanged.local.assets.set(ASSET_ID, { ...metadataChanged.original, label: 'renamed-private-file.png' });
     await assert.rejects(metadataChanged.client.prepareForUpload([ASSET_ID]), /different ciphertext|descriptor/i);
+  });
+
+  test('encrypts the current source snapshot once even if later opens would change same-length bytes', async () => {
+    const first = await fixture();
+    await first.client.prepareForUpload([ASSET_ID]);
+    const secondLocal = new MemoryLocalPort();
+    secondLocal.assets.set(ASSET_ID, structuredClone(first.original));
+    const originalOpen = secondLocal.openAssetSource.bind(secondLocal);
+    secondLocal.openAssetSource = async (value): Promise<{ plaintextBytes: number; source: PrivateProVaultAssetPlaintextSource }> => {
+      const opened = await originalOpen(value);
+      if (secondLocal.sourceOpenCount > 1) {
+        const changed = Uint8Array.from(Buffer.from(value.data.base64, 'base64'));
+        changed[0] ^= 0x80;
+        return { plaintextBytes: changed.byteLength, source: changed };
+      }
+      return opened;
+    };
+    const secondClient = createPrivateProVaultAssetClient({
+      vaultId: UID,
+      masterKey: first.masterKey,
+      keyVersion: KEY_VERSION,
+      local: secondLocal,
+      transport: first.transport,
+      createOperationId: () => 'asset-operation-mutable-source',
+    });
+
+    await secondClient.prepareForUpload([ASSET_ID]);
+
+    assert.equal(secondLocal.sourceOpenCount, 1);
+    assert.deepEqual(first.transport.reservations[1].chunks, first.transport.reservations[0].chunks);
   });
 
   test('derives the same opaque descriptors on a fresh device with no local vault mapping', async () => {
