@@ -25,11 +25,12 @@ test('mounts encrypted asset procedures without plaintext compatibility procedur
   const { appRouterCloud } = await import('~/server/trpc/trpc.router-cloud');
   const procedureNames = Object.keys(appRouterCloud._def.procedures);
 
-  assert.deepEqual(procedureNames.filter(name => name.startsWith('privateProAssets.')).sort(), [
-    'privateProAssets.finalizeEncryptedUpload',
-    'privateProAssets.getEncryptedDownload',
-    'privateProAssets.releaseEncryptedReservation',
-    'privateProAssets.reserveEncryptedUpload',
+  assert.equal(procedureNames.some(name => name.startsWith('privateProAssets.')), false);
+  assert.deepEqual(procedureNames.filter(name => name.startsWith('privateProVaultAssets.')).sort(), [
+    'privateProVaultAssets.finalizeEncryptedUpload',
+    'privateProVaultAssets.getEncryptedDownload',
+    'privateProVaultAssets.releaseEncryptedReservation',
+    'privateProVaultAssets.reserveEncryptedUpload',
   ]);
   assert.equal(procedureNames.some(name => name.startsWith('privateProSync.')), false);
 });

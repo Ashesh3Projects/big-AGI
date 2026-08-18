@@ -3,7 +3,7 @@ import { createTRPCRouter } from './trpc.server';
 import { browseRouter } from '~/modules/browse/browse.router';
 import { tradeRouter } from '~/modules/trade/server/trade.router';
 import { privateProAuthRouter } from '~/modules/private-pro/auth/privatePro.auth.router';
-import { privateProAssetsRouter } from '~/modules/private-pro/assets/privatePro.assets.router';
+import { privateProVaultAssetsRouter } from '~/modules/private-pro/assets/privatePro.assets.router';
 import { privateProVaultRouter } from '~/modules/private-pro/vault/privatePro.vault.router';
 
 /**
@@ -13,7 +13,7 @@ import { privateProVaultRouter } from '~/modules/private-pro/vault/privatePro.va
 export const appRouterCloud = createTRPCRouter({
   browse: browseRouter,
   privateProAuth: privateProAuthRouter,
-  privateProAssets: privateProAssetsRouter,
+  privateProVaultAssets: privateProVaultAssetsRouter,
   privateProVault: privateProVaultRouter,
   trade: tradeRouter,
 });

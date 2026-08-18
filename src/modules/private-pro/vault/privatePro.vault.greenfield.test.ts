@@ -19,6 +19,7 @@ describe('private Pro greenfield vault contract', () => {
     const indexes = readFileSync('firestore.indexes.json', 'utf8');
 
     assert.doesNotMatch(cloudRouter, /privateProSync/);
+    assert.doesNotMatch(cloudRouter, /privateProAssets/);
     assert.doesNotMatch(assetRouter, /getFirebasePrivateProAssetsService|reserveUpload:\s*privateProNodePremiumProcedure|finalizeUpload:\s*privateProNodePremiumProcedure|getDownload:\s*privateProNodePremiumProcedure/);
     assert.doesNotMatch(sweep, /legacy|getFirebasePrivateProAssetsService/);
     assert.doesNotMatch(indexes, /quotaReservations|"collectionGroup": "assets"/);

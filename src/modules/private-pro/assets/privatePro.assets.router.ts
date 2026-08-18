@@ -28,7 +28,7 @@ const vaultProcedure = createPrivateProVaultProcedure(privateProNodePremiumProce
   },
 });
 
-export const privateProAssetsRouter = createTRPCRouter({
+export const privateProVaultAssetsRouter = createTRPCRouter({
   reserveEncryptedUpload: vaultProcedure
     .input(z.object({
       operationId: operationIdSchema,

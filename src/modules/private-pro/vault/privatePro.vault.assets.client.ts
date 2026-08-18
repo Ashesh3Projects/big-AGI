@@ -235,7 +235,7 @@ function defaultLocalPort(): PrivateProVaultAssetLocalPort {
 
 function defaultTransport(): PrivateProVaultAssetClientTransport {
   return {
-    reserveUpload: input => apiAsyncNode.privateProAssets.reserveEncryptedUpload.mutate(input),
+    reserveUpload: input => apiAsyncNode.privateProVaultAssets.reserveEncryptedUpload.mutate(input),
     async uploadChunk(input) {
       const response = await fetch(input.uploadUrl, {
         method: 'PUT',
@@ -245,11 +245,11 @@ function defaultTransport(): PrivateProVaultAssetClientTransport {
       });
       if (!response.ok) throw new Error(`Encrypted attachment upload failed with HTTP ${response.status}.`);
     },
-    finalizeUpload: operationId => apiAsyncNode.privateProAssets.finalizeEncryptedUpload.mutate({ operationId }),
+    finalizeUpload: operationId => apiAsyncNode.privateProVaultAssets.finalizeEncryptedUpload.mutate({ operationId }),
     async releaseReservation(operationId) {
-      await apiAsyncNode.privateProAssets.releaseEncryptedReservation.mutate({ operationId });
+      await apiAsyncNode.privateProVaultAssets.releaseEncryptedReservation.mutate({ operationId });
     },
-    getDownload: opaqueAssetId => apiAsyncNode.privateProAssets.getEncryptedDownload.query({ opaqueAssetId }),
+    getDownload: opaqueAssetId => apiAsyncNode.privateProVaultAssets.getEncryptedDownload.query({ opaqueAssetId }),
     async downloadChunk(input) {
       const response = await fetch(input.downloadUrl, { signal: input.signal });
       if (!response.ok) throw new Error(`Encrypted attachment download failed with HTTP ${response.status}.`);
