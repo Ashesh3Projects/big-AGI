@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync, sign } from 'node:crypto';
 import { describe, test } from 'node:test';
-import { mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -589,6 +589,10 @@ describe('private Pro security audit classifiers', () => {
     const trailingBitAlias = `${canonicalAlias.slice(0, 1)}${canonicalAlias[1] === 'w' ? 'x' : 'w'}==`;
     const duplicateKey = Buffer.from('{"schemaVersion":1,"schemaVersion":1}', 'utf8').toString('base64');
     const invalidUtf8 = Buffer.from([0xc3, 0x28]).toString('base64');
+    const bomPrefixed = Buffer.concat([
+      Buffer.from([0xef, 0xbb, 0xbf]),
+      Buffer.from(canonicalJsonForTest(signedRestoreEvidence()), 'utf8'),
+    ]).toString('base64');
     const noncanonicalJson = Buffer.from(JSON.stringify(signedRestoreEvidence()), 'utf8').toString('base64');
     const oversized = Buffer.alloc(16 * 1024 + 1, 0x20).toString('base64');
     for (const value of [
@@ -601,6 +605,7 @@ describe('private Pro security audit classifiers', () => {
       noncanonicalJson,
       duplicateKey,
       invalidUtf8,
+      bomPrefixed,
       oversized,
     ]) assert.equal(audit.collectFirestoreRestoreEvidenceFromBase64(value, input).readable, false);
   });
@@ -651,6 +656,66 @@ describe('private Pro security audit classifiers', () => {
     await assert.rejects(() => audit.collectGitReleaseStateWithExecutor(async () => ({ stdout: 'not-a-commit\n' })));
   });
 
+  test('loads the restore trust descriptor from the audited HEAD blob', async () => {
+    const audit = securityAuditModule as unknown as {
+      collectFirestoreRestoreTrustAtHeadWithExecutor(
+        headSha: string,
+        execute?: (command: string, args: string[], maxBuffer: number) => Promise<{ stdout: Buffer; stderr: Buffer }>,
+      ): Promise<unknown>;
+    };
+    const committedTrust = {
+      schemaVersion: 1,
+      status: 'unconfigured',
+      algorithm: 'Ed25519',
+      keyId: 'unconfigured',
+      publicKeyJwk: null,
+      issuer: 'unconfigured',
+      allowedClaims: TEST_TRUST.allowedClaims,
+      activatedAt: null,
+      expiresAt: null,
+      revokedAt: null,
+    };
+    const calls: Array<{ command: string; args: string[]; maxBuffer: number }> = [];
+    const collected = await audit.collectFirestoreRestoreTrustAtHeadWithExecutor(TEST_RELEASE_COMMIT, async (command, args, maxBuffer) => {
+      calls.push({ command, args, maxBuffer });
+      return { stdout: Buffer.from(JSON.stringify(committedTrust)), stderr: Buffer.alloc(0) };
+    });
+    assert.deepEqual(collected, committedTrust);
+    assert.deepEqual(calls, [{
+      command: 'git',
+      args: ['show', `${TEST_RELEASE_COMMIT}:infra/private-pro/firestore-restore-attestor-trust.json`],
+      maxBuffer: 16 * 1024,
+    }]);
+    await assert.rejects(() => audit.collectFirestoreRestoreTrustAtHeadWithExecutor(TEST_RELEASE_COMMIT, async () => {
+      throw new Error('missing blob');
+    }));
+    await assert.rejects(() => audit.collectFirestoreRestoreTrustAtHeadWithExecutor('not-a-head', async () => ({
+      stdout: Buffer.from('{}'),
+      stderr: Buffer.alloc(0),
+    })));
+
+    const directory = await mkdtemp(join(tmpdir(), 'restore-trust-head-'));
+    const trustDirectory = join(directory, 'infra', 'private-pro');
+    const trustPath = join(trustDirectory, 'firestore-restore-attestor-trust.json');
+    await mkdir(trustDirectory, { recursive: true });
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(directory);
+      await runCommand('git', ['init', '--quiet']);
+      await runCommand('git', ['config', 'user.name', 'Private Pro Test']);
+      await runCommand('git', ['config', 'user.email', 'private-pro@example.invalid']);
+      await writeFile(trustPath, JSON.stringify(committedTrust), 'utf8');
+      await runCommand('git', ['add', 'infra/private-pro/firestore-restore-attestor-trust.json']);
+      await runCommand('git', ['commit', '--quiet', '-m', 'trust']);
+      const head = (await runCommand('git', ['rev-parse', 'HEAD'])).stdout.trim();
+      await writeFile(trustPath, JSON.stringify(TEST_TRUST), 'utf8');
+
+      assert.deepEqual(await audit.collectFirestoreRestoreTrustAtHeadWithExecutor(head), committedTrust);
+    } finally {
+      process.chdir(previousCwd);
+    }
+  });
+
   test('ships an explicitly unconfigured restore attestor trust descriptor', async () => {
     const trust = JSON.parse(await readFile('infra/private-pro/firestore-restore-attestor-trust.json', 'utf8')) as Record<string, unknown>;
     assert.deepEqual(trust, {
@@ -683,6 +748,67 @@ describe('private Pro security audit classifiers', () => {
 
     assert.equal(JSON.parse(result.stdout), argument);
     await assert.rejects(readFile(sideEffect, 'utf8'));
+  });
+
+  test('scrubs audit evidence and attestation secrets from child processes', async () => {
+    const evidence = restoreEvidenceBase64();
+    const names = {
+      PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64: evidence,
+      PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY: 'legacy-hmac',
+      PRIVATE_PRO_FIRESTORE_RESTORE_ATTESTOR_PRIVATE_KEY: 'attestor-private-key',
+      PRIVATE_PRO_FIRESTORE_RESTORE_ATTESTATION_SECRET: 'attestation-secret',
+      PRIVATE_PRO_FIRESTORE_RESTORE_PRIVATE_KEY: 'future-private-key',
+      PRIVATE_PRO_FUTURE_ATTEST_PRIVATE_KEY: 'future-attest-key',
+      PRIVATE_PRO_RESTORE_SIGNING_KEY: 'future-signing-key',
+      PRIVATE_PRO_FIRESTORE_RESTORE_ACCESS_TOKEN: 'future-access-token',
+      PRIVATE_PRO_CHILD_ENV_SENTINEL: 'ordinary-value',
+    } as const;
+    const previous = Object.fromEntries(Object.keys(names).map(name => [name, process.env[name]]));
+    try {
+      Object.assign(process.env, names);
+      const result = await runCommand(process.execPath, ['-e', `
+        process.stdout.write(JSON.stringify({
+          evidence: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64,
+          legacyHmac: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY,
+          attestorKey: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_ATTESTOR_PRIVATE_KEY,
+          attestationSecret: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_ATTESTATION_SECRET,
+          futurePrivateKey: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_PRIVATE_KEY,
+          futureAttestKey: !!process.env.PRIVATE_PRO_FUTURE_ATTEST_PRIVATE_KEY,
+          futureSigningKey: !!process.env.PRIVATE_PRO_RESTORE_SIGNING_KEY,
+          futureAccessToken: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_ACCESS_TOKEN,
+          ordinary: process.env.PRIVATE_PRO_CHILD_ENV_SENTINEL,
+        }));
+      `]);
+
+      assert.deepEqual(JSON.parse(result.stdout), {
+        evidence: false,
+        legacyHmac: false,
+        attestorKey: false,
+        attestationSecret: false,
+        futurePrivateKey: false,
+        futureAttestKey: false,
+        futureSigningKey: false,
+        futureAccessToken: false,
+        ordinary: 'ordinary-value',
+      });
+      assert.equal(process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64, evidence);
+      assert.equal((securityAuditModule as unknown as {
+        collectFirestoreRestoreEvidenceFromBase64(value: string | undefined, input: {
+          nowMs: number;
+          actualHeadSha: string;
+          trustDescriptor: unknown;
+        }): { readable: boolean };
+      }).collectFirestoreRestoreEvidenceFromBase64(process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64, {
+        nowMs: Date.parse('2026-08-18T12:00:00Z'),
+        actualHeadSha: TEST_RELEASE_COMMIT,
+        trustDescriptor: TEST_TRUST,
+      }).readable, true);
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
   });
 
   test('blocks wildcard CORS and missing CSP headers', () => {

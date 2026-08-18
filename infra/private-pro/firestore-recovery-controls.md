@@ -35,7 +35,7 @@ The security audit uses the exact `gcloud firestore databases describe` command 
 
 The audit accepts restore rehearsal evidence only through the audit-process environment variable `PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64`. Its value must be canonical padded base64 of canonical UTF-8 JSON with no whitespace or alternate encoding. Decoded evidence is capped at 16 KiB. Malformed or noncanonical base64, invalid UTF-8, noncanonical JSON, duplicate object keys, and oversized evidence block. No evidence path or root override exists.
 
-Evidence verification uses `infra/private-pro/firestore-restore-attestor-trust.json`. The checked-in descriptor is intentionally `unconfigured` and blocks. Installing an active descriptor is approval-gated and must pin an independent Ed25519 attestor key ID/public JWK, issuer, exact repository/workflow/ref/protected-environment claims, activation, expiry, and revocation state. Never commit the private key. The rehearsal author/operator must not have access to it.
+Evidence verification uses `infra/private-pro/firestore-restore-attestor-trust.json` from the audited git commit, loaded with `git show HEAD:infra/private-pro/firestore-restore-attestor-trust.json` after HEAD is validated. A working-tree edit cannot replace the trust policy used by the audit, and a missing or oversized commit blob blocks. The checked-in descriptor is intentionally `unconfigured` and blocks. Installing an active descriptor is approval-gated and must pin an independent Ed25519 attestor key ID/public JWK, issuer, exact repository/workflow/ref/protected-environment claims, activation, expiry, and revocation state. Never commit the private key. The rehearsal author/operator must not have access to it.
 
 The audit gets the release commit from `git rev-parse HEAD` and requires `git status --porcelain --untracked-files=normal` to be empty. A dirty checkout blocks even when HEAD matches. `PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA` is optional and can only add another equality constraint; it cannot replace actual HEAD. Missing evidence, missing/unconfigured trust, unsigned evidence, wrong signer/key ID/issuer/CI claims, invalid signature, or a signed field change blocks. Valid evidence completion and artifact times must be no older than 90 days, attestation must be within 24 hours after completion, and timestamps more than five minutes in the future block.
 
@@ -298,7 +298,7 @@ try {
 }
 ```
 
-Use this only for an approved rehearsal or release gate. Do not save, print, echo, log, or include the environment value in a report. The attestor or CI job stores the immutable artifact externally and injects its exact base64 only into the audit process environment. Clear the variable immediately after the audit.
+Use this only for an approved rehearsal or release gate. Do not save, print, echo, log, or include the environment value in a report. The attestor or CI job stores the immutable artifact externally and injects its exact base64 only into the audit process environment. The audit keeps that value in-process for verification and removes restore evidence, legacy HMAC, attestation, signing, private-key, and access-token variables from every child-process environment while retaining ordinary required environment variables. Clear the variable immediately after the audit.
 
 The evidence schema is strict. Extra or missing keys block.
 

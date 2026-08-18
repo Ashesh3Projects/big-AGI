@@ -414,3 +414,56 @@ The checked-in trust descriptor remains `unconfigured`. Activating a public trus
 - Checked-in trust descriptor remains `unconfigured` with no production public or private key.
 - `git diff --check`: passed.
 - Added-diff credential-pattern scan: no credential-like values. The checked-in trust descriptor remained `unconfigured` with no public key.
+
+## Fix round 5
+
+Status: complete. No cloud mutation occurred. No real trust key, private key, or restore evidence was created.
+
+### Review findings
+
+The audit-only evidence value was inherited by every child process because `execFile` used the full process environment. The trust descriptor was read from the mutable working tree rather than the commit named by the evidence and actual HEAD. Node's UTF-8 decoder also accepted and stripped a byte-order mark before JSON validation.
+
+### Changes
+
+- Added one child-process environment scrubber used by both text and bounded-buffer command execution.
+- Scrubbed restore evidence, legacy restore HMAC, attestation, attestor, signing, restore private-key/secret/token/credential, and Private Pro access-token environment variables from child processes while retaining ordinary environment variables required by git, gcloud, npm, and test executables.
+- Kept evidence available in the audit process for in-memory verification.
+- Collected and validated actual HEAD first, then loaded the fixed trust path with `git show <40_HEX_HEAD>:infra/private-pro/firestore-restore-attestor-trust.json`.
+- Required strict 40-character lowercase hex HEAD before constructing the fixed git object expression.
+- Capped trust output at 16 KiB, kept it as bytes until strict UTF-8 decoding, and failed closed on a missing blob, invalid UTF-8, duplicate keys, malformed schema, or oversized output.
+- Removed the mutable working-tree trust read from the release gate. Clean-tree validation remains a separate required check.
+- Rejected a UTF-8 BOM explicitly before evidence or trust JSON decoding.
+- Updated recovery docs to describe child-process scrubbing and HEAD-bound trust verification.
+
+### TDD
+
+RED:
+
+```text
+48 audit tests: 45 passed, 3 failed
+```
+
+The failures proved that BOM evidence passed, the HEAD trust collector was missing, and evidence plus attestation secrets were inherited by a real child process.
+
+GREEN:
+
+```text
+48 focused audit tests: 48 passed, 0 failed
+```
+
+Coverage includes a real executable child that receives an ordinary sentinel but not evidence, legacy HMAC, attestor/private-key, attestation-secret, future restore private-key, or access-token values. An actual temporary git repository proves that an attacker-key working-tree edit does not replace the descriptor in HEAD. Unit coverage asserts the exact `git show` vector, fixed path, 16 KiB cap, strict HEAD validation, missing-blob failure, and BOM rejection.
+
+### Approval and cloud boundary
+
+The committed trust descriptor remains `unconfigured`. No production evidence or key was accessed. No restore, backup, export, import, database, schedule, IAM, storage, deployment, cleanup, trust activation, key, or evidence mutation ran.
+
+### Verification
+
+- Focused Task 22 TypeScript: passed. The temporary project file was deleted and is not committed.
+- Focused security-audit tests: 48 passed, 0 failed.
+- All Private Pro tool tests: 53 passed, 0 failed.
+- Report-only audit: exited 0 with 45 pass, 8 warn, and 45 block findings across the existing audit. With the dirty pre-commit tree, absent evidence, and unconfigured committed trust, the expected restore-evidence blockers remained set.
+- Focused ESLint remained blocked before file analysis by the existing `@rushstack/eslint-patch` caller-recognition error.
+- `git diff --check`: passed.
+- Added-diff credential-pattern scan: no credential-like values.
+- Post-commit report-only audit: exited 0 with 46 pass, 8 warn, and 44 block findings. The clean-tree check passed; absent evidence and the unconfigured trust blob from the audited HEAD remained blocked as designed.

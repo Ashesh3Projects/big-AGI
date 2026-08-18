@@ -11,7 +11,7 @@ import { GoogleAuth } from 'google-auth-library';
 const execFile = promisify(execFileCallback);
 const DEFAULT_PROJECT_ID = 'big-agi-243b6';
 const DEFAULT_DEPLOYMENT_ORIGIN = 'https://chatgpt.ashesh.dev';
-const FIRESTORE_RESTORE_TRUST_URL = new URL('../../infra/private-pro/firestore-restore-attestor-trust.json', import.meta.url);
+const FIRESTORE_RESTORE_TRUST_REPO_PATH = 'infra/private-pro/firestore-restore-attestor-trust.json';
 const FIRESTORE_RESTORE_EVIDENCE_MAX_AGE_DAYS = 90;
 const FIRESTORE_RESTORE_ATTESTATION_MAX_DELAY_MS = 24 * 60 * 60 * 1000;
 const FIRESTORE_RESTORE_FUTURE_SKEW_MS = 5 * 60 * 1000;
@@ -818,7 +818,13 @@ function decodeCanonicalRestoreEvidenceBase64(value: string): string {
   const bytes = Buffer.from(value, 'base64');
   if (bytes.length > FIRESTORE_RESTORE_EVIDENCE_MAX_BYTES || bytes.toString('base64') !== value)
     throw new Error('Evidence base64 is noncanonical or too large.');
-  return new TextDecoder('utf-8', { fatal: true }).decode(bytes);
+  return decodeStrictUtf8(bytes);
+}
+
+function decodeStrictUtf8(bytes: Uint8Array): string {
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf)
+    throw new Error('UTF-8 BOM is not allowed.');
+  return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
 }
 
 function inspectVersionRetentionPeriod(value: unknown): FirestoreVersionRetentionPeriod | undefined {
@@ -1156,9 +1162,41 @@ export async function runCommand(command: string, args: string[]): Promise<{ std
   const executable = await resolveExecutable(command);
   return execFile(executable.file, [...executable.prefixArgs, ...args], {
     encoding: 'utf8',
+    env: childProcessEnvironment(),
     maxBuffer: 20 * 1024 * 1024,
     windowsHide: true,
     shell: false,
+  });
+}
+
+function childProcessEnvironment(): NodeJS.ProcessEnv {
+  const environment = { ...process.env };
+  for (const name of Object.keys(environment)) {
+    const upper = name.toUpperCase();
+    const privateProAuditSecret = upper.startsWith('PRIVATE_PRO_')
+      && (upper.includes('RESTORE_EVIDENCE')
+        || upper.includes('ATTEST')
+        || (upper.includes('SIGN') && /(?:_PRIVATE_KEY|_SECRET|_TOKEN|_CREDENTIAL|_SIGNING_KEY)$/.test(upper))
+        || (upper.includes('RESTORE') && /(?:_PRIVATE_KEY|_SECRET|_TOKEN|_CREDENTIAL)$/.test(upper))
+        || upper.endsWith('_ACCESS_TOKEN'));
+    if (privateProAuditSecret) delete environment[name];
+  }
+  return environment;
+}
+
+async function runCommandBuffer(command: string, args: string[], maxBuffer: number): Promise<{ stdout: Buffer; stderr: Buffer }> {
+  const executable = await resolveExecutable(command);
+  return new Promise((resolvePromise, rejectPromise) => {
+    execFileCallback(executable.file, [...executable.prefixArgs, ...args], {
+      encoding: null,
+      env: childProcessEnvironment(),
+      maxBuffer,
+      windowsHide: true,
+      shell: false,
+    }, (error, stdout, stderr) => {
+      if (error) rejectPromise(error);
+      else resolvePromise({ stdout, stderr });
+    });
   });
 }
 
@@ -1850,6 +1888,16 @@ export async function collectGitReleaseStateWithExecutor(
   return { headSha: head, clean: statusOutput.trim().length === 0 };
 }
 
+export async function collectFirestoreRestoreTrustAtHeadWithExecutor(
+  headSha: string,
+  execute: (command: string, args: string[], maxBuffer: number) => Promise<{ stdout: Buffer; stderr: Buffer }> = runCommandBuffer,
+): Promise<unknown> {
+  if (!GIT_SHA.test(headSha)) throw new Error('Current git HEAD is invalid.');
+  const { stdout } = await execute('git', ['show', `${headSha}:${FIRESTORE_RESTORE_TRUST_REPO_PATH}`], FIRESTORE_RESTORE_TRUST_MAX_BYTES);
+  if (stdout.length > FIRESTORE_RESTORE_TRUST_MAX_BYTES) throw new Error('Restore trust descriptor is too large.');
+  return parseStrictEvidenceJson(decodeStrictUtf8(stdout), FIRESTORE_RESTORE_TRUST_MAX_BYTES);
+}
+
 async function collectFirestoreRestoreEvidence(): Promise<FirestoreRestoreEvidenceFacts> {
   const evidenceBase64 = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64;
   const additionalExpectedCommitSha = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim();
@@ -1860,13 +1908,8 @@ async function collectFirestoreRestoreEvidence(): Promise<FirestoreRestoreEviden
     ...(additionalExpectedCommitSha ? { additionalExpectedCommitSha } : {}),
   };
   try {
-    const [releaseState, trustDescriptor] = await Promise.all([
-      collectGitReleaseStateWithExecutor(),
-      readFile(FIRESTORE_RESTORE_TRUST_URL).then(bytes => {
-        if (bytes.length > FIRESTORE_RESTORE_TRUST_MAX_BYTES) throw new Error('Restore trust descriptor is too large.');
-        return parseStrictEvidenceJson(new TextDecoder('utf-8', { fatal: true }).decode(bytes), FIRESTORE_RESTORE_TRUST_MAX_BYTES);
-      }),
-    ]);
+    const releaseState = await collectGitReleaseStateWithExecutor();
+    const trustDescriptor = await collectFirestoreRestoreTrustAtHeadWithExecutor(releaseState.headSha);
     return collectFirestoreRestoreEvidenceFromBase64(evidenceBase64, {
       nowMs: Date.now(),
       actualHeadSha: releaseState.headSha,
