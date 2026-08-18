@@ -123,6 +123,19 @@ class MemorySyncRepository implements PrivateProSyncRepository {
     this.tombstones.delete(this.key(uid, `persona:${request.personaId}`));
     return { status: 'committed' as const, revision };
   }
+
+  async cleanupMigratedEntity(input: { uid: string; entityType: 'chat' | 'persona'; entityId: string; sourceVersion: string }) {
+    const [revisionText, contentHash] = input.sourceVersion.split(':');
+    const revision = Number(revisionText);
+    const current = input.entityType === 'chat'
+      ? this.chats.get(this.key(input.uid, input.entityId))
+      : this.personas.get(this.key(input.uid, input.entityId));
+    if (!current) return 'already-deleted' as const;
+    if (current.revision !== revision || current.contentHash !== contentHash) return 'conflict' as const;
+    if (input.entityType === 'chat') this.chats.delete(this.key(input.uid, input.entityId));
+    else this.personas.delete(this.key(input.uid, input.entityId));
+    return 'deleted' as const;
+  }
 }
 
 
@@ -230,5 +243,18 @@ describe('private Pro revisioned sync service', () => {
       operationId: 'delete-persona-1', entityId: 'persona-1', baseRevision: 1, deviceId: 'device-1',
     }), { status: 'deleted', revision: 2 });
     assert.deepEqual([...repository.seenUids], ['uid-owner']);
+  });
+
+  test('legacy cleanup deletes only the authenticated UID and exact frozen revision/hash', async () => {
+    const repository = new MemorySyncRepository();
+    repository.chats.set('uid-owner:chat-1', {
+      chatId: 'chat-1', revision: 3, operationId: 'legacy', contentHash: 'a'.repeat(64), chunkIds: [], byteLength: 0, deviceId: 'legacy', updatedAtMs: 1,
+    });
+    const service = createPrivateProSyncService(repository, () => 1000);
+
+    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { entityType: 'chat', entityId: 'chat-1', sourceVersion: `2:${'a'.repeat(64)}` }), 'conflict');
+    assert.equal(repository.chats.has('uid-owner:chat-1'), true);
+    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { entityType: 'chat', entityId: 'chat-1', sourceVersion: `3:${'a'.repeat(64)}` }), 'deleted');
+    assert.equal(await service.cleanupMigratedEntity(IDENTITY, { entityType: 'chat', entityId: 'chat-1', sourceVersion: `3:${'a'.repeat(64)}` }), 'already-deleted');
   });
 });

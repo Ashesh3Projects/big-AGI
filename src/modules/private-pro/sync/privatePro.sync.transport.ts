@@ -2,6 +2,7 @@ import {
   collection,
   doc,
   getDoc,
+  getDocs,
   onSnapshot,
   orderBy,
   query,
@@ -12,6 +13,7 @@ import { apiAsyncNode } from '~/common/util/trpc.client';
 import { getPrivateProClientFirestore } from '../firebase/firebase.client';
 import { joinSyncChunks, splitSyncPayload } from './privatePro.sync.chunk';
 import type { PrivateProLocalEntity, PrivateProRemoteEvent, PrivateProSyncTransport } from './privatePro.sync.engine';
+import type { PrivateProLegacyMigrationItem, PrivateProLegacyMigrationTransport } from './privatePro.sync.engine';
 import { SyncChunkSchema, SyncConversationSchema, SyncPersonaSchema } from './privatePro.sync.schemas';
 import { PRIVATE_PRO_CHAT_CHUNK_BYTES } from '../config/privatePro.config';
 
@@ -44,7 +46,8 @@ function isManifest(value: unknown): value is RemoteChatManifest {
     typeof manifest.operationId === 'string' && typeof manifest.contentHash === 'string';
 }
 
-async function downloadChat(uid: string, manifest: RemoteChatManifest): Promise<PrivateProLocalEntity> {
+async function downloadChat(uid: string, manifest: RemoteChatManifest, signal?: AbortSignal): Promise<PrivateProLocalEntity> {
+  if (signal?.aborted) throw new DOMException('Legacy sync migration was cancelled.', 'AbortError');
   const firestore = getPrivateProClientFirestore();
   const revisionPath = `users/${uid}/chats/${manifest.chatId}/revisions/${manifest.revision}-${manifest.operationId}`;
   const chunksQuery = query(collection(firestore, revisionPath, 'chunks'), orderBy('index', 'asc'));
@@ -54,7 +57,8 @@ async function downloadChat(uid: string, manifest: RemoteChatManifest): Promise<
       resolve(snapshot.docs.map(chunkDoc => SyncChunkSchema.parse(chunkDoc.data())));
     }, reject);
   });
-      const payload = SyncConversationSchema.parse(JSON.parse(await joinSyncChunks(chunks)));
+  if (signal?.aborted) throw new DOMException('Legacy sync migration was cancelled.', 'AbortError');
+  const payload = SyncConversationSchema.parse(JSON.parse(await joinSyncChunks(chunks)));
   const assetIds = new Set<string>();
   for (const message of payload.conversation.messages) {
     for (const fragment of message.fragments) {
@@ -66,6 +70,56 @@ async function downloadChat(uid: string, manifest: RemoteChatManifest): Promise<
     }
   }
   return { entityType: 'chat', entityId: manifest.chatId, contentHash: manifest.contentHash, payload, assetIds: [...assetIds] };
+}
+
+function migrationVersion(entity: PrivateProLocalEntity, revision: number): string {
+  return `${revision}:${entity.contentHash}`;
+}
+
+export function createPrivateProLegacyMigrationTransport(uid: string): PrivateProLegacyMigrationTransport {
+  return {
+    async listForMigration(signal) {
+      const firestore = getPrivateProClientFirestore();
+      const [chats, personas] = await Promise.all([
+        getDocs(collection(firestore, `users/${uid}/chats`)),
+        getDocs(collection(firestore, `users/${uid}/personas`)),
+      ]);
+      if (signal.aborted) throw new DOMException('Legacy sync migration was cancelled.', 'AbortError');
+      const items: PrivateProLegacyMigrationItem[] = [];
+      for (const snapshot of chats.docs) {
+        const manifest = snapshot.data();
+        if (!isManifest(manifest)) throw new Error('Remote chat manifest is invalid.');
+        const entity = await downloadChat(uid, manifest, signal);
+        items.push({ entity, sourceVersion: migrationVersion(entity, manifest.revision) });
+      }
+      for (const snapshot of personas.docs) {
+        const persona = snapshot.data() as RemotePersonaDocument;
+        const entity: PrivateProLocalEntity = {
+          entityType: 'persona', entityId: persona.personaId, contentHash: persona.contentHash,
+          payload: SyncPersonaSchema.parse(persona.payload),
+        };
+        items.push({ entity, sourceVersion: migrationVersion(entity, persona.revision) });
+      }
+      return items;
+    },
+
+    async currentVersion(entityType, entityId, signal) {
+      if (signal.aborted) throw new DOMException('Legacy sync migration was cancelled.', 'AbortError');
+      const remote = await createPrivateProFirebaseTransport(uid).fetch(entityType, entityId);
+      if (!remote || remote.kind === 'delete') return null;
+      return migrationVersion(remote.entity, remote.revision);
+    },
+
+    async cleanupMigrationItem(_item, signal) {
+      if (signal.aborted) throw new DOMException('Legacy sync migration was cancelled.', 'AbortError');
+      const result = await apiAsyncNode.privateProSync.cleanupMigratedEntity.mutate({
+        entityType: _item.entity.entityType,
+        entityId: _item.entity.entityId,
+        sourceVersion: _item.sourceVersion,
+      });
+      if (result === 'conflict') throw new Error('Legacy cloud data changed after inventory. Cleanup was blocked.');
+    },
+  };
 }
 
 export function createPrivateProFirebaseTransport(uid: string): PrivateProSyncTransport {

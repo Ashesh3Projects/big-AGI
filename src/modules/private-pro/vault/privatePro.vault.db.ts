@@ -9,7 +9,7 @@ import type {
 } from './privatePro.vault.types';
 
 
-export const PRIVATE_PRO_VAULT_DB_VERSION = 3;
+export const PRIVATE_PRO_VAULT_DB_VERSION = 4;
 
 export interface PrivateProVaultDeviceKeyRecord {
   uid: string;
@@ -49,7 +49,12 @@ export interface PrivateProVaultMigrationRecord {
   uid: string;
   migrationId: string;
   phase: string;
+  revision?: number;
+  totalItems?: number;
+  completedItems?: number;
+  operationIds?: string[];
   updatedAtMs: number;
+  encryptedState?: PrivateProVaultEnvelope;
   encryptedError?: PrivateProVaultEnvelope;
 }
 
@@ -100,7 +105,7 @@ export class PrivateProVaultDB extends Dexie {
 
   constructor(name = 'private-pro-vault-v1') {
     super(name);
-    this.version(PRIVATE_PRO_VAULT_DB_VERSION).stores({
+    const stores = {
       deviceKeys: '&uid',
       wrappedKeys: '&uid',
       records: '[uid+recordType+recordId], uid, [uid+recordType], revision',
@@ -109,7 +114,9 @@ export class PrivateProVaultDB extends Dexie {
       migration: '[uid+migrationId], uid, phase, updatedAtMs',
       quarantine: '++id, uid, [uid+recordType+recordId], createdAtMs',
       hydratedAssets: '[uid+assetId], uid, assetId',
-    });
+    } as const;
+    this.version(3).stores(stores);
+    this.version(PRIVATE_PRO_VAULT_DB_VERSION).stores(stores);
   }
 
   async storeDeviceKey(uid: string, key: CryptoKey, deviceId: string): Promise<void> {

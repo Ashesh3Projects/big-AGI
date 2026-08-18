@@ -6,6 +6,7 @@ import type { PrivateProVaultRecordType } from './privatePro.vault.types';
 export type PrivateProVaultPhase =
   | 'locked'
   | 'hydrating'
+  | 'migrating'
   | 'ready'
   | 'reconnecting'
   | 'conflict'

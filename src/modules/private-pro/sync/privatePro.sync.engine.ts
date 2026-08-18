@@ -53,6 +53,17 @@ export interface PrivateProSyncTransport {
   subscribe(uid: string, listener: (event: PrivateProRemoteEvent) => void): () => void;
 }
 
+export interface PrivateProLegacyMigrationItem {
+  entity: PrivateProLocalEntity;
+  sourceVersion: string;
+}
+
+export interface PrivateProLegacyMigrationTransport {
+  listForMigration(signal: AbortSignal): Promise<PrivateProLegacyMigrationItem[]>;
+  currentVersion(entityType: PrivateProEntityType, entityId: string, signal: AbortSignal): Promise<string | null>;
+  cleanupMigrationItem(item: PrivateProLegacyMigrationItem, signal: AbortSignal): Promise<void>;
+}
+
 export type PrivateProSyncStartResult = 'started' | 'already-started' | 'binding-conflict';
 export type PrivateProSyncProblemPhase = 'offline' | 'quota-blocked' | 'error';
 
@@ -145,6 +156,12 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
   let unsubscribeStore: (() => void) | undefined;
   let unsubscribeRemote: (() => void) | undefined;
   let work = Promise.resolve();
+  let runAbortController: AbortController | null = null;
+
+  const beginRun = () => {
+    runAbortController?.abort();
+    runAbortController = new AbortController();
+  };
 
   const queue = (task: () => Promise<void>): Promise<void> => {
     work = work.then(task, task);
@@ -385,6 +402,7 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
       if (binding.status === 'binding-conflict') return 'binding-conflict';
       started = true;
       stopped = false;
+      beginRun();
       unsubscribeStore = deps.store.subscribe(() => {
         if (!suppressLocalEvents && !stopped) void queue(scanAndDrain);
       });
@@ -398,6 +416,8 @@ export function createPrivateProSyncEngine(deps: PrivateProSyncEngineDependencie
     stop() {
       stopped = true;
       started = false;
+      runAbortController?.abort();
+      runAbortController = null;
       unsubscribeStore?.();
       unsubscribeRemote?.();
       unsubscribeStore = undefined;

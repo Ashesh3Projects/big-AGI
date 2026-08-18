@@ -33,6 +33,16 @@ import { createPrivateProVaultTransport } from './privatePro.vault.transport';
 import type { PrivateProVaultDeviceMetadata, PrivateProVaultKeyset } from './privatePro.vault.types';
 import { clearPrivateProVaultDeviceId, resolvePrivateProVaultRequestDeviceId } from './privatePro.vault.device';
 import { signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
+import {
+  createPrivateProVaultLegacyCloudInventoryPort,
+  createPrivateProVaultLocalMigrationPort,
+  createPrivateProVaultMigration,
+  type PrivateProVaultMigration,
+  type PrivateProVaultMigrationProgress,
+} from './privatePro.vault.migration';
+import { createPrivateProLegacyMigrationTransport } from '../sync/privatePro.sync.transport';
+import { privateProVaultRecordId } from './privatePro.vault.recordIds';
+import { deleteDBAsset } from '~/common/stores/blob/dblobs-portability';
 
 
 export type PrivateProVaultPublicPhase = 'setup' | 'locked' | 'hydrating' | 'ready' | 'reconnecting' | 'migrating' | 'error';
@@ -82,6 +92,8 @@ export interface PrivateProVaultRuntimeState {
   masterKey: CryptoKey | null;
   devices: PrivateProVaultDeviceMetadata[];
   assets: PrivateProVaultAssetClient | null;
+  migration?: PrivateProVaultMigration | null;
+  migrationProgress?: PrivateProVaultMigrationProgress | null;
 }
 
 export interface PrivateProVaultRuntimeCleanupPort {
@@ -106,8 +118,34 @@ async function clearPrivateProVaultRuntime(
   runtime.masterKey = null;
   runtime.keyset = null;
   runtime.assets = null;
+  runtime.migration = null;
+  runtime.migrationProgress = null;
   runtime.devices = [];
   port.clearDeviceId(uid);
+}
+
+export async function activatePrivateProVaultRuntime(
+  runtime: PrivateProVaultRuntimeState,
+  deps: {
+    createMigration(): PrivateProVaultMigration;
+    createEngine(): PrivateProVaultEngine;
+    onMigrationProgress(progress: PrivateProVaultMigrationProgress): void;
+  },
+): Promise<void> {
+  await runtime.engine?.stopAndWait();
+  await runtime.migration?.stopAndWait();
+  const migration = deps.createMigration();
+  runtime.migration = migration;
+  const unsubscribe = migration.subscribe(progress => deps.onMigrationProgress(progress));
+  try {
+    await migration.run();
+    const engine = deps.createEngine();
+    runtime.engine = engine;
+    await engine.hydrateBeforeOpen();
+    await engine.start();
+  } finally {
+    unsubscribe();
+  }
 }
 
 export async function logoutPrivateProVaultRuntime(
@@ -201,14 +239,12 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
     masterKey = nextMasterKey;
     keyset = nextKeyset;
     setState({ phase: 'hydrating', busy: true, error: null });
+    bindRuntime();
     try {
       await deps.activate(nextMasterKey, nextKeyset);
-      bindRuntime();
       activationReady = true;
       setState({ phase: 'ready', busy: false, error: null });
     } catch {
-      masterKey = null;
-      keyset = null;
       setState({ phase: 'error', busy: false, error: errorForPhase('error') });
     }
   };
@@ -248,7 +284,10 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
       return () => listeners.delete(listener);
     },
     start,
-    retry: start,
+    retry: async () => {
+      if (keyset && masterKey) return activate(masterKey, keyset);
+      return start();
+    },
     async setup(password) {
       if (!privateProVaultPasswordStrength(password).acceptable) {
         setState({ phase: 'setup', error: 'Use at least 14 characters.' });
@@ -435,26 +474,81 @@ function createProductionDependencies(
       await runtime.engine?.stopAndWait();
       const identifierKey = await deriveVaultSubkey(masterKey, 'record-identifiers', 'portable-state', ['sign']);
       const assets = createPrivateProVaultAssetClient({ vaultId: user.uid, masterKey, keyVersion: keyset.keyVersion });
-      const engine = createPrivateProVaultEngine({
-        uid: user.uid,
-        keyVersion: keyset.keyVersion,
-        masterKey,
-        vaultContext: { vaultId: user.uid },
-        db: privateProVaultDB,
-        serializers: createPrivateProVaultSerializers(identifierKey),
-        transport: createPrivateProVaultTransport(),
-        store: privateProVaultStore,
-        assets: {
-          referencedAssetIds: collectPrivateProVaultAssetIds,
-          prepareForUpload: (assetIds, signal) => assets.prepareForUpload(assetIds, signal),
-          prepareForHydrate: (assetIds, signal) => assets.prepareForHydrate(assetIds, signal),
-          clearHydratedAssets: () => assets.clearHydratedAssets(),
+      const serializers = createPrivateProVaultSerializers(identifierKey);
+      const transport = createPrivateProVaultTransport();
+      const local = createPrivateProVaultLocalMigrationPort({
+        serializers,
+        collectAssetIds: collectPrivateProVaultAssetIds,
+        deleteAsset: deleteDBAsset,
+      });
+      const legacyCloud = createPrivateProVaultLegacyCloudInventoryPort({
+        transport: createPrivateProLegacyMigrationTransport(user.uid),
+        serializers,
+        recordId: (recordType, logicalId) => privateProVaultRecordId(identifierKey, recordType, logicalId),
+      });
+      runtime.assets = assets;
+      await activatePrivateProVaultRuntime(runtime, {
+        createMigration: () => createPrivateProVaultMigration({
+          uid: user.uid,
+          migrationId: 'legacy-v1',
+          keyVersion: keyset.keyVersion,
+          masterKey,
+          db: privateProVaultDB,
+          serializers,
+          inventory: {
+            listLocal: local.listLocal,
+            listCloud: legacyCloud.listCloud,
+            currentVersion: (item, signal) => item.source === 'local' ? local.currentVersion(item, signal) : legacyCloud.currentVersion(item, signal),
+          },
+          records: {
+            upload: (operation, _signal) => transport.write(operation),
+            download: (recordIds, _signal) => transport.getRecords(recordIds),
+          },
+          assets: {
+            prepareForUpload: (assetIds, signal) => assets.prepareForUpload(assetIds, signal),
+            verifyCloud: (assetIds, signal) => assets.verifyCloud(assetIds, signal),
+          },
+          server: {
+            async commit(input) {
+              const result = await apiAsyncNode.privateProVault.commitMigration.mutate(input);
+              return result.status === 'conflict'
+                ? { status: 'conflict' as const, currentPhase: result.currentPhase as PrivateProVaultMigrationProgress['phase'] | null }
+                : { status: result.status, phase: result.phase as PrivateProVaultMigrationProgress['phase'] };
+            },
+          },
+          exportGate: { isConfirmed: async () => false },
+          cleanup: {
+            local: (item, signal) => local.cleanupLocal(item, signal),
+            cloud: (item, signal) => legacyCloud.cleanupCloud(item, signal),
+          },
+          collectAssetIds: collectPrivateProVaultAssetIds,
+          createOperationId: purpose => `migration-${purpose.replace(/[^A-Za-z0-9._:-]/g, '_').slice(0, 72)}-${crypto.randomUUID()}`.slice(0, 128),
+        }),
+        createEngine: () => createPrivateProVaultEngine({
+          uid: user.uid,
+          keyVersion: keyset.keyVersion,
+          masterKey,
+          vaultContext: { vaultId: user.uid },
+          db: privateProVaultDB,
+          serializers,
+          transport,
+          store: privateProVaultStore,
+          assets: {
+            referencedAssetIds: collectPrivateProVaultAssetIds,
+            prepareForUpload: (assetIds, signal) => assets.prepareForUpload(assetIds, signal),
+            prepareForHydrate: (assetIds, signal) => assets.prepareForHydrate(assetIds, signal),
+            clearHydratedAssets: () => assets.clearHydratedAssets(),
+          },
+        }),
+        onMigrationProgress: progress => {
+          runtime.migrationProgress = progress;
+          privateProVaultStore.getState().setState({
+            phase: progress.phase === 'complete' ? 'hydrating' : 'migrating',
+            ready: false,
+            lastError: progress.error,
+          });
         },
       });
-      runtime.engine = engine;
-      runtime.assets = assets;
-      await engine.hydrateBeforeOpen();
-      await engine.start();
       const current = privateProVaultStore.getState();
       if (!current.ready) throw new Error('Vault hydration did not reach ready.');
       runtime.devices = await apiAsyncNode.privateProVault.listDevices.query();
@@ -463,7 +557,7 @@ function createProductionDependencies(
       const mapPhase = (phase: PrivateProVaultPhase): 'ready' | 'reconnecting' | 'migrating' | 'error' => {
         if (phase === 'ready') return 'ready';
         if (phase === 'reconnecting') return 'reconnecting';
-        if (phase === 'hydrating') return 'migrating';
+        if (phase === 'hydrating' || phase === 'migrating') return 'migrating';
         return 'error';
       };
       return privateProVaultStore.subscribe(state => listener(mapPhase(state.phase)));
@@ -489,7 +583,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
   const auth = usePrivateProAuth();
   const [state, setState] = React.useState<PrivateProVaultPublicState>(INITIAL_STATE);
   const lifecycleRef = React.useRef<PrivateProVaultLifecycle | null>(null);
-  const runtimeRef = React.useRef<PrivateProVaultRuntimeState>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null });
+  const runtimeRef = React.useRef<PrivateProVaultRuntimeState>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null, migration: null, migrationProgress: null });
 
   React.useEffect(() => {
     if (!auth.user) return;
@@ -542,6 +636,8 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     }));
     const blob = await response.blob();
     downloadBlob(blob, `Big-AGI-private-pro-encrypted-${new Date().toISOString().slice(0, 10)}.ndjson`);
+    if (runtime.migration && runtime.migration.getProgress().phase === 'commit')
+      await runtime.migration.confirmEncryptedExport();
   }, [auth.user]);
 
   const importEncryptedBackup = React.useCallback(async (
@@ -617,7 +713,14 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
     onRecovery={(recoveryKey, newPassword) => value.unlockWithRecovery(recoveryKey, newPassword)}
     onLogout={() => value.logout()}
   />;
-  if (state.phase !== 'ready') return <PrivateProVaultStatus phase={state.phase} error={state.error} onRetry={() => value.retry()} onLogout={() => value.logout()} />;
+  if (state.phase !== 'ready') return <PrivateProVaultStatus
+    phase={state.phase}
+    error={state.error}
+    migration={runtimeRef.current.migrationProgress ?? null}
+    onCreateEncryptedExport={runtimeRef.current.migrationProgress?.phase === 'commit' ? createEncryptedExport : undefined}
+    onRetry={() => value.retry()}
+    onLogout={() => value.logout()}
+  />;
 
   return <PrivateProVaultContext.Provider value={value}>{props.children}</PrivateProVaultContext.Provider>;
 }

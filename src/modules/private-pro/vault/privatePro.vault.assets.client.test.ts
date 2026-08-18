@@ -636,4 +636,15 @@ describe('private Pro encrypted vault asset client', () => {
     await client.importAssetChunks(exported);
     assert.deepEqual(local.assets.get(ASSET_ID), original);
   });
+
+  test('verifies cloud asset ciphertext by fully decrypting without materializing plaintext', async () => {
+    const { client, local, original } = await fixture();
+    await client.prepareForUpload([ASSET_ID]);
+    local.assets.delete(ASSET_ID);
+
+    await client.verifyCloud([ASSET_ID]);
+
+    assert.equal(local.assets.has(ASSET_ID), false);
+    assert.deepEqual(original.id, ASSET_ID);
+  });
 });

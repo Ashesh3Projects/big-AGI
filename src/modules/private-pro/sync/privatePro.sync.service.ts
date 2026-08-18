@@ -34,6 +34,12 @@ export interface DeleteEntityRequest {
   deviceId: string;
 }
 
+export interface CleanupMigratedEntityRequest {
+  entityType: 'chat' | 'persona';
+  entityId: string;
+  sourceVersion: string;
+}
+
 function requireNonNegativeRevision(revision: number): void {
   if (!Number.isInteger(revision) || revision < 0) throw new Error('Sync base revision must be a non-negative integer.');
 }
@@ -146,6 +152,12 @@ export function createPrivateProSyncService(repository: PrivateProSyncRepository
     deletePersona(identity: PrivateProIdentity, request: DeleteEntityRequest): Promise<PrivateProDeleteResult> {
       requireNonNegativeRevision(request.baseRevision);
       return repository.deleteEntity(identity.uid, 'persona', request.entityId, request.baseRevision, request.deviceId, request.operationId);
+    },
+
+    cleanupMigratedEntity(identity: PrivateProIdentity, request: CleanupMigratedEntityRequest) {
+      if (!request.entityId || !/^\d+:[a-f0-9]{64}$/.test(request.sourceVersion))
+        throw new Error('Legacy migration cleanup input is invalid.');
+      return repository.cleanupMigratedEntity({ uid: identity.uid, ...request });
     },
   };
 }

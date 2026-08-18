@@ -19,6 +19,10 @@ import { verifyPrivateProVaultDeviceRegistration } from './privatePro.vault.regi
 const OPAQUE_RECORD_ID = /^[A-Za-z0-9_-]{43}$/;
 const OPERATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 const MIGRATION_ID = /^[A-Za-z0-9._:-]{1,128}$/;
+const MIGRATION_PHASES = [
+  'inventory', 'encrypt-local', 'upload', 'verify-cloud', 'commit', 'cleanup-local', 'cleanup-cloud', 'complete',
+] as const;
+const MIGRATION_PHASE_INDEX = new Map<string, number>(MIGRATION_PHASES.map((phase, index) => [phase, index]));
 
 export interface PutVaultRecordInput {
   operationId: string;
@@ -417,6 +421,8 @@ export function createPrivateProVaultService(
       assertOperationId(input.operationId);
       if (!MIGRATION_ID.test(input.migrationId) || !input.phase || input.phase.length > 128)
         throw new Error('Vault migration input is invalid.');
+      const nextPhaseIndex = MIGRATION_PHASE_INDEX.get(input.phase);
+      if (nextPhaseIndex === undefined) throw new Error('Vault migration phase is invalid.');
       const requestFingerprint = fingerprint({ kind: 'migration', ...input });
 
       return repository.transaction(uid, async transaction => {
@@ -429,6 +435,14 @@ export function createPrivateProVaultService(
           await transaction.createOperation({ operationId: input.operationId, requestFingerprint, outcome });
           return { status: 'conflict', currentPhase };
         }
+        const currentPhaseIndex = currentPhase === null ? -1 : MIGRATION_PHASE_INDEX.get(currentPhase);
+        const allowedNext = currentPhase === null
+          ? input.phase === 'commit'
+          : currentPhase === 'commit'
+            ? input.phase === 'complete'
+            : false;
+        if (currentPhaseIndex === undefined || nextPhaseIndex < currentPhaseIndex || (!allowedNext && input.phase !== currentPhase))
+          throw new Error('Vault migration phase regression is not allowed.');
         const serverUpdatedAtMs = now();
         await transaction.setMigration({ migrationId: input.migrationId, phase: input.phase, serverUpdatedAtMs });
         const outcome = { kind: 'migration', status: 'committed', phase: input.phase, serverUpdatedAtMs } as const;
