@@ -196,7 +196,11 @@ export async function clearPrivateProPlaintextPortablePersistence(): Promise<voi
   if (typeof window === 'undefined') return;
   for (const key of PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS) window.localStorage.removeItem(key);
   const { del } = await import('idb-keyval');
-  await Promise.all([...PRIVATE_PRO_PORTABLE_IDB_KEYS].map(key => del(key)));
+  const { clearPrivateProPlaintextDBlobPersistence } = await import('~/modules/dblobs/dblobs.db');
+  await Promise.all([
+    ...[...PRIVATE_PRO_PORTABLE_IDB_KEYS].map(key => del(key)),
+    clearPrivateProPlaintextDBlobPersistence(),
+  ]);
 }
 
 function installPrivateProStoragePrototypeGate(): void {

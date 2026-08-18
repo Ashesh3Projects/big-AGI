@@ -44,3 +44,22 @@ test('keeps private Pro DBlobs in volatile runtime state and out of the plaintex
   assert.equal(JSON.stringify(await raw.table('largeAssets').toArray()).includes(sentinel), false);
   raw.close();
 });
+
+test('clears volatile and legacy plaintext DBlobs during private Pro setup or logout', async () => {
+  const asset: DBlobDBAsset = {
+    id: 'asset-clear-private-pro', contextId: 'global', scopeId: 'app-chat', assetType: DBlobAssetType.IMAGE,
+    label: 'sentinel-clear', data: { mimeType: DBlobMimeType.IMG_PNG, base64: 'c2VudGluZWw=' },
+    origin: { ot: 'user', source: 'attachment', media: 'file-open' }, metadata: { width: 1, height: 1 },
+    createdAt: new Date('2026-08-19T00:00:00.000Z'), updatedAt: new Date('2026-08-19T00:00:00.000Z'), cache: {},
+  };
+  await dbModule.putDBAsset(asset);
+  const raw = new Dexie('Big-AGI');
+  raw.version(1).stores({ largeAssets: 'id' });
+  await raw.table('largeAssets').put({ ...asset, id: 'legacy-plaintext-asset' });
+
+  await dbModule.clearPrivateProPlaintextDBlobPersistence();
+
+  assert.equal(await dbModule.getDBAsset(asset.id), undefined);
+  assert.equal(await raw.table('largeAssets').count(), 0);
+  raw.close();
+});

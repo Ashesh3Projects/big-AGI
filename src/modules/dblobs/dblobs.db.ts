@@ -51,6 +51,11 @@ function privateProAssetClone<T extends DBlobDBAsset>(asset: T): T {
   return structuredClone(asset);
 }
 
+export async function clearPrivateProPlaintextDBlobPersistence(): Promise<void> {
+  volatileAssets.clear();
+  await assetsTable.clear();
+}
+
 
 // CRUD
 
