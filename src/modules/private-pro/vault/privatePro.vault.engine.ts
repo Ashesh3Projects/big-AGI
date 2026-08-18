@@ -124,6 +124,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
   let runAbortController: AbortController | null = null;
   let stopping = Promise.resolve();
   let stoppingActive = false;
+  const preparedAssetOperations = new Set<string>();
 
   const assertCurrent = (epoch: number) => {
     if (epoch !== runEpoch) throw new PrivateProVaultRunCancelledError();
@@ -460,9 +461,11 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
       }
       try {
         if (next.operation.kind === 'put' && deps.assets) {
-          const local = await decryptAndValidate(epoch, next.operation.envelope);
-          const assetIds = [...new Set(deps.assets.referencedAssetIds(local.serializer.recordType, local.value))];
-          if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForUpload(assetIds, currentSignal(epoch)));
+          if (!preparedAssetOperations.delete(next.operationId)) {
+            const local = await decryptAndValidate(epoch, next.operation.envelope);
+            const assetIds = [...new Set(deps.assets.referencedAssetIds(local.serializer.recordType, local.value))];
+            if (assetIds.length) await waitCurrent(epoch, deps.assets.prepareForUpload(assetIds, currentSignal(epoch)));
+          }
         }
         const result = await waitCurrent(epoch, deps.transport.write(next.operation));
         if (result.status === 'conflict') {
@@ -535,6 +538,13 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
       const revision = await waitCurrent(currentEpoch, deps.db.revisions.get([deps.uid, mutation.recordType, mutation.recordId]));
       const operationId = createOperationId();
       const operation = await mutationOperation(currentEpoch, mutation, revision?.revision ?? 0, operationId);
+      if (operation.kind === 'put' && mutation.kind === 'put' && deps.assets) {
+        const assetIds = [...new Set(deps.assets.referencedAssetIds(mutation.recordType, mutation.value))];
+        if (assetIds.length) {
+          await waitCurrent(currentEpoch, deps.assets.prepareForUpload(assetIds, currentSignal(currentEpoch)));
+          preparedAssetOperations.add(operationId);
+        }
+      }
       await waitCurrent(currentEpoch, deps.db.outbox.put({
         uid: deps.uid,
         operationId,
@@ -565,6 +575,7 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
     unsubscribeConnectivity = undefined;
     for (const unsubscribe of unsubscribeSerializers) unsubscribe();
     unsubscribeSerializers = [];
+    preparedAssetOperations.clear();
   };
 
   const beginStop = () => {

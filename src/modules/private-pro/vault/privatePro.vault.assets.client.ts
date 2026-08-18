@@ -518,6 +518,7 @@ export function createPrivateProVaultAssetClient(deps: PrivateProVaultAssetClien
     await local.markHydratedAsset(deps.vaultId, asset.id);
     try {
       await local.putAsset(asset);
+      markPrivateProPortableAssetEncrypted(asset.id);
       return true;
     } catch (error) {
       await local.deleteAsset(asset.id).catch(() => undefined);

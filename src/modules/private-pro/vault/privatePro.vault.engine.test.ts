@@ -381,6 +381,30 @@ describe('private Pro blocking multi-device vault engine', () => {
     assert.deepEqual(order, ['upload:asset-private', 'write:chat']);
   });
 
+  test('uploads referenced assets before the encrypted outbox operation becomes durable', async (t) => {
+    const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
+    const server = new TestVaultServer();
+    let releaseUpload = () => {};
+    const uploadGate = new Promise<void>(resolve => releaseUpload = resolve);
+    const client = await createClient(t, server, masterKey, 'asset-before-outbox', {
+      assets: {
+        referencedAssetIds: recordType => recordType === 'chat' ? ['asset-private'] : [],
+        async prepareForHydrate() {},
+        async prepareForUpload() { await uploadGate; },
+        async clearHydratedAssets() {},
+      },
+    });
+    await openClient(client);
+
+    await serializer(client, 'chat').mutate(CHAT_ID, { id: 'chat', value: 'local' });
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 0);
+
+    releaseUpload();
+    await client.engine.whenCurrent();
+    assert.equal(server.operations.length, 1);
+  });
+
   test('stop aborts an in-flight asset upload before any remote write or acknowledgement', async (t) => {
     const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
     const server = new TestVaultServer();
@@ -410,7 +434,7 @@ describe('private Pro blocking multi-device vault engine', () => {
 
     assert.equal(uploadAborted, true);
     assert.equal(server.operations.length, 0);
-    assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 1);
+    assert.equal(await client.db.outbox.where('uid').equals(UID).count(), 0);
   });
 
   test('stop aborts in-flight asset hydration and prevents stale apply or persistence', async (t) => {
