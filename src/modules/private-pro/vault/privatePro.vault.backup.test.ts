@@ -260,4 +260,47 @@ describe('private Pro vault backup orchestration', () => {
       },
     )), /verification mismatch/i);
   });
+
+  test('replays one atomic operation after an ambiguous post-commit response', async (t) => {
+    const backup = await withVaultPasswordWorker(realArgon2idWorkerResponse, () => createPrivateProVaultKeyset(PASSWORD, UID));
+    const activeMasterKey = await importVaultMasterKey(Uint8Array.from({ length: 32 }, (_, index) => 0xc0 + index));
+    const targetDB = createDB(t);
+    const serializer = new TestSerializer();
+    const importedValue = { id: 'chat', assetIds: [] };
+    const importedEnvelope = await envelope(backup.masterKey, importedValue);
+    const bytes = await collect(createPrivateProEncryptedBackupStream({
+      vaultId: UID, keyset: backup.keyset, masterKey: backup.masterKey,
+      records: async function* () { yield importedEnvelope; },
+    }));
+    const remote = new Map<string, PrivateProVaultEnvelope>();
+    const operationIds: string[] = [];
+    let first = true;
+    const transport = {
+      isOnline: () => true,
+      subscribeConnectivity: () => () => undefined,
+      async getIndex() { return [...remote.values()].map(value => ({ kind: 'record' as const, recordType: value.recordType, opaqueRecordId: value.recordId, revision: value.revision, keyVersion: value.keyVersion, ciphertextBytes: value.ciphertextBytes, serverUpdatedAtMs: 2 })); },
+      async getRecords(ids: readonly string[]) { return ids.flatMap(id => remote.has(id) ? [structuredClone(remote.get(id)!)] : []); },
+      async mergeBackup(operation: any) {
+        operationIds.push(operation.operationId);
+        if (first) {
+          first = false;
+          remote.set(RECORD_ID, structuredClone(operation.records[0].envelope));
+          throw new TypeError('response lost after commit');
+        }
+        return { status: 'unchanged' as const, records: [{ opaqueRecordId: RECORD_ID, revision: operation.records[0].envelope.revision, serverUpdatedAtMs: 2 }] };
+      },
+      async write() { throw new Error('sequential backup writes are forbidden'); },
+    };
+    const assets = { async importAssetChunks() { return []; }, async rollbackImportedAssets() {} } as never;
+
+    await withVaultPasswordWorker(realArgon2idWorkerResponse, () => importPrivateProVaultBackup(
+      stream(bytes), { kind: 'password', password: PASSWORD }, {
+        uid: UID, db: targetDB, serializers: [serializer], activeMasterKey, activeKeyVersion: 7,
+        activeAssets: { async prepareForUpload() {} } as never,
+        transport, createBackupAssetClient: () => assets, createOperationId: () => 'restore-ambiguous',
+      },
+    ));
+
+    assert.deepEqual(operationIds, ['restore-ambiguous', 'restore-ambiguous']);
+  });
 });

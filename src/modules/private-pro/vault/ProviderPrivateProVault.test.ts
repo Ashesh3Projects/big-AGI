@@ -226,7 +226,7 @@ describe('private Pro vault lifecycle', () => {
       throw new Error('pre-commit validation failed');
     }), /pre-commit/);
 
-    assert.deepEqual(order, ['stop', 'import', 'start', 'current']);
+    assert.deepEqual(order, ['stop', 'import', 'hydrate', 'start', 'current']);
   });
 
   test('backup import blocks ready state when cloud committed before local hydration failed', async () => {

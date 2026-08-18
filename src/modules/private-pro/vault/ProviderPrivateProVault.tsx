@@ -112,6 +112,7 @@ export async function runPrivateProVaultBackupImport(
       store.getState().setState({ phase: 'error', ready: false, lastError: message });
       throw new PrivateProVaultBackupCommittedError(message, { cause: error });
     }
+    await engine.hydrateBeforeOpen();
     await engine.start();
     await engine.whenCurrent();
     throw error;

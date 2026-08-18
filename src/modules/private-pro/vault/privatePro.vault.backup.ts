@@ -179,14 +179,21 @@ export async function importPrivateProVaultBackup(
             return { ...record, baseRevision, envelope };
           }));
           const operationId = deps.createOperationId?.() ?? `restore-${crypto.randomUUID()}`;
-          const result = await deps.transport.mergeBackup({
+          const mergeInput = {
             operationId,
             records: mergeRecords.map(record => ({
               opaqueRecordId: record.recordId,
               baseRevision: record.baseRevision,
               envelope: record.envelope,
             })),
-          });
+          };
+          let result;
+          try {
+            result = await deps.transport.mergeBackup(mergeInput);
+          } catch (error) {
+            if (!(error instanceof TypeError) || !deps.transport.isOnline()) throw error;
+            result = await deps.transport.mergeBackup(mergeInput);
+          }
           if (result.status === 'conflict') throw new Error('The cloud vault changed during backup merge. Retry the merge.');
           cloudCommitted = true;
           const committedById = new Map(result.records.map(record => [record.opaqueRecordId, record]));
