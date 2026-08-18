@@ -11,11 +11,10 @@ Commit subject: `Security: prepare Firebase origin restrictions`.
 The exact production browser API-key target allowlist is:
 
 - `firebaseappcheck.googleapis.com`
-- `firebaseinstallations.googleapis.com`
 - `identitytoolkit.googleapis.com`
 - `securetoken.googleapis.com`
 
-The mounted browser code imports and calls Firebase Auth and Firebase App Check. Firebase App Check uses Firebase Installations. The installed Firebase 12.17.1 SDK confirms the App Check and Installations endpoints.
+The mounted browser code imports and calls Firebase Auth and Firebase App Check. The installed `@firebase/app-check` 0.13.0 package calls the App Check exchange endpoint directly and has no Installations dependency.
 
 `firestore.googleapis.com` and `firebasestorage.googleapis.com` were removed from the browser-key allowlist. Task 19 denies all browser Firestore and Storage SDK access. The only browser Firestore consumer is the unmounted legacy plaintext sync transport. The mounted provider tree uses authenticated Vercel procedures for Firestore and Storage metadata, plus object-specific signed URLs for browser file transfer. Firebase Admin APIs use server credentials and are unrelated to the browser API key.
 
@@ -116,3 +115,59 @@ After explicit user approval:
 5. Save the redacted after snapshot and run the blocking audit without `--report-only`.
 6. In a clean profile on `https://chatgpt.ashesh.dev`, verify Google sign-in, redirect fallback, App Check, encrypted vault bootstrap, signed encrypted upload/download, and browser Firestore/Storage denial.
 7. If a check fails, restore only the exact required origin, API target, method, or header. Do not restore wildcard or unrestricted state.
+
+## Fix round 1/5
+
+Status: implemented locally. No cloud mutation or deployment was performed.
+
+### Findings addressed
+
+1. Changed the Private Pro response header from `Referrer-Policy: no-referrer` to `strict-origin-when-cross-origin`. HTTP-referrer-restricted Firebase browser keys require a Referer on cross-origin requests. The new policy sends only the application origin and does not send path or query data cross-origin. The live audit now blocks any other Referrer-Policy value.
+2. Removed `firebaseinstallations.googleapis.com` from the browser API-key allowlist and the explicit CSP sources. The mounted `@firebase/app-check` 0.13.0 package has no Installations dependency and its exchange request goes directly to `content-firebaseappcheck.googleapis.com` with the browser key. The exact browser API-key target set is now App Check, Identity Toolkit, and Secure Token.
+3. Bound the configured browser key resource to the selected project. The audit reads the numeric project number with `gcloud projects describe`, requires `projects/<expected-number>/locations/global/keys/...`, rejects a different project or non-global location, and never prints the resource name or project number.
+4. Updated the security design, deployment guide, operator plan, and redacted snapshot schema. The new header and project-binding evidence is recorded as counts only.
+
+### TDD
+
+Initial fix-round RED:
+
+```text
+36 tests: 32 passed, 4 failed
+```
+
+The failures proved that the header still used `no-referrer`, the CSP still allowed Installations, the audit still required Installations, and project-number/key-resource binding did not exist.
+
+Exact referrer-policy audit RED:
+
+```text
+37 tests: 36 passed, 1 failed
+isAllowedReferrerPolicy is not a function
+```
+
+Project-number collector RED:
+
+```text
+38 tests: 37 passed, 1 failed
+collectProjectNumber is not a function
+```
+
+### Read-only live collection
+
+- `gcloud projects describe big-agi-243b6 --format=json` succeeded.
+- The numeric project number was not printed or saved.
+- `NEXT_PUBLIC_FIREBASE_API_KEY` remains absent from this shell, so key-resource project/location matching remains unverified and blocks.
+
+### Approval-gated state
+
+The approval-required API-key update command now contains exactly three API targets. Referrers remain exactly `https://chatgpt.ashesh.dev/*` and `https://big-agi-243b6.firebaseapp.com/*`. No mutation command was run.
+
+### Verification
+
+- Focused header and security-audit command: 38 passed, 0 failed.
+- `npm run private-pro:security-audit -- --report-only`: completed and now blocks the deployed non-matching Referrer-Policy while keeping output to booleans and counts.
+- Direct `next.config.ts` integration probe with `NEXT_PUBLIC_PRIVATE_PRO_ENABLED=true`: one route header rule, exact `strict-origin-when-cross-origin`, and no explicit Installations CSP source.
+- Read-only project-number collection: readable; the number was not printed or saved.
+- Redacted snapshot JSON parse: passed.
+- `git diff --check`: passed.
+- Focused ESLint remains blocked before file analysis by the local `@rushstack/eslint-patch` caller-recognition error.
+- Private-Pro-enabled `npm run build`: application compilation passed, then the existing duplicate React type baseline stopped type checking at `pages/_app.tsx:42` (`ProviderSingleTab` JSX type mismatch). The build did not reach route-manifest generation.

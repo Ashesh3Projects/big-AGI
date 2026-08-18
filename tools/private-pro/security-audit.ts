@@ -13,7 +13,6 @@ const DEFAULT_DEPLOYMENT_ORIGIN = 'https://chatgpt.ashesh.dev';
 const EXPECTED_BROWSER_REFERRERS = new Set(['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*']);
 const REQUIRED_BROWSER_API_SERVICES = new Set([
   'firebaseappcheck.googleapis.com',
-  'firebaseinstallations.googleapis.com',
   'identitytoolkit.googleapis.com',
   'securetoken.googleapis.com',
 ]);
@@ -305,6 +304,10 @@ export function classifyHeaders(facts: HeaderFacts): AuditFinding[] {
   ];
 }
 
+export function isAllowedReferrerPolicy(value: string): boolean {
+  return value.trim().toLowerCase() === 'strict-origin-when-cross-origin';
+}
+
 export function classifyAuthorizedDomains(facts: AuthorizedDomainFacts): AuditFinding[] {
   return [
     finding('authorizedDomains', 'exact', facts.exactMatches === ALLOWED_AUTH_DOMAINS.size ? 'pass' : 'block', facts.exactMatches),
@@ -591,9 +594,19 @@ export function inspectBrowserApiKeys(
   return { total: keys.length, unrestricted, missingExpectedReferrers, staleReferrers, broadReferrers, missingRequiredApiTargets, unrelatedApiTargets, duplicateReferrers, duplicateApiTargets };
 }
 
-export function inspectApiKeyLookup(value: unknown): string {
+export function inspectProjectNumber(value: unknown): string {
+  const projectNumber = asRecord(value).projectNumber;
+  if (typeof projectNumber !== 'string' || !/^[1-9]\d{0,19}$/.test(projectNumber))
+    throw new Error('Firebase project number could not be read.');
+  return projectNumber;
+}
+
+export function inspectApiKeyLookup(value: unknown, expectedProjectNumber: string): string {
   const name = asRecord(value).name;
-  if (typeof name !== 'string' || !/^projects\/\d+\/locations\/[a-z0-9-]+\/keys\/[A-Za-z0-9_-]+$/.test(name))
+  const match = typeof name === 'string'
+    ? /^projects\/(\d+)\/locations\/(global)\/keys\/[A-Za-z0-9_-]+$/.exec(name)
+    : null;
+  if (!match || match[1] !== expectedProjectNumber)
     throw new Error('Configured Firebase browser API key could not be resolved to one key resource.');
   return name;
 }
@@ -1108,7 +1121,7 @@ async function collectHeaders(origin: string): Promise<HeaderFacts> {
     contentSecurityPolicy: get('content-security-policy').length > 0,
     strictTransportSecurity: get('strict-transport-security').length > 0,
     noSniff: get('x-content-type-options').toLowerCase() === 'nosniff',
-    referrerPolicy: get('referrer-policy').length > 0,
+    referrerPolicy: isAllowedReferrerPolicy(get('referrer-policy')),
     permissionsPolicy: get('permissions-policy').length > 0,
     frameDenied: frameOptions === 'DENY' || get('content-security-policy').includes("frame-ancestors 'none'"),
     crossOriginOpenerPolicy: get('cross-origin-opener-policy').length > 0,
@@ -1138,10 +1151,21 @@ async function collectDeployment(origin: string): Promise<DeploymentFacts> {
   return inspectDeployment(await runJson('vercel', ['inspect', new URL(origin).hostname, '--format=json', '--non-interactive']));
 }
 
+export async function collectProjectNumber(
+  projectId: string,
+  readJson: (command: string, args: string[]) => Promise<unknown> = (command, args) => runJson(command, args),
+): Promise<string> {
+  return inspectProjectNumber(await readJson('gcloud', ['projects', 'describe', projectId, '--format=json']));
+}
+
 async function collectBrowserApiKeys(projectId: string): Promise<BrowserApiKeyFacts> {
   const keyString = process.env.NEXT_PUBLIC_FIREBASE_API_KEY?.trim();
   if (!keyString) throw new Error('NEXT_PUBLIC_FIREBASE_API_KEY is required for browser API key audit.');
-  const resourceName = inspectApiKeyLookup(await runJson('gcloud', ['services', 'api-keys', 'lookup', keyString, `--project=${projectId}`, '--format=json']));
+  const projectNumber = await collectProjectNumber(projectId);
+  const resourceName = inspectApiKeyLookup(
+    await runJson('gcloud', ['services', 'api-keys', 'lookup', keyString, `--project=${projectId}`, '--format=json']),
+    projectNumber,
+  );
   return inspectBrowserApiKeys([await runJson('gcloud', ['services', 'api-keys', 'describe', resourceName, `--project=${projectId}`, '--format=json'])]);
 }
 

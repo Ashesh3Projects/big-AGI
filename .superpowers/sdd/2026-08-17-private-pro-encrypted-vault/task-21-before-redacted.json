@@ -3,8 +3,14 @@
   "phase": "before",
   "collectedAt": "2026-08-18T17:11:46+05:30",
   "projectId": "big-agi-243b6",
+  "headers": {
+    "referrerPolicyMismatchCount": 1
+  },
   "browserApiKey": {
     "resolved": false,
+    "projectNumberUnreadableCount": 0,
+    "resourceProjectUnverifiedCount": 1,
+    "resourceLocationUnverifiedCount": 1,
     "configuredInShell": false,
     "keyCount": 0,
     "referrerCount": 0,
@@ -13,7 +19,7 @@
     "broadReferrerCount": 0,
     "duplicateReferrerCount": 0,
     "apiTargetCount": 0,
-    "missingApiTargetCount": 4,
+    "missingApiTargetCount": 3,
     "unrelatedApiTargetCount": 0,
     "duplicateApiTargetCount": 0
   },

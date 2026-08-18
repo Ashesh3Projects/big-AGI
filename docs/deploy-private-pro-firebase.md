@@ -149,10 +149,12 @@ The accepted production state is defined in `infra/private-pro/firebase-origin-r
 - Firebase Auth authorized domains are exactly `chatgpt.ashesh.dev` and `big-agi-243b6.firebaseapp.com`.
 - The production deployment is ready, targets production, and has exactly the `chatgpt.ashesh.dev` alias. A Vercel alias may exist only as a separately approved conditional rollback target, not accepted current state.
 - The configured Firebase browser API key referrers are exactly `https://chatgpt.ashesh.dev/*` and `https://big-agi-243b6.firebaseapp.com/*`.
-- That key targets exactly `firebaseappcheck.googleapis.com`, `firebaseinstallations.googleapis.com`, `identitytoolkit.googleapis.com`, and `securetoken.googleapis.com`.
+- That key targets exactly `firebaseappcheck.googleapis.com`, `identitytoolkit.googleapis.com`, and `securetoken.googleapis.com`.
 - Bucket CORS is readable and exactly matches the policy above.
 
-Task 19 denies all browser Firestore and Storage SDK access. `firebase/firestore` is referenced only by the unmounted legacy plaintext sync transport. Mounted browser code uses Firebase Auth, App Check, and signed Storage URLs. Therefore `firestore.googleapis.com` and `firebasestorage.googleapis.com` are not browser-key targets. Firebase Admin APIs use server credentials and are unrelated to browser API-key restrictions.
+Task 19 denies all browser Firestore and Storage SDK access. `firebase/firestore` is referenced only by the unmounted legacy plaintext sync transport. Mounted browser code uses Firebase Auth, App Check, and signed Storage URLs. The installed `@firebase/app-check` 0.13.0 package calls the App Check endpoint directly and has no Installations dependency. Therefore `firestore.googleapis.com`, `firebasestorage.googleapis.com`, and `firebaseinstallations.googleapis.com` are not browser-key targets. Firebase Admin APIs use server credentials and are unrelated to browser API-key restrictions.
+
+Private Pro must emit `Referrer-Policy: strict-origin-when-cross-origin`. HTTP-referrer API-key restrictions depend on a cross-origin Referer. This policy sends only `https://chatgpt.ashesh.dev/` to Firebase APIs and omits path and query data. `no-referrer` is incompatible with the restricted browser key and blocks rollout.
 
 Save redacted before and after snapshots using the schema in the restriction plan. Unreadable state blocks rollout. Cloud changes, alias removal, and deployment still require explicit user approval.
 

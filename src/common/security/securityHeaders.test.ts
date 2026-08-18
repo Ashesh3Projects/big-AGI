@@ -11,7 +11,7 @@ test('private Pro emits the required browser security headers', () => {
   assert.equal(headers.get('strict-transport-security'), 'max-age=63072000; includeSubDomains; preload');
   assert.equal(headers.get('x-content-type-options'), 'nosniff');
   assert.equal(headers.get('x-frame-options'), 'DENY');
-  assert.equal(headers.get('referrer-policy'), 'no-referrer');
+  assert.equal(headers.get('referrer-policy'), 'strict-origin-when-cross-origin', 'Firebase HTTP-referrer restrictions require an origin Referer without path or query leakage');
   assert.equal(headers.get('cross-origin-opener-policy'), 'same-origin-allow-popups');
   assert.match(headers.get('permissions-policy') ?? '', /geolocation=\(\)/);
   assert.doesNotMatch(headers.get('content-security-policy') ?? '', /(?:^|\s)'unsafe-eval'(?:\s|;|$)/);
@@ -23,7 +23,7 @@ test('private Pro CSP permits Firebase, Google sign-in, media, workers, and supp
   assert.match(policy, /connect-src[^;]*https:\/\/identitytoolkit\.googleapis\.com/);
   assert.match(policy, /connect-src[^;]*https:\/\/firestore\.googleapis\.com/);
   assert.match(policy, /connect-src[^;]*https:\/\/content-firebaseappcheck\.googleapis\.com/);
-  assert.match(policy, /connect-src[^;]*https:\/\/firebaseinstallations\.googleapis\.com/);
+  assert.doesNotMatch(policy, /connect-src[^;]*https:\/\/firebaseinstallations\.googleapis\.com/);
   assert.match(policy, /connect-src[^;]*https:\/\/storage\.googleapis\.com/);
   assert.match(policy, /frame-src[^;]*https:\/\/accounts\.google\.com/);
   assert.match(policy, /img-src[^;]*data:[^;]*blob:/);

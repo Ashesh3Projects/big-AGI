@@ -19,11 +19,12 @@ The configured Firebase browser API key has these exact HTTP referrers:
 The configured browser key has these exact API targets:
 
 - `firebaseappcheck.googleapis.com`
-- `firebaseinstallations.googleapis.com`
 - `identitytoolkit.googleapis.com`
 - `securetoken.googleapis.com`
 
-`firebase/firestore` remains imported only by the unmounted legacy plaintext sync transport. Task 19 denies all browser Firestore and Storage SDK paths. Mounted providers use Firebase Auth and App Check in the browser, authenticated Vercel procedures for data access, and object-specific signed URLs for file transfer. Therefore `firestore.googleapis.com` and `firebasestorage.googleapis.com` are excluded from this browser key. Firebase Admin APIs use server credentials, not this browser key.
+`firebase/firestore` remains imported only by the unmounted legacy plaintext sync transport. Task 19 denies all browser Firestore and Storage SDK paths. Mounted providers use Firebase Auth and App Check in the browser, authenticated Vercel procedures for data access, and object-specific signed URLs for file transfer. The installed `@firebase/app-check` 0.13.0 package has no Installations dependency and calls only the App Check exchange endpoint with the Firebase browser key. Therefore `firestore.googleapis.com`, `firebasestorage.googleapis.com`, and `firebaseinstallations.googleapis.com` are excluded from this browser key. Firebase Admin APIs use server credentials, not this browser key.
+
+Private Pro sends `Referrer-Policy: strict-origin-when-cross-origin`. Cross-origin Firebase requests therefore carry the exact application origin needed by HTTP-referrer restrictions, without path or query data. `no-referrer` is not accepted because it suppresses the Referer required to authorize the restricted browser key.
 
 The installed Firebase Web SDK loads reCAPTCHA Enterprise JavaScript from Google and exchanges App Check tokens through the Firebase App Check endpoint. reCAPTCHA site-key domain configuration is separate from Google Cloud browser API-key API targets. Do not add `recaptchaenterprise.googleapis.com` to the Firebase browser key without a captured request proving the browser sends this key to that service.
 
@@ -55,15 +56,21 @@ Save before and after evidence as JSON containing only booleans and counts. Neve
   "phase": "before",
   "collectedAt": "ISO-8601 timestamp",
   "projectId": "big-agi-243b6",
+  "headers": {
+    "referrerPolicyMismatchCount": 0
+  },
   "browserApiKey": {
     "resolved": true,
+    "projectNumberUnreadableCount": 0,
+    "resourceProjectUnverifiedCount": 0,
+    "resourceLocationUnverifiedCount": 0,
     "keyCount": 1,
     "referrerCount": 2,
     "missingReferrerCount": 0,
     "staleReferrerCount": 0,
     "broadReferrerCount": 0,
     "duplicateReferrerCount": 0,
-    "apiTargetCount": 4,
+    "apiTargetCount": 3,
     "missingApiTargetCount": 0,
     "unrelatedApiTargetCount": 0,
     "duplicateApiTargetCount": 0
@@ -109,6 +116,7 @@ These commands do not mutate cloud state. Do not save or paste their raw output.
 $ProjectId='big-agi-243b6'
 $Bucket='big-agi-243b6.firebasestorage.app'
 
+gcloud projects describe $ProjectId --format=json
 npm run private-pro:security-audit -- --report-only
 gcloud services api-keys lookup $env:NEXT_PUBLIC_FIREBASE_API_KEY --project=$ProjectId --format=json
 gcloud services api-keys describe KEY_RESOURCE_NAME --project=$ProjectId --format=json
@@ -147,7 +155,7 @@ $ProjectId='big-agi-243b6'
 $Bucket='big-agi-243b6.firebasestorage.app'
 $KeyResourceName='projects/PROJECT_NUMBER/locations/global/keys/KEY_ID'
 
-gcloud services api-keys update $KeyResourceName --project=$ProjectId --allowed-referrers='https://chatgpt.ashesh.dev/*,https://big-agi-243b6.firebaseapp.com/*' --api-target=service=firebaseappcheck.googleapis.com --api-target=service=firebaseinstallations.googleapis.com --api-target=service=identitytoolkit.googleapis.com --api-target=service=securetoken.googleapis.com
+gcloud services api-keys update $KeyResourceName --project=$ProjectId --allowed-referrers='https://chatgpt.ashesh.dev/*,https://big-agi-243b6.firebaseapp.com/*' --api-target=service=firebaseappcheck.googleapis.com --api-target=service=identitytoolkit.googleapis.com --api-target=service=securetoken.googleapis.com
 
 $AccessToken = gcloud auth print-access-token
 $Headers = @{ Authorization = "Bearer $AccessToken"; 'Content-Type' = 'application/json' }

@@ -324,7 +324,7 @@ Set and verify at least:
 - `Content-Security-Policy`.
 - `Strict-Transport-Security` with includeSubDomains where domain ownership permits.
 - `X-Content-Type-Options: nosniff`.
-- `Referrer-Policy: no-referrer` or a documented equally strict policy.
+- `Referrer-Policy: strict-origin-when-cross-origin` so cross-origin Firebase calls carry only the production origin required by HTTP-referrer API-key restrictions, without path or query leakage.
 - `Permissions-Policy` denying unused powerful features.
 - `frame-ancestors 'none'` in CSP and `X-Frame-Options: DENY` as legacy defense.
 - `Cross-Origin-Opener-Policy` where OAuth popup compatibility permits.

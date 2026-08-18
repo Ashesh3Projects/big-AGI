@@ -8,7 +8,6 @@ const FIREBASE_AND_GOOGLE_CONNECT_SOURCES = [
   'https://firebasestorage.googleapis.com',
   'https://storage.googleapis.com',
   'https://content-firebaseappcheck.googleapis.com',
-  'https://firebaseinstallations.googleapis.com',
   'https://recaptchaenterprise.googleapis.com',
   'https://www.googleapis.com',
   'https://accounts.google.com',
@@ -102,7 +101,8 @@ export function privateProSecurityHeaders(): SecurityHeader[] {
     { key: 'Strict-Transport-Security', value: 'max-age=63072000; includeSubDomains; preload' },
     { key: 'X-Content-Type-Options', value: 'nosniff' },
     { key: 'X-Frame-Options', value: 'DENY' },
-    { key: 'Referrer-Policy', value: 'no-referrer' },
+    // Preserve only the origin on cross-origin Firebase calls so HTTP-referrer API-key restrictions work without path or query leakage.
+    { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
     { key: 'Permissions-Policy', value: PRIVATE_PRO_PERMISSIONS_POLICY },
     { key: 'Cross-Origin-Opener-Policy', value: 'same-origin-allow-popups' },
   ];

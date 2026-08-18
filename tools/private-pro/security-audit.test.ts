@@ -17,6 +17,7 @@ import {
   classifyRuntimeIdentity,
   classifyRuntimeRoleManifest,
   classifyServiceAccountKeys,
+  collectProjectNumber,
   runCommand,
   selectRuntimeIdentity,
   buildAuditReport,
@@ -28,6 +29,8 @@ import {
   inspectDeployment,
   inspectIamRoles,
   inspectApiKeyLookup,
+  isAllowedReferrerPolicy,
+  inspectProjectNumber,
   inspectRuntimeIdentity,
   inspectRuntimeRoleManifest,
   inspectServiceAccountKeys,
@@ -69,6 +72,14 @@ describe('private Pro security audit classifiers', () => {
     });
 
     assert.deepEqual(severities(findings), ['block', 'block', 'pass', 'pass', 'pass', 'pass', 'pass', 'pass']);
+  });
+
+  test('accepts only the origin-preserving production referrer policy', () => {
+    assert.equal(isAllowedReferrerPolicy('strict-origin-when-cross-origin'), true);
+    assert.equal(isAllowedReferrerPolicy(' STRICT-ORIGIN-WHEN-CROSS-ORIGIN '), true);
+    assert.equal(isAllowedReferrerPolicy('no-referrer'), false);
+    assert.equal(isAllowedReferrerPolicy('origin'), false);
+    assert.equal(isAllowedReferrerPolicy(''), false);
   });
 
   test('blocks stale or wildcard authorized domains without exposing domain values', () => {
@@ -147,7 +158,6 @@ describe('private Pro security audit classifiers', () => {
       browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] },
       apiTargets: [
         { service: 'firebaseappcheck.googleapis.com' },
-        { service: 'firebaseinstallations.googleapis.com' },
         { service: 'identitytoolkit.googleapis.com' },
         { service: 'securetoken.googleapis.com' },
       ],
@@ -156,11 +166,11 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(classifyBrowserApiKeys(facts).every(finding => finding.severity === 'pass'), true);
     assert.equal(classifyBrowserApiKeys(inspectBrowserApiKeys([
       { restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] }, apiTargets: [
-        { service: 'firebaseappcheck.googleapis.com' }, { service: 'firebaseinstallations.googleapis.com' },
+        { service: 'firebaseappcheck.googleapis.com' },
         { service: 'identitytoolkit.googleapis.com' }, { service: 'securetoken.googleapis.com' },
       ] } },
       { restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] }, apiTargets: [
-        { service: 'firebaseappcheck.googleapis.com' }, { service: 'firebaseinstallations.googleapis.com' },
+        { service: 'firebaseappcheck.googleapis.com' },
         { service: 'identitytoolkit.googleapis.com' }, { service: 'securetoken.googleapis.com' },
       ] } },
     ])).some(finding => finding.severity === 'block'), true);
@@ -168,16 +178,34 @@ describe('private Pro security audit classifiers', () => {
       browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] },
       apiTargets: [
         { service: 'firebaseappcheck.googleapis.com' }, { service: 'firebaseappcheck.googleapis.com' },
-        { service: 'firebaseinstallations.googleapis.com' }, { service: 'identitytoolkit.googleapis.com' },
+        { service: 'identitytoolkit.googleapis.com' },
         { service: 'securetoken.googleapis.com' },
       ],
     } }])).some(finding => finding.severity === 'block'), true);
   });
 
-  test('accepts one API key resource lookup without exposing the browser key string', () => {
-    assert.equal(inspectApiKeyLookup({ name: 'projects/123/locations/global/keys/browser-key-id' }), 'projects/123/locations/global/keys/browser-key-id');
-    assert.throws(() => inspectApiKeyLookup({}));
-    assert.throws(() => inspectApiKeyLookup({ name: 'not-a-key-resource' }));
+  test('accepts only a global API key resource from the expected project number', () => {
+    assert.equal(inspectProjectNumber({ projectNumber: '123' }), '123');
+    assert.throws(() => inspectProjectNumber({ projectNumber: 'project-id' }));
+    assert.equal(inspectApiKeyLookup({ name: 'projects/123/locations/global/keys/browser-key-id' }, '123'), 'projects/123/locations/global/keys/browser-key-id');
+    assert.throws(() => inspectApiKeyLookup({}, '123'));
+    assert.throws(() => inspectApiKeyLookup({ name: 'not-a-key-resource' }, '123'));
+    assert.throws(() => inspectApiKeyLookup({ name: 'projects/456/locations/global/keys/browser-key-id' }, '123'));
+    assert.throws(() => inspectApiKeyLookup({ name: 'projects/123/locations/us-central1/keys/browser-key-id' }, '123'));
+  });
+
+  test('collects the numeric project number with a read-only project describe command', async () => {
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const projectNumber = await collectProjectNumber('big-agi-243b6', async (command, args) => {
+      calls.push({ command, args });
+      return { projectNumber: '123456789012' };
+    });
+
+    assert.equal(projectNumber, '123456789012');
+    assert.deepEqual(calls, [{
+      command: 'gcloud',
+      args: ['projects', 'describe', 'big-agi-243b6', '--format=json'],
+    }]);
   });
 
   test('blocks empty, missing, stale, broad, and unrelated browser API key restrictions', () => {
@@ -193,7 +221,7 @@ describe('private Pro security audit classifiers', () => {
 
     assert.equal(classifyBrowserApiKeys(empty).some(finding => finding.severity === 'block'), true);
     assert.equal(classifyBrowserApiKeys(wrong).some(finding => finding.severity === 'block'), true);
-    assert.equal(wrong.missingRequiredApiTargets, 3);
+    assert.equal(wrong.missingRequiredApiTargets, 2);
     assert.equal(wrong.unrelatedApiTargets, 2);
   });
 
