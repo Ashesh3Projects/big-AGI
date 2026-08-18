@@ -4,7 +4,7 @@
 
 **NOT READY FOR PRODUCTION.**
 
-Local verification and fix-round verification completed through test commit `b9b04d6a1` on 2026-08-18 IST. The branch still has approval-gated live-control blockers, nine high dependency audit findings, and unexecuted clean-profile and multi-device acceptance.
+Local final-fix verification completed through code commit `ec97c78d5` on 2026-08-19 IST. Local high and critical dependency findings are zero. The branch still has approval-gated live-control blockers and unexecuted clean-profile and multi-device acceptance.
 
 This verification was local and read-only except for generated files inside the isolated worktree. It did not:
 
@@ -22,6 +22,7 @@ This verification was local and read-only except for generated files inside the 
 - Restore audit isolation commit: `e86685620ab4392a60b0af46ca181332cd687662`
 - Acknowledgment verification stabilization: `bf7ff8848`
 - One-shot audit evidence verification: `b9b04d6a1`
+- Final persistence, restore, analytics, recovery, and route fixes: `3f499a60d..ec97c78d5`
 - Verification timezone: Asia/Calcutta, UTC+05:30
 - OS: Windows 10 Pro, 10.0.19045, x64
 - Node.js: `v24.5.0`
@@ -110,7 +111,33 @@ TDD and stress evidence:
 
 ## Command matrix
 
-All timestamps are 2026-08-18 UTC+05:30.
+Final-fix commands below supersede the earlier Task 23 counts. All were run from `ec97c78d5` unless noted.
+
+| Status | Command | Result |
+|---|---|---|
+| PASS | Final focused Private Pro/security suite | 229 passed, 0 failed. Covers portable plaintext suppression, volatile and legacy DBlob cleanup, exact encrypted asset API surface, cloud backup merge, analytics shutdown, recovery audit, engine ordering, crypto, router, schemas, headers, HTML/SVG isolation, and encrypted backup. |
+| PASS | `npx --no-install cross-env NODE_ENV=development tsx --test "src/modules/private-pro/**/*.test.ts" "src/modules/dblobs/dblobs.private-pro.test.ts" "src/modules/trade/privateProEncryptedBackup.test.ts"` | 256 passed, 0 failed. |
+| PASS | `npm run test:private-pro-tools` | 62 passed, 0 failed. |
+| PASS | `npm run test:firebase:exec` with Microsoft JDK 21 | 35 passed, 0 failed. Expected permission-denied lines asserted browser denial. |
+| PASS | `npm run tscheck` | Root and tools projects passed. |
+| PASS | `npm run lint` | Passed. |
+| PASS | Private Pro production build with analytics environment variables set and non-secret placeholder deployment config | Compiled, linted, type-checked, generated 17 static pages, and completed trace collection. Analytics source and mount contract tests prove Private Pro excludes GA, PostHog, Vercel Analytics, and Speed Insights. |
+| PASS | `npm audit --omit=dev --audit-level=high --json` | 0 critical, 0 high, 8 reviewed moderate findings. |
+| KNOWN UNRELATED BASELINE | `npm test` with ambient live-vendor environment | Private Pro tools passed. Repository result: 275 passed, 18 skipped, 1 failed. Only failure: live Groq catalog drift for three stale curated IDs. No Private Pro test failed. |
+| PASS WITH LIVE BLOCKERS | `npm run private-pro:security-audit -- --report-only` | Exit 0 by report-only contract: 47 pass, 8 warn, 43 block; clean-worktree check passed. |
+| EXPECTED BLOCKING FAILURE | `npm run private-pro:security-audit` | Exit 1 with the same 47 pass, 8 warn, 43 block live findings. |
+
+### Final-fix coverage
+
+- Every Task 11 portable Zustand/localStorage key and the chat IndexedDB cell use a central build-activated volatile adapter in Private Pro. Open behavior remains durable.
+- Setup/logout clear only the explicit portable key/cell list plus the dedicated `Big-AGI/largeAssets` plaintext table and volatile DBlob map.
+- DBlobs stay runtime-available in memory; new referenced assets finalize encrypted cloud storage before the record outbox reference becomes durable. Reload is blocked while an asset is pending.
+- `privateProSync` and the legacy `privateProAssets` namespace are absent. Only four encrypted procedures are mounted under `privateProVaultAssets`.
+- Backup import is a cloud merge: backup-key decryption is staged, assets upload first under the active vault key, records are re-encrypted with active key version and current revisions, existing cloud-only records remain, and cloud reconstruction is downloaded and verified before engine hydration reports success.
+- Private Pro analytics are disabled at mount and source flag boundaries even if analytics environment variables are present.
+- Password/recovery rotation records one bounded server security event in the same keyset transaction and prompts for immediate revocation of other remembered devices.
+
+The rows below this note are the historical Task 23 matrix from 2026-08-18 UTC+05:30. They are retained as earlier evidence and are superseded by the final-fix table above where counts or audit state changed.
 
 | Status | Start - end | Command | Result |
 |---|---|---|---|
@@ -151,7 +178,7 @@ Refreshing the Groq catalog is separate LLM vendor maintenance and was not perfo
 
 ## Plaintext leakage review
 
-No Private Pro vault plaintext leakage was found in the tested durable-store, backup, transport, or error surfaces.
+No Private Pro vault plaintext leakage was found in the tested durable-store, backup, transport, analytics, or error surfaces.
 
 Automated and static evidence includes:
 
@@ -168,7 +195,7 @@ The older generic `Export All` feature remains an unencrypted local backup surfa
 
 ## Dependency audit ruling
 
-No critical finding was reported. The nine high findings are not waived. The branch remains blocked until the production audit no longer reports reachable high findings or a separately approved dependency change removes the vulnerable production package path.
+Final production audit reports 0 critical, 0 high, and 8 moderate findings. The earlier high-finding table below is historical and was resolved by the dependency hardening commits before this final-fix wave. The eight remaining Firebase Admin/Google-client moderate nodes remain documented warnings and do not satisfy production readiness by themselves.
 
 | Package path | Severity | Reachability and current control | Ruling |
 |---|---|---|---|
@@ -187,7 +214,7 @@ No critical finding was reported. The nine high findings are not waived. The bra
 
 ## Security audit blockers
 
-The final clean-tree report-only and blocking runs both produced 46 pass, 8 warn, and 44 block findings.
+The final clean-tree report-only and blocking runs both produced 47 pass, 8 warn, and 43 block findings.
 
 | Area | Current blocker |
 |---|---|
@@ -199,7 +226,7 @@ The final clean-tree report-only and blocking runs both produced 46 pass, 8 warn
 | Firestore recovery | Deletion protection is disabled. PITR/RPO/RTO selection remains a warning pending a cost and recovery decision. |
 | Restore evidence | No approved rehearsal ran. Evidence, independent trust, signature, provenance, release binding, target isolation, counts, hashes, application acceptance, and cleanup evidence remain blocked. The final clean-worktree check passed. |
 | Runtime identity and IAM | The expected runtime identity is not configured or actively verified. Deployed custom role, project policy, and service-account policy collectors did not pass. IAM and service-account-key observations remain warnings where identity attribution is unavailable. |
-| Dependencies | Nine high findings block. Ten moderate findings warn. |
+| Dependencies | Zero critical/high findings. Eight reviewed moderate Firebase Admin/Google-client findings warn. |
 | Firebase rule probes | Anonymous Firestore and Storage reads were denied. Write state remained unknown in the read-only audit and therefore blocks. Emulator rules passed locally. |
 
 Blocking mode must not be changed to report-only in release automation. Production readiness requires the blocking command itself to exit 0.
@@ -210,7 +237,7 @@ All items below are PENDING. None was simulated as a production success.
 
 ### Preconditions
 
-- [ ] Resolve the nine high dependency findings and rerun `npm audit --omit=dev`.
+- [x] Resolve critical/high dependency findings and rerun `npm audit --omit=dev --audit-level=high`.
 - [ ] Complete and approve the header, alias, Auth-domain, browser-key, CORS, and App Check changes.
 - [ ] Provision and validate the dedicated runtime identity, WIF or approved static fallback, custom role, project binding, service-account policy, and key state.
 - [ ] Enable Firestore deletion protection after explicit approval.
