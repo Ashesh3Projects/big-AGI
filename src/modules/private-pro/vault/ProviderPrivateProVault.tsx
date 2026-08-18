@@ -12,6 +12,7 @@ import { privateProClientConfig } from '../config/privatePro.config';
 import { PrivateProVaultSetup } from '../ui/PrivateProVaultSetup';
 import { PrivateProVaultStatus } from '../ui/PrivateProVaultStatus';
 import { PrivateProVaultUnlock } from '../ui/PrivateProVaultUnlock';
+import { PrivateProVaultRecoveryRecommendation } from '../ui/PrivateProVaultRecoveryRecommendation';
 import { deriveVaultSubkey, hmacVaultIdentifier } from './privatePro.vault.crypto';
 import { privateProVaultDB } from './privatePro.vault.db';
 import { createPrivateProVaultEngine, type PrivateProVaultEngine } from './privatePro.vault.engine';
@@ -528,6 +529,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
   setPrivateProEncryptedPersistenceActive(true);
   const auth = usePrivateProAuth();
   const [state, setState] = React.useState<PrivateProVaultPublicState>(INITIAL_STATE);
+  const [revokeBusy, setRevokeBusy] = React.useState(false);
   const lifecycleRef = React.useRef<PrivateProVaultLifecycle | null>(null);
   const runtimeRef = React.useRef<PrivateProVaultRuntimeState>({ engine: null, keyset: null, masterKey: null, devices: [], assets: null });
 
@@ -674,7 +676,20 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
   />;
   if (state.phase !== 'ready') return <PrivateProVaultStatus phase={state.phase} error={state.error} onRetry={() => value.retry()} onLogout={() => value.logout()} />;
 
-  return <PrivateProVaultContext.Provider value={value}>{props.children}</PrivateProVaultContext.Provider>;
+  return <PrivateProVaultContext.Provider value={value}>
+    {state.revokeOtherDevicesRecommended && <PrivateProVaultRecoveryRecommendation
+      busy={revokeBusy}
+      onRevoke={async () => {
+        setRevokeBusy(true);
+        try {
+          await value.revokeOtherDevices();
+        } finally {
+          setRevokeBusy(false);
+        }
+      }}
+    />}
+    {props.children}
+  </PrivateProVaultContext.Provider>;
 }
 
 export function usePrivateProVault(): PrivateProVaultContextValue {

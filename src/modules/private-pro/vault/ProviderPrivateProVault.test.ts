@@ -17,6 +17,7 @@ import {
 import { PrivateProVaultSetup } from '../ui/PrivateProVaultSetup';
 import { PrivateProVaultStatus } from '../ui/PrivateProVaultStatus';
 import { PrivateProVaultUnlock } from '../ui/PrivateProVaultUnlock';
+import { PrivateProVaultRecoveryRecommendation } from '../ui/PrivateProVaultRecoveryRecommendation';
 import {
   rewrapPrivateProVaultPassword,
   rewrapPrivateProVaultPasswordWithRecovery,
@@ -404,6 +405,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(harness.counts.register, 1);
     assert.equal(harness.counts.commitRecovery, 1);
     assert.deepEqual(harness.registrationKeys, ['recovery-enrollment-key']);
+    assert.equal(lifecycle.getState().revokeOtherDevicesRecommended, true);
   });
 
   test('wrong passwords stay locked and return one secret-free failure', async () => {
@@ -563,6 +565,17 @@ describe('private Pro vault accessibility', () => {
 
     assert.match(markup, /role="status"/);
     assert.match(markup, /Reconnect/);
+    assert.match(markup, /<button/);
+  });
+
+  test('ready recovery flow renders an immediate revoke recommendation with explicit action', () => {
+    const markup = renderToStaticMarkup(React.createElement(PrivateProVaultRecoveryRecommendation, {
+      busy: false,
+      onRevoke: async () => {},
+    }));
+
+    assert.match(markup, /Vault credentials changed/);
+    assert.match(markup, /Revoke other devices now/);
     assert.match(markup, /<button/);
   });
 });
