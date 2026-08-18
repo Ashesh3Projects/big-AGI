@@ -4,18 +4,62 @@ import { readFile } from 'node:fs/promises';
 
 import {
   assertFails,
-  assertSucceeds,
   initializeTestEnvironment,
+  type RulesTestContext,
   type RulesTestEnvironment,
 } from '@firebase/rules-unit-testing';
-import { deleteDoc, doc, getDoc, setDoc } from 'firebase/firestore';
-import { getBytes, ref, uploadBytes } from 'firebase/storage';
+import {
+  collection,
+  collectionGroup,
+  deleteDoc,
+  doc,
+  getDoc,
+  getDocs,
+  setDoc,
+} from 'firebase/firestore';
+import { deleteObject, getBytes, listAll, ref, uploadBytes } from 'firebase/storage';
 
 
 const PROJECT_ID = 'demo-private-pro';
+
+const ENCRYPTED_FIRESTORE_DOCUMENTS = [
+  ['vault data root', 'users/uid-a/vault/data', 'users/uid-a/vault/data-new'],
+  ['keyset', 'users/uid-a/vault/data/keysets/current', 'users/uid-a/vault/data/keysets/next'],
+  ['former keys', 'users/uid-a/vault/data/keys/current', 'users/uid-a/vault/data/keys/next'],
+  ['record', 'users/uid-a/vault/data/records/record-1', 'users/uid-a/vault/data/records/record-new'],
+  ['index', 'users/uid-a/vault/data/index/entry-1', 'users/uid-a/vault/data/index/entry-new'],
+  ['tombstone', 'users/uid-a/vault/data/tombstones/record-2', 'users/uid-a/vault/data/tombstones/record-new'],
+  ['device', 'users/uid-a/vault/data/devices/device-1', 'users/uid-a/vault/data/devices/device-new'],
+  ['operation', 'users/uid-a/vault/data/operations/operation-1', 'users/uid-a/vault/data/operations/operation-new'],
+  ['registration challenge', 'users/uid-a/vault/data/registrationChallenges/challenge-1', 'users/uid-a/vault/data/registrationChallenges/challenge-new'],
+  ['asset metadata', 'users/uid-a/vault/data/assets/asset-1', 'users/uid-a/vault/data/assets/asset-new'],
+  ['asset reservation', 'users/uid-a/vault/data/assetReservations/reservation-1', 'users/uid-a/vault/data/assetReservations/reservation-new'],
+  ['asset rate window', 'users/uid-a/vault/data/assetRateWindows/window-1', 'users/uid-a/vault/data/assetRateWindows/window-new'],
+  ['former migration', 'users/uid-a/vault/data/migrations/legacy-v1', 'users/uid-a/vault/data/migrations/legacy-new'],
+  ['unknown nested path', 'users/uid-a/vault/data/unknown/nested/deeper/item-1', 'users/uid-a/vault/data/unknown/nested/deeper/item-new'],
+] as const;
+
+const LEGACY_FIRESTORE_DOCUMENTS = [
+  ['chat', 'users/uid-a/chats/chat-1', 'users/uid-a/chats/chat-new'],
+  ['persona', 'users/uid-a/personas/persona-1', 'users/uid-a/personas/persona-new'],
+  ['tombstone', 'users/uid-a/tombstones/chat:deleted', 'users/uid-a/tombstones/chat:new'],
+  ['asset metadata', 'users/uid-a/assets/asset-1', 'users/uid-a/assets/asset-new'],
+  ['device', 'users/uid-a/devices/device-1', 'users/uid-a/devices/device-new'],
+  ['quota reservation', 'users/uid-a/quotaReservations/reservation-1', 'users/uid-a/quotaReservations/reservation-new'],
+  ['upload rate window', 'users/uid-a/uploadRateWindows/window-1', 'users/uid-a/uploadRateWindows/window-new'],
+  ['chat upload chunk', 'users/uid-a/chatUploads/upload-1/chunks/chunk-1', 'users/uid-a/chatUploads/upload-new/chunks/chunk-new'],
+] as const;
+
+const STORAGE_OBJECTS = [
+  ['encrypted chunk', 'users/uid-a/vault/assets/opaque-asset-1/opaque-chunk-1'],
+  ['former unchunked vault asset', 'users/uid-a/vault/assets/opaque-asset-legacy'],
+  ['legacy plaintext asset', 'users/uid-a/assets/asset-1'],
+  ['legacy upload chunk', 'users/uid-a/chatUploads/upload-1/chunks/chunk-1'],
+] as const;
+
 let testEnv: RulesTestEnvironment;
 
-function approvedContext(uid = 'uid-a', epoch = 1) {
+function approvedContext(uid = 'uid-a', epoch = 1): RulesTestContext {
   return testEnv.authenticatedContext(uid, {
     email: `${uid}@example.com`,
     email_verified: true,
@@ -43,24 +87,12 @@ beforeEach(async () => {
     await setDoc(doc(firestore, 'users/uid-b'), {
       uid: 'uid-b', active: true, accessEpoch: 1, quotaBytes: 1024, usedBytes: 0, reservedBytes: 0,
     });
-    await setDoc(doc(firestore, 'users/uid-a/chats/chat-1'), {
-      chatId: 'chat-1', revision: 1, operationId: 'operation-1', contentHash: 'a'.repeat(64),
-      chunkIds: ['000000'], byteLength: 3, deviceId: 'device-a', updatedAtMs: 100,
-    });
-    await setDoc(doc(firestore, 'users/uid-a/personas/persona-1'), {
-      personaId: 'persona-1', revision: 1, contentHash: 'b'.repeat(64), payload: { schemaVersion: 1 }, deviceId: 'device-a', updatedAtMs: 100,
-    });
-    await setDoc(doc(firestore, 'users/uid-a/tombstones/chat:deleted'), {
-      entityType: 'chat', entityId: 'deleted', revision: 2, operationId: 'delete-1', deviceId: 'device-a', deletedAtMs: 100,
-    });
-    await setDoc(doc(firestore, 'users/uid-a/assets/asset-1'), {
-      uid: 'uid-a', assetId: 'asset-1', contentHash: 'c'.repeat(64), contentType: 'image/png', byteSize: 3,
-      objectPath: 'users/uid-a/assets/asset-1', status: 'ready', metadata: {}, createdAtMs: 100, updatedAtMs: 100,
-    });
-    await setDoc(doc(firestore, 'users/uid-a/vault/data/migrations/legacy-v1'), {
-      migrationId: 'legacy-v1', phase: 'committed', updatedAtMs: 100,
-    });
-    await uploadBytes(ref(context.storage(), 'users/uid-a/assets/asset-1'), new Uint8Array([1, 2, 3]), { contentType: 'image/png' });
+
+    for (const [, existingPath] of [...ENCRYPTED_FIRESTORE_DOCUMENTS, ...LEGACY_FIRESTORE_DOCUMENTS])
+      await setDoc(doc(firestore, existingPath), { seeded: true });
+
+    for (const [, objectPath] of STORAGE_OBJECTS)
+      await uploadBytes(ref(context.storage(), objectPath), new Uint8Array([1, 2, 3]), { contentType: 'application/octet-stream' });
   });
 });
 
@@ -69,69 +101,127 @@ after(async () => {
 });
 
 
-describe('private Pro Firestore rules', () => {
-  test('allows an approved user to read only its own synchronized records', async () => {
-    const firestore = approvedContext().firestore();
-
-    await assertSucceeds(getDoc(doc(firestore, 'users/uid-a')));
-    await assertSucceeds(getDoc(doc(firestore, 'users/uid-a/chats/chat-1')));
-    await assertSucceeds(getDoc(doc(firestore, 'users/uid-a/personas/persona-1')));
-    await assertSucceeds(getDoc(doc(firestore, 'users/uid-a/tombstones/chat:deleted')));
-    await assertSucceeds(getDoc(doc(firestore, 'users/uid-a/assets/asset-1')));
-    await assertFails(getDoc(doc(firestore, 'users/uid-b')));
+describe('private Pro Firestore account rules', () => {
+  test('denies the account document because browser bootstrap is server-mediated', async () => {
+    await assertFails(getDoc(doc(approvedContext().firestore(), 'users/uid-a')));
   });
 
-  test('rejects missing, stale, and inactive entitlements', async () => {
-    await assertFails(getDoc(doc(testEnv.unauthenticatedContext().firestore(), 'users/uid-a/chats/chat-1')));
-    await assertFails(getDoc(doc(testEnv.authenticatedContext('uid-a', { privatePro: false, privateProEpoch: 1 }).firestore(), 'users/uid-a/chats/chat-1')));
-    await assertFails(getDoc(doc(approvedContext('uid-a', 2).firestore(), 'users/uid-a/chats/chat-1')));
+  test('denies account reads without a current active same-account entitlement', async () => {
+    const accountPath = 'users/uid-a';
+    const missingClaim = testEnv.authenticatedContext('uid-a', { privateProEpoch: 1 });
+    const missingEpoch = testEnv.authenticatedContext('uid-a', { privatePro: true });
+
+    await assertFails(getDoc(doc(testEnv.unauthenticatedContext().firestore(), accountPath)));
+    await assertFails(getDoc(doc(missingClaim.firestore(), accountPath)));
+    await assertFails(getDoc(doc(missingEpoch.firestore(), accountPath)));
+    await assertFails(getDoc(doc(approvedContext('uid-a', 2).firestore(), accountPath)));
+    await assertFails(getDoc(doc(approvedContext('uid-b').firestore(), accountPath)));
 
     await testEnv.withSecurityRulesDisabled(async context => {
-      await setDoc(doc(context.firestore(), 'users/uid-a'), { active: false }, { merge: true });
+      await setDoc(doc(context.firestore(), accountPath), { active: false }, { merge: true });
     });
-    await assertFails(getDoc(doc(approvedContext().firestore(), 'users/uid-a/chats/chat-1')));
+    await assertFails(getDoc(doc(approvedContext().firestore(), accountPath)));
   });
 
-  test('denies every browser write in the synchronized vault', async () => {
+  test('denies all browser writes to account metadata', async () => {
     const firestore = approvedContext().firestore();
 
-    await assertFails(setDoc(doc(firestore, 'users/uid-a/chats/new-chat'), { revision: 1 }));
-    await assertFails(setDoc(doc(firestore, 'users/uid-a/personas/new-persona'), { revision: 1 }));
-    await assertFails(setDoc(doc(firestore, 'users/uid-a/quotaReservations/op-1'), { requestedBytes: 1 }));
-    await assertFails(deleteDoc(doc(firestore, 'users/uid-a/chats/chat-1')));
+    await assertFails(setDoc(doc(firestore, 'users/uid-a'), { active: false }, { merge: true }));
+    await assertFails(setDoc(doc(firestore, 'users/uid-new'), { active: true }));
+    await assertFails(deleteDoc(doc(firestore, 'users/uid-a')));
+  });
+});
+
+describe('private Pro encrypted Firestore vault rules', () => {
+  for (const [family, existingPath, newPath] of ENCRYPTED_FIRESTORE_DOCUMENTS) {
+    test(`denies direct reads and writes for the ${family} family`, async () => {
+      const firestore = approvedContext().firestore();
+
+      await assertFails(getDoc(doc(firestore, existingPath)));
+      await assertFails(setDoc(doc(firestore, newPath), { browserCreated: true }));
+      await assertFails(setDoc(doc(firestore, existingPath), { browserUpdated: true }, { merge: true }));
+      await assertFails(deleteDoc(doc(firestore, existingPath)));
+    });
+  }
+
+  test('denies unauthenticated and cross-account encrypted vault reads', async () => {
+    const recordPath = 'users/uid-a/vault/data/records/record-1';
+
+    await assertFails(getDoc(doc(testEnv.unauthenticatedContext().firestore(), recordPath)));
+    await assertFails(getDoc(doc(approvedContext('uid-b').firestore(), recordPath)));
   });
 
-  test('denies the removed encrypted-vault migration path to every browser caller', async () => {
-    const migration = doc(approvedContext().firestore(), 'users/uid-a/vault/data/migrations/legacy-v1');
+  test('denies direct list queries and collection-group scans', async () => {
+    const firestore = approvedContext().firestore();
 
-    await assertFails(getDoc(migration));
-    await assertFails(setDoc(migration, { migrationId: 'legacy-v1', phase: 'complete', updatedAtMs: 200 }));
-    await assertFails(getDoc(doc(approvedContext('uid-b').firestore(), 'users/uid-a/vault/data/migrations/legacy-v1')));
+    await assertFails(getDocs(collection(firestore, 'users/uid-a/vault/data/records')));
+    await assertFails(getDocs(collection(firestore, 'users/uid-a/vault/data/devices')));
+    await assertFails(getDocs(collectionGroup(firestore, 'records')));
+    await assertFails(getDocs(collectionGroup(firestore, 'assetReservations')));
+  });
+});
+
+describe('private Pro former plaintext Firestore rules', () => {
+  for (const [family, existingPath, newPath] of LEGACY_FIRESTORE_DOCUMENTS) {
+    test(`denies direct reads and writes for the former ${family} family`, async () => {
+      const firestore = approvedContext().firestore();
+
+      await assertFails(getDoc(doc(firestore, existingPath)));
+      await assertFails(setDoc(doc(firestore, newPath), { browserCreated: true }));
+      await assertFails(setDoc(doc(firestore, existingPath), { browserUpdated: true }, { merge: true }));
+      await assertFails(deleteDoc(doc(firestore, existingPath)));
+    });
+  }
+
+  test('denies broad same-account and recursive legacy list queries', async () => {
+    const firestore = approvedContext().firestore();
+
+    await assertFails(getDocs(collection(firestore, 'users')));
+    await assertFails(getDocs(collection(firestore, 'users/uid-a/chats')));
+    await assertFails(getDocs(collection(firestore, 'users/uid-a/personas')));
+    await assertFails(getDocs(collectionGroup(firestore, 'chunks')));
   });
 });
 
 describe('private Pro Storage rules', () => {
-  test('allows an entitled user to read only its own attachment', async () => {
-    await assertSucceeds(getBytes(ref(approvedContext().storage(), 'users/uid-a/assets/asset-1')));
-    await assertFails(getBytes(ref(approvedContext('uid-b').storage(), 'users/uid-a/assets/asset-1')));
-    await assertFails(getBytes(ref(testEnv.unauthenticatedContext().storage(), 'users/uid-a/assets/asset-1')));
+  for (const [family, objectPath] of STORAGE_OBJECTS) {
+    test(`denies direct read, write, and delete for the ${family} path`, async () => {
+      const storageReference = ref(approvedContext().storage(), objectPath);
+
+      await assertFails(getBytes(storageReference));
+      await assertFails(uploadBytes(storageReference, new Uint8Array([4])));
+      await assertFails(deleteObject(storageReference));
+    });
+  }
+
+  test('denies encrypted chunk reads for every browser entitlement state', async () => {
+    const objectPath = 'users/uid-a/vault/assets/opaque-asset-1/opaque-chunk-1';
+    const missingClaim = testEnv.authenticatedContext('uid-a', { privateProEpoch: 1 });
+    const missingEpoch = testEnv.authenticatedContext('uid-a', { privatePro: true });
+
+    await assertFails(getBytes(ref(testEnv.unauthenticatedContext().storage(), objectPath)));
+    await assertFails(getBytes(ref(missingClaim.storage(), objectPath)));
+    await assertFails(getBytes(ref(missingEpoch.storage(), objectPath)));
+    await assertFails(getBytes(ref(approvedContext('uid-a', 2).storage(), objectPath)));
+    await assertFails(getBytes(ref(approvedContext('uid-b').storage(), objectPath)));
   });
 
-  test('denies direct browser uploads even for an approved user', async () => {
-    await assertFails(uploadBytes(ref(approvedContext().storage(), 'users/uid-a/assets/direct-upload'), new Uint8Array([4])));
-  });
+  test('denies list access to encrypted, legacy, and broad user prefixes', async () => {
+    const storage = approvedContext().storage();
 
-  test('requires a private Pro claim and numeric epoch for reads', async () => {
-    const noClaim = testEnv.authenticatedContext('uid-a', { privatePro: false, privateProEpoch: 1 });
-    const noEpoch = testEnv.authenticatedContext('uid-a', { privatePro: true });
-    await assertFails(getBytes(ref(noClaim.storage(), 'users/uid-a/assets/asset-1')));
-    await assertFails(getBytes(ref(noEpoch.storage(), 'users/uid-a/assets/asset-1')));
+    await assertFails(listAll(ref(storage, 'users/uid-a/vault/assets/opaque-asset-1')));
+    await assertFails(listAll(ref(storage, 'users/uid-a/vault/assets')));
+    await assertFails(listAll(ref(storage, 'users/uid-a/assets')));
+    await assertFails(listAll(ref(storage, 'users/uid-a')));
   });
 });
 
-test('seeded storage object is readable with rules disabled', async () => {
+test('rules-disabled seeding can read encrypted Firestore and Storage data', async () => {
   await testEnv.withSecurityRulesDisabled(async context => {
-    const bytes = new Uint8Array(await getBytes(ref(context.storage(), 'users/uid-a/assets/asset-1')));
+    const record = await getDoc(doc(context.firestore(), 'users/uid-a/vault/data/records/record-1'));
+    const bytes = new Uint8Array(await getBytes(ref(context.storage(), 'users/uid-a/vault/assets/opaque-asset-1/opaque-chunk-1')));
+
+    assert.equal(record.data()?.seeded, true);
     assert.deepEqual([...bytes], [1, 2, 3]);
   });
 });
