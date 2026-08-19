@@ -4,7 +4,17 @@ import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer, PrivateProS
 import { privateProCanonicalJson, privateProContentHash } from '../privatePro.sync.codec';
 
 
-export function createPrivateProAssetSerializer(uid: string, local: PrivateProAssetLocalPort): PrivateProSyncSerializer<PrivateProAssetManifest> {
+export type PrivateProAssetSerializerErrorCategory = 'schema' | 'offline';
+
+function classifyAssetSerializerError(error: unknown): PrivateProAssetSerializerErrorCategory {
+  return error instanceof TypeError || error instanceof RangeError || (error instanceof Error && error.name === 'ZodError') ? 'schema' : 'offline';
+}
+
+export function createPrivateProAssetSerializer(
+  uid: string,
+  local: PrivateProAssetLocalPort,
+  onError: (category: PrivateProAssetSerializerErrorCategory) => void,
+): PrivateProSyncSerializer<PrivateProAssetManifest> {
   const serialized = (manifest: PrivateProAssetManifest): PrivateProSyncSerializedRecord<PrivateProAssetManifest> => ({
     recordType: 'asset', logicalId: manifest.assetId, projectionKey: manifest.assetId, schemaVersion: 1,
     value: structuredClone(manifest), referencedAssetIds: [manifest.assetId],
@@ -44,6 +54,10 @@ export function createPrivateProAssetSerializer(uid: string, local: PrivateProAs
     subscribe(listener) {
       let previous = new Map<string, string>();
       let stopped = false;
+      const report = (error: unknown) => {
+        if (stopped) return;
+        try { onError(classifyAssetSerializerError(error)); } catch { /* reporting must not reject the serializer queue */ }
+      };
       const capture = async () => {
         const currentManifests = await local.listManifests();
         if (stopped) return;
@@ -58,7 +72,10 @@ export function createPrivateProAssetSerializer(uid: string, local: PrivateProAs
         previous = current;
         mutations.forEach(listener);
       };
-      let queue = local.listManifests().then(manifests => { previous = new Map(manifests.map(manifest => [manifest.assetId, JSON.stringify(manifest)])); });
+      let queue = local.listManifests().then(
+        manifests => { previous = new Map(manifests.map(manifest => [manifest.assetId, JSON.stringify(manifest)])); },
+        report,
+      );
       const unsubscribe = local.subscribe(() => {
         const notification = queue.catch(() => {}).then(capture);
         queue = notification;

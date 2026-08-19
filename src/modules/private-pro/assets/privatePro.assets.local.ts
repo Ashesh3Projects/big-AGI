@@ -86,8 +86,16 @@ export function activatePrivateProAssetPersistence(uid: string | null, port: Pri
 export async function runActivePrivateProAssetOperation<T>(
   operation: (port: PrivateProAssetLocalPort, guard: PrivateProAssetActivationGuard, deleteAsset: PrivateProAssetDelete) => Promise<T>,
 ): Promise<{ active: false } | { active: true; value: T }> {
-  if (!active && transition) await transition;
-  const selected = active;
+  let selected: ActivePrivateProAssetPersistence | null;
+  for (;;) {
+    const observedGeneration = activationGeneration;
+    const observedTransition = transition;
+    if (observedTransition) await observedTransition;
+    if (activationGeneration !== observedGeneration || (transition && transition !== observedTransition)) continue;
+    selected = active;
+    if (!selected && transition) continue;
+    break;
+  }
   if (!selected) return { active: false };
   const guard: PrivateProAssetActivationGuard = {
     signal: selected.controller.signal,

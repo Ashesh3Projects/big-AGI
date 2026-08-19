@@ -3,6 +3,7 @@ import { deleteObject, getBytes, getMetadata, ref, uploadBytesResumable, type Fu
 import type { DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import { getPrivateProClientStorage } from '../firebase/firebase.client';
 import { assertPrivateProPayloadSize, privateProCanonicalJson, privateProContentHash } from '../sync/privatePro.sync.codec';
+import type { PrivateProAssetUploadLease } from '../sync/privatePro.sync.db';
 import { PrivateProSyncTransportError } from '../sync/privatePro.sync.transport';
 import type { PrivateProAssetActivationGuard, PrivateProAssetLocalPort } from './privatePro.assets.local';
 import {
@@ -30,7 +31,21 @@ export interface PrivateProAssetManifestTransport {
 }
 
 export interface PrivateProAssetLockPort {
-  request<T>(name: string, signal: AbortSignal | undefined, callback: () => Promise<T>): Promise<T>;
+  request<T>(name: string, signal: AbortSignal | undefined, callback: (lockSignal: AbortSignal | undefined) => Promise<T>): Promise<T>;
+}
+
+export interface PrivateProAssetUploadLeasePort {
+  acquireAssetUploadLease(uid: string, assetId: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetUploadLease | null>;
+  renewAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetUploadLease | null>;
+  releaseAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string): Promise<void>;
+}
+
+export interface PrivateProAssetUploadLeaseOptions {
+  port: PrivateProAssetUploadLeasePort;
+  leaseMs?: number;
+  renewEveryMs?: number;
+  retryEveryMs?: number;
+  now?: () => number;
 }
 
 export interface PrivateProAssetClient {
@@ -147,10 +162,13 @@ export function createPrivateProAssetClient(
   storage: PrivateProAssetStoragePort = firebaseStoragePort(),
   transport: PrivateProAssetManifestTransport,
   local: PrivateProAssetLocalPort,
-  locks: PrivateProAssetLockPort = browserLockPort(),
+  locks?: PrivateProAssetLockPort | null,
+  leaseOptions?: PrivateProAssetUploadLeaseOptions,
 ): PrivateProAssetClient {
   if (!uid) throw new TypeError('Private Pro asset UID is required.');
   const uploadQueues = new Map<string, Promise<void>>();
+  const selectedLocks = locks === undefined ? browserLockPort() : locks;
+  const uploadLock = selectedLocks ?? (leaseOptions ? durableLeaseLockPort(uid, leaseOptions) : unavailableLockPort());
 
   function currentGeneration(assetId: string, expected: number, signal?: AbortSignal): Promise<void> {
     abortIfNeeded(signal);
@@ -162,20 +180,20 @@ export function createPrivateProAssetClient(
 
   function enqueueUpload(assetId: string, signal?: AbortSignal): Promise<void> {
     const previous = uploadQueues.get(assetId) ?? Promise.resolve();
-    const task = previous.catch(() => {}).then(() => locks.request(`private-pro-asset-upload:${uid}:${assetId}`, signal, async () => {
-      abortIfNeeded(signal);
+    const task = previous.catch(() => {}).then(() => uploadLock.request(`private-pro-asset-upload:${uid}:${assetId}`, signal, async lockSignal => {
+      abortIfNeeded(lockSignal);
       const snapshot = await local.getAssetSnapshot(assetId);
       if (!snapshot) throw new Error('Private Pro attachment is unavailable locally.');
       const { manifest, manifestHash, bytes } = await manifestFromAsset(uid, snapshot.asset, snapshot.contentGeneration);
       try {
         for (const kind of ['original', 'thumb256'] as const) {
-          await currentGeneration(assetId, snapshot.contentGeneration, signal);
+          await currentGeneration(assetId, snapshot.contentGeneration, lockSignal);
           const object = kind === 'original' ? manifest.objects.original : manifest.objects.thumb256;
           if (!object) continue;
           await storage.uploadBytesResumable(objectPath(uid, assetId, kind), bytes.get(kind)!, {
             contentType: object.mimeType, customMetadata: { uid, assetId, kind, sha256: object.sha256 },
-          }, signal);
-          await currentGeneration(assetId, snapshot.contentGeneration, signal);
+          }, lockSignal);
+          await currentGeneration(assetId, snapshot.contentGeneration, lockSignal);
         }
       } catch (error) {
         storageError(error);
@@ -260,12 +278,85 @@ export function createPrivateProAssetClient(
   };
 }
 
-function browserLockPort(): PrivateProAssetLockPort {
+function browserLockPort(): PrivateProAssetLockPort | null {
+  if (typeof navigator === 'undefined' || !navigator.locks) return null;
+  return { request: (name, signal, callback) => navigator.locks.request(name, { mode: 'exclusive', signal }, () => callback(signal)) };
+}
+
+function unavailableLockPort(): PrivateProAssetLockPort {
+  return { request: async () => { throw new TypeError('Private Pro asset upload lock is unavailable.'); } };
+}
+
+function delayWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
+  abortIfNeeded(signal);
+  return new Promise((resolve, reject) => {
+    const timer = globalThis.setTimeout(() => {
+      signal?.removeEventListener('abort', abort);
+      resolve();
+    }, ms);
+    const abort = () => {
+      globalThis.clearTimeout(timer);
+      reject(new DOMException('Private Pro attachment operation aborted.', 'AbortError'));
+    };
+    signal?.addEventListener('abort', abort, { once: true });
+  });
+}
+
+function durableLeaseLockPort(uid: string, options: PrivateProAssetUploadLeaseOptions): PrivateProAssetLockPort {
+  const leaseMs = options.leaseMs ?? 15_000;
+  const renewEveryMs = options.renewEveryMs ?? 5_000;
+  const retryEveryMs = options.retryEveryMs ?? 250;
+  const now = options.now ?? Date.now;
+  if (leaseMs <= 0 || renewEveryMs <= 0 || retryEveryMs <= 0 || renewEveryMs >= leaseMs)
+    throw new TypeError('Private Pro asset upload lease configuration is invalid.');
   return {
-    request: async (name, signal, callback) => {
-      if (typeof navigator !== 'undefined' && navigator.locks)
-        return navigator.locks.request(name, { mode: 'exclusive', signal }, callback);
-      return callback();
+    async request(name, signal, callback) {
+      const prefix = `private-pro-asset-upload:${uid}:`;
+      if (!name.startsWith(prefix) || name.length === prefix.length) throw new TypeError('Private Pro asset upload lock identity is invalid.');
+      const assetId = name.slice(prefix.length);
+      let lease: PrivateProAssetUploadLease | null = null;
+      while (!lease) {
+        abortIfNeeded(signal);
+        lease = await options.port.acquireAssetUploadLease(uid, assetId, now(), leaseMs);
+        if (!lease) await delayWithSignal(retryEveryMs, signal);
+      }
+      const identity = { fence: lease.fence, ownerToken: lease.ownerToken };
+      let stopped = false;
+      let renewal: Promise<void> | null = null;
+      let renewalFailure: unknown = null;
+      const operationAbort = new AbortController();
+      const abort = () => operationAbort.abort();
+      signal?.addEventListener('abort', abort, { once: true });
+      const timer = globalThis.setInterval(() => {
+        if (stopped || renewal) return;
+        renewal = options.port.renewAssetUploadLease(uid, assetId, identity.fence, identity.ownerToken, now(), leaseMs)
+          .then(renewed => {
+            if (!renewed && !stopped) {
+              renewalFailure = new PrivateProSyncTransportError('offline');
+              operationAbort.abort();
+            }
+          })
+          .catch(error => {
+            if (!stopped) {
+              renewalFailure = error;
+              operationAbort.abort();
+            }
+          })
+          .finally(() => { renewal = null; });
+      }, renewEveryMs);
+      try {
+        abortIfNeeded(signal);
+        const result = await callback(operationAbort.signal);
+        if (renewalFailure) throw renewalFailure;
+        return result;
+      } finally {
+        stopped = true;
+        globalThis.clearInterval(timer);
+        signal?.removeEventListener('abort', abort);
+        operationAbort.abort();
+        await renewal;
+        await options.port.releaseAssetUploadLease(uid, assetId, identity.fence, identity.ownerToken);
+      }
     },
   };
 }

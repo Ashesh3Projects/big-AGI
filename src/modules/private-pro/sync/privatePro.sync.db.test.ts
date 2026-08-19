@@ -250,6 +250,38 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(renewed?.expiresAtMs, 12_000);
   });
 
+  test('keeps asset upload leases UID-scoped, monotonic, and fenced against delayed stale owners', async (t) => {
+    const db = createDB(t);
+    const first = await db.acquireAssetUploadLease(UID_A, 'asset-1', 1_000, 5_000);
+    const otherUid = await db.acquireAssetUploadLease(UID_B, 'asset-1', 1_000, 5_000);
+    const current = await db.acquireAssetUploadLease(UID_A, 'asset-1', 6_000, 5_000);
+    if (!first || !otherUid || !current) assert.fail('Expected durable asset upload leases.');
+
+    await db.releaseAssetUploadLease(UID_A, 'asset-1', first.fence, first.ownerToken);
+    assert.equal(await db.renewAssetUploadLease(UID_A, 'asset-1', first.fence, first.ownerToken, 7_000, 5_000), null);
+    const renewed = await db.renewAssetUploadLease(UID_A, 'asset-1', current.fence, current.ownerToken, 7_000, 5_000);
+
+    assert.ok(current.fence > first.fence);
+    assert.notEqual(current.ownerToken, first.ownerToken);
+    assert.equal(otherUid.fence, 1);
+    assert.equal(renewed?.ownerToken, current.ownerToken);
+    assert.equal(renewed?.expiresAtMs, 12_000);
+  });
+
+  test('does not let a delayed asset renewal resurrect an owner after release', async (t) => {
+    const db = createDB(t);
+    const stopped = await db.acquireAssetUploadLease(UID_A, 'asset-stopped', 1_000, 5_000);
+    if (!stopped) assert.fail('Expected the stopped asset lease.');
+
+    await db.releaseAssetUploadLease(UID_A, 'asset-stopped', stopped.fence, stopped.ownerToken);
+    const delayedRenewal = await db.renewAssetUploadLease(UID_A, 'asset-stopped', stopped.fence, stopped.ownerToken, 2_000, 5_000);
+    const replacement = await db.acquireAssetUploadLease(UID_A, 'asset-stopped', 2_000, 5_000);
+
+    assert.equal(delayedRenewal, null);
+    assert.ok(replacement && replacement.fence > stopped.fence);
+    assert.notEqual(replacement?.ownerToken, stopped.ownerToken);
+  });
+
   test('does not let a stale outbox lease retry, rebase, or acknowledge after re-lease', async (t) => {
     const db = createDB(t);
     await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);

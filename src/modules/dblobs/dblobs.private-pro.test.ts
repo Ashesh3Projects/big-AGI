@@ -167,6 +167,45 @@ test('does not expose the new UID until the old native transaction settles', asy
   assert.equal(await dbModule.getDBAsset('asset-transition-barrier'), undefined);
 });
 
+test('routes a DBlob operation through the latest chained activation without contaminating Open Dexie', async () => {
+  const dbModule = await dbModulePromise;
+  await activatePrivateProAssetPersistence(null, null);
+  await dbModule.clearPrivateProPlaintextDBlobPersistence();
+  const portA = createPrivateProAssetLocalPort('uid-a', syncDB);
+  const portB = createPrivateProAssetLocalPort('uid-b', syncDB);
+  const portC = createPrivateProAssetLocalPort('uid-c', syncDB);
+  const gate = deferred();
+  const started = deferred();
+  const slow = new Proxy(portA, {
+    get(target, property, receiver) {
+      if (property !== 'putAsset') return Reflect.get(target, property, receiver);
+      return async (...args: unknown[]) => {
+        started.resolve();
+        await gate.promise;
+        return target.putAsset(...args as Parameters<typeof target.putAsset>);
+      };
+    },
+  });
+  await activatePrivateProAssetPersistence('uid-a', slow);
+  const blocking = dbModule.putDBAsset(imageAsset('asset-transition-blocker'));
+  await started.promise;
+
+  const switchingToB = activatePrivateProAssetPersistence('uid-b', portB);
+  const asset = imageAsset('asset-transition-chained');
+  const writing = dbModule.putDBAsset(asset);
+  const switchingToC = activatePrivateProAssetPersistence('uid-c', portC);
+  gate.resolve();
+
+  await assert.rejects(blocking, { name: 'AbortError' });
+  await Promise.all([switchingToB, switchingToC, writing]);
+  const routedAsset = await portC.getAsset(asset.id);
+  await activatePrivateProAssetPersistence(null, null);
+  const openAsset = await dbModule.getDBAsset(asset.id);
+
+  assert.deepEqual(routedAsset, asset);
+  assert.equal(openAsset, undefined);
+});
+
 test('routes DBlob delete through canonical manifest deletion and both Storage objects', async () => {
   const dbModule = await dbModulePromise;
   const port = createPrivateProAssetLocalPort('uid-a', syncDB);

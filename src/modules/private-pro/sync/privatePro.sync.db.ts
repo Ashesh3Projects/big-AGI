@@ -8,7 +8,7 @@ import type { DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import type { PrivateProAssetManifest } from '../assets/privatePro.assets.schemas';
 
 
-export const PRIVATE_PRO_SYNC_DB_VERSION = 1;
+export const PRIVATE_PRO_SYNC_DB_VERSION = 2;
 
 export interface PrivateProSyncRecordIdentity {
   recordType: PrivateProSyncRecordType;
@@ -62,6 +62,14 @@ interface PrivateProRemoteBaseRecord extends PrivateProRemoteBaseState {
 export interface PrivateProCoordinatorLease {
   uid: string;
   name: string;
+  expiresAtMs: number;
+  fence: number;
+  ownerToken: string;
+}
+
+export interface PrivateProAssetUploadLease {
+  uid: string;
+  assetId: string;
   expiresAtMs: number;
   fence: number;
   ownerToken: string;
@@ -128,11 +136,12 @@ export class PrivateProSyncDB extends Dexie {
   quarantine!: EntityTable<PrivateProSyncQuarantineState, 'id'>;
   assets!: Table<PrivateProSyncAssetState, [string, string]>;
   leases!: Table<PrivateProCoordinatorLease, [string, string]>;
+  assetUploadLeases!: Table<PrivateProAssetUploadLease, [string, string]>;
   meta!: Table<PrivateProSyncMetaState, [string, string]>;
 
   constructor(name = 'private-pro-workspace-v1') {
     super(name);
-    this.version(PRIVATE_PRO_SYNC_DB_VERSION).stores({
+    const storesV1 = {
       localRecords: '[uid+recordKey], uid, recordType, projectionKey, generation, contentHash',
       outbox: '[uid+recordKey], uid, dueAtMs, leaseUntilMs, blocked',
       remoteBases: '[uid+recordKey], uid, revision, mutationId, deleted',
@@ -140,6 +149,11 @@ export class PrivateProSyncDB extends Dexie {
       assets: '[uid+assetId], uid, assetId, updatedAtMs',
       leases: '[uid+name], uid, expiresAtMs, fence',
       meta: '[uid+key], uid',
+    };
+    this.version(1).stores(storesV1);
+    this.version(PRIVATE_PRO_SYNC_DB_VERSION).stores({
+      ...storesV1,
+      assetUploadLeases: '[uid+assetId], uid, expiresAtMs, fence',
     });
   }
 
@@ -611,8 +625,44 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
+  async acquireAssetUploadLease(uid: string, assetId: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetUploadLease | null> {
+    return this.transaction('rw', this.assetUploadLeases, async () => {
+      const previous = await this.assetUploadLeases.get([uid, assetId]);
+      if (previous && previous.expiresAtMs > nowMs) return null;
+      const lease: PrivateProAssetUploadLease = {
+        uid,
+        assetId,
+        expiresAtMs: nowMs + leaseMs,
+        fence: (previous?.fence ?? 0) + 1,
+        ownerToken: crypto.randomUUID(),
+      };
+      await this.assetUploadLeases.put(lease);
+      return { ...lease };
+    });
+  }
+
+  async renewAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetUploadLease | null> {
+    return this.transaction('rw', this.assetUploadLeases, async () => {
+      const lease = await this.assetUploadLeases.get([uid, assetId]);
+      if (!lease || lease.fence !== fence || lease.ownerToken !== ownerToken || lease.expiresAtMs <= nowMs) return null;
+      lease.expiresAtMs = nowMs + leaseMs;
+      await this.assetUploadLeases.put(lease);
+      return { ...lease };
+    });
+  }
+
+  async releaseAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string): Promise<void> {
+    await this.transaction('rw', this.assetUploadLeases, async () => {
+      const lease = await this.assetUploadLeases.get([uid, assetId]);
+      if (!lease || lease.fence !== fence || lease.ownerToken !== ownerToken) return;
+      lease.expiresAtMs = 0;
+      lease.ownerToken = crypto.randomUUID();
+      await this.assetUploadLeases.put(lease);
+    });
+  }
+
   async clearUid(uid: string): Promise<void> {
-    await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.quarantine, this.assets, this.leases, this.meta], async () => {
+    await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.quarantine, this.assets, this.leases, this.assetUploadLeases, this.meta], async () => {
       await Promise.all([
         this.localRecords.where('uid').equals(uid).delete(),
         this.outbox.where('uid').equals(uid).delete(),
@@ -622,7 +672,11 @@ export class PrivateProSyncDB extends Dexie {
         this.meta.where('uid').equals(uid).delete(),
       ]);
       const leases = await this.leases.where('uid').equals(uid).toArray();
-      await Promise.all(leases.map(lease => this.leases.put({ ...lease, expiresAtMs: 0, ownerToken: crypto.randomUUID() })));
+      const assetUploadLeases = await this.assetUploadLeases.where('uid').equals(uid).toArray();
+      await Promise.all([
+        ...leases.map(lease => this.leases.put({ ...lease, expiresAtMs: 0, ownerToken: crypto.randomUUID() })),
+        ...assetUploadLeases.map(lease => this.assetUploadLeases.put({ ...lease, expiresAtMs: 0, ownerToken: crypto.randomUUID() })),
+      ]);
     });
   }
 

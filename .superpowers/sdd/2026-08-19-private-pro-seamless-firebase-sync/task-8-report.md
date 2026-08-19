@@ -181,3 +181,42 @@ None.
 ### Concerns
 
 None.
+
+## Fix round 4
+
+### Findings addressed
+
+- Active DBlob routing now loops over stable activation generations and transition promises. An operation that enters during A to B and is then superseded by B to C waits for C and routes only through C. It cannot fall through to the Open `Big-AGI` Dexie table while a newer transition remains pending.
+- Direct uploads no longer run unlocked when Web Locks are unavailable. Sync DB version 2 adds a separate UID plus asset ID upload-lease table with unique owner tokens, monotonic fences, expiry, renewal, release, and stale-owner rejection. The client prefers Web Locks, uses an injected durable DB lease fallback when Web Locks are absent, renews for the complete callback, aborts and releases on cancellation, and throws a sanitized schema error before Storage when no lock mechanism exists.
+- Durable upload lease release rotates ownership while retaining the fence tombstone. Delayed renewal and release calls cannot alter or resurrect a replacement owner, and UID clearing preserves the same stale-owner protection.
+- The asset serializer attaches the initial seed rejection handler in the promise construction turn. It reports only `schema` or `offline`, recovers to an empty baseline, emits no process-level unhandled rejection, and processes later successful manifest notifications.
+
+### RED evidence
+
+- The chained transition DBlob regression failed because the operation resolved without writing UID C and had fallen through to Open Dexie.
+- The explicit no-Web-Locks and DB lease RED run had 4 failures: the client attempted a null lock, the durable fallback was absent, and the DB asset lease methods did not exist.
+- The initial seed rejection regression failed with `secret initial failure` and Node emitted `PromiseRejectionHandledWarning`, proving the rejection handler was attached too late.
+
+### GREEN evidence
+
+- Targeted chained-transition regression: 1 passed, 0 failed.
+- Targeted durable upload lease regressions: 4 passed, 0 failed before the added delayed-renewal coverage.
+- Targeted seed and notification recovery regressions: 2 passed, 0 failed.
+- Final DBlob, asset, DB, outbound, serializer, and engine test files: 124 tests passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for asset, sync DB and serializer, and DBlob source: exit 0.
+- `git diff --check`: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- The active lookup returns inactive only after the latest observed transition is stable and intentionally has no active Private Pro port.
+- Upload leases use a dedicated table and API, separate from coordinator leadership and outbox leases.
+- The upload callback receives a lease-owned AbortSignal. Lease loss aborts Storage work, cancellation releases the exact fenced owner, and in-flight renewal settles before release.
+- Asset upload lease fences remain monotonic after expiry, explicit release, and UID clear tombstones.
+- Missing Web Locks plus missing lease dependency never invokes the upload callback or Storage.
+- The seed rejection reporter cannot leak the original error and cannot reject the serializer queue if reporting itself throws.
+- The 60-second outbound window, outbox fencing, deterministic Storage paths, and Open-build behavior remain unchanged.
+
+### Concerns
+
+None.
