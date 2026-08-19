@@ -59,6 +59,21 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      - name: Checkout trusted automation from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.sync_main.outputs.automation_source_sha }}
+          path: .trusted-automation
+          sparse-checkout: tools/automation/nightly-pro-integration.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Move trusted automation outside the workspace
+        run: |
+          cp .trusted-automation/tools/automation/nightly-pro-integration.ts "$RUNNER_TEMP/nightly-pro-integration.ts"
+          rm -rf .trusted-automation
+
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
@@ -76,7 +91,7 @@ jobs:
         env:
           AUTOMATION_SOURCE_SHA: ${{ needs.sync_main.outputs.automation_source_sha }}
           UPSTREAM_URL: https://github.com/enricoros/big-AGI.git
-        run: node tools/automation/nightly-pro-integration.ts prepare
+        run: node "$RUNNER_TEMP/nightly-pro-integration.ts" prepare
 
       - name: Remove repository credentials before Copilot
         if: steps.prepare.outputs.has_upstream_changes == 'true'
@@ -154,7 +169,7 @@ jobs:
         if: steps.prepare.outputs.has_upstream_changes == 'true'
         env:
           NODE_ENV: development
-        run: node tools/automation/nightly-pro-integration.ts verify-package
+        run: node "$RUNNER_TEMP/nightly-pro-integration.ts" verify-package
 
       - name: Upload verified integration package
         if: steps.prepare.outputs.has_upstream_changes == 'true'

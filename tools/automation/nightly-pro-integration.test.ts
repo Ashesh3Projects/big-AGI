@@ -59,13 +59,16 @@ test('uses a deterministic checkpoint and a separate trusted publisher', () => {
   const workflow = readRepoFile('.github/workflows/nightly-pro-integration.yml');
   const coordinator = readRepoFile('tools/automation/nightly-pro-integration.ts');
 
-  assert.match(workflow, /tools\/automation\/nightly-pro-integration\.ts prepare/);
-  assert.match(workflow, /tools\/automation\/nightly-pro-integration\.ts verify-package/);
-  assert.match(workflow, /tools\/automation\/nightly-pro-integration\.ts publish/);
+  assert.match(workflow, /nightly-pro-integration\.ts" prepare/);
+  assert.match(workflow, /nightly-pro-integration\.ts" verify-package/);
+  assert.match(workflow, /nightly-pro-integration\.ts publish/);
   assert.match(workflow, /actions\/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a/);
   assert.match(workflow, /actions\/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c/);
   assert.match(workflow, /repository:\s*\$\{\{ github\.repository \}\}/);
   assert.match(workflow, /ref:\s*main/);
+  assert.match(workflow, /RUNNER_TEMP\/nightly-pro-integration\.ts/);
+  assert.match(workflow, /node "\$RUNNER_TEMP\/nightly-pro-integration\.ts" prepare/);
+  assert.match(workflow, /node "\$RUNNER_TEMP\/nightly-pro-integration\.ts" verify-package/);
   assert.match(coordinator, /\$\{CHECKPOINT_TRAILER\}: \$\{manifest\.upstreamHead\}/);
   assert.match(coordinator, /--force-with-lease=refs\/heads\/pro:\$\{manifest\.expectedProHead\}/);
   assert.match(coordinator, /run\(resolveBin\('tsc'\), \['--noEmit', '--pretty'\]\)/);
