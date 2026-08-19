@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { appendFileSync, existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
@@ -12,14 +12,11 @@ const MANIFEST_PATH = '.nightly-pro-integration-manifest.json';
 const WORKSPACE_COMMITS_PATH = '.nightly-upstream-commits.txt';
 const WORKSPACE_FILES_PATH = '.nightly-upstream-files.txt';
 const PROTECTED_PATHS = new Set([
-  '.gitmodules',
-  'AGENTS.md',
-  'CLAUDE.md',
+  '.github/workflows/nightly-pro-integration.yml',
   'tools/automation/nightly-pro-integration.ts',
   'tools/automation/nightly-pro-integration.test.ts',
   'tools/automation/sync-upstream-main.sh',
 ]);
-const PROTECTED_PREFIXES = ['.github/', 'tools/automation/'];
 const MAX_PATCH_BYTES = 50 * 1024 * 1024;
 
 type IntegrationReport = {
@@ -165,6 +162,7 @@ function prepare(): void {
 
   const reportPrompt =
     `Review the completed minimal upstream integration from ${previousUpstreamHead}..${upstreamHead}. Do not edit source files, tests, or git state. ` +
+    `Do not run tests, builds, linters, installs, package managers, generators, or subagents. Trusted verification runs separately. ` +
     `Read every commit in .nightly-upstream-commits.txt, every upstream path in .nightly-upstream-files.txt, and the current git diff. ` +
     `Write ${REPORT_PATH} as strict JSON with exactly these fields: extraFiles (an array of {path, reason}), status (changes_applied or no_changes_required), ` +
     `reviewedCommits (every SHA from .nightly-upstream-commits.txt in order), reviewedFiles (every path from .nightly-upstream-files.txt in order), ` +
@@ -269,12 +267,14 @@ function untrackedIntegrationPaths(): string[] {
 }
 
 function isProtectedPath(path: string): boolean {
-  return PROTECTED_PATHS.has(path) || PROTECTED_PREFIXES.some((prefix) => path.startsWith(prefix));
+  return PROTECTED_PATHS.has(path);
 }
 
 function listNonBuildIgnoredFiles(): string[] {
-  const output = run('git', ['ls-files', '--others', '--ignored', '--exclude-standard', '-z'], { capture: true });
-  return output.split('\0').filter((path) => path && !path.startsWith('node_modules/') && !path.startsWith('.next/'));
+  const output = run('git', ['ls-files', '--others', '--ignored', '--exclude-standard', '-z', '--', '.', ':(exclude)node_modules/*', ':(exclude).next/*'], {
+    capture: true,
+  });
+  return output.split('\0').filter(Boolean);
 }
 
 function stageIntegrationChanges(): void {
@@ -333,9 +333,13 @@ function verifyAndPackage(): void {
   run(resolveBin('tsc'), ['--noEmit', '--pretty']);
   run(resolveBin('tsc'), ['--noEmit', '--pretty', '-p', 'tools/tsconfig.json']);
   run(resolveBin('eslint'), ['.']);
-  run(resolveBin('tsx'), ['--test', 'tools/private-pro/**/*.test.ts']);
+  const verificationBin = trustedPath('nightly-verification-bin');
+  mkdirSync(verificationBin, { recursive: true });
+  if (process.platform !== 'win32' && existsSync('/usr/bin/pwsh')) symlinkSync('/usr/bin/pwsh', resolve(verificationBin, 'powershell.exe'));
+  run('npm', ['run', 'test:private-pro-tools'], { env: { ...process.env, PATH: `${verificationBin}:${process.env.PATH ?? ''}` } });
   run(resolveBin('tsx'), ['--test', 'src/**/*.test.ts'], { env: { ...process.env, NODE_ENV: 'development' } });
-  run(resolveBin('next'), ['build']);
+  run(resolveBin('next'), ['build'], { env: { ...process.env, NODE_ENV: 'production' } });
+  git(['checkout', '--', 'next-env.d.ts']);
 
   if (JSON.stringify(changedPaths()) !== JSON.stringify(proChangedFiles)) {
     throw new Error('Verification commands changed the integration file set');
@@ -384,10 +388,11 @@ function publish(): void {
     throw new Error('Integration artifact digest mismatch');
   }
   if (git(['rev-parse', 'HEAD'], true) !== manifest.expectedProHead) throw new Error('Pro moved before publish checkout');
+  const allowedPublishArtifacts = new Set([PATCH_PATH, REPORT_PATH, MANIFEST_PATH]);
   const unexpectedStatus = git(['status', '--porcelain', '--untracked-files=all'], true)
     .split(/\r?\n/)
     .filter(Boolean)
-    .filter((line) => !line.includes(' .nightly-pro-integration-') && !line.includes(' .trusted-automation/'));
+    .filter((line) => !allowedPublishArtifacts.has(line.replace(/^\?\?\s+/, '')) && !line.slice(3).startsWith('.trusted-automation/'));
   if (unexpectedStatus.length) throw new Error(`Trusted publish checkout is dirty: ${unexpectedStatus.join(', ')}`);
 
   const report = parseReport();

@@ -267,7 +267,7 @@ jobs:
           GIT_INDEX_FILE="$(realpath "$(/usr/bin/git rev-parse --git-path index)")"
           trusted_git_index_parent_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$GIT_INDEX_FILE")")"
           trusted_git_index_b64="$(base64 -w0 "$GIT_INDEX_FILE")"
-          trusted_workspace_status_b64="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all | base64 -w0)"
+          trusted_workspace_status_b64="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all -- ':(exclude).nightly-*' | base64 -w0)"
           env -i \
             HOME="$copilot_home" \
             PATH="$PATH" \
@@ -301,8 +301,8 @@ jobs:
             echo 'Git directory identity changed during Copilot execution' >&2
             exit 1
           fi
-          workspace_status="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all)"
-          if [[ "$(printf '%s' "$workspace_status" | base64 -w0)" != "$trusted_workspace_status_b64" ]]; then
+          workspace_status_b64="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all -- ':(exclude).nightly-*' | base64 -w0)"
+          if [[ "$workspace_status_b64" != "$trusted_workspace_status_b64" ]]; then
             echo 'Copilot modified the integration workspace during report generation' >&2
             exit 1
           fi
@@ -310,6 +310,7 @@ jobs:
       - name: Verify and package integration
         if: steps.prepare.outputs.has_upstream_changes == 'true'
         env:
+          AUTOMATION_SOURCE_SHA: ${{ needs.sync_main.outputs.automation_source_sha }}
           NODE_ENV: development
           TRUSTED_NODE_BIN: ${{ steps.node_bin.outputs.path }}
         run: |

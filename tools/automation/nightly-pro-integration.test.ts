@@ -70,8 +70,11 @@ test('runs the pinned Copilot CLI with the requested model and maximum effort', 
   assert.match(workflow, /Restored trusted file digest mismatch/);
   assert.match(workflow, /Git directory identity changed during Copilot execution/);
   assert.match(workflow, /Trusted target parent identity changed/);
-  assert.match(workflow, /\/usr\/bin\/git status --porcelain=v1 -z --untracked-files=all/);
-  assert.match(workflow, /workspace_status="\$\(\/usr\/bin\/git status --porcelain=v1 -z --untracked-files=all\)"/);
+  assert.match(workflow, /\/usr\/bin\/git status --porcelain=v1 -z --untracked-files=all -- ':\(exclude\)\.nightly-\*'/);
+  assert.match(
+    workflow,
+    /workspace_status_b64="\$\(\/usr\/bin\/git status --porcelain=v1 -z --untracked-files=all -- ':\(exclude\)\.nightly-\*' \| base64 -w0\)"/,
+  );
   assert.match(workflow, /Copilot modified the integration workspace during report generation/);
   assert.match(workflow, /trusted_node_bin="\$\(command -v node\)"/);
   assert.equal(workflow.match(/"\$trusted_node_bin" "\$RUNNER_TEMP\/nightly-pro-integration\.ts"/g)?.length, 1);
@@ -89,6 +92,7 @@ test('keeps Copilot to a minimal upstream port without invented tests or feature
   assert.match(coordinator, /paused trusted git cherry-pick --no-commit/);
   assert.match(coordinator, /Do not create or modify tests unless the conflicted upstream path itself is a test/);
   assert.match(coordinator, /Do not add features, refactor, rename, reformat, or improve unrelated code/);
+  assert.match(coordinator, /Do not run tests, builds, linters, installs, package managers, generators, or subagents/);
   assert.match(coordinator, /changed outside the upstream file set/);
   assert.doesNotMatch(coordinator, /Add or update tests for behavior you change/);
   assert.match(workflow, /include-hidden-files:\s*true/g);
@@ -104,6 +108,8 @@ test('keeps Copilot to a minimal upstream port without invented tests or feature
   assert.match(coordinator, /trustedPath/);
   assert.match(coordinator, /Minimal integration patch changed after trusted cherry-pick/);
   assert.match(coordinator, /Copilot created non-upstream untracked files/);
+  assert.match(coordinator, /'\.github\/workflows\/nightly-pro-integration\.yml'/);
+  assert.doesNotMatch(coordinator, /const PROTECTED_PREFIXES/);
 });
 
 test('uses a deterministic checkpoint and a separate trusted publisher', () => {
@@ -120,14 +126,22 @@ test('uses a deterministic checkpoint and a separate trusted publisher', () => {
   assert.match(workflow, /RUNNER_TEMP\/nightly-pro-integration\.ts/);
   assert.match(workflow, /node "\$RUNNER_TEMP\/nightly-pro-integration\.ts" prepare/);
   assert.match(workflow, /"\$TRUSTED_NODE_BIN" "\$RUNNER_TEMP\/nightly-pro-integration\.ts" verify-package/);
+  assert.match(workflow, /AUTOMATION_SOURCE_SHA: \$\{\{ needs\.sync_main\.outputs\.automation_source_sha \}\}[\s\S]*TRUSTED_NODE_BIN/);
   assert.match(coordinator, /\$\{CHECKPOINT_TRAILER\}: \$\{manifest\.upstreamHead\}/);
   assert.match(coordinator, /--force-with-lease=refs\/heads\/pro:\$\{manifest\.expectedProHead\}/);
+  assert.match(coordinator, /allowedPublishArtifacts\.has\(line\.replace\(\/\^\\\?\\\?\\s\+\/, ''\)\)/);
   assert.match(coordinator, /run\(resolveBin\('tsc'\), \['--noEmit', '--pretty'\]\)/);
   assert.match(coordinator, /run\('npm', \['ci'\]\)/);
   assert.match(coordinator, /run\(resolveBin\('tsc'\), \['--noEmit', '--pretty', '-p', 'tools\/tsconfig\.json'\]\)/);
   assert.match(coordinator, /resolveBin\('eslint'\)/);
   assert.match(coordinator, /resolveBin\('tsx'\)/);
   assert.match(coordinator, /resolveBin\('next'\)/);
+  assert.match(coordinator, /resolveBin\('next'\), \['build'\], \{ env: \{ \.\.\.process\.env, NODE_ENV: 'production' \} \}/);
+  assert.match(coordinator, /git\(\['checkout', '--', 'next-env\.d\.ts'\]\)/);
+  assert.match(coordinator, /run\('npm', \['run', 'test:private-pro-tools'\]/);
+  assert.match(coordinator, /powershell\.exe/);
+  assert.match(coordinator, /\/usr\/bin\/pwsh/);
+  assert.doesNotMatch(coordinator, /--test-name-pattern/);
   assert.match(coordinator, /git\(\['diff', '--cached', '--check'\]\)/);
   assert.match(coordinator, /git\(\['add', '-A', '--', '\.', ':\(exclude\)\.nightly-\*'\]\)/);
 });
@@ -141,7 +155,7 @@ test('requires a complete structured Copilot report before packaging', () => {
   assert.match(coordinator, /reviewedCommits/);
   assert.match(coordinator, /reviewedFiles/);
   assert.match(coordinator, /PROTECTED_PATHS/);
-  assert.match(coordinator, /PROTECTED_PREFIXES/);
+  assert.doesNotMatch(coordinator, /PROTECTED_PREFIXES/);
   assert.match(coordinator, /Head changed during Copilot integration/);
   assert.match(coordinator, /summary\.includes\('\\n'\)/);
   assert.match(coordinator, /Unsupported git mode/);
@@ -153,6 +167,8 @@ test('runs package verification from a clean reinstall and blocks generated drif
   const coordinator = readRepoFile('tools/automation/nightly-pro-integration.ts');
 
   assert.match(coordinator, /run\('npm', \['ci'\]\)/);
+  assert.match(coordinator, /':\(exclude\)node_modules\/\*'/);
+  assert.match(coordinator, /':\(exclude\)\.next\/\*'/);
   assert.match(coordinator, /git status changed during npm ci/);
   assert.match(coordinator, /Verification commands changed the integration file set/);
 });
