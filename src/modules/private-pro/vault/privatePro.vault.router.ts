@@ -6,8 +6,11 @@ import { createTRPCRouter } from '~/server/trpc/trpc.server';
 import { createPrivateProVaultProcedure, createPrivateProVaultPutKeysetProcedure, privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
+  PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS,
   PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS,
   PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE,
+  PRIVATE_PRO_VAULT_RESTORE_MAX_RECORDS,
+  PRIVATE_PRO_VAULT_RESTORE_MAX_TOTAL_CIPHERTEXT_BYTES,
 } from './privatePro.vault.repository';
 import { getFirebasePrivateProVaultService } from './privatePro.vault.repository.firebase';
 import {
@@ -119,8 +122,13 @@ export function createPrivateProVaultRouter(
     .input(z.object({
       restoreId: operationIdSchema,
       backupFingerprint: opaqueIdSchema,
-      chunkCount: z.number().int().min(1).max(100_000),
-      recordCount: z.number().int().min(1).max(100_000),
+      backupRecordCount: z.number().int().min(0).max(PRIVATE_PRO_VAULT_RESTORE_MAX_RECORDS),
+      backupTotalCiphertextBytes: z.number().int().min(0).max(PRIVATE_PRO_VAULT_RESTORE_MAX_TOTAL_CIPHERTEXT_BYTES),
+      chunkCount: z.number().int().min(0).max(PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS),
+      recordCount: z.number().int().min(0).max(PRIVATE_PRO_VAULT_RESTORE_MAX_RECORDS),
+      chunkRecordCounts: z.array(z.number().int().min(1).max(PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS)).max(PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS),
+      chunkFingerprints: z.array(opaqueIdSchema).max(PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS),
+      totalCiphertextBytes: z.number().int().min(0).max(PRIVATE_PRO_VAULT_RESTORE_MAX_TOTAL_CIPHERTEXT_BYTES),
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().beginBackupRestore(ctx.privateProIdentity.uid, input))),
 
@@ -132,8 +140,8 @@ export function createPrivateProVaultRouter(
     .input(z.object({
       restoreId: operationIdSchema,
       operationId: operationIdSchema,
-      chunkIndex: z.number().int().min(0).max(99_999),
-      chunkCount: z.number().int().min(1).max(100_000),
+      chunkIndex: z.number().int().min(0).max(PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS - 1),
+      chunkFingerprint: opaqueIdSchema,
       records: z.array(z.object({
         opaqueRecordId: opaqueIdSchema,
         baseRevision: baseVersionSchema,
@@ -157,9 +165,13 @@ export function createPrivateProVaultRouter(
     }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getBackupRestoreRecords(ctx.privateProIdentity.uid, input.restoreId, input.opaqueRecordIds))),
 
-  finalizeBackupRestore: deviceProcedure
+  sealBackupRestore: deviceProcedure
     .input(z.object({ restoreId: operationIdSchema, operationId: operationIdSchema }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => service().finalizeBackupRestore(ctx.privateProIdentity.uid, input))),
+    .mutation(({ ctx, input }) => vaultCall(() => service().sealBackupRestore(ctx.privateProIdentity.uid, input))),
+
+  confirmBackupRestoreVerified: deviceProcedure
+    .input(z.object({ restoreId: operationIdSchema, operationId: operationIdSchema, sessionFingerprint: opaqueIdSchema }).strict())
+    .mutation(({ ctx, input }) => vaultCall(() => service().confirmBackupRestoreVerified(ctx.privateProIdentity.uid, input))),
 
   deleteRecord: deviceProcedure
     .input(z.object({

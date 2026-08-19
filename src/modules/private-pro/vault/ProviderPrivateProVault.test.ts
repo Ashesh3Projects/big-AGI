@@ -251,6 +251,25 @@ describe('private Pro vault lifecycle', () => {
     assert.match(store.getState().lastError ?? '', /committed.*restart|restart.*reconcile/i);
   });
 
+  test('does not re-fetch normal vault state after restore-specific verified hydration', async () => {
+    const order: string[] = [];
+    const engine = {
+      async stopAndWait() { order.push('stop'); },
+      async hydrateBeforeOpen() { order.push('normal-hydrate'); },
+      async start() { order.push('start'); },
+      async whenCurrent() { order.push('current'); },
+    } as never;
+    const store = createPrivateProVaultStore();
+    store.getState().setState({ phase: 'ready', ready: true });
+
+    await runPrivateProVaultBackupImport(engine, store, async () => {
+      order.push('import');
+      return { verifiedCloudHydration: true };
+    });
+
+    assert.deepEqual(order, ['stop', 'import', 'start', 'current']);
+  });
+
   test('normal logout clears tracked hydrated assets before sign-out when no engine is active', async () => {
     const order: string[] = [];
     const runtime = {

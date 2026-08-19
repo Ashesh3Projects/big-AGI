@@ -364,6 +364,30 @@ describe('private Pro blocking multi-device vault engine', () => {
     assert.deepEqual(order, ['hydrate:asset-private', 'apply:chat']);
   });
 
+  test('hydrates an authorized sealed restore snapshot without calling blocked normal reads', async (t) => {
+    const server = new TestVaultServer();
+    const masterKey = await importVaultMasterKey(new Uint8Array(32).fill(0x39));
+    const client = await createClient(t, server, masterKey, 'sealed-restore');
+    const value = { id: 'theme', value: 'dark' };
+    const envelope = await encryptedEnvelope(masterKey, 'settings', THEME_ID, 1, value);
+    const index = [{
+      kind: 'record' as const,
+      opaqueRecordId: envelope.recordId,
+      recordType: envelope.recordType,
+      revision: envelope.revision,
+      keyVersion: envelope.keyVersion,
+      ciphertextBytes: envelope.ciphertextBytes,
+      serverUpdatedAtMs: 1,
+    }];
+    const fetchesBefore = server.fetches.length;
+
+    await client.engine.hydrateVerifiedRestore(index, [envelope]);
+
+    assert.equal(server.fetches.length, fetchesBefore);
+    assert.deepEqual(serializer(client, 'settings').values.get(THEME_ID), value);
+    assert.equal((await client.db.records.get([UID, 'settings', THEME_ID]))?.revision, 1);
+  });
+
   test('uploads referenced assets before writing a local encrypted chat record', async (t) => {
     const masterKey = await importVaultMasterKey(generateVaultMasterKeyBytes());
     const server = new TestVaultServer();

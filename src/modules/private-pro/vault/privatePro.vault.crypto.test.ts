@@ -112,6 +112,17 @@ describe('private Pro vault cryptography', () => {
     assert.equal(nonces.size, 10_000);
   });
 
+  test('accepts an explicit restore nonce without changing the random default contract', async () => {
+    const key = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, false, ['encrypt', 'decrypt']);
+    const nonce = Uint8Array.from({ length: 12 }, (_, index) => index + 1);
+    const first = await encryptVaultRecord(key, RECORD_AAD, PLAINTEXT, nonce);
+    const second = await encryptVaultRecord(key, RECORD_AAD, PLAINTEXT, nonce);
+    assert.equal(first.nonceBase64, second.nonceBase64);
+    assert.equal(first.ciphertextBase64, second.ciphertextBase64);
+    assert.deepEqual(await decryptVaultRecord(key, first, VAULT_CONTEXT), PLAINTEXT);
+    await assert.rejects(encryptVaultRecord(key, RECORD_AAD, PLAINTEXT, nonce.subarray(0, 11)), /96 bits/i);
+  });
+
   test('rejects record encryption keys with the wrong algorithm, length, or usage', async () => {
     const hmacKey = await generateHmacKey('SHA-256', ['sign']);
     const aes128Key = await generateAesKey(128, ['encrypt']);

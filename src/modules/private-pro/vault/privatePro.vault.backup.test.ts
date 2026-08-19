@@ -111,9 +111,12 @@ function stream(bytes: Uint8Array) {
 function addRestoreSessionTransport(transport: any, remote: Map<string, PrivateProVaultEnvelope>) {
   let nextChunkIndex = 0;
   let activeRestoreId: string | null = null;
+  let sessionFingerprint = 's'.repeat(43);
   return Object.assign(transport, {
     async beginBackupRestore(input: { restoreId: string }) { activeRestoreId = input.restoreId; return { status: 'started' }; },
-    async getBackupRestoreStatus() { return activeRestoreId ? { nextChunkIndex } : null; },
+    async getBackupRestoreStatus() {
+      return activeRestoreId ? { phase: 'merging' as const, nextChunkIndex } : null;
+    },
     async mergeBackupRestoreChunk(operation: any) {
       const result = await transport.mergeBackup(operation);
       if (result.status !== 'conflict') nextChunkIndex = operation.chunkIndex + 1;
@@ -121,9 +124,12 @@ function addRestoreSessionTransport(transport: any, remote: Map<string, PrivateP
     },
     async getBackupRestoreIndex() { return transport.getIndex(); },
     async getBackupRestoreRecords(_restoreId: string, ids: readonly string[]) { return transport.getRecords(ids); },
-    async finalizeBackupRestore() { activeRestoreId = null; return { status: 'completed' }; },
+    async sealBackupRestore() { return { status: 'sealed' as const, sessionFingerprint }; },
+    async confirmBackupRestoreVerified() { activeRestoreId = null; return { status: 'completed' }; },
   });
 }
+
+const verifyHydrated = async () => undefined;
 
 describe('private Pro vault backup orchestration', () => {
   test('derives export assets from the frozen encrypted records, not a pending live edit or delete', async (t) => {
@@ -245,6 +251,7 @@ describe('private Pro vault backup orchestration', () => {
         activeMasterKey, activeKeyVersion: 7, activeAssets, transport,
         createBackupAssetClient: () => backupAssets,
         createOperationId: () => 'restore-operation-1',
+        verifyHydrated,
       },
     ));
 
@@ -304,7 +311,7 @@ describe('private Pro vault backup orchestration', () => {
       stream(bytes), { kind: 'password', password: PASSWORD }, {
         uid: UID, db: targetDB, serializers: [serializer], activeMasterKey, activeKeyVersion: 7,
         activeAssets: { async prepareForUpload() {} } as never,
-        transport, createBackupAssetClient: () => assets, createOperationId: () => 'restore-exact-mismatch',
+        transport, createBackupAssetClient: () => assets, createOperationId: () => 'restore-exact-mismatch', verifyHydrated,
       },
     )), /verification mismatch/i);
   });
@@ -345,7 +352,7 @@ describe('private Pro vault backup orchestration', () => {
       stream(bytes), { kind: 'password', password: PASSWORD }, {
         uid: UID, db: targetDB, serializers: [serializer], activeMasterKey, activeKeyVersion: 7,
         activeAssets: { async prepareForUpload() {} } as never,
-        transport, createBackupAssetClient: () => assets, createOperationId: () => 'restore-ambiguous',
+        transport, createBackupAssetClient: () => assets, createOperationId: () => 'restore-ambiguous', verifyHydrated,
       },
     ));
 
@@ -379,7 +386,7 @@ describe('private Pro vault backup orchestration', () => {
       stream(bytes), { kind: 'password', password: PASSWORD }, {
         uid: UID, db: targetDB, serializers: [serializer], activeMasterKey, activeKeyVersion: 7,
         activeAssets: { async prepareForUpload() {} } as never,
-        transport, createBackupAssetClient: () => assets, createOperationId: () => 'restore-validation',
+        transport, createBackupAssetClient: () => assets, createOperationId: () => 'restore-validation', verifyHydrated,
       },
     )), error => error instanceof Error
       && /committed.*reconcile/i.test(error.message)
@@ -419,6 +426,7 @@ describe('private Pro vault backup orchestration', () => {
         activeAssets: { async prepareForUpload() {} } as never,
         transport, createBackupAssetClient: () => ({ async importAssetChunks() { return []; }, async rollbackImportedAssets() {} }) as never,
         createOperationId: () => 'restore-large',
+        verifyHydrated,
       },
     ));
 
@@ -446,7 +454,7 @@ describe('private Pro vault backup orchestration', () => {
       async getRecords() { throw new Error('normal records blocked'); },
       async mergeBackup() { throw new Error('legacy merge forbidden'); },
       async beginBackupRestore() { return { status: 'unchanged' }; },
-      async getBackupRestoreStatus() { return { nextChunkIndex: 0 }; },
+      async getBackupRestoreStatus() { return { phase: 'merging' as const, nextChunkIndex: 0 }; },
       async mergeBackupRestoreChunk(operation: any) {
         for (const record of operation.records) remote.set(record.opaqueRecordId, structuredClone(record.envelope));
         return { status: 'committed' as const, records: [], nextChunkIndex: 1 };
@@ -456,7 +464,8 @@ describe('private Pro vault backup orchestration', () => {
         return [...remote.values()].map(value => ({ kind: 'record' as const, recordType: value.recordType, opaqueRecordId: value.recordId, revision: value.revision, keyVersion: value.keyVersion, ciphertextBytes: value.ciphertextBytes, serverUpdatedAtMs: 2 }));
       },
       async getBackupRestoreRecords(_restoreId: string, ids: readonly string[]) { return ids.map(id => structuredClone(remote.get(id)!)); },
-      async finalizeBackupRestore() { return { status: 'completed' }; },
+      async sealBackupRestore() { return { status: 'sealed' as const, sessionFingerprint: 's'.repeat(43) }; },
+      async confirmBackupRestoreVerified() { return { status: 'completed' }; },
       async write() { throw new Error('sequential backup writes are forbidden'); },
     };
 
@@ -466,10 +475,82 @@ describe('private Pro vault backup orchestration', () => {
         activeAssets: { async prepareForUpload() {} } as never,
         transport, createBackupAssetClient: () => ({ async importAssetChunks() { return []; }, async rollbackImportedAssets() {} }) as never,
         createOperationId: () => 'restore-resume-active',
+        verifyHydrated,
       },
     ));
 
     assert.equal(normalIndexCalls, 0);
     assert.equal(sessionIndexCalls >= 2, true, 'resume and exact verification use the authorized index');
+  });
+
+  test('retains the sealed marker when exact verification fails and confirms only after retry hydration', async (t) => {
+    const backup = await withVaultPasswordWorker(realArgon2idWorkerResponse, () => createPrivateProVaultKeyset(PASSWORD, UID));
+    const activeMasterKey = await importVaultMasterKey(Uint8Array.from({ length: 32 }, (_, index) => 0x90 + index));
+    const targetDB = createDB(t);
+    const serializer = new TestSerializer();
+    const importedEnvelope = await envelope(backup.masterKey, { id: 'chat', assetIds: [] });
+    const bytes = await collect(createPrivateProEncryptedBackupStream({
+      vaultId: UID, keyset: backup.keyset, masterKey: backup.masterKey,
+      records: async function* () { yield importedEnvelope; },
+    }));
+    const remote = new Map<string, PrivateProVaultEnvelope>();
+    let status: null | { phase: 'merging' | 'awaiting-verification'; nextChunkIndex: number } = null;
+    let sessionFingerprint = 's'.repeat(43);
+    let confirmations = 0;
+    let hydrationAttempts = 0;
+    const transport = {
+      isOnline: () => true,
+      subscribeConnectivity: () => () => undefined,
+      async getIndex() { return []; },
+      async getRecords() { return []; },
+      async mergeBackup() { throw new Error('legacy merge forbidden'); },
+      async beginBackupRestore(input: any) {
+        status ??= { phase: 'merging', nextChunkIndex: 0 };
+        return { status: 'started' };
+      },
+      async getBackupRestoreStatus() { return status; },
+      async mergeBackupRestoreChunk(input: any) {
+        for (const record of input.records) remote.set(record.opaqueRecordId, structuredClone(record.envelope));
+        status = { phase: 'merging', nextChunkIndex: 1 };
+        return { status: 'committed' as const, records: [], nextChunkIndex: 1 };
+      },
+      async getBackupRestoreIndex() {
+        return [...remote.values()].map(value => ({
+          kind: 'record' as const, recordType: value.recordType, opaqueRecordId: value.recordId,
+          revision: value.revision, keyVersion: value.keyVersion, ciphertextBytes: value.ciphertextBytes, serverUpdatedAtMs: 2,
+        }));
+      },
+      async getBackupRestoreRecords(_restoreId: string, ids: readonly string[]) { return ids.map(id => structuredClone(remote.get(id)!)); },
+      async sealBackupRestore() {
+        status = { phase: 'awaiting-verification', nextChunkIndex: 1 };
+        return { status: 'sealed' as const, sessionFingerprint };
+      },
+      async confirmBackupRestoreVerified() { confirmations++; status = null; return { status: 'completed' }; },
+      async write() { throw new Error('sequential backup writes are forbidden'); },
+    };
+    const dependencies = {
+      uid: UID, db: targetDB, serializers: [serializer], activeMasterKey, activeKeyVersion: 7,
+      activeAssets: { async prepareForUpload() {} } as never,
+      transport,
+      createBackupAssetClient: () => ({ async importAssetChunks() { return []; }, async rollbackImportedAssets() {} }) as never,
+      createOperationId: () => 'restore-sealed-retry',
+      async verifyHydrated() {
+        hydrationAttempts++;
+        if (hydrationAttempts === 1) throw new Error('local hydration failed');
+      },
+    };
+
+    await assert.rejects(withVaultPasswordWorker(realArgon2idWorkerResponse, () => importPrivateProVaultBackup(
+      stream(bytes), { kind: 'password', password: PASSWORD }, dependencies,
+    )), /hydration|reconcile/i);
+    assert.deepEqual(status, { phase: 'awaiting-verification', nextChunkIndex: 1 });
+    assert.equal(confirmations, 0);
+
+    await withVaultPasswordWorker(realArgon2idWorkerResponse, () => importPrivateProVaultBackup(
+      stream(bytes), { kind: 'password', password: PASSWORD }, dependencies,
+    ));
+    assert.equal(hydrationAttempts, 2);
+    assert.equal(confirmations, 1);
+    assert.equal(status, null);
   });
 });

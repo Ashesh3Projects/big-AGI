@@ -4,7 +4,14 @@ import { TRPCClientError } from '@trpc/client';
 import { PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES } from './privatePro.vault.repository';
 import type { PrivateProVaultIndexEntry } from './privatePro.vault.repository';
 import type { PutVaultRecordResult } from './privatePro.vault.service';
-import type { MergeVaultBackupInput, MergeVaultBackupResult } from './privatePro.vault.service';
+import type {
+  BeginVaultBackupRestoreInput,
+  ConfirmVaultBackupRestoreInput,
+  MergeVaultBackupInput,
+  MergeVaultBackupRestoreChunkInput,
+  MergeVaultBackupResult,
+  SealVaultBackupRestoreInput,
+} from './privatePro.vault.service';
 import type { PrivateProVaultEnvelope, PrivateProVaultOperation } from './privatePro.vault.types';
 
 
@@ -17,12 +24,16 @@ export interface PrivateProVaultTransport {
   getIndex(): Promise<PrivateProVaultIndexEntry[]>;
   getRecords(recordIds: readonly string[]): Promise<PrivateProVaultEnvelope[]>;
   mergeBackup(input: MergeVaultBackupInput): Promise<MergeVaultBackupResult>;
-  beginBackupRestore?(input: { restoreId: string; backupFingerprint: string; chunkCount: number; recordCount: number }): Promise<unknown>;
-  getBackupRestoreStatus?(restoreId: string): Promise<{ nextChunkIndex: number } | null>;
-  mergeBackupRestoreChunk?(input: MergeVaultBackupInput & { restoreId: string; chunkIndex: number; chunkCount: number }): Promise<MergeVaultBackupResult & { nextChunkIndex: number }>;
+  beginBackupRestore?(input: BeginVaultBackupRestoreInput): Promise<unknown>;
+  getBackupRestoreStatus?(restoreId: string): Promise<{
+    phase: 'merging' | 'awaiting-verification' | 'completed';
+    nextChunkIndex: number;
+  } | null>;
+  mergeBackupRestoreChunk?(input: MergeVaultBackupRestoreChunkInput): Promise<MergeVaultBackupResult & { nextChunkIndex: number }>;
   getBackupRestoreIndex?(restoreId: string): Promise<PrivateProVaultIndexEntry[]>;
   getBackupRestoreRecords?(restoreId: string, recordIds: readonly string[]): Promise<PrivateProVaultEnvelope[]>;
-  finalizeBackupRestore?(input: { restoreId: string; operationId: string }): Promise<unknown>;
+  sealBackupRestore?(input: SealVaultBackupRestoreInput): Promise<{ status: 'sealed' | 'unchanged'; sessionFingerprint: string }>;
+  confirmBackupRestoreVerified?(input: ConfirmVaultBackupRestoreInput): Promise<unknown>;
   write(operation: PrivateProVaultOperation): Promise<PrivateProVaultWriteResult>;
 }
 
@@ -42,11 +53,13 @@ export class PrivateProVaultAmbiguousTransportError extends Error {
 
 export function isPrivateProVaultAmbiguousTRPCError(error: unknown): boolean {
   if (!(error instanceof TRPCClientError)) return false;
-  if (error.data?.httpStatus !== undefined || error.data?.code !== undefined) return false;
+  if (error.data != null || error.shape != null) return false;
   const cause = error.cause;
-  return cause instanceof TypeError
-    || cause instanceof DOMException && cause.name !== 'AbortError'
-    || cause instanceof Error && /(?:failed to fetch|fetch failed|network|socket|terminated|connection|stream closed)/i.test(cause.message);
+  if (cause instanceof Error && cause.name === 'AbortError') return false;
+  return cause instanceof SyntaxError
+    || cause instanceof TypeError
+    || cause instanceof DOMException
+    || cause instanceof Error && /(?:failed to fetch|fetch failed|network|socket|terminated|connection|stream closed|invalid json|unexpected (?:end|token)|response.*pars)/i.test(cause.message);
 }
 
 async function mergeBackup(input: MergeVaultBackupInput): Promise<MergeVaultBackupResult> {
@@ -132,7 +145,9 @@ export function createPrivateProVaultTransport(): PrivateProVaultTransport {
       return envelopes;
     },
 
-    finalizeBackupRestore: input => ambiguousMutation(() => apiAsyncNode.privateProVault.finalizeBackupRestore.mutate(input)),
+    sealBackupRestore: input => ambiguousMutation(() => apiAsyncNode.privateProVault.sealBackupRestore.mutate(input)),
+
+    confirmBackupRestoreVerified: input => ambiguousMutation(() => apiAsyncNode.privateProVault.confirmBackupRestoreVerified.mutate(input)),
 
     async write(operation) {
       if (operation.kind === 'put') {

@@ -67,6 +67,10 @@ interface PrivateProVaultEngineDependencies {
 
 export interface PrivateProVaultEngine {
   hydrateBeforeOpen(): Promise<void>;
+  hydrateVerifiedRestore(
+    index: readonly PrivateProVaultIndexEntry[],
+    envelopes: readonly PrivateProVaultEnvelope[],
+  ): Promise<void>;
   start(): Promise<void>;
   stop(): void;
   stopAndWait(): Promise<void>;
@@ -333,6 +337,25 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
     return {
       records: await waitCurrent(epoch, Promise.all(envelopes.map(envelope => decryptAndValidate(epoch, envelope)))),
       envelopes,
+    };
+  };
+
+  const stageVerifiedRestore = async (
+    epoch: number,
+    index: readonly PrivateProVaultIndexEntry[],
+    envelopes: readonly PrivateProVaultEnvelope[],
+  ) => {
+    const downloadedByKey = new Map(envelopes.map(envelope => [recordKey(envelope.recordType, envelope.recordId), envelope]));
+    const orderedEnvelopes = index.filter(isRecordEntry).map(entry => {
+      const envelope = downloadedByKey.get(recordKey(entry.recordType, entry.opaqueRecordId));
+      if (!envelope || envelope.revision !== entry.revision || envelope.keyVersion !== entry.keyVersion)
+        throw new Error('Encrypted vault index and record payload disagree.');
+      return envelope;
+    });
+    if (orderedEnvelopes.length !== envelopes.length) throw new Error('Encrypted vault restore payload set is incomplete.');
+    return {
+      records: await waitCurrent(epoch, Promise.all(orderedEnvelopes.map(envelope => decryptAndValidate(epoch, envelope)))),
+      envelopes: orderedEnvelopes,
     };
   };
 
@@ -604,6 +627,28 @@ export function createPrivateProVaultEngine(deps: PrivateProVaultEngineDependenc
       const epoch = ++runEpoch;
       beginRun();
       await queue(currentEpoch => reconcile(currentEpoch, true), epoch);
+    },
+
+    async hydrateVerifiedRestore(index, envelopes) {
+      await stopping;
+      stopped = false;
+      const epoch = ++runEpoch;
+      beginRun();
+      await queue(async currentEpoch => {
+        setStatus(currentEpoch, { phase: 'hydrating', ready: false, lastError: null, conflict: null });
+        const stage = await stageVerifiedRestore(currentEpoch, index, envelopes);
+        const before = await captureRuntime(currentEpoch);
+        const durableBefore = await captureDurable(currentEpoch);
+        await replaceRuntime(currentEpoch, stage.records, before);
+        try {
+          await persistCurrent(currentEpoch, index, stage.envelopes);
+          setStatus(currentEpoch, { phase: 'ready', ready: true, lastError: null, conflict: null });
+        } catch (error) {
+          await restoreDurable(durableBefore);
+          await restoreRuntime(before);
+          throw error;
+        }
+      }, epoch);
     },
 
     async start() {

@@ -79,7 +79,7 @@ const service = {
   },
   getBackupRestoreStatus: async (uid: string, restoreId: string) => {
     state.calls.push({ method: 'getBackupRestoreStatus', uid, input: restoreId });
-    return { nextChunkIndex: 0 };
+    return { phase: 'merging' as const, nextChunkIndex: 0 };
   },
   mergeBackupRestoreChunk: async (uid: string, input: unknown) => {
     state.calls.push({ method: 'mergeBackupRestoreChunk', uid, input });
@@ -93,8 +93,12 @@ const service = {
     state.calls.push({ method: 'getBackupRestoreRecords', uid, input: { restoreId, input } });
     return [];
   },
-  finalizeBackupRestore: async (uid: string, input: unknown) => {
-    state.calls.push({ method: 'finalizeBackupRestore', uid, input });
+  sealBackupRestore: async (uid: string, input: unknown) => {
+    state.calls.push({ method: 'sealBackupRestore', uid, input });
+    return { status: 'sealed' as const, sessionFingerprint: 's'.repeat(43) };
+  },
+  confirmBackupRestoreVerified: async (uid: string, input: unknown) => {
+    state.calls.push({ method: 'confirmBackupRestoreVerified', uid, input });
     return { status: 'completed' as const };
   },
   deleteRecord: async (uid: string, input: unknown) => {
@@ -249,15 +253,22 @@ describe('private Pro vault router input bounds', () => {
       operationId: 'merge-backup-1',
       records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
     });
-    await caller.beginBackupRestore({ restoreId: 'restore-1', backupFingerprint: 'f'.repeat(43), chunkCount: 1, recordCount: 1 });
+    await caller.beginBackupRestore({
+      restoreId: 'restore-1', backupFingerprint: 'f'.repeat(43), backupRecordCount: 1, backupTotalCiphertextBytes: 16,
+      chunkCount: 1, recordCount: 1,
+      chunkRecordCounts: [1], chunkFingerprints: ['c'.repeat(43)], totalCiphertextBytes: 16,
+    });
     await caller.getBackupRestoreStatus({ restoreId: 'restore-1' });
     await caller.mergeBackupRestoreChunk({
-      restoreId: 'restore-1', operationId: 'restore-1:0', chunkIndex: 0, chunkCount: 1,
+      restoreId: 'restore-1', operationId: 'restore-1:0', chunkIndex: 0, chunkFingerprint: 'c'.repeat(43),
       records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
     });
     await caller.getBackupRestoreIndex({ restoreId: 'restore-1', pageSize: 1 });
     await caller.getBackupRestoreRecords({ restoreId: 'restore-1', opaqueRecordIds: [RECORD_ID] });
-    await caller.finalizeBackupRestore({ restoreId: 'restore-1', operationId: 'restore-1:finalize' });
+    await caller.sealBackupRestore({ restoreId: 'restore-1', operationId: 'restore-1:seal' });
+    await caller.confirmBackupRestoreVerified({
+      restoreId: 'restore-1', operationId: 'restore-1:confirm', sessionFingerprint: 's'.repeat(43),
+    });
     await caller.deleteRecord({
       operationId: 'delete-record-1',
       opaqueRecordId: RECORD_ID,
@@ -353,6 +364,27 @@ describe('private Pro vault router input bounds', () => {
     }));
     await assert.rejects(caller.revokeDevice({ operationId: 'spaces are invalid', deviceId: DEVICE_ID }));
     await assert.rejects((caller.getIndex as (input: unknown) => Promise<unknown>)({ pageSize: 1, uid: OTHER_UID }));
+  });
+
+  test('rejects malformed restore manifests at the router boundary', async () => {
+    state.account = account();
+    state.devices.set(DEVICE_ID, { deviceId: DEVICE_ID, keyVersion: 1, revokedAtMs: null });
+    const caller = (await router()).createCaller(context(identity()));
+    const base = {
+      restoreId: 'restore-router-bounds', backupFingerprint: 'f'.repeat(43), backupRecordCount: 1, backupTotalCiphertextBytes: 16,
+      chunkCount: 1, recordCount: 1,
+      chunkRecordCounts: [1], chunkFingerprints: ['c'.repeat(43)], totalCiphertextBytes: 16,
+    };
+
+    await assert.rejects(caller.beginBackupRestore({ ...base, chunkCount: 501 }));
+    await assert.rejects(caller.beginBackupRestore({ ...base, recordCount: 100_001 }));
+    await assert.rejects(caller.beginBackupRestore({ ...base, totalCiphertextBytes: 128 * 1024 * 1024 + 1 }));
+    await assert.rejects(caller.beginBackupRestore({ ...base, chunkRecordCounts: [201] }));
+    await assert.rejects(caller.beginBackupRestore({ ...base, chunkFingerprints: ['short'] }));
+    await assert.rejects(caller.mergeBackupRestoreChunk({
+      restoreId: base.restoreId, operationId: `${base.restoreId}:0`, chunkIndex: 500,
+      chunkFingerprint: 'c'.repeat(43), records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
+    }));
   });
 });
 

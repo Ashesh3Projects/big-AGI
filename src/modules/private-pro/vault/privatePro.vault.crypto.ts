@@ -144,9 +144,13 @@ export async function encryptVaultRecord(
   key: CryptoKey,
   aad: VaultRecordAADInput,
   plaintext: Uint8Array,
+  nonceInput?: Uint8Array,
 ): Promise<PrivateProVaultEnvelope> {
   assertAesGcmKey(key, 'encrypt');
-  const nonce = crypto.getRandomValues(new Uint8Array(AES_GCM_NONCE_BYTES));
+  const nonce = nonceInput === undefined
+    ? crypto.getRandomValues(new Uint8Array(AES_GCM_NONCE_BYTES))
+    : new Uint8Array(nonceInput);
+  if (nonce.byteLength !== AES_GCM_NONCE_BYTES) throw new Error('Vault record nonces must be 96 bits.');
   const ciphertext = new Uint8Array(await crypto.subtle.encrypt({
     name: 'AES-GCM',
     iv: nonce,

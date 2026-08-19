@@ -2,12 +2,16 @@ import { createHash, randomBytes } from 'node:crypto';
 
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
+  PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS,
   PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS,
   PRIVATE_PRO_VAULT_BACKUP_MAX_TOTAL_CIPHERTEXT_BYTES,
   PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE,
+  PRIVATE_PRO_VAULT_RESTORE_MAX_RECORDS,
+  PRIVATE_PRO_VAULT_RESTORE_MAX_TOTAL_CIPHERTEXT_BYTES,
   type PrivateProVaultOperationOutcome,
   type PrivateProVaultRepository,
 } from './privatePro.vault.repository';
+import { canonicalPrivateProVaultRestoreChunk } from './privatePro.vault.restore';
 import {
   PrivateProVaultEnvelopeSchema,
   PrivateProVaultKeysetSchema,
@@ -62,19 +66,28 @@ export interface MergeVaultBackupInput {
 export interface BeginVaultBackupRestoreInput {
   restoreId: string;
   backupFingerprint: string;
+  backupRecordCount: number;
+  backupTotalCiphertextBytes: number;
   chunkCount: number;
   recordCount: number;
+  chunkRecordCounts: number[];
+  chunkFingerprints: string[];
+  totalCiphertextBytes: number;
 }
 
 export interface MergeVaultBackupRestoreChunkInput extends MergeVaultBackupInput {
   restoreId: string;
   chunkIndex: number;
-  chunkCount: number;
+  chunkFingerprint: string;
 }
 
-export interface FinalizeVaultBackupRestoreInput {
+export interface SealVaultBackupRestoreInput {
   restoreId: string;
   operationId: string;
+}
+
+export interface ConfirmVaultBackupRestoreInput extends SealVaultBackupRestoreInput {
+  sessionFingerprint: string;
 }
 
 export type MergeVaultBackupResult =
@@ -137,6 +150,12 @@ function canonicalJson(value: unknown): string {
 
 function equalCanonical(left: unknown, right: unknown): boolean {
   return canonicalJson(left) === canonicalJson(right);
+}
+
+export function privateProVaultRestoreChunkFingerprint(
+  records: readonly MergeVaultBackupRestoreChunkInput['records'][number][],
+): string {
+  return createHash('sha256').update(canonicalPrivateProVaultRestoreChunk(records)).digest('base64url');
 }
 
 function assertPasswordWrappingRotation(current: PrivateProVaultKeyset, next: PrivateProVaultKeyset): void {
@@ -519,36 +538,46 @@ export function createPrivateProVaultService(
     async beginBackupRestore(uid: string, input: BeginVaultBackupRestoreInput) {
       assertUid(uid);
       assertRestoreId(input.restoreId);
-      assertRestoreCounts(input.chunkCount, input.recordCount);
+      assertRestoreManifest(input);
       if (!OPAQUE_RECORD_ID.test(input.backupFingerprint)) throw new Error('Vault restore fingerprint is invalid.');
+      if (input.backupRecordCount !== input.recordCount) throw new Error('Vault restore record count does not match the authenticated backup manifest.');
+      if (!Number.isSafeInteger(input.backupTotalCiphertextBytes)
+        || input.backupTotalCiphertextBytes < 0
+        || input.backupTotalCiphertextBytes > PRIVATE_PRO_VAULT_RESTORE_MAX_TOTAL_CIPHERTEXT_BYTES
+        || input.totalCiphertextBytes > input.backupTotalCiphertextBytes)
+        throw new Error('Vault restore ciphertext bytes do not match the authenticated backup manifest.');
+      const manifestFingerprint = fingerprint({ kind: 'restore-manifest', ...input });
       return repository.transaction(uid, async transaction => {
         const [active, completion] = await Promise.all([
           transaction.getRestoreSession(),
           transaction.getRestoreCompletion(input.restoreId),
         ]);
         if (completion) {
-          if (completion.backupFingerprint !== input.backupFingerprint
-            || completion.chunkCount !== input.chunkCount
-            || completion.recordCount !== input.recordCount)
+          if (completion.manifestFingerprint !== manifestFingerprint)
             throw new Error('Vault restore ID is already used by different content.');
           return { status: 'completed' as const, completion };
         }
         if (active) {
-          if (active.restoreId !== input.restoreId
-            || active.backupFingerprint !== input.backupFingerprint
-            || active.chunkCount !== input.chunkCount
-            || active.recordCount !== input.recordCount)
+          if (active.restoreId !== input.restoreId || active.manifestFingerprint !== manifestFingerprint)
             throw new Error('Another encrypted backup restore is already in progress.');
           return { status: 'unchanged' as const, session: active };
         }
         const session = {
           formatVersion: 1 as const,
+          phase: 'merging' as const,
           restoreId: input.restoreId,
           backupFingerprint: input.backupFingerprint,
+          backupRecordCount: input.backupRecordCount,
+          backupTotalCiphertextBytes: input.backupTotalCiphertextBytes,
+          manifestFingerprint,
           chunkCount: input.chunkCount,
           recordCount: input.recordCount,
+          chunkRecordCounts: [...input.chunkRecordCounts],
+          chunkFingerprints: [...input.chunkFingerprints],
+          totalCiphertextBytes: input.totalCiphertextBytes,
           nextChunkIndex: 0,
           committedRecordCount: 0,
+          committedCiphertextBytes: 0,
           startedAtMs: now(),
         };
         await transaction.setRestoreSession(session);
@@ -563,7 +592,11 @@ export function createPrivateProVaultService(
         const active = await transaction.getRestoreSession();
         if (active?.restoreId === restoreId) return active;
         const completion = await transaction.getRestoreCompletion(restoreId);
-        return completion ? { ...completion, nextChunkIndex: completion.chunkCount } : null;
+        return completion ? {
+          ...completion,
+          phase: 'completed' as const,
+          nextChunkIndex: completion.chunkCount,
+        } : null;
       });
     },
 
@@ -571,9 +604,8 @@ export function createPrivateProVaultService(
       assertUid(uid);
       assertRestoreId(input.restoreId);
       assertOperationId(input.operationId);
-      if (!Number.isSafeInteger(input.chunkCount) || input.chunkCount < 1 || input.chunkCount > 100_000)
-        throw new Error('Vault restore chunk count is invalid.');
-      if (!Number.isSafeInteger(input.chunkIndex) || input.chunkIndex < 0 || input.chunkIndex >= input.chunkCount)
+      if (!OPAQUE_RECORD_ID.test(input.chunkFingerprint)) throw new Error('Vault restore chunk fingerprint is invalid.');
+      if (!Number.isSafeInteger(input.chunkIndex) || input.chunkIndex < 0 || input.chunkIndex >= PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS)
         throw new Error('Vault restore chunk index is invalid.');
       if (input.records.length < 1 || input.records.length > PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS)
         throw new Error('Vault backup merge contains too many records.');
@@ -594,17 +626,33 @@ export function createPrivateProVaultService(
       });
       if (totalCiphertextBytes > PRIVATE_PRO_VAULT_BACKUP_MAX_TOTAL_CIPHERTEXT_BYTES)
         throw new Error('Vault backup merge exceeds the total ciphertext byte limit.');
+      const actualChunkFingerprint = privateProVaultRestoreChunkFingerprint(records);
+      if (actualChunkFingerprint !== input.chunkFingerprint) throw new Error('Vault restore chunk fingerprint does not match its content.');
       const requestFingerprint = fingerprint({ kind: 'restore-chunk', ...input, records });
       return repository.transaction(uid, async transaction => {
         const session = await transaction.getRestoreSession();
-        if (!session || session.restoreId !== input.restoreId) throw new Error('Encrypted backup restore session is unavailable.');
-        if (session.chunkCount !== input.chunkCount) throw new Error('Encrypted backup restore chunk count changed.');
+        if (!session || session.restoreId !== input.restoreId) {
+          const [completion, repeated] = await Promise.all([
+            transaction.getRestoreCompletion(input.restoreId),
+            transaction.getBackupMerge(input.operationId),
+          ]);
+          if (!completion || !repeated) throw new Error('Encrypted backup restore session is unavailable.');
+          if (repeated.requestFingerprint !== requestFingerprint) throw new Error('Vault operation ID is already used by different content.');
+          return { status: 'unchanged' as const, records: repeated.outcome.records, nextChunkIndex: completion.chunkCount };
+        }
+        if (input.chunkIndex >= session.chunkCount) throw new Error('Vault restore chunk index is invalid.');
+        if (records.length !== session.chunkRecordCounts[input.chunkIndex]) throw new Error('Vault restore chunk record count differs from its declaration.');
+        if (input.chunkFingerprint !== session.chunkFingerprints[input.chunkIndex]) throw new Error('Vault restore chunk fingerprint differs from its declaration.');
         const repeated = await transaction.getBackupMerge(input.operationId);
         if (repeated) {
           if (repeated.requestFingerprint !== requestFingerprint) throw new Error('Vault operation ID is already used by different content.');
           return { status: 'unchanged' as const, records: repeated.outcome.records, nextChunkIndex: session.nextChunkIndex };
         }
+        if (session.phase !== 'merging') throw new Error('Encrypted backup restore is sealed.');
         if (input.chunkIndex !== session.nextChunkIndex) throw new Error('Encrypted backup restore chunk is out of sequence.');
+        if (session.committedRecordCount + records.length > session.recordCount
+          || session.committedCiphertextBytes + totalCiphertextBytes > session.totalCiphertextBytes)
+          throw new Error('Encrypted backup restore would exceed its declared manifest.');
         const current = await Promise.all(records.map(async record => {
           const [stored, tombstone] = await Promise.all([transaction.getRecord(record.opaqueRecordId), transaction.getTombstone(record.opaqueRecordId)]);
           return { record, currentRevision: Math.max(stored?.revision ?? 0, tombstone?.revision ?? 0) };
@@ -623,6 +671,7 @@ export function createPrivateProVaultService(
           ...session,
           nextChunkIndex: session.nextChunkIndex + 1,
           committedRecordCount: session.committedRecordCount + records.length,
+          committedCiphertextBytes: session.committedCiphertextBytes + totalCiphertextBytes,
         });
         return { status: 'committed' as const, records: outcomes, nextChunkIndex: session.nextChunkIndex + 1 };
       });
@@ -637,8 +686,7 @@ export function createPrivateProVaultService(
       if (cursor !== null) assertOpaqueRecordId(cursor, 'cursor');
       return repository.transaction(uid, async transaction => {
         const active = await transaction.getRestoreSession();
-        const completion = await transaction.getRestoreCompletion(restoreId);
-        if (active?.restoreId !== restoreId && !completion) throw new Error('Encrypted backup restore session is unavailable.');
+        if (active?.restoreId !== restoreId) throw new Error('Encrypted backup restore session is unavailable.');
         const entries = await transaction.listIndexEntries(cursor, input.pageSize + 1);
         const hasMore = entries.length > input.pageSize;
         const page = entries.slice(0, input.pageSize);
@@ -653,33 +701,82 @@ export function createPrivateProVaultService(
       opaqueRecordIds.forEach(recordId => assertOpaqueRecordId(recordId));
       return repository.transaction(uid, async transaction => {
         const active = await transaction.getRestoreSession();
-        const completion = await transaction.getRestoreCompletion(restoreId);
-        if (active?.restoreId !== restoreId && !completion) throw new Error('Encrypted backup restore session is unavailable.');
+        if (active?.restoreId !== restoreId) throw new Error('Encrypted backup restore session is unavailable.');
         return transaction.getRecords(opaqueRecordIds);
       });
     },
 
-    async finalizeBackupRestore(uid: string, input: FinalizeVaultBackupRestoreInput) {
+    async sealBackupRestore(uid: string, input: SealVaultBackupRestoreInput) {
       assertUid(uid);
       assertRestoreId(input.restoreId);
       assertOperationId(input.operationId);
-      const requestFingerprint = fingerprint({ kind: 'finalize-restore', ...input });
+      const requestFingerprint = fingerprint({ kind: 'seal-restore', ...input });
+      return repository.transaction(uid, async transaction => {
+        const completion = await transaction.getRestoreCompletion(input.restoreId);
+        if (completion) {
+          if (completion.sealOperationId !== input.operationId || completion.sealRequestFingerprint !== requestFingerprint)
+            throw new Error('Vault operation ID is already used by different content.');
+          return { status: 'unchanged' as const, sessionFingerprint: completion.sessionFingerprint };
+        }
+        const session = await transaction.getRestoreSession();
+        if (!session || session.restoreId !== input.restoreId) throw new Error('Encrypted backup restore session is unavailable.');
+        if (session.phase === 'awaiting-verification') {
+          if (session.sealOperationId !== input.operationId || session.sealRequestFingerprint !== requestFingerprint)
+            throw new Error('Vault operation ID is already used by different content.');
+          return { status: 'unchanged' as const, sessionFingerprint: session.sessionFingerprint! };
+        }
+        if (session.nextChunkIndex !== session.chunkCount) throw new Error('Encrypted backup restore is incomplete.');
+        if (session.committedRecordCount !== session.recordCount) throw new Error('Encrypted backup restore record count is incomplete.');
+        if (session.committedCiphertextBytes !== session.totalCiphertextBytes)
+          throw new Error('Encrypted backup restore ciphertext byte count is incomplete.');
+        const sealedAtMs = now();
+        const sessionFingerprint = fingerprint({
+          kind: 'sealed-restore',
+          restoreId: session.restoreId,
+          manifestFingerprint: session.manifestFingerprint,
+          committedRecordCount: session.committedRecordCount,
+          committedCiphertextBytes: session.committedCiphertextBytes,
+        });
+        await transaction.setRestoreSession({
+          ...session,
+          phase: 'awaiting-verification',
+          sealedAtMs,
+          sealOperationId: input.operationId,
+          sealRequestFingerprint: requestFingerprint,
+          sessionFingerprint,
+        });
+        return { status: 'sealed' as const, sessionFingerprint };
+      });
+    },
+
+    async confirmBackupRestoreVerified(uid: string, input: ConfirmVaultBackupRestoreInput) {
+      assertUid(uid);
+      assertRestoreId(input.restoreId);
+      assertOperationId(input.operationId);
+      if (!OPAQUE_RECORD_ID.test(input.sessionFingerprint)) throw new Error('Vault restore session fingerprint is invalid.');
+      const requestFingerprint = fingerprint({ kind: 'confirm-restore', ...input });
       return repository.transaction(uid, async transaction => {
         const existing = await transaction.getRestoreCompletion(input.restoreId);
         if (existing) {
-          if (existing.operationId !== input.operationId || existing.requestFingerprint !== requestFingerprint)
+          if (existing.operationId !== input.operationId
+            || existing.requestFingerprint !== requestFingerprint
+            || existing.sessionFingerprint !== input.sessionFingerprint)
             throw new Error('Vault operation ID is already used by different content.');
           return { status: 'unchanged' as const, completion: existing };
         }
         const session = await transaction.getRestoreSession();
         if (!session || session.restoreId !== input.restoreId) throw new Error('Encrypted backup restore session is unavailable.');
-        if (session.nextChunkIndex !== session.chunkCount) throw new Error('Encrypted backup restore is incomplete.');
-        if (session.committedRecordCount !== session.recordCount) throw new Error('Encrypted backup restore record count is incomplete.');
+        if (session.phase !== 'awaiting-verification' || session.sessionFingerprint !== input.sessionFingerprint)
+          throw new Error('Encrypted backup restore verification is not confirmed for this session.');
         const completion = {
           formatVersion: 1 as const,
           restoreId: input.restoreId,
           operationId: input.operationId,
           requestFingerprint,
+          sessionFingerprint: input.sessionFingerprint,
+          manifestFingerprint: session.manifestFingerprint,
+          sealOperationId: session.sealOperationId!,
+          sealRequestFingerprint: session.sealRequestFingerprint!,
           backupFingerprint: session.backupFingerprint,
           chunkCount: session.chunkCount,
           recordCount: session.recordCount,
@@ -699,10 +796,32 @@ function assertRestoreId(restoreId: string): void {
 }
 
 function assertRestoreCounts(chunkCount: number, recordCount: number): void {
-  if (!Number.isSafeInteger(chunkCount) || chunkCount < 1 || chunkCount > 100_000)
+  if (!Number.isSafeInteger(chunkCount) || chunkCount < 0 || chunkCount > PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS)
     throw new Error('Vault restore chunk count is invalid.');
-  if (!Number.isSafeInteger(recordCount) || recordCount < 1 || recordCount > 100_000)
+  if (!Number.isSafeInteger(recordCount) || recordCount < 0 || recordCount > PRIVATE_PRO_VAULT_RESTORE_MAX_RECORDS)
     throw new Error('Vault restore record count is invalid.');
+}
+
+function assertRestoreManifest(input: BeginVaultBackupRestoreInput): void {
+  assertRestoreCounts(input.chunkCount, input.recordCount);
+  if (input.chunkRecordCounts.length !== input.chunkCount || input.chunkFingerprints.length !== input.chunkCount)
+    throw new Error('Vault restore manifest chunk count is inconsistent.');
+  if (!Number.isSafeInteger(input.totalCiphertextBytes)
+    || input.totalCiphertextBytes < 0
+    || input.totalCiphertextBytes > PRIVATE_PRO_VAULT_RESTORE_MAX_TOTAL_CIPHERTEXT_BYTES)
+    throw new Error('Vault restore total ciphertext byte count is invalid.');
+  if (input.recordCount === 0) {
+    if (input.chunkCount !== 0 || input.totalCiphertextBytes !== 0)
+      throw new Error('An empty vault restore must have an empty manifest.');
+    return;
+  }
+  if (input.chunkCount === 0
+    || input.chunkRecordCounts.some(count => !Number.isSafeInteger(count) || count < 1 || count > PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS))
+    throw new Error('Vault restore manifest chunk record count is invalid.');
+  if (input.chunkFingerprints.some(chunkFingerprint => !OPAQUE_RECORD_ID.test(chunkFingerprint)))
+    throw new Error('Vault restore manifest fingerprint is invalid.');
+  if (input.chunkRecordCounts.reduce((sum, count) => sum + count, 0) !== input.recordCount)
+    throw new Error('Vault restore manifest record count sum is inconsistent.');
 }
 
 export type PrivateProVaultService = ReturnType<typeof createPrivateProVaultService>;

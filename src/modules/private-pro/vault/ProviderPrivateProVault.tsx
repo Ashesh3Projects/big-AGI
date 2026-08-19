@@ -100,9 +100,13 @@ export async function runPrivateProVaultBackupImport(
   await engine.stopAndWait();
   let committed = false;
   try {
-    await importBackup();
+    const result = await importBackup();
     committed = true;
-    await engine.hydrateBeforeOpen();
+    const verifiedCloudHydration = typeof result === 'object'
+      && result !== null
+      && 'verifiedCloudHydration' in result
+      && result.verifiedCloudHydration === true;
+    if (!verifiedCloudHydration) await engine.hydrateBeforeOpen();
     await engine.start();
     await engine.whenCurrent();
     if (!store.getState().ready) throw new Error('Encrypted backup merge did not reach a verified current state.');
@@ -618,6 +622,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
         activeAssets: assets,
         transport: createPrivateProVaultTransport(),
         createBackupAssetClient: (masterKey, keyVersion, vaultId) => createPrivateProVaultAssetClient({ vaultId, masterKey, keyVersion }),
+        verifyHydrated: (index, envelopes) => engine.hydrateVerifiedRestore(index, envelopes),
       }));
   }, [auth.user]);
 

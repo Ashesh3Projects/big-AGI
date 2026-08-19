@@ -116,6 +116,7 @@ export interface PrivateProEncryptedBackupApplyInput {
   masterKey: CryptoKey;
   records: readonly PrivateProVaultEnvelope[];
   assets: readonly PrivateProEncryptedBackupAsset[];
+  totalCiphertextBytes: number;
   transcriptMacBase64: string;
 }
 
@@ -500,7 +501,7 @@ export async function importPrivateProEncryptedBackup(
       throw new Error('Private Pro encrypted backup asset key version does not match its keyset.');
   }
 
-  await apply({ header, masterKey, records, assets, transcriptMacBase64: end.transcriptMacBase64 });
+  await apply({ header, masterKey, records, assets, totalCiphertextBytes: end.totalCiphertextBytes, transcriptMacBase64: end.transcriptMacBase64 });
   return { recordCount: records.length, assetCount: assets.length, reloadRequired: true };
 }
 

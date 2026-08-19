@@ -1,7 +1,9 @@
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { describe, test } from 'node:test';
 
 import {
+  PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS,
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
   comparePrivateProVaultOpaqueIds,
   mergePrivateProVaultIndexEntries,
@@ -15,7 +17,13 @@ import {
   type PrivateProVaultStoredRecord,
   type PrivateProVaultStoredTombstone,
 } from './privatePro.vault.repository';
-import { createPrivateProVaultService, type PrivateProVaultService } from './privatePro.vault.service';
+import {
+  createPrivateProVaultService,
+  type BeginVaultBackupRestoreInput,
+  type MergeVaultBackupRestoreChunkInput,
+  type PrivateProVaultService,
+} from './privatePro.vault.service';
+import { canonicalPrivateProVaultRestoreChunk } from './privatePro.vault.restore';
 import { createPrivateProVaultEnrollmentAuthority, signPrivateProVaultDeviceRegistration } from './privatePro.vault.registration';
 import type {
   PrivateProVaultEnvelope,
@@ -239,6 +247,42 @@ function serviceFixture() {
   let randomFill = 1;
   const service = createPrivateProVaultService(repository, () => now++, byteLength => new Uint8Array(byteLength).fill(randomFill++));
   return { repository, service, setNow: (value: number) => { now = value; } };
+}
+
+function restoreChunk(
+  restoreId: string,
+  chunkIndex: number,
+  records: MergeVaultBackupRestoreChunkInput['records'],
+): Omit<MergeVaultBackupRestoreChunkInput, 'chunkFingerprint'> & { chunkFingerprint: string } {
+  return {
+    restoreId,
+    operationId: `${restoreId}:${chunkIndex}`,
+    chunkIndex,
+    chunkFingerprint: testRestoreChunkFingerprint(records),
+    records,
+  };
+}
+
+function restoreManifest(
+  restoreId: string,
+  chunks: readonly MergeVaultBackupRestoreChunkInput['records'][],
+  totalCiphertextBytes = chunks.flat().reduce((sum, record) => sum + record.envelope.ciphertextBytes, 0),
+): BeginVaultBackupRestoreInput {
+  return {
+    restoreId,
+    backupFingerprint: 'f'.repeat(43),
+    backupRecordCount: chunks.reduce((sum, chunk) => sum + chunk.length, 0),
+    backupTotalCiphertextBytes: totalCiphertextBytes,
+    recordCount: chunks.reduce((sum, chunk) => sum + chunk.length, 0),
+    chunkCount: chunks.length,
+    chunkRecordCounts: chunks.map(chunk => chunk.length),
+    chunkFingerprints: chunks.map(chunk => testRestoreChunkFingerprint(chunk)),
+    totalCiphertextBytes,
+  };
+}
+
+function testRestoreChunkFingerprint(records: MergeVaultBackupRestoreChunkInput['records']): string {
+  return createHash('sha256').update(canonicalPrivateProVaultRestoreChunk(records)).digest('base64url');
 }
 
 async function registrationFixture() {
@@ -762,7 +806,7 @@ describe('Private Pro encrypted vault service', () => {
     }), /byte limit/i);
   });
 
-  test('restores more than 500 records in resumable atomic chunks and blocks normal access until finalization', async () => {
+  test('keeps normal access blocked after sealing until verified confirmation clears the marker', async () => {
     const { service } = serviceFixture();
     const restoreId = 'restore-session-large';
     const records = Array.from({ length: 1_001 }, (_, index) => {
@@ -772,22 +816,28 @@ describe('Private Pro encrypted vault service', () => {
       return { opaqueRecordId, baseRevision: 0, envelope: envelope(opaqueRecordId, 1) };
     });
 
-    await service.beginBackupRestore(UID_A, { restoreId, backupFingerprint: 'f'.repeat(43), chunkCount: 6, recordCount: records.length });
+    const chunks = Array.from({ length: 6 }, (_, index) => records.slice(index * 200, (index + 1) * 200));
+    await service.beginBackupRestore(UID_A, restoreManifest(restoreId, chunks));
     await assert.rejects(service.getIndex(UID_A, { pageSize: 10 }), /restore.*progress/i);
     await assert.rejects(service.putRecord(UID_A, {
       operationId: 'normal-write-during-restore', opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1),
     }), /restore.*progress/i);
 
-    for (let chunkIndex = 0; chunkIndex < 6; chunkIndex++) {
-      const chunk = records.slice(chunkIndex * 200, (chunkIndex + 1) * 200);
-      const result = await service.mergeBackupRestoreChunk(UID_A, {
-        restoreId, operationId: `${restoreId}:${chunkIndex}`, chunkIndex, chunkCount: 6, records: chunk,
-      });
+    for (let chunkIndex = 0; chunkIndex < chunks.length; chunkIndex++) {
+      const result = await service.mergeBackupRestoreChunk(UID_A, restoreChunk(restoreId, chunkIndex, chunks[chunkIndex]));
       assert.equal(result.nextChunkIndex, chunkIndex + 1);
     }
     const status = await service.getBackupRestoreStatus(UID_A, restoreId);
     assert.equal(status?.nextChunkIndex, 6);
-    await service.finalizeBackupRestore(UID_A, { restoreId, operationId: `${restoreId}:finalize` });
+    const sealed = await service.sealBackupRestore(UID_A, { restoreId, operationId: `${restoreId}:seal` });
+    assert.equal(sealed.status, 'sealed');
+    assert.equal((await service.getBackupRestoreStatus(UID_A, restoreId))?.phase, 'awaiting-verification');
+    await assert.rejects(service.getIndex(UID_A, { pageSize: 10 }), /restore.*progress/i);
+    await service.confirmBackupRestoreVerified(UID_A, {
+      restoreId,
+      operationId: `${restoreId}:confirm`,
+      sessionFingerprint: sealed.sessionFingerprint,
+    });
     assert.equal((await service.getIndex(UID_A, { pageSize: 500 })).entries.length, 500);
   });
 
@@ -796,21 +846,108 @@ describe('Private Pro encrypted vault service', () => {
     await service.putRecord(UID_A, {
       operationId: 'seed-middle-conflict', opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1),
     });
-    await service.beginBackupRestore(UID_A, { restoreId: 'restore-resume', backupFingerprint: 'f'.repeat(43), chunkCount: 2, recordCount: 2 });
-    const firstInput = {
-      restoreId: 'restore-resume', operationId: 'restore-resume:0', chunkIndex: 0, chunkCount: 2,
-      records: [{ opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) }],
-    };
+    const chunks = [
+      [{ opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) }],
+      [{ opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1) }],
+    ];
+    await service.beginBackupRestore(UID_A, restoreManifest('restore-resume', chunks));
+    const firstInput = restoreChunk('restore-resume', 0, chunks[0]);
     const committed = await service.mergeBackupRestoreChunk(UID_A, firstInput);
     assert.deepEqual(await service.mergeBackupRestoreChunk(UID_A, firstInput), { ...committed, status: 'unchanged' });
 
-    const conflict = await service.mergeBackupRestoreChunk(UID_A, {
-      restoreId: 'restore-resume', operationId: 'restore-resume:1', chunkIndex: 1, chunkCount: 2,
-      records: [{ opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1) }],
-    });
+    const conflict = await service.mergeBackupRestoreChunk(UID_A, restoreChunk('restore-resume', 1, chunks[1]));
     assert.deepEqual(conflict, { status: 'conflict', conflicts: [{ opaqueRecordId: RECORD_B, currentRevision: 1 }], nextChunkIndex: 1 });
     assert.equal((await service.getBackupRestoreStatus(UID_A, 'restore-resume'))?.nextChunkIndex, 1);
-    await assert.rejects(service.finalizeBackupRestore(UID_A, { restoreId: 'restore-resume', operationId: 'restore-resume:finalize' }), /incomplete/i);
+    await assert.rejects(service.sealBackupRestore(UID_A, { restoreId: 'restore-resume', operationId: 'restore-resume:seal' }), /incomplete/i);
+  });
+
+  test('rejects a duplicate chunk operation after sealing when its content differs', async () => {
+    const { service } = serviceFixture();
+    const records = [{ opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) }];
+    await service.beginBackupRestore(UID_A, restoreManifest('restore-sealed-duplicate', [records]));
+    const input = restoreChunk('restore-sealed-duplicate', 0, records);
+    await service.mergeBackupRestoreChunk(UID_A, input);
+    await service.sealBackupRestore(UID_A, { restoreId: 'restore-sealed-duplicate', operationId: 'restore-sealed-duplicate:seal' });
+    assert.equal((await service.mergeBackupRestoreChunk(UID_A, input)).status, 'unchanged');
+    await assert.rejects(service.mergeBackupRestoreChunk(UID_A, {
+      ...input,
+      records: [{ ...records[0], envelope: { ...records[0].envelope, keyVersion: 2 } }],
+    }), /different content|fingerprint/i);
+    const sealed = await service.sealBackupRestore(UID_A, {
+      restoreId: 'restore-sealed-duplicate', operationId: 'restore-sealed-duplicate:seal',
+    });
+    await service.confirmBackupRestoreVerified(UID_A, {
+      restoreId: 'restore-sealed-duplicate', operationId: 'restore-sealed-duplicate:confirm',
+      sessionFingerprint: sealed.sessionFingerprint,
+    });
+    assert.equal((await service.mergeBackupRestoreChunk(UID_A, input)).status, 'unchanged');
+  });
+
+  test('rejects inconsistent or oversized restore manifests including overcommit', async () => {
+    const { service } = serviceFixture();
+    const one = [{ opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) }];
+    const valid = restoreManifest('restore-manifest', [one]);
+    await assert.rejects(service.beginBackupRestore(UID_A, { ...valid, recordCount: 2 }), /sum|record count/i);
+    await assert.rejects(service.beginBackupRestore(UID_A, { ...valid, backupRecordCount: 2 }), /authenticated backup manifest/i);
+    await assert.rejects(service.beginBackupRestore(UID_A, { ...valid, backupTotalCiphertextBytes: 15 }), /authenticated backup manifest/i);
+    await assert.rejects(service.beginBackupRestore(UID_A, {
+      ...valid,
+      restoreId: 'restore-too-many-chunks',
+      chunkCount: PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS + 1,
+      chunkRecordCounts: Array(PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS + 1).fill(1),
+      chunkFingerprints: Array(PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS + 1).fill('a'.repeat(43)),
+      recordCount: PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS + 1,
+    }), /chunk count/i);
+    await service.beginBackupRestore(UID_A, valid);
+    await assert.rejects(service.mergeBackupRestoreChunk(UID_A, {
+      ...restoreChunk('restore-manifest', 0, [...one, { opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1) }]),
+    }), /declared|count|fingerprint/i);
+  });
+
+  test('binds each ordered restore chunk to its declared canonical fingerprint', async () => {
+    const { service } = serviceFixture();
+    const records = [
+      { opaqueRecordId: RECORD_A, baseRevision: 0, envelope: envelope(RECORD_A, 1) },
+      { opaqueRecordId: RECORD_B, baseRevision: 0, envelope: envelope(RECORD_B, 1, 'chat') },
+    ];
+    await service.beginBackupRestore(UID_A, restoreManifest('restore-fingerprint', [records]));
+    await assert.rejects(service.mergeBackupRestoreChunk(UID_A, {
+      ...restoreChunk('restore-fingerprint', 0, [...records].reverse()),
+      chunkFingerprint: testRestoreChunkFingerprint(records),
+    }), /fingerprint/i);
+    await assert.rejects(service.mergeBackupRestoreChunk(UID_A, {
+      ...restoreChunk('restore-fingerprint', 0, records),
+      records: [records[0], { ...records[1], envelope: { ...records[1].envelope, keyVersion: 2 } }],
+    }), /fingerprint/i);
+  });
+
+  test('supports an empty restore without a synthetic chunk and cannot get stuck', async () => {
+    const { service } = serviceFixture();
+    await service.beginBackupRestore(UID_A, restoreManifest('restore-empty', []));
+    const sealed = await service.sealBackupRestore(UID_A, { restoreId: 'restore-empty', operationId: 'restore-empty:seal' });
+    assert.equal((await service.getBackupRestoreStatus(UID_A, 'restore-empty'))?.phase, 'awaiting-verification');
+    await service.confirmBackupRestoreVerified(UID_A, {
+      restoreId: 'restore-empty', operationId: 'restore-empty:confirm', sessionFingerprint: sealed.sessionFingerprint,
+    });
+    assert.equal(await service.getBackupRestoreStatus(UID_A, 'restore-empty') instanceof Object, true);
+    assert.deepEqual((await service.getIndex(UID_A, { pageSize: 10 })).entries, []);
+  });
+
+  test('makes seal and verified confirmation idempotent only for the exact operations', async () => {
+    const { service } = serviceFixture();
+    await service.beginBackupRestore(UID_A, restoreManifest('restore-idempotent', []));
+    const sealInput = { restoreId: 'restore-idempotent', operationId: 'restore-idempotent:seal' };
+    const sealed = await service.sealBackupRestore(UID_A, sealInput);
+    assert.deepEqual(await service.sealBackupRestore(UID_A, sealInput), { ...sealed, status: 'unchanged' });
+    const confirmInput = {
+      restoreId: 'restore-idempotent', operationId: 'restore-idempotent:confirm', sessionFingerprint: sealed.sessionFingerprint,
+    };
+    const completed = await service.confirmBackupRestoreVerified(UID_A, confirmInput);
+    assert.deepEqual(await service.confirmBackupRestoreVerified(UID_A, confirmInput), { ...completed, status: 'unchanged' });
+    assert.deepEqual(await service.sealBackupRestore(UID_A, sealInput), { status: 'unchanged', sessionFingerprint: sealed.sessionFingerprint });
+    await assert.rejects(service.confirmBackupRestoreVerified(UID_A, {
+      ...confirmInput, operationId: 'restore-idempotent:other-confirm',
+    }), /different content|operation ID/i);
   });
 
   test('records a bounded security event after recovery without accepting sensitive metadata', async () => {

@@ -11,6 +11,11 @@ export const PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES = 700 * 1024;
 export const PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE = 500;
 export const PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS = 200;
 export const PRIVATE_PRO_VAULT_BACKUP_MAX_TOTAL_CIPHERTEXT_BYTES = 4 * 1024 * 1024;
+export const PRIVATE_PRO_VAULT_RESTORE_MAX_RECORDS = 100_000;
+export const PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS = Math.ceil(
+  PRIVATE_PRO_VAULT_RESTORE_MAX_RECORDS / PRIVATE_PRO_VAULT_BACKUP_MAX_RECORDS,
+);
+export const PRIVATE_PRO_VAULT_RESTORE_MAX_TOTAL_CIPHERTEXT_BYTES = 128 * 1024 * 1024;
 
 export interface PrivateProVaultStoredRecord {
   opaqueRecordId: string;
@@ -85,13 +90,25 @@ export interface PrivateProVaultBackupMergeReceipt {
 
 export interface PrivateProVaultRestoreSession {
   formatVersion: 1;
+  phase: 'merging' | 'awaiting-verification';
   restoreId: string;
   backupFingerprint: string;
+  backupRecordCount: number;
+  backupTotalCiphertextBytes: number;
+  manifestFingerprint: string;
   chunkCount: number;
   recordCount: number;
+  chunkRecordCounts: number[];
+  chunkFingerprints: string[];
+  totalCiphertextBytes: number;
   nextChunkIndex: number;
   committedRecordCount: number;
+  committedCiphertextBytes: number;
   startedAtMs: number;
+  sealedAtMs?: number;
+  sealOperationId?: string;
+  sealRequestFingerprint?: string;
+  sessionFingerprint?: string;
 }
 
 export interface PrivateProVaultRestoreCompletion {
@@ -99,6 +116,10 @@ export interface PrivateProVaultRestoreCompletion {
   restoreId: string;
   operationId: string;
   requestFingerprint: string;
+  sessionFingerprint: string;
+  manifestFingerprint: string;
+  sealOperationId: string;
+  sealRequestFingerprint: string;
   backupFingerprint: string;
   chunkCount: number;
   recordCount: number;

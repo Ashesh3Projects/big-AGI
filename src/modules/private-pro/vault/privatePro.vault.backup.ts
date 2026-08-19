@@ -6,6 +6,7 @@ import type { PrivateProVaultEnvelope, PrivateProVaultKeyset } from './privatePr
 import { PrivateProVaultAmbiguousTransportError, type PrivateProVaultTransport } from './privatePro.vault.transport';
 import { collectPrivateProVaultAssetIds } from './privatePro.vault.assets.client';
 import { PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES } from './privatePro.vault.repository';
+import { digestPrivateProVaultRestoreChunk } from './privatePro.vault.restore';
 import {
   createPrivateProEncryptedBackupStream,
   importPrivateProEncryptedBackup,
@@ -161,10 +162,15 @@ export async function importPrivateProVaultBackup(
     createBackupAssetClient?(masterKey: CryptoKey, keyVersion: number, vaultId: string): PrivateProVaultAssetClient;
     createAssetClient?(masterKey: CryptoKey, keyVersion: number, vaultId: string): PrivateProVaultAssetClient;
     createOperationId?(): string;
+    verifyHydrated?(
+      index: readonly import('./privatePro.vault.repository').PrivateProVaultIndexEntry[],
+      envelopes: readonly PrivateProVaultEnvelope[],
+    ): Promise<void>;
   },
 ) {
   const serializers = serializerMap(deps.serializers);
-  return importPrivateProEncryptedBackup(
+  let verifiedCloudHydration = false;
+  const result = await importPrivateProEncryptedBackup(
     stream,
     credential,
     async ({ envelope, plaintext }) => {
@@ -179,9 +185,11 @@ export async function importPrivateProVaultBackup(
         const activeMasterKey = deps.activeMasterKey;
         const activeKeyVersion = deps.activeKeyVersion;
         if (!deps.transport.isOnline()) throw new Error('Reconnect before merging an encrypted backup.');
+        if (!deps.verifyHydrated) throw new Error('Encrypted backup restore hydration is unavailable.');
         if (!deps.transport.beginBackupRestore || !deps.transport.getBackupRestoreStatus
           || !deps.transport.mergeBackupRestoreChunk || !deps.transport.getBackupRestoreIndex
-          || !deps.transport.getBackupRestoreRecords || !deps.transport.finalizeBackupRestore)
+          || !deps.transport.getBackupRestoreRecords || !deps.transport.sealBackupRestore
+          || !deps.transport.confirmBackupRestoreVerified)
           throw new Error('Encrypted backup restore sessions are unavailable.');
         const backupAssets = (deps.createBackupAssetClient ?? deps.createAssetClient)?.(
           input.masterKey, input.header.keyset.keyVersion, input.header.vaultId,
@@ -206,21 +214,79 @@ export async function importPrivateProVaultBackup(
         try {
           await deps.activeAssets.prepareForUpload(assetIds);
           const index = restoreStatus
+            && restoreStatus.phase !== 'completed'
             ? await deps.transport.getBackupRestoreIndex(restoreId)
             : await deps.transport.getIndex();
           const revisions = new Map(index.map(entry => [`${entry.recordType}:${entry.opaqueRecordId}`, entry.revision]));
+          const nonceKey = await deriveVaultSubkey(activeMasterKey, 'backup-restore-nonce', backupFingerprint, ['sign']);
+          const restoreChunksWithManifest = await Promise.all(chunks.map(async (chunk, chunkIndex) => {
+            const records = await Promise.all(chunk.map(async record => {
+              const currentRevision = revisions.get(`${record.serializer.recordType}:${record.recordId}`) ?? 0;
+              const alreadyCommitted = restoreStatus !== null
+                && restoreStatus.phase !== 'completed'
+                && chunkIndex < restoreStatus.nextChunkIndex;
+              if (alreadyCommitted && currentRevision < 1)
+                throw new PrivateProVaultBackupCommittedError('Cloud backup restore progress is incomplete. Restart to reconcile.');
+              const baseRevision = alreadyCommitted ? currentRevision - 1 : currentRevision;
+              const key = await deriveVaultSubkey(
+                activeMasterKey, 'record-encryption', `${record.serializer.recordType}:${record.recordId}`, ['encrypt'],
+              );
+              const nonce = new Uint8Array(await crypto.subtle.sign(
+                'HMAC',
+                nonceKey,
+                textEncoder.encode(canonicalJson({
+                  kind: 'private-pro-vault-restore-nonce/v1',
+                  backupFingerprint,
+                  recordType: record.serializer.recordType,
+                  recordId: record.recordId,
+                  revision: baseRevision + 1,
+                })),
+              )).slice(0, 12);
+              const envelope = await encryptVaultRecord(key, {
+                vaultId: deps.uid,
+                formatVersion: 1,
+                recordType: record.serializer.recordType,
+                recordId: record.recordId,
+                schemaVersion: record.serializer.schemaVersion,
+                keyVersion: activeKeyVersion,
+                revision: baseRevision + 1,
+              }, record.plaintext, nonce);
+              nonce.fill(0);
+              return { ...record, baseRevision, envelope };
+            }));
+            return {
+              records,
+              chunkFingerprint: await digestPrivateProVaultRestoreChunk(records.map(record => ({
+                opaqueRecordId: record.recordId,
+                baseRevision: record.baseRevision,
+                envelope: record.envelope,
+              }))),
+            };
+          }));
+          const totalRestoreCiphertextBytes = restoreChunksWithManifest
+            .flatMap(chunk => chunk.records)
+            .reduce((sum, record) => sum + record.envelope.ciphertextBytes, 0);
           const expectedRevisions = new Map<string, number>();
           if (restoreStatus && restoreStatus.nextChunkIndex > 0) {
-            for (const record of chunks.slice(0, restoreStatus.nextChunkIndex).flat()) {
+            for (const record of restoreChunksWithManifest.slice(0, restoreStatus.nextChunkIndex).flatMap(chunk => chunk.records)) {
               const revision = revisions.get(`${record.serializer.recordType}:${record.recordId}`);
               if (!revision)
                 throw new PrivateProVaultBackupCommittedError('Cloud backup restore progress is incomplete. Restart to reconcile.');
               expectedRevisions.set(record.recordId, revision);
             }
           }
+          if (restoreStatus?.phase === 'completed') return;
           try {
             await retryAmbiguous(deps.transport, () => deps.transport!.beginBackupRestore!({
-              restoreId, backupFingerprint, chunkCount: chunks.length, recordCount: staged.length,
+              restoreId,
+              backupFingerprint,
+              backupRecordCount: input.records.length,
+              backupTotalCiphertextBytes: input.totalCiphertextBytes,
+              chunkCount: restoreChunksWithManifest.length,
+              recordCount: staged.length,
+              chunkRecordCounts: restoreChunksWithManifest.map(chunk => chunk.records.length),
+              chunkFingerprints: restoreChunksWithManifest.map(chunk => chunk.chunkFingerprint),
+              totalCiphertextBytes: totalRestoreCiphertextBytes,
             }));
           } catch (error) {
             if (error instanceof PrivateProVaultAmbiguousTransportError) {
@@ -232,47 +298,40 @@ export async function importPrivateProVaultBackup(
           cloudCommitted = true;
           const status = await deps.transport.getBackupRestoreStatus(restoreId);
           let nextChunkIndex = status?.nextChunkIndex ?? 0;
-          for (let chunkIndex = nextChunkIndex; chunkIndex < chunks.length; chunkIndex++) {
-            const chunk = await Promise.all(chunks[chunkIndex].map(async record => {
-              const baseRevision = revisions.get(`${record.serializer.recordType}:${record.recordId}`) ?? 0;
-              const key = await deriveVaultSubkey(
-                activeMasterKey, 'record-encryption', `${record.serializer.recordType}:${record.recordId}`, ['encrypt'],
-              );
-              const envelope = await encryptVaultRecord(key, {
-                vaultId: deps.uid,
-                formatVersion: 1,
-                recordType: record.serializer.recordType,
-                recordId: record.recordId,
-                schemaVersion: record.serializer.schemaVersion,
-                keyVersion: activeKeyVersion,
-                revision: baseRevision + 1,
-              }, record.plaintext);
-              return { ...record, baseRevision, envelope };
-            }));
+          for (let chunkIndex = nextChunkIndex; chunkIndex < restoreChunksWithManifest.length; chunkIndex++) {
+            const chunk = restoreChunksWithManifest[chunkIndex].records;
             const result = await retryAmbiguous(deps.transport, () => deps.transport!.mergeBackupRestoreChunk!({
               restoreId,
               operationId: `restore-chunk-${backupFingerprint}:${chunkIndex}`,
               chunkIndex,
-              chunkCount: chunks.length,
+              chunkFingerprint: restoreChunksWithManifest[chunkIndex].chunkFingerprint,
               records: chunk.map(record => ({ opaqueRecordId: record.recordId, baseRevision: record.baseRevision, envelope: record.envelope })),
             }));
             if (result.status === 'conflict') throw new Error('The cloud vault changed during backup merge. Retry the merge.');
             for (const record of chunk) expectedRevisions.set(record.recordId, record.envelope.revision);
             nextChunkIndex = result.nextChunkIndex;
           }
-          if (nextChunkIndex !== chunks.length)
+          if (nextChunkIndex !== restoreChunksWithManifest.length)
             throw new PrivateProVaultBackupCommittedError('Cloud backup restore is incomplete. Restart to reconcile.');
-          await retryAmbiguous(deps.transport, () => deps.transport!.finalizeBackupRestore!({
+          const sealed = await retryAmbiguous(deps.transport, () => deps.transport!.sealBackupRestore!({
             restoreId,
-            operationId: `restore-finalize-${backupFingerprint}`,
+            operationId: `restore-seal-${backupFingerprint}`,
           }));
           const verifiedIndex = await deps.transport.getBackupRestoreIndex(restoreId);
           const restoredIds = new Set(staged.map(record => `${record.serializer.recordType}:${record.recordId}`));
           const relevantIndex = verifiedIndex
             .filter(entry => restoredIds.has(`${entry.recordType}:${entry.opaqueRecordId}`))
             .sort((left, right) => left.opaqueRecordId.localeCompare(right.opaqueRecordId));
-          const verifiedEnvelopes = await deps.transport.getBackupRestoreRecords(restoreId, relevantIndex.map(entry => entry.opaqueRecordId));
-          const verifiedById = new Map(verifiedEnvelopes.map(envelope => [envelope.recordId, envelope]));
+          const allRecordEntries = verifiedIndex.filter(entry => entry.kind === 'record');
+          const allVerifiedEnvelopes = await deps.transport.getBackupRestoreRecords(
+            restoreId,
+            allRecordEntries.map(entry => entry.opaqueRecordId),
+          );
+          const verifiedById = new Map(allVerifiedEnvelopes.map(envelope => [envelope.recordId, envelope]));
+          const verifiedEnvelopes = relevantIndex.flatMap(entry => {
+            const envelope = verifiedById.get(entry.opaqueRecordId);
+            return envelope ? [envelope] : [];
+          });
           for (const record of staged) {
             const entry = relevantIndex.find(candidate => candidate.opaqueRecordId === record.recordId);
             const envelope = verifiedById.get(record.recordId);
@@ -296,6 +355,15 @@ export async function importPrivateProVaultBackup(
           }
           if (verifiedEnvelopes.length !== staged.length)
             throw new PrivateProVaultBackupCommittedError('Cloud backup merge committed, but exact verification is incomplete. Restart to reconcile.');
+          if (allVerifiedEnvelopes.length !== allRecordEntries.length)
+            throw new PrivateProVaultBackupCommittedError('Cloud backup restore record hydration is incomplete. Restart to reconcile.');
+          await deps.verifyHydrated(verifiedIndex, allVerifiedEnvelopes);
+          verifiedCloudHydration = true;
+          await retryAmbiguous(deps.transport, () => deps.transport!.confirmBackupRestoreVerified!({
+            restoreId,
+            operationId: `restore-confirm-${backupFingerprint}`,
+            sessionFingerprint: sealed.sessionFingerprint,
+          }));
           return;
         } catch (error) {
           if (!cloudCommitted) {
@@ -362,4 +430,5 @@ export async function importPrivateProVaultBackup(
       }
     },
   );
+  return { ...result, verifiedCloudHydration };
 }
