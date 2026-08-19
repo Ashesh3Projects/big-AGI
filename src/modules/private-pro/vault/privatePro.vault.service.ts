@@ -111,6 +111,7 @@ export interface BeginVaultDeviceRegistrationInput {
 
 export interface CompleteVaultDeviceRegistrationInput {
   operationId: string;
+  formatVersion: 1;
   deviceId: string;
   keyVersion: number;
   challengeId: string;
@@ -250,6 +251,7 @@ export function createPrivateProVaultService(
       assertOpaqueRecordId(input.deviceId, 'device ID');
       assertOpaqueRecordId(input.challengeId, 'registration challenge ID');
       assertOperationId(input.operationId);
+      if (input.formatVersion !== 1) throw new Error('Vault device registration version is invalid.');
       if (!Number.isSafeInteger(input.keyVersion) || input.keyVersion <= 0) throw new Error('Vault device key version is invalid.');
       if (!Number.isSafeInteger(input.expiresAtMs) || input.expiresAtMs <= 0) throw new Error('Vault registration challenge expiry is invalid.');
       if (!/^(?:[A-Za-z0-9+/]{4}){10}[A-Za-z0-9+/]{3}=$/.test(input.challengeBase64)
@@ -274,7 +276,7 @@ export function createPrivateProVaultService(
           throw new Error('Vault registration challenge is invalid.');
         if (challenge.expiresAtMs <= now()) throw new Error('Vault registration challenge expired.');
         if (!await verifyPrivateProVaultDeviceRegistration(storedKeyset.keyset.enrollmentAuthority.publicJwk, {
-          formatVersion: 1,
+          formatVersion: input.formatVersion,
           uid,
           deviceId: input.deviceId,
           keyVersion: input.keyVersion,

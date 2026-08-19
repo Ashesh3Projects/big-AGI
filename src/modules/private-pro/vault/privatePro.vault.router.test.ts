@@ -239,8 +239,8 @@ describe('private Pro vault router input bounds', () => {
 
     await caller.bootstrap({ deviceId: DEVICE_ID });
     await caller.listDevices();
-    await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
-    await caller.completeDeviceRegistration({ operationId: 'register-device-1', deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' });
+    const challenge = await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
+    await caller.completeDeviceRegistration({ operationId: 'register-device-1', ...challenge, signatureBase64: 'AA==' });
     await caller.getIndex({ pageSize: 1 });
     await caller.getRecords({ opaqueRecordIds: [RECORD_ID] });
     await caller.putRecord({
@@ -312,13 +312,13 @@ describe('private Pro vault router input bounds', () => {
     const caller = (await router()).createCaller(context(identity()));
 
     await caller.putKeyset({ operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) });
-    await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
-    await caller.completeDeviceRegistration({ operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' });
+    const challenge = await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
+    await caller.completeDeviceRegistration({ operationId: 'register-device-initial', ...challenge, signatureBase64: 'AA==' });
 
     assert.deepEqual(state.calls, [
       { method: 'putKeyset', uid: UID, input: { operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) } },
       { method: 'beginDeviceRegistration', uid: UID, input: { deviceId: DEVICE_ID, keyVersion: 1 } },
-      { method: 'completeDeviceRegistration', uid: UID, input: { operationId: 'register-device-initial', deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' } },
+      { method: 'completeDeviceRegistration', uid: UID, input: { operationId: 'register-device-initial', formatVersion: 1, deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' } },
     ]);
   });
 

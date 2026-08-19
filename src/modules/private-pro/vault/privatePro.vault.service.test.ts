@@ -661,6 +661,12 @@ describe('Private Pro encrypted vault service', () => {
       signatureBase64: await signPrivateProVaultDeviceRegistration(registration.privateKey, { uid: UID_A, ...challenge }),
     };
 
+    await assert.rejects(
+      // @ts-expect-error The runtime boundary must also reject unsupported protocol versions.
+      service.completeDeviceRegistration(UID_A, { ...valid, formatVersion: 2 }),
+      /version/i,
+    );
+
     for (const tampered of [
       { ...valid, deviceId: 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee' },
       { ...valid, keyVersion: 2 },

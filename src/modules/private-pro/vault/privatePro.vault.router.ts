@@ -72,6 +72,7 @@ export function createPrivateProVaultRouter(
   completeDeviceRegistration: procedure
     .input(z.object({
       operationId: operationIdSchema,
+      formatVersion: z.literal(1),
       deviceId: opaqueIdSchema,
       keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       challengeId: opaqueIdSchema,
