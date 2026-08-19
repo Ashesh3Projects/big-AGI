@@ -22,10 +22,20 @@ interface WebLocksPort {
   request(name: string, options: LockOptions, callback: () => Promise<void>): Promise<void>;
 }
 
+interface LeaseIdentity {
+  fence: number;
+  ownerToken: string;
+}
+
 export interface PrivateProCoordinatorLeasePort {
   acquireCoordinatorLease(uid: string, name: string, nowMs: number, leaseMs: number): Promise<PrivateProCoordinatorLease | null>;
   renewCoordinatorLease(uid: string, name: string, fence: number, ownerToken: string, nowMs: number, leaseMs: number): Promise<PrivateProCoordinatorLease | null>;
   releaseCoordinatorLease(uid: string, name: string, fence: number, ownerToken: string): Promise<void>;
+}
+
+export interface PrivateProSyncLeaderContext {
+  signal: AbortSignal;
+  coordinatorFence: number;
 }
 
 export interface PrivateProSyncCoordinatorOptions {
@@ -41,10 +51,19 @@ export interface PrivateProSyncCoordinatorOptions {
 }
 
 export interface PrivateProSyncCoordinator {
-  start(runLeader: (signal: AbortSignal) => Promise<void>): Promise<void>;
+  start(runLeader: (context: PrivateProSyncLeaderContext) => Promise<void>): Promise<void>;
   wake(): void;
   stop(): Promise<void>;
   isLeader(): boolean;
+}
+
+
+function sameLeaseIdentity(left: LeaseIdentity | null, right: LeaseIdentity | null): boolean {
+  return !!left && !!right && left.fence === right.fence && left.ownerToken === right.ownerToken;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === 'AbortError';
 }
 
 
@@ -60,14 +79,23 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
   let started = false;
   let stopped = false;
   let leader = false;
-  let runLeader: ((signal: AbortSignal) => Promise<void>) | null = null;
+  let coordinatorFailure: unknown = null;
+  let runLeader: ((context: PrivateProSyncLeaderContext) => Promise<void>) | null = null;
   let leaderAbort: AbortController | null = null;
   let webLockAbort: AbortController | null = null;
+  let webLockRequest: Promise<void> | null = null;
   let leadership: Promise<void> | null = null;
   let fallbackLease: PrivateProCoordinatorLease | null = null;
+  let fallbackIdentity: LeaseIdentity | null = null;
   let fallbackPollTimer: IntervalHandle | null = null;
   let fallbackRenewTimer: IntervalHandle | null = null;
   let fallbackAttempt: Promise<void> | null = null;
+  let renewalPromise: Promise<void> | null = null;
+
+  function rememberFailure(error: unknown, signal?: AbortSignal): void {
+    if (coordinatorFailure || (signal?.aborted && isAbortError(error)) || (stopped && isAbortError(error))) return;
+    coordinatorFailure = error;
+  }
 
   function ensureChannel(): void {
     if (channel || !broadcastChannel) return;
@@ -90,53 +118,70 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
     fallbackPollTimer = null;
   }
 
-  async function endLeadership(releaseFallbackLease: boolean): Promise<void> {
-    const lease = fallbackLease;
-    fallbackLease = null;
-    clearFallbackRenewTimer();
-    if (leaderAbort) leaderAbort.abort();
-    if (releaseFallbackLease && lease && options.leases)
-      await options.leases.releaseCoordinatorLease(options.uid, COORDINATOR_NAME, lease.fence, lease.ownerToken);
+  async function releaseFallbackIdentity(identity: LeaseIdentity | null): Promise<void> {
+    if (!identity || !options.leases) return;
+    await options.leases.releaseCoordinatorLease(options.uid, COORDINATOR_NAME, identity.fence, identity.ownerToken);
   }
 
   async function runAsLeader(lease: PrivateProCoordinatorLease | null): Promise<void> {
     if (stopped || !runLeader) return;
+    const identity = lease ? { fence: lease.fence, ownerToken: lease.ownerToken } : null;
     leader = true;
     leaderAbort = new AbortController();
     if (lease) {
       fallbackLease = lease;
+      fallbackIdentity = identity;
       fallbackRenewTimer = scheduleInterval(() => {
-        if (fallbackLease) void renewFallbackLease(fallbackLease);
+        if (!renewalPromise && fallbackLease && fallbackIdentity) void renewFallbackLease(fallbackLease, fallbackIdentity);
       }, FALLBACK_RENEW_MS);
     }
     try {
-      await runLeader(leaderAbort.signal);
+      await runLeader({ signal: leaderAbort.signal, coordinatorFence: lease?.fence ?? 0 });
+    } catch (error) {
+      rememberFailure(error, leaderAbort.signal);
     } finally {
       leader = false;
       leaderAbort = null;
-      const mustRelease = fallbackLease === lease;
-      await endLeadership(mustRelease);
+      clearFallbackRenewTimer();
+      if (!stopped) {
+        await releaseFallbackIdentity(identity);
+        if (sameLeaseIdentity(fallbackIdentity, identity)) {
+          fallbackLease = null;
+          fallbackIdentity = null;
+        }
+      }
     }
   }
 
-  async function renewFallbackLease(lease: PrivateProCoordinatorLease): Promise<void> {
-    if (stopped || fallbackLease !== lease || !options.leases) return;
-    const renewed = await options.leases.renewCoordinatorLease(
-      options.uid,
-      COORDINATOR_NAME,
-      lease.fence,
-      lease.ownerToken,
-      now(),
-      FALLBACK_LEASE_MS,
-    );
-    if (renewed) {
-      fallbackLease = renewed;
-      return;
-    }
-    if (fallbackLease === lease) {
-      fallbackLease = null;
+  async function renewFallbackLease(lease: PrivateProCoordinatorLease, identity: LeaseIdentity): Promise<void> {
+    if (stopped || !leader || !options.leases || !sameLeaseIdentity(fallbackIdentity, identity)) return;
+    renewalPromise = (async () => {
+      const renewed = await options.leases!.renewCoordinatorLease(
+        options.uid,
+        COORDINATOR_NAME,
+        identity.fence,
+        identity.ownerToken,
+        now(),
+        FALLBACK_LEASE_MS,
+      );
+      if (stopped || !leader || !sameLeaseIdentity(fallbackIdentity, identity)) {
+        if (renewed) await releaseFallbackIdentity(identity);
+        return;
+      }
+      if (renewed) {
+        fallbackLease = renewed;
+        return;
+      }
       clearFallbackRenewTimer();
       leaderAbort?.abort();
+    })();
+    try {
+      await renewalPromise;
+    } catch (error) {
+      rememberFailure(error);
+      if (sameLeaseIdentity(fallbackIdentity, identity)) leaderAbort?.abort();
+    } finally {
+      renewalPromise = null;
     }
   }
 
@@ -146,7 +191,7 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       const lease = await options.leases!.acquireCoordinatorLease(options.uid, COORDINATOR_NAME, now(), FALLBACK_LEASE_MS);
       if (!lease) return;
       if (stopped) {
-        await options.leases!.releaseCoordinatorLease(options.uid, COORDINATOR_NAME, lease.fence, lease.ownerToken);
+        await releaseFallbackIdentity(lease);
         return;
       }
       leadership = runAsLeader(lease);
@@ -154,6 +199,8 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
     })();
     try {
       await fallbackAttempt;
+    } catch (error) {
+      rememberFailure(error);
     } finally {
       fallbackAttempt = null;
     }
@@ -169,16 +216,17 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       if (started) return;
       started = true;
       stopped = false;
+      coordinatorFailure = null;
       runLeader = nextRunLeader;
       ensureChannel();
 
       if (locks) {
         webLockAbort = new AbortController();
-        void locks.request(lockName, { mode: 'exclusive', signal: webLockAbort.signal }, async () => {
+        webLockRequest = locks.request(lockName, { mode: 'exclusive', signal: webLockAbort.signal }, async () => {
           leadership = runAsLeader(null);
           await leadership;
         }).catch(error => {
-          if (!stopped) throw error;
+          if (!(stopped && isAbortError(error))) rememberFailure(error, webLockAbort?.signal);
         });
         return;
       }
@@ -196,16 +244,23 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       if (!started) return;
       stopped = true;
       channel?.postMessage('signed-out');
-      webLockAbort?.abort();
       clearFallbackPollTimer();
-      await endLeadership(true);
+      clearFallbackRenewTimer();
+      webLockAbort?.abort();
+      leaderAbort?.abort();
       await fallbackAttempt;
+      await renewalPromise;
       await leadership;
+      await releaseFallbackIdentity(fallbackIdentity);
+      await webLockRequest;
       channel?.close();
       channel = null;
       started = false;
       runLeader = null;
       webLockAbort = null;
+      fallbackLease = null;
+      fallbackIdentity = null;
+      if (coordinatorFailure) throw coordinatorFailure;
     },
 
     isLeader(): boolean {
