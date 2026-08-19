@@ -23,6 +23,7 @@ import {
   restorePrivateProRememberedUnlock,
   rewrapPrivateProVaultPassword,
   rewrapPrivateProVaultPasswordWithRecovery,
+  type PrivateProRememberedUnlockSource,
   unlockPrivateProVaultCredentialsWithPassword,
   unlockPrivateProVaultCredentialsWithRecovery,
 } from './privatePro.vault.keyset';
@@ -53,16 +54,16 @@ export interface PrivateProVaultPublicState {
   revokeOtherDevicesRecommended: boolean;
 }
 
-export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnrollmentKey = unknown> {
+export interface PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnrollmentKey = unknown, TRememberedUnlockSource = unknown> {
   isOnline(): boolean;
   bootstrap(): Promise<{ keyset: TKeyset | null; rememberedDeviceKnown: boolean }>;
   restoreRemembered(keyset: TKeyset): Promise<TMasterKey | null>;
-  unlockPassword(keyset: TKeyset, password: string): Promise<{ masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
-  unlockRecovery(keyset: TKeyset, recoveryKey: string, newPassword: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey }>;
+  unlockPassword(keyset: TKeyset, password: string): Promise<{ masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; rememberedUnlockSource: TRememberedUnlockSource }>;
+  unlockRecovery(keyset: TKeyset, recoveryKey: string, newPassword: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; rememberedUnlockSource: TRememberedUnlockSource }>;
   commitRecovery(previousKeyset: TKeyset, rotatedKeyset: TKeyset): Promise<'committed' | 'conflict'>;
-  setup(password: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; recoveryKey: string }>;
+  setup(password: string): Promise<{ keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; rememberedUnlockSource: TRememberedUnlockSource; recoveryKey: string }>;
   commitSetup(keyset: TKeyset, operationId: string): Promise<'committed' | 'conflict'>;
-  remember(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
+  remember(rememberedUnlockSource: TRememberedUnlockSource, masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
   register(keyset: TKeyset, enrollmentKey: TEnrollmentKey): Promise<void>;
   activate(masterKey: TMasterKey, keyset: TKeyset): Promise<void>;
   subscribeRuntime(listener: (phase: 'hydrating' | 'ready' | 'reconnecting' | 'error') => void): () => void;
@@ -212,14 +213,14 @@ function errorForPhase(phase: PrivateProVaultPublicPhase): string {
   return 'The encrypted vault could not be opened.';
 }
 
-export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentKey>(
-  deps: PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnrollmentKey>,
+export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentKey, TRememberedUnlockSource>(
+  deps: PrivateProVaultLifecycleDependencies<TKeyset, TMasterKey, TEnrollmentKey, TRememberedUnlockSource>,
 ): PrivateProVaultLifecycle {
   let state = INITIAL_STATE;
   let keyset: TKeyset | null = null;
   let masterKey: TMasterKey | null = null;
   let activationReady = false;
-  let pendingSetup: { keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; recoveryKey: string; operationId: string } | null = null;
+  let pendingSetup: { keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; rememberedUnlockSource: TRememberedUnlockSource; recoveryKey: string; operationId: string } | null = null;
   let confirmation: Promise<void> | null = null;
   let destroyed = false;
   let unsubscribeRuntime: (() => void) | undefined;
@@ -325,7 +326,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
             return;
           }
           await deps.register(pending.keyset, pending.enrollmentKey);
-          await deps.remember(pending.masterKey, pending.keyset);
+          await deps.remember(pending.rememberedUnlockSource, pending.masterKey, pending.keyset);
           await deps.activate(pending.masterKey, pending.keyset);
           masterKey = pending.masterKey;
           keyset = pending.keyset;
@@ -344,7 +345,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
     async unlockWithPassword(password) {
       if (!keyset) return start();
       setState({ phase: 'locked', busy: true, error: null });
-      let unlocked: { masterKey: TMasterKey; enrollmentKey: TEnrollmentKey };
+      let unlocked: { masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; rememberedUnlockSource: TRememberedUnlockSource };
       try {
         unlocked = await deps.unlockPassword(keyset, password);
       } catch {
@@ -358,7 +359,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
         return;
       }
       try {
-        await deps.remember(unlocked.masterKey, keyset);
+        await deps.remember(unlocked.rememberedUnlockSource, unlocked.masterKey, keyset);
       } catch {
         setState({ phase: 'locked', busy: false, error: REMEMBER_UNLOCK_FAILED });
         return;
@@ -372,7 +373,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
         return;
       }
       setState({ phase: 'locked', busy: true, error: null });
-      let unlocked: { keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey };
+      let unlocked: { keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey; rememberedUnlockSource: TRememberedUnlockSource };
       try {
         unlocked = await deps.unlockRecovery(keyset, recoveryKey, newPassword);
       } catch {
@@ -394,7 +395,7 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
       }
       keyset = unlocked.keyset;
       try {
-        await deps.remember(unlocked.masterKey, unlocked.keyset);
+        await deps.remember(unlocked.rememberedUnlockSource, unlocked.masterKey, unlocked.keyset);
       } catch {
         setState({ phase: 'locked', busy: false, error: REMEMBER_UNLOCK_FAILED });
         return;
@@ -427,7 +428,7 @@ function createProductionDependencies(
   user: User,
   signOut: () => Promise<void>,
   runtime: PrivateProVaultRuntimeState,
-): PrivateProVaultLifecycleDependencies<PrivateProVaultKeyset, CryptoKey, CryptoKey> {
+): PrivateProVaultLifecycleDependencies<PrivateProVaultKeyset, CryptoKey, CryptoKey, PrivateProRememberedUnlockSource> {
   let deviceId = '';
   return {
     isOnline: () => typeof navigator === 'undefined' || navigator.onLine,
@@ -488,8 +489,8 @@ function createProductionDependencies(
       });
       return result.status === 'conflict' ? 'conflict' : 'committed';
     },
-    async remember(masterKey, keyset) {
-      const remembered = await createPrivateProRememberedUnlock(masterKey);
+    async remember(rememberedSource, masterKey, keyset) {
+      const remembered = await createPrivateProRememberedUnlock(rememberedSource);
       await privateProVaultDB.transaction('rw', [privateProVaultDB.deviceKeys, privateProVaultDB.wrappedKeys], async () => {
         await privateProVaultDB.storeDeviceKey(user.uid, remembered.deviceKey, deviceId);
         await privateProVaultDB.wrappedKeys.put({ uid: user.uid, envelope: remembered.envelope });

@@ -55,6 +55,7 @@ export function PrivateProVaultSetup(props: PrivateProVaultSetupProps) {
             <FormLabel>Recovery key groups</FormLabel>
             <Input autoComplete='off' value={recoveryConfirmation} onChange={event => setRecoveryConfirmation(event.target.value)} />
           </FormControl>
+          {props.error && <Alert color='danger'>{props.error}</Alert>}
           <Button loading={props.busy} disabled={enteredConfirmation !== expectedConfirmation} onClick={() => void props.onRecoveryConfirmed()}>
             Save recovery key
           </Button>

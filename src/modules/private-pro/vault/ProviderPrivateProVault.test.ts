@@ -19,8 +19,13 @@ import { PrivateProVaultStatus } from '../ui/PrivateProVaultStatus';
 import { PrivateProVaultUnlock } from '../ui/PrivateProVaultUnlock';
 import { PrivateProVaultRecoveryRecommendation } from '../ui/PrivateProVaultRecoveryRecommendation';
 import {
+  createPrivateProRememberedUnlock,
+  createPrivateProVaultKeyset,
   rewrapPrivateProVaultPassword,
   rewrapPrivateProVaultPasswordWithRecovery,
+  restorePrivateProRememberedUnlock,
+  unlockPrivateProVaultCredentialsWithPassword,
+  unlockPrivateProVaultCredentialsWithRecovery,
   unlockPrivateProVaultWithPassword,
   unlockPrivateProVaultWithRecovery,
 } from './privatePro.vault.keyset';
@@ -39,10 +44,11 @@ type _MigratingIsNotAVaultPhase = AssertFalse<'migrating' extends PrivateProVaul
 
 
 interface Harness {
-  deps: PrivateProVaultLifecycleDependencies<string, string, string>;
+  deps: PrivateProVaultLifecycleDependencies<string, string, string, string>;
   phases: PrivateProVaultLifecyclePhase[];
   operationIds: string[];
   registrationKeys: string[];
+  rememberedUnlockSources: string[];
   resolveApply?: () => void;
   runtimePhase(phase: 'hydrating' | 'ready' | 'reconnecting' | 'error'): void;
   counts: {
@@ -85,10 +91,11 @@ function createHarness(options: {
   const phases: PrivateProVaultLifecyclePhase[] = [];
   const operationIds: string[] = [];
   const registrationKeys: string[] = [];
+  const rememberedUnlockSources: string[] = [];
   let runtimeListener: ((phase: 'hydrating' | 'ready' | 'reconnecting' | 'error') => void) | undefined;
   let resolveApply: (() => void) | undefined;
 
-  const deps: PrivateProVaultLifecycleDependencies<string, string, string> = {
+  const deps: PrivateProVaultLifecycleDependencies<string, string, string, string> = {
     isOnline: () => options.online ?? true,
     bootstrap: async () => {
       counts.bootstrap++;
@@ -101,17 +108,17 @@ function createHarness(options: {
     unlockPassword: async (_keyset, _password) => {
       counts.passwordUnlock++;
       if (options.passwordError) throw options.passwordError;
-      return { masterKey: 'password-master-key', enrollmentKey: 'password-enrollment-key' };
+      return { masterKey: 'password-master-key', enrollmentKey: 'password-enrollment-key', rememberedUnlockSource: 'password-remembered-source' };
     },
     unlockRecovery: async (_keyset, _recoveryKey, _newPassword) => {
       counts.recoveryUnlock++;
       if (options.recoveryError) throw options.recoveryError;
-      return { keyset: 'keyset-2', masterKey: 'recovery-master-key', enrollmentKey: 'recovery-enrollment-key' };
+      return { keyset: 'keyset-2', masterKey: 'recovery-master-key', enrollmentKey: 'recovery-enrollment-key', rememberedUnlockSource: 'recovery-remembered-source' };
     },
     commitRecovery: async () => { counts.commitRecovery++; return 'committed'; },
     setup: async (_password) => {
       counts.setup++;
-      return { keyset: 'keyset-1', masterKey: 'setup-master-key', enrollmentKey: 'setup-enrollment-key', recoveryKey: 'AAAA-BBBB-CCCC-DDDD' };
+      return { keyset: 'keyset-1', masterKey: 'setup-master-key', enrollmentKey: 'setup-enrollment-key', rememberedUnlockSource: 'setup-remembered-source', recoveryKey: 'AAAA-BBBB-CCCC-DDDD' };
     },
     commitSetup: async (_keyset, operationId) => {
       counts.commitSetup++;
@@ -119,7 +126,7 @@ function createHarness(options: {
       if (options.commitError) throw options.commitError;
       return 'committed';
     },
-    remember: async () => { counts.remember++; },
+    remember: async (rememberedUnlockSource) => { counts.remember++; rememberedUnlockSources.push(rememberedUnlockSource); },
     register: async (_keyset, enrollmentKey) => { counts.register++; registrationKeys.push(enrollmentKey); },
     activate: async () => {
       counts.activate++;
@@ -140,6 +147,7 @@ function createHarness(options: {
     phases,
     operationIds,
     registrationKeys,
+    rememberedUnlockSources,
     counts,
     get resolveApply() { return resolveApply; },
     runtimePhase: phase => runtimeListener?.(phase),
@@ -334,6 +342,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(lifecycle.getState().phase, 'ready');
     assert.equal(lifecycle.getState().recoveryKey, null);
     assert.deepEqual(harness.registrationKeys, ['setup-enrollment-key']);
+    assert.deepEqual(harness.rememberedUnlockSources, ['setup-remembered-source']);
   });
 
   test('failed setup confirmation preserves the recovery key and retry succeeds', async () => {
@@ -426,6 +435,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(harness.counts.remember, 1);
     assert.equal(harness.counts.register, 1);
     assert.deepEqual(harness.registrationKeys, ['password-enrollment-key']);
+    assert.deepEqual(harness.rememberedUnlockSources, ['password-remembered-source']);
   });
 
   test('password unlock authorizes the device before persisting remembered unlock state', async () => {
@@ -466,6 +476,7 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(harness.counts.register, 1);
     assert.equal(harness.counts.commitRecovery, 1);
     assert.deepEqual(harness.registrationKeys, ['recovery-enrollment-key']);
+    assert.deepEqual(harness.rememberedUnlockSources, ['recovery-remembered-source']);
     assert.equal(lifecycle.getState().revokeOtherDevicesRecommended, true);
   });
 
@@ -643,7 +654,7 @@ describe('private Pro vault accessibility', () => {
     }));
     const recoveryMarkup = renderToStaticMarkup(React.createElement(PrivateProVaultSetup, {
       busy: false,
-      error: null,
+      error: 'The encrypted vault could not be created.',
       recoveryKey: 'AAAA-BBBB-CCCC-DDDD',
       onSetup: async () => {},
       onRecoveryConfirmed: async () => {},
@@ -654,6 +665,7 @@ describe('private Pro vault accessibility', () => {
     assert.match(passwordMarkup, /type="password"/);
     assert.match(recoveryMarkup, /<label[^>]*>Recovery key groups<\/label>/);
     assert.match(recoveryMarkup, /Save recovery key/);
+    assert.match(recoveryMarkup, /The encrypted vault could not be created/);
   });
 
   test('unlock provides password and recovery tabs without ever rendering a stored recovery key', () => {
@@ -763,6 +775,44 @@ describe('private Pro vault keyset lifecycle', () => {
 
     assert.equal(masterKey.algorithm.name, 'HKDF');
     assert.equal(masterKey.extractable, false);
+  });
+
+  test('setup can create remembered unlock material without exporting the runtime master key', async () => {
+    const created = await withVaultPasswordWorker(
+      realArgon2idWorkerResponse,
+      () => createPrivateProVaultKeyset('correct horse battery staple', 'uid-test'),
+    );
+    const remembered = await createPrivateProRememberedUnlock(created.rememberedUnlockSource);
+    const restored = await restorePrivateProRememberedUnlock(remembered.deviceKey, remembered.envelope);
+
+    assert.equal(created.masterKey.extractable, false);
+    assert.equal(restored.algorithm.name, 'HKDF');
+    assert.equal(restored.extractable, false);
+    assert.deepEqual(restored.usages, ['deriveKey']);
+  });
+
+  test('password unlock can create remembered material without making the runtime master key extractable', async () => {
+    const { keyset } = await keysetFixture('old vault password');
+
+    const unlocked = await unlockPrivateProVaultCredentialsWithPassword(keyset, 'old vault password', 'uid-test');
+    const remembered = await createPrivateProRememberedUnlock(unlocked.rememberedUnlockSource);
+    const restored = await restorePrivateProRememberedUnlock(remembered.deviceKey, remembered.envelope);
+
+    assert.equal(unlocked.masterKey.extractable, false);
+    assert.equal(restored.algorithm.name, 'HKDF');
+    assert.equal(restored.extractable, false);
+  });
+
+  test('recovery unlock can create remembered material without making the runtime master key extractable', async () => {
+    const { keyset, recoveryKey } = await keysetFixture('old vault password');
+
+    const unlocked = await unlockPrivateProVaultCredentialsWithRecovery(keyset, recoveryKey, 'uid-test');
+    const remembered = await createPrivateProRememberedUnlock(unlocked.rememberedUnlockSource);
+    const restored = await restorePrivateProRememberedUnlock(remembered.deviceKey, remembered.envelope);
+
+    assert.equal(unlocked.masterKey.extractable, false);
+    assert.equal(restored.algorithm.name, 'HKDF');
+    assert.equal(restored.extractable, false);
   });
 
   test('password rotation requires the current password and preserves recovery unlock', async () => {
