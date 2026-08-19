@@ -39,6 +39,7 @@ export interface PrivateProOutboxState extends PrivateProSyncRecordIdentity {
   leaseUntilMs: number | null;
   leaseToken: string | null;
   leaseFence: number | null;
+  leasedGeneration: number | null;
   blocked: boolean;
   errorCode: string | null;
 }
@@ -99,6 +100,13 @@ function asIdentity(record: PrivateProSyncPreparedRecord): PrivateProSyncRecordI
     projectionKey: record.projectionKey,
     schemaVersion: record.schemaVersion,
   };
+}
+
+function clearOutboxLease(state: PrivateProOutboxState): void {
+  state.leaseUntilMs = null;
+  state.leaseToken = null;
+  state.leaseFence = null;
+  state.leasedGeneration = null;
 }
 
 
@@ -177,6 +185,7 @@ export class PrivateProSyncDB extends Dexie {
         leaseUntilMs: previousOutbox?.leaseUntilMs ?? null,
         leaseToken: previousOutbox?.leaseToken ?? null,
         leaseFence: previousOutbox?.leaseFence ?? null,
+        leasedGeneration: previousOutbox?.leasedGeneration ?? null,
         blocked: false,
         errorCode: null,
       };
@@ -219,6 +228,7 @@ export class PrivateProSyncDB extends Dexie {
         leaseUntilMs: previousOutbox?.leaseUntilMs ?? null,
         leaseToken: previousOutbox?.leaseToken ?? null,
         leaseFence: previousOutbox?.leaseFence ?? null,
+        leasedGeneration: previousOutbox?.leasedGeneration ?? null,
         blocked: false,
         errorCode: null,
       };
@@ -236,6 +246,7 @@ export class PrivateProSyncDB extends Dexie {
       due.leaseUntilMs = nowMs + leaseMs;
       due.leaseToken = crypto.randomUUID();
       due.leaseFence = coordinatorFence;
+      due.leasedGeneration = due.generation;
       await this.outbox.put(due);
       return cloneOutbox(due);
     });
@@ -246,9 +257,7 @@ export class PrivateProSyncDB extends Dexie {
       const pending = await this.outbox.get([uid, recordKey]);
       if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
       pending.dueAtMs = nowMs + delayMs;
-      pending.leaseUntilMs = null;
-      pending.leaseToken = null;
-      pending.leaseFence = null;
+      clearOutboxLease(pending);
       pending.errorCode = errorCode;
       await this.outbox.put(pending);
     });
@@ -262,15 +271,13 @@ export class PrivateProSyncDB extends Dexie {
       ]);
       if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
       const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
-      if (local && local.generation === generation) {
+      if (local && local.generation >= generation) {
         local.baseRevision = effectiveBase.revision;
         await this.localRecords.put(local);
       }
       pending.baseRevision = effectiveBase.revision;
       pending.dueAtMs = nowMs;
-      pending.leaseUntilMs = null;
-      pending.leaseToken = null;
-      pending.leaseFence = null;
+      clearOutboxLease(pending);
       pending.errorCode = null;
       await this.outbox.put(pending);
     });
@@ -284,11 +291,19 @@ export class PrivateProSyncDB extends Dexie {
       ]);
       if (!this.matchesOutboxLease(pending, sentGeneration, leaseToken, leaseFence)) return;
       const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
-      if (local && local.generation === sentGeneration) {
+      if (local && local.generation >= sentGeneration) {
         local.baseRevision = effectiveBase.revision;
         await this.localRecords.put(local);
       }
-      await this.outbox.delete([uid, recordKey]);
+      if (pending.generation === sentGeneration) {
+        await this.outbox.delete([uid, recordKey]);
+        return;
+      }
+      pending.baseRevision = effectiveBase.revision;
+      pending.dueAtMs = Math.max(pending.dueAtMs, sentAtMs + PRIVATE_PRO_SYNC_WINDOW_MS);
+      clearOutboxLease(pending);
+      pending.errorCode = null;
+      await this.outbox.put(pending);
     });
   }
 
@@ -357,7 +372,7 @@ export class PrivateProSyncDB extends Dexie {
 
   private matchesOutboxLease(pending: PrivateProOutboxState | undefined, generation: number, leaseToken: string, leaseFence: number): pending is PrivateProOutboxState {
     return !!pending
-      && pending.generation === generation
+      && pending.leasedGeneration === generation
       && pending.leaseToken === leaseToken
       && pending.leaseFence === leaseFence;
   }

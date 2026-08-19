@@ -76,8 +76,12 @@ describe('Private Pro seamless sync database', () => {
     const pending = await db.getOutbox(UID_A, sent.recordKey);
     assert.equal(pending?.generation, 2);
     assert.equal(pending?.payload, second.payload);
-    assert.equal(pending?.baseRevision, 0);
-    assert.equal(pending?.dueAtMs, 61_000);
+    assert.equal(pending?.baseRevision, 1);
+    assert.equal(pending?.dueAtMs, 121_000);
+    assert.equal(pending?.leaseUntilMs, null);
+    assert.equal(pending?.leaseToken, null);
+    assert.equal(pending?.leaseFence, null);
+    assert.equal(pending?.leasedGeneration, null);
   });
 
   test('clears only one UID namespace', async (t) => {
@@ -100,6 +104,7 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(leased?.leaseUntilMs, 66_000);
     assert.equal(leased?.leaseFence, 1);
     assert.notEqual(leased?.leaseToken, null);
+    assert.equal(leased?.leasedGeneration, leased?.generation);
     assert.equal(await db.leaseDue(UID_A, 61_000, 5_000, 1), null);
   });
 
@@ -143,6 +148,35 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(pending?.dueAtMs, 61_000);
     assert.equal(pending?.baseRevision, 0);
     assert.equal(await db.getRemoteBase(UID_A, oldLease.recordKey), null);
+  });
+
+  test('retries and rebases the newest pending generation after an older sent generation changes locally', async (t) => {
+    const db = createDB(t);
+    const sent = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected a sent lease.');
+    const latest = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+
+    await db.retry(UID_A, sent.recordKey, sent.generation, lease.leaseToken, lease.leaseFence, 63_000, 1_000, 'offline');
+    let pending = await db.getOutbox(UID_A, sent.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.payload, '{"value":2}');
+    assert.equal(pending?.dueAtMs, 64_000);
+    assert.equal(pending?.leaseToken, null);
+    assert.equal(pending?.leasedGeneration, null);
+
+    const rebaseLease = await db.leaseDue(UID_A, 64_000, 5_000, 1);
+    if (!rebaseLease?.leaseToken || rebaseLease.leaseFence === null) assert.fail('Expected rebase lease.');
+    await db.rebase(UID_A, latest.recordKey, rebaseLease.generation, rebaseLease.leaseToken, rebaseLease.leaseFence, remoteBase(4), 65_000);
+    pending = await db.getOutbox(UID_A, latest.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.payload, '{"value":2}');
+    assert.equal(pending?.baseRevision, 4);
+    assert.equal(pending?.dueAtMs, 65_000);
+    assert.equal(pending?.leaseUntilMs, null);
+    assert.equal(pending?.leaseToken, null);
+    assert.equal(pending?.leaseFence, null);
+    assert.equal(pending?.leasedGeneration, null);
   });
 
   test('preserves coordinator fence tombstones across clearUid and rejects the old owner', async (t) => {
