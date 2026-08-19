@@ -68,14 +68,16 @@ describe('Private Pro seamless sync database', () => {
     const second = preparedRecord('record-1', '{"value":2}');
 
     const sent = await db.recordLocalPut(UID_A, first, 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected a leased outbox row.');
     await db.recordLocalPut(UID_A, second, 2_000);
-    await db.acknowledge(UID_A, sent.recordKey, sent.generation, remoteBase(1), 61_000);
+    await db.acknowledge(UID_A, sent.recordKey, sent.generation, lease.leaseToken, lease.leaseFence, remoteBase(1), 61_000);
 
     const pending = await db.getOutbox(UID_A, sent.recordKey);
     assert.equal(pending?.generation, 2);
     assert.equal(pending?.payload, second.payload);
-    assert.equal(pending?.baseRevision, 1);
-    assert.equal(pending?.dueAtMs, 121_000);
+    assert.equal(pending?.baseRevision, 0);
+    assert.equal(pending?.dueAtMs, 61_000);
   });
 
   test('clears only one UID namespace', async (t) => {
@@ -93,10 +95,12 @@ describe('Private Pro seamless sync database', () => {
     const db = createDB(t);
     await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
 
-    const leased = await db.leaseDue(UID_A, 61_000, 5_000);
+    const leased = await db.leaseDue(UID_A, 61_000, 5_000, 1);
     assert.equal(leased?.recordKey, 'record-1');
     assert.equal(leased?.leaseUntilMs, 66_000);
-    assert.equal(await db.leaseDue(UID_A, 61_000, 5_000), null);
+    assert.equal(leased?.leaseFence, 1);
+    assert.notEqual(leased?.leaseToken, null);
+    assert.equal(await db.leaseDue(UID_A, 61_000, 5_000, 1), null);
   });
 
   test('increments coordinator fences for each acquired UID lease', async (t) => {
@@ -115,9 +119,87 @@ describe('Private Pro seamless sync database', () => {
     const second = await db.acquireCoordinatorLease(UID_A, 'sync', 6_000, 5_000);
     if (!first || !second) assert.fail('Expected coordinator lease acquisition.');
 
-    assert.equal(await db.renewCoordinatorLease(UID_A, 'sync', first.fence, 7_000, 5_000), null);
-    const renewed = await db.renewCoordinatorLease(UID_A, 'sync', second.fence, 7_000, 5_000);
+    assert.equal(await db.renewCoordinatorLease(UID_A, 'sync', first.fence, first.ownerToken, 7_000, 5_000), null);
+    const renewed = await db.renewCoordinatorLease(UID_A, 'sync', second.fence, second.ownerToken, 7_000, 5_000);
     assert.equal(renewed?.fence, second.fence);
     assert.equal(renewed?.expiresAtMs, 12_000);
+  });
+
+  test('does not let a stale outbox lease retry, rebase, or acknowledge after re-lease', async (t) => {
+    const db = createDB(t);
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const oldLease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    const currentLease = await db.leaseDue(UID_A, 66_000, 5_000, 2);
+    if (!oldLease?.leaseToken || oldLease.leaseFence === null || !currentLease?.leaseToken || currentLease.leaseFence === null)
+      assert.fail('Expected both outbox leases.');
+
+    await db.retry(UID_A, oldLease.recordKey, oldLease.generation, oldLease.leaseToken, oldLease.leaseFence, 67_000, 1_000, 'offline');
+    await db.rebase(UID_A, oldLease.recordKey, oldLease.generation, oldLease.leaseToken, oldLease.leaseFence, remoteBase(4), 67_000);
+    await db.acknowledge(UID_A, oldLease.recordKey, oldLease.generation, oldLease.leaseToken, oldLease.leaseFence, remoteBase(5), 67_000);
+
+    const pending = await db.getOutbox(UID_A, oldLease.recordKey);
+    assert.equal(pending?.leaseToken, currentLease.leaseToken);
+    assert.equal(pending?.leaseFence, 2);
+    assert.equal(pending?.dueAtMs, 61_000);
+    assert.equal(pending?.baseRevision, 0);
+    assert.equal(await db.getRemoteBase(UID_A, oldLease.recordKey), null);
+  });
+
+  test('preserves coordinator fence tombstones across clearUid and rejects the old owner', async (t) => {
+    const db = createDB(t);
+    const first = await db.acquireCoordinatorLease(UID_A, 'sync', 1_000, 5_000);
+    if (!first) assert.fail('Expected the first coordinator lease.');
+
+    await db.clearUid(UID_A);
+    const second = await db.acquireCoordinatorLease(UID_A, 'sync', 2_000, 5_000);
+    if (!second) assert.fail('Expected the post-clear coordinator lease.');
+    await db.releaseCoordinatorLease(UID_A, 'sync', first.fence, first.ownerToken);
+
+    assert.ok(second.fence > first.fence);
+    assert.equal(await db.renewCoordinatorLease(UID_A, 'sync', first.fence, first.ownerToken, 3_000, 5_000), null);
+    assert.notEqual(await db.renewCoordinatorLease(UID_A, 'sync', second.fence, second.ownerToken, 3_000, 5_000), null);
+  });
+
+  test('keeps a higher remote base when lower rebase and acknowledgement callbacks arrive', async (t) => {
+    const db = createDB(t);
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const firstLease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!firstLease?.leaseToken || firstLease.leaseFence === null) assert.fail('Expected first lease.');
+    await db.rebase(UID_A, firstLease.recordKey, firstLease.generation, firstLease.leaseToken, firstLease.leaseFence, remoteBase(5), 61_000);
+    const next = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+    const nextLease = await db.leaseDue(UID_A, 62_000, 5_000, 1);
+    if (!nextLease?.leaseToken || nextLease.leaseFence === null) assert.fail('Expected next lease.');
+
+    await db.rebase(UID_A, next.recordKey, next.generation, nextLease.leaseToken, nextLease.leaseFence, remoteBase(1), 63_000);
+    assert.equal((await db.getOutbox(UID_A, next.recordKey))?.baseRevision, 5);
+    const final = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":3}'), 64_000);
+    const finalLease = await db.leaseDue(UID_A, 64_000, 5_000, 1);
+    if (!finalLease?.leaseToken || finalLease.leaseFence === null) assert.fail('Expected final lease.');
+    await db.acknowledge(UID_A, final.recordKey, final.generation, finalLease.leaseToken, finalLease.leaseFence, remoteBase(1), 64_000);
+
+    assert.deepEqual(await db.getRemoteBase(UID_A, next.recordKey), remoteBase(5));
+    assert.equal((await db.getLocalRecord(UID_A, final.recordKey))?.baseRevision, 5);
+  });
+
+  test('does not reuse a generation after tombstone discard or accept delayed callbacks', async (t) => {
+    const db = createDB(t);
+    const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const oldLease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!oldLease?.leaseToken || oldLease.leaseFence === null) assert.fail('Expected old lease.');
+    await db.discardAcrossTombstone(UID_A, first.recordKey, { revision: 2, mutationId: 'tombstone-2', deleted: true });
+    const recreated = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+    const currentLease = await db.leaseDue(UID_A, 122_000, 5_000, 2);
+    if (!currentLease?.leaseToken || currentLease.leaseFence === null) assert.fail('Expected recreated lease.');
+
+    await db.retry(UID_A, first.recordKey, first.generation, oldLease.leaseToken, oldLease.leaseFence, 123_000, 1_000, 'offline');
+    await db.rebase(UID_A, first.recordKey, first.generation, oldLease.leaseToken, oldLease.leaseFence, remoteBase(99), 123_000);
+    await db.acknowledge(UID_A, first.recordKey, first.generation, oldLease.leaseToken, oldLease.leaseFence, remoteBase(100), 123_000);
+
+    const pending = await db.getOutbox(UID_A, first.recordKey);
+    assert.ok(recreated.generation > first.generation);
+    assert.equal(pending?.generation, recreated.generation);
+    assert.equal(pending?.leaseToken, currentLease.leaseToken);
+    assert.equal(pending?.baseRevision, 2);
+    assert.deepEqual(await db.getRemoteBase(UID_A, first.recordKey), { revision: 2, mutationId: 'tombstone-2', deleted: true });
   });
 });

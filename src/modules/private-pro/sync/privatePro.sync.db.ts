@@ -37,6 +37,8 @@ export interface PrivateProOutboxState extends PrivateProSyncRecordIdentity {
   baseRevision: number;
   dueAtMs: number;
   leaseUntilMs: number | null;
+  leaseToken: string | null;
+  leaseFence: number | null;
   blocked: boolean;
   errorCode: string | null;
 }
@@ -57,6 +59,7 @@ export interface PrivateProCoordinatorLease {
   name: string;
   expiresAtMs: number;
   fence: number;
+  ownerToken: string;
 }
 
 export interface PrivateProSyncQuarantineState {
@@ -141,13 +144,13 @@ export class PrivateProSyncDB extends Dexie {
   }
 
   async recordLocalPut(uid: string, record: PrivateProSyncPreparedRecord, nowMs: number): Promise<PrivateProOutboxState> {
-    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
+    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.meta], async () => {
       const [previousLocal, previousOutbox, remoteBase] = await Promise.all([
         this.localRecords.get([uid, record.recordKey]),
         this.outbox.get([uid, record.recordKey]),
         this.remoteBases.get([uid, record.recordKey]),
       ]);
-      const generation = (previousLocal?.generation ?? 0) + 1;
+      const generation = await this.nextGeneration(uid, record.recordKey);
       const baseRevision = remoteBase?.revision ?? previousLocal?.baseRevision ?? 0;
       const localRecord: PrivateProLocalRecordState = {
         uid,
@@ -172,6 +175,8 @@ export class PrivateProSyncDB extends Dexie {
         baseRevision,
         dueAtMs: previousOutbox?.dueAtMs ?? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS,
         leaseUntilMs: previousOutbox?.leaseUntilMs ?? null,
+        leaseToken: previousOutbox?.leaseToken ?? null,
+        leaseFence: previousOutbox?.leaseFence ?? null,
         blocked: false,
         errorCode: null,
       };
@@ -181,13 +186,13 @@ export class PrivateProSyncDB extends Dexie {
   }
 
   async recordLocalDelete(uid: string, identity: PrivateProSyncRecordIdentity, nowMs: number): Promise<PrivateProOutboxState> {
-    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
+    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.meta], async () => {
       const [previousLocal, previousOutbox, remoteBase] = await Promise.all([
         this.localRecords.get([uid, identity.recordKey]),
         this.outbox.get([uid, identity.recordKey]),
         this.remoteBases.get([uid, identity.recordKey]),
       ]);
-      const generation = (previousLocal?.generation ?? 0) + 1;
+      const generation = await this.nextGeneration(uid, identity.recordKey);
       const baseRevision = remoteBase?.revision ?? previousLocal?.baseRevision ?? 0;
       const localRecord: PrivateProLocalRecordState = {
         uid,
@@ -212,6 +217,8 @@ export class PrivateProSyncDB extends Dexie {
         baseRevision,
         dueAtMs: previousOutbox?.dueAtMs ?? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS,
         leaseUntilMs: previousOutbox?.leaseUntilMs ?? null,
+        leaseToken: previousOutbox?.leaseToken ?? null,
+        leaseFence: previousOutbox?.leaseFence ?? null,
         blocked: false,
         errorCode: null,
       };
@@ -220,78 +227,76 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
-  async leaseDue(uid: string, nowMs: number, leaseMs: number): Promise<PrivateProOutboxState | null> {
+  async leaseDue(uid: string, nowMs: number, leaseMs: number, coordinatorFence: number): Promise<PrivateProOutboxState | null> {
     return this.transaction('rw', this.outbox, async () => {
       const due = (await this.outbox.where('uid').equals(uid).toArray())
         .filter(entry => !entry.blocked && entry.dueAtMs <= nowMs && (entry.leaseUntilMs === null || entry.leaseUntilMs <= nowMs))
         .sort((left, right) => left.dueAtMs - right.dueAtMs || left.recordKey.localeCompare(right.recordKey))[0];
       if (!due) return null;
       due.leaseUntilMs = nowMs + leaseMs;
+      due.leaseToken = crypto.randomUUID();
+      due.leaseFence = coordinatorFence;
       await this.outbox.put(due);
       return cloneOutbox(due);
     });
   }
 
-  async retry(uid: string, recordKey: string, generation: number, nowMs: number, delayMs: number, errorCode: string): Promise<void> {
+  async retry(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, nowMs: number, delayMs: number, errorCode: string): Promise<void> {
     await this.transaction('rw', this.outbox, async () => {
       const pending = await this.outbox.get([uid, recordKey]);
-      if (!pending || pending.generation !== generation) return;
+      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
       pending.dueAtMs = nowMs + delayMs;
       pending.leaseUntilMs = null;
+      pending.leaseToken = null;
+      pending.leaseFence = null;
       pending.errorCode = errorCode;
       await this.outbox.put(pending);
     });
   }
 
-  async rebase(uid: string, recordKey: string, generation: number, remoteBase: PrivateProRemoteBaseState, nowMs: number): Promise<void> {
+  async rebase(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, remoteBase: PrivateProRemoteBaseState, nowMs: number): Promise<void> {
     await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
-      await this.putRemoteBase(uid, recordKey, remoteBase);
       const [local, pending] = await Promise.all([
         this.localRecords.get([uid, recordKey]),
         this.outbox.get([uid, recordKey]),
       ]);
+      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
+      const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
       if (local && local.generation === generation) {
-        local.baseRevision = remoteBase.revision;
+        local.baseRevision = effectiveBase.revision;
         await this.localRecords.put(local);
       }
-      if (!pending || pending.generation !== generation) return;
-      pending.baseRevision = remoteBase.revision;
+      pending.baseRevision = effectiveBase.revision;
       pending.dueAtMs = nowMs;
       pending.leaseUntilMs = null;
+      pending.leaseToken = null;
+      pending.leaseFence = null;
       pending.errorCode = null;
       await this.outbox.put(pending);
     });
   }
 
-  async acknowledge(uid: string, recordKey: string, sentGeneration: number, remoteBase: PrivateProRemoteBaseState, sentAtMs: number): Promise<void> {
+  async acknowledge(uid: string, recordKey: string, sentGeneration: number, leaseToken: string, leaseFence: number, remoteBase: PrivateProRemoteBaseState, sentAtMs: number): Promise<void> {
     await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
-      await this.putRemoteBase(uid, recordKey, remoteBase);
       const [local, pending] = await Promise.all([
         this.localRecords.get([uid, recordKey]),
         this.outbox.get([uid, recordKey]),
       ]);
-      if (local && local.generation >= sentGeneration) {
-        local.baseRevision = remoteBase.revision;
+      if (!this.matchesOutboxLease(pending, sentGeneration, leaseToken, leaseFence)) return;
+      const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
+      if (local && local.generation === sentGeneration) {
+        local.baseRevision = effectiveBase.revision;
         await this.localRecords.put(local);
       }
-      if (!pending || pending.generation < sentGeneration) return;
-      if (pending.generation === sentGeneration) {
-        await this.outbox.delete([uid, recordKey]);
-        return;
-      }
-      pending.baseRevision = remoteBase.revision;
-      pending.dueAtMs = Math.max(pending.dueAtMs, sentAtMs + PRIVATE_PRO_SYNC_WINDOW_MS);
-      pending.leaseUntilMs = null;
-      pending.errorCode = null;
-      await this.outbox.put(pending);
+      await this.outbox.delete([uid, recordKey]);
     });
   }
 
   async discardAcrossTombstone(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<void> {
     await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
-      await this.putRemoteBase(uid, recordKey, remoteBase);
+      const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
       const pending = await this.outbox.get([uid, recordKey]);
-      if (!remoteBase.deleted || !pending || pending.kind !== 'put' || pending.baseRevision >= remoteBase.revision) return;
+      if (!effectiveBase.deleted || !pending || pending.kind !== 'put' || pending.baseRevision >= effectiveBase.revision) return;
       await Promise.all([
         this.localRecords.delete([uid, recordKey]),
         this.outbox.delete([uid, recordKey]),
@@ -308,27 +313,29 @@ export class PrivateProSyncDB extends Dexie {
         name,
         expiresAtMs: nowMs + leaseMs,
         fence: (previous?.fence ?? 0) + 1,
+        ownerToken: crypto.randomUUID(),
       };
       await this.leases.put(lease);
       return { ...lease };
     });
   }
 
-  async renewCoordinatorLease(uid: string, name: string, fence: number, nowMs: number, leaseMs: number): Promise<PrivateProCoordinatorLease | null> {
+  async renewCoordinatorLease(uid: string, name: string, fence: number, ownerToken: string, nowMs: number, leaseMs: number): Promise<PrivateProCoordinatorLease | null> {
     return this.transaction('rw', this.leases, async () => {
       const lease = await this.leases.get([uid, name]);
-      if (!lease || lease.fence !== fence || lease.expiresAtMs <= nowMs) return null;
+      if (!lease || lease.fence !== fence || lease.ownerToken !== ownerToken || lease.expiresAtMs <= nowMs) return null;
       lease.expiresAtMs = nowMs + leaseMs;
       await this.leases.put(lease);
       return { ...lease };
     });
   }
 
-  async releaseCoordinatorLease(uid: string, name: string, fence: number): Promise<void> {
+  async releaseCoordinatorLease(uid: string, name: string, fence: number, ownerToken: string): Promise<void> {
     await this.transaction('rw', this.leases, async () => {
       const lease = await this.leases.get([uid, name]);
-      if (!lease || lease.fence !== fence) return;
+      if (!lease || lease.fence !== fence || lease.ownerToken !== ownerToken) return;
       lease.expiresAtMs = 0;
+      lease.ownerToken = crypto.randomUUID();
       await this.leases.put(lease);
     });
   }
@@ -341,16 +348,39 @@ export class PrivateProSyncDB extends Dexie {
         this.remoteBases.where('uid').equals(uid).delete(),
         this.quarantine.where('uid').equals(uid).delete(),
         this.assets.where('uid').equals(uid).delete(),
-        this.leases.where('uid').equals(uid).delete(),
         this.meta.where('uid').equals(uid).delete(),
       ]);
+      const leases = await this.leases.where('uid').equals(uid).toArray();
+      await Promise.all(leases.map(lease => this.leases.put({ ...lease, expiresAtMs: 0, ownerToken: crypto.randomUUID() })));
     });
   }
 
-  private async putRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<void> {
+  private matchesOutboxLease(pending: PrivateProOutboxState | undefined, generation: number, leaseToken: string, leaseFence: number): pending is PrivateProOutboxState {
+    return !!pending
+      && pending.generation === generation
+      && pending.leaseToken === leaseToken
+      && pending.leaseFence === leaseFence;
+  }
+
+  private async nextGeneration(uid: string, recordKey: string): Promise<number> {
+    const key = `generation:${recordKey}`;
+    const previous = await this.meta.get([uid, key]);
+    const generation = typeof previous?.value === 'number' ? previous.value + 1 : 1;
+    await this.meta.put({ uid, key, value: generation });
+    return generation;
+  }
+
+  private async storeEffectiveRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<PrivateProRemoteBaseState> {
     const current = await this.remoteBases.get([uid, recordKey]);
-    if (current && current.revision > remoteBase.revision) return;
+    if (current && current.revision > remoteBase.revision)
+      return { revision: current.revision, mutationId: current.mutationId, deleted: current.deleted };
+    if (current && current.revision === remoteBase.revision) {
+      if (current.mutationId !== remoteBase.mutationId || current.deleted !== remoteBase.deleted)
+        throw new Error('Conflicting Private Pro sync remote base identity at the same revision.');
+      return { revision: current.revision, mutationId: current.mutationId, deleted: current.deleted };
+    }
     await this.remoteBases.put({ uid, recordKey, ...remoteBase });
+    return { ...remoteBase };
   }
 }
 
