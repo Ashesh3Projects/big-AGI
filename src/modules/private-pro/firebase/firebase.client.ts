@@ -1,13 +1,16 @@
 import { getApp, getApps, initializeApp, type FirebaseApp } from 'firebase/app';
 import { getToken, initializeAppCheck, ReCaptchaEnterpriseProvider, type AppCheck } from 'firebase/app-check';
 import { getAuth, type Auth } from 'firebase/auth';
-import { getFirestore, type Firestore } from 'firebase/firestore';
+import { getFirestore, initializeFirestore, memoryLocalCache, type Firestore } from 'firebase/firestore';
+import { getStorage, type FirebaseStorage } from 'firebase/storage';
 
 import { privateProClientConfig, privateProClientConfigComplete } from '../config/privatePro.config';
 
 
 let privateProFirebaseApp: FirebaseApp | undefined;
 let privateProAppCheck: AppCheck | null | undefined;
+let privateProFirestore: Firestore | undefined;
+let privateProStorage: FirebaseStorage | undefined;
 
 interface PrivateProAppCheckDebugGlobal {
   FIREBASE_APPCHECK_DEBUG_TOKEN?: boolean | string;
@@ -29,7 +32,22 @@ export function getPrivateProFirebaseAuth(): Auth {
 }
 
 export function getPrivateProClientFirestore(): Firestore {
-  return getFirestore(getPrivateProFirebaseApp());
+  if (privateProFirestore) return privateProFirestore;
+  const app = getPrivateProFirebaseApp();
+  getPrivateProClientAppCheck();
+  try {
+    return privateProFirestore = initializeFirestore(app, { localCache: memoryLocalCache() });
+  } catch (error) {
+    if (typeof error !== 'object' || error === null || !('code' in error) || error.code !== 'failed-precondition') throw error;
+    return privateProFirestore = getFirestore(app);
+  }
+}
+
+export function getPrivateProClientStorage(): FirebaseStorage {
+  if (privateProStorage) return privateProStorage;
+  const app = getPrivateProFirebaseApp();
+  getPrivateProClientAppCheck();
+  return privateProStorage = getStorage(app);
 }
 
 export function getPrivateProClientAppCheck(): AppCheck | null {
