@@ -53,6 +53,7 @@ export interface PrivateProSyncCoordinatorOptions {
 export interface PrivateProSyncCoordinator {
   start(runLeader: (context: PrivateProSyncLeaderContext) => Promise<void>): Promise<void>;
   wake(): void;
+  broadcastSignedOut?(): void;
   stop(): Promise<void>;
   isLeader(): boolean;
 }
@@ -241,10 +242,20 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       channel?.postMessage('wake');
     },
 
+    broadcastSignedOut(): void {
+      if (channel) {
+        channel.postMessage('signed-out');
+        return;
+      }
+      if (!broadcastChannel) return;
+      const broadcaster = new broadcastChannel(lockName);
+      broadcaster.postMessage('signed-out');
+      broadcaster.close();
+    },
+
     async stop(): Promise<void> {
       if (!started) return;
       stopped = true;
-      channel?.postMessage('signed-out');
       clearFallbackPollTimer();
       clearFallbackRenewTimer();
       webLockAbort?.abort();

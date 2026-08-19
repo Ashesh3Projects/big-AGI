@@ -11,14 +11,12 @@ import { get, set } from 'idb-keyval';
 import {
   PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS,
   PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS,
-  clearPrivateProPlaintextPortablePersistence,
+  activatePrivateProManagedPersistence,
+  clearPrivateProManagedPersistence,
   createPrivateProPortableLocalStorage,
-  isPrivateProEncryptedPersistenceActive,
-  hasPrivateProPendingPortableAssets,
-  markPrivateProPortableAssetEncrypted,
-  markPrivateProPortableAssetPending,
-  privateProPortableAssetBeforeUnload,
-  setPrivateProEncryptedPersistenceActive,
+  deactivatePrivateProManagedPersistence,
+  isPrivateProManagedPersistenceActive,
+  privateProManagedPersistenceUid,
 } from './privatePro.persistence';
 
 
@@ -34,37 +32,37 @@ class MemoryStorage implements Storage {
 }
 
 
-afterEach(() => setPrivateProEncryptedPersistenceActive(false));
+afterEach(() => activatePrivateProManagedPersistence(null));
 
-describe('private Pro portable persistence gate', () => {
-  test('uses volatile storage for an explicit portable key while encrypted persistence is active', () => {
+describe('private Pro managed persistence gate', () => {
+  test('uses volatile storage for an explicit portable key while managed persistence is active', async () => {
     const durable = new MemoryStorage();
     const storage = createPrivateProPortableLocalStorage(() => durable);
     const key = 'app-models';
     const sentinel = 'sentinel-provider-api-key';
 
-    setPrivateProEncryptedPersistenceActive(true);
+    await activatePrivateProManagedPersistence('uid-a');
     storage.setItem(key, sentinel);
 
-    assert.equal(isPrivateProEncryptedPersistenceActive(), true);
+    assert.equal(isPrivateProManagedPersistenceActive(), true);
     assert.equal(storage.getItem(key), sentinel);
     assert.equal(durable.getItem(key), null);
   });
 
-  test('keeps Open storage behavior unchanged', () => {
+  test('keeps Open storage behavior unchanged', async () => {
     const durable = new MemoryStorage();
     const storage = createPrivateProPortableLocalStorage(() => durable);
 
-    setPrivateProEncryptedPersistenceActive(false);
+    await activatePrivateProManagedPersistence(null);
     storage.setItem('app-models', 'open-model-state');
 
     assert.equal(durable.getItem('app-models'), 'open-model-state');
     assert.equal(storage.getItem('app-models'), 'open-model-state');
   });
 
-  test('fails closed for portable stores outside the inclusion list', () => {
+  test('fails closed for portable stores outside the inclusion list', async () => {
     const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
-    setPrivateProEncryptedPersistenceActive(true);
+    await activatePrivateProManagedPersistence('uid-a');
 
     assert.throws(() => storage.setItem('unregistered-portable-store', 'secret'), /allowlist/i);
   });
@@ -170,6 +168,7 @@ describe('private Pro portable persistence gate', () => {
       ['modules/private-pro/vault/privatePro.vault.db.ts', 'encrypted-vault'],
       ['modules/private-pro/vault/privatePro.vault.device.ts', 'device-only'],
       ['modules/private-pro/persistence/privatePro.persistence.ts', 'portable-gate'],
+      ['modules/private-pro/sync/privatePro.sync.db.ts', 'managed-workspace'],
       ['modules/trade/BackupRestore.tsx', 'manual-export-only'],
     ] as const;
     const sourceRoot = join(process.cwd(), 'src');
@@ -202,7 +201,7 @@ describe('private Pro portable persistence gate', () => {
         const nativeSetItem = Storage.prototype.setItem;
         Reflect.apply(nativeSetItem, localStorage, ['app-models', 'plaintext-secret']);
         Reflect.apply(nativeSetItem, localStorage, ['unrelated-feature', 'keep-me']);
-        await module.clearPrivateProPlaintextPortablePersistence();
+        await module.clearPrivateProManagedPersistence('uid-a', { clearUid: async () => {} });
         const nativeGetItem = Storage.prototype.getItem;
         if (Reflect.apply(nativeGetItem, localStorage, ['app-models']) !== null) throw new Error('allowlisted plaintext survived');
         if (Reflect.apply(nativeGetItem, localStorage, ['unrelated-feature']) !== 'keep-me') throw new Error('unrelated key was removed');
@@ -228,7 +227,8 @@ describe('private Pro portable persistence gate', () => {
     await set('app-chats', 'sentinel-chat');
     await set('unrelated-cell', 'keep-me');
 
-    await clearPrivateProPlaintextPortablePersistence();
+    await activatePrivateProManagedPersistence('uid-a');
+    await clearPrivateProManagedPersistence('uid-a', { clearUid: async () => {} });
 
     assert.equal(durable.getItem('app-models'), null);
     assert.equal(durable.getItem('app-state'), null);
@@ -240,17 +240,29 @@ describe('private Pro portable persistence gate', () => {
     assert.equal(await get('unrelated-cell'), 'keep-me');
   });
 
-  test('blocks reload while a volatile attachment has not reached encrypted storage', () => {
-    const event = { preventDefaultCalled: false, preventDefault() { this.preventDefaultCalled = true; }, returnValue: '' };
-    setPrivateProEncryptedPersistenceActive(true);
-    markPrivateProPortableAssetPending('asset-sentinel');
+  test('atomically clears volatile values and only the requested UID sync state', async () => {
+    const durable = new MemoryStorage();
+    const storage = createPrivateProPortableLocalStorage(() => durable);
+    const cleared: string[] = [];
+    await activatePrivateProManagedPersistence('uid-a');
+    storage.setItem('app-models', 'uid-a-models');
 
-    assert.equal(hasPrivateProPendingPortableAssets(), true);
-    assert.equal(privateProPortableAssetBeforeUnload(event), 'Encrypted attachments are still being saved.');
-    assert.equal(event.preventDefaultCalled, true);
+    await clearPrivateProManagedPersistence('uid-a', { clearUid: async uid => { cleared.push(uid); } });
 
-    markPrivateProPortableAssetEncrypted('asset-sentinel');
-    assert.equal(hasPrivateProPendingPortableAssets(), false);
-    assert.equal(privateProPortableAssetBeforeUnload(event), undefined);
+    await activatePrivateProManagedPersistence('uid-a');
+    assert.equal(storage.getItem('app-models'), null);
+    assert.deepEqual(cleared, ['uid-a']);
+  });
+
+  test('stale UID cleanup cannot clear or deactivate the current account runtime', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    let runtimeClears = 0;
+    await activatePrivateProManagedPersistence('uid-b');
+    storage.setItem('app-models', 'uid-b-models');
+
+    assert.equal(await deactivatePrivateProManagedPersistence('uid-a', () => { runtimeClears++; }), false);
+    assert.equal(storage.getItem('app-models'), 'uid-b-models');
+    assert.equal(runtimeClears, 0);
+    assert.equal(privateProManagedPersistenceUid(), 'uid-b');
   });
 });

@@ -70,9 +70,9 @@ class ManualClock {
   setTimeout = (callback: () => void, ms: number): ReturnType<typeof globalThis.setTimeout> => {
     const id = this.nextId++;
     this.timers.set(id, { at: this.nowMs + Math.max(0, ms), callback });
-    return id;
+    return id as unknown as ReturnType<typeof globalThis.setTimeout>;
   };
-  clearTimeout = (id: ReturnType<typeof globalThis.setTimeout>): void => { this.timers.delete(id); };
+  clearTimeout = (id: ReturnType<typeof globalThis.setTimeout>): void => { this.timers.delete(id as unknown as number); };
 
   set(value: number): void {
     assert.ok(value >= this.nowMs);

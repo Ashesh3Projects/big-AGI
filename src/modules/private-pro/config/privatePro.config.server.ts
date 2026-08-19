@@ -1,7 +1,6 @@
 import { env } from '~/server/env.server';
 
 import {
-  PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
   PRIVATE_PRO_MAX_FILE_BYTES,
   PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES,
   PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS,
@@ -41,7 +40,6 @@ export interface PrivateProServerConfig {
     storageBucket: string;
     credentialSource: PrivateProFirebaseCredentialSource;
   };
-  attachmentQuotaBytes: number;
   maxFileBytes: number;
   uploadRateLimit: {
     windowMs: number;
@@ -99,7 +97,6 @@ export function parsePrivateProServerConfig(input: PrivateProServerConfigInput):
       storageBucket: input.firebaseStorageBucket ?? '',
       credentialSource,
     },
-    attachmentQuotaBytes: PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
     maxFileBytes: PRIVATE_PRO_MAX_FILE_BYTES,
     uploadRateLimit: {
       windowMs: PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS,
@@ -128,11 +125,6 @@ export function getPrivateProServerConfig(): PrivateProServerConfig {
 
   cachedConfig = {
     ...parsedConfig,
-    attachmentQuotaBytes: parsePrivateProPositiveInteger(
-      env.PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
-      PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES,
-      'PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES',
-    ),
     maxFileBytes: parsePrivateProPositiveInteger(
       env.PRIVATE_PRO_MAX_FILE_BYTES,
       PRIVATE_PRO_MAX_FILE_BYTES,

@@ -11,7 +11,7 @@
   },
   "include": [
     "**/*.ts", "**/*.tsx",
-    "../src/**/*.test.ts",
+    "../src/**/*.test.ts", "../src/**/*.test.tsx",
     // ambient augmentations (authjs.d.ts widens next-auth's Session): nothing imports them, so
     // without this the shared src/ files they describe fail here but pass at the root
     "../src/**/*.d.ts"

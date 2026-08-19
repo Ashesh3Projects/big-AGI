@@ -460,9 +460,13 @@ function durableLeaseLockPort(uid: string, options: PrivateProAssetUploadLeaseOp
         clearExpiryTimer();
         signal?.removeEventListener('abort', abort);
         operationAbort.abort();
-        const pendingRenewal = renewal;
-        await pendingRenewal;
-        await options.port.releaseAssetUploadLease(uid, assetId, identity.fence, identity.ownerToken);
+        let release: Promise<void>;
+        try {
+          release = options.port.releaseAssetUploadLease(uid, assetId, identity.fence, identity.ownerToken);
+        } catch (error) {
+          release = Promise.reject(error);
+        }
+        release.catch(() => {});
       }
     },
   };

@@ -44,7 +44,6 @@ export const privateProAuthRouter = createTRPCRouter({
     try {
       return await bootstrapPrivateProAccount(ctx.privateProIdentity, createPrivateProAuthAdminPort(), {
         allowedEmails: config.allowedEmails,
-        attachmentQuotaBytes: config.attachmentQuotaBytes,
         nowMs: Date.now(),
       });
     } catch (error) {
@@ -57,8 +56,5 @@ export const privateProAuthRouter = createTRPCRouter({
     uid: ctx.privateProAccount.uid,
     email: ctx.privateProAccount.email,
     accessEpoch: ctx.privateProAccount.accessEpoch,
-    quotaBytes: ctx.privateProAccount.quotaBytes,
-    usedBytes: ctx.privateProAccount.usedBytes,
-    reservedBytes: ctx.privateProAccount.reservedBytes,
   })),
 });

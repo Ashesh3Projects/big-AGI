@@ -3,7 +3,7 @@ import * as z from 'zod/v4';
 
 import { createTRPCRouter } from '~/server/trpc/trpc.server';
 
-import { createPrivateProVaultProcedure, createPrivateProVaultPutKeysetProcedure, privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
+import { privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
 import {
   PRIVATE_PRO_VAULT_FIRESTORE_MAX_CIPHERTEXT_BYTES,
   PRIVATE_PRO_VAULT_BACKUP_MAX_CHUNKS,
@@ -43,31 +43,19 @@ export function createPrivateProVaultRouter(
   serviceFactory: () => PrivateProVaultService = getFirebasePrivateProVaultService,
 ) {
   const service = () => serviceFactory();
-  const accessDependencies = {
-    async getVaultAccess(uid, deviceId) {
-      const [keyset, devices] = await Promise.all([service().getKeyset(uid), service().listDevices(uid)]);
-      return { keyset: keyset?.keyset ?? null, device: devices.find(device => device.deviceId === deviceId) ?? null };
-    },
-  } satisfies Parameters<typeof createPrivateProVaultProcedure>[1];
-  const deviceProcedure = createPrivateProVaultProcedure(procedure, accessDependencies);
-  const putKeysetProcedure = createPrivateProVaultPutKeysetProcedure(procedure, accessDependencies);
   return createTRPCRouter({
   bootstrap: procedure
     .input(z.object({ deviceId: opaqueIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().bootstrap(ctx.privateProIdentity.uid, input.deviceId))),
 
-  listDevices: deviceProcedure.query(({ ctx }) => vaultCall(() => service().listDevices(ctx.privateProIdentity.uid))),
+  listDevices: procedure.query(({ ctx }) => vaultCall(() => service().listDevices(ctx.privateProIdentity.uid))),
 
   beginDeviceRegistration: procedure
     .input(z.object({
       deviceId: opaqueIdSchema,
       keyVersion: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
     }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => {
-      if (ctx.privateProDeviceId !== input.deviceId)
-        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
-      return service().beginDeviceRegistration(ctx.privateProIdentity.uid, input);
-    })),
+    .mutation(({ ctx, input }) => vaultCall(() => service().beginDeviceRegistration(ctx.privateProIdentity.uid, input))),
 
   completeDeviceRegistration: procedure
     .input(z.object({
@@ -80,26 +68,22 @@ export function createPrivateProVaultRouter(
       expiresAtMs: z.number().int().positive().max(Number.MAX_SAFE_INTEGER),
       signatureBase64: z.string().min(1).max(256),
     }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => {
-      if (ctx.privateProDeviceId !== input.deviceId)
-        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
-      return service().completeDeviceRegistration(ctx.privateProIdentity.uid, input);
-    })),
+    .mutation(({ ctx, input }) => vaultCall(() => service().completeDeviceRegistration(ctx.privateProIdentity.uid, input))),
 
-  getIndex: deviceProcedure
+  getIndex: procedure
     .input(z.object({
       pageSize: z.number().int().min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
       cursor: opaqueIdSchema.nullish(),
     }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getIndex(ctx.privateProIdentity.uid, input))),
 
-  getRecords: deviceProcedure
+  getRecords: procedure
     .input(z.object({
       opaqueRecordIds: z.array(opaqueIdSchema).min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
     }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getRecords(ctx.privateProIdentity.uid, input.opaqueRecordIds))),
 
-  putRecord: deviceProcedure
+  putRecord: procedure
     .input(z.object({
       operationId: operationIdSchema,
       opaqueRecordId: opaqueIdSchema,
@@ -108,7 +92,7 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().putRecord(ctx.privateProIdentity.uid, input))),
 
-  mergeBackup: deviceProcedure
+  mergeBackup: procedure
     .input(z.object({
       operationId: operationIdSchema,
       records: z.array(z.object({
@@ -119,7 +103,7 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().mergeBackup(ctx.privateProIdentity.uid, input))),
 
-  beginBackupRestore: deviceProcedure
+  beginBackupRestore: procedure
     .input(z.object({
       restoreId: operationIdSchema,
       backupFingerprint: opaqueIdSchema,
@@ -133,11 +117,11 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().beginBackupRestore(ctx.privateProIdentity.uid, input))),
 
-  getBackupRestoreStatus: deviceProcedure
+  getBackupRestoreStatus: procedure
     .input(z.object({ restoreId: operationIdSchema }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getBackupRestoreStatus(ctx.privateProIdentity.uid, input.restoreId))),
 
-  mergeBackupRestoreChunk: deviceProcedure
+  mergeBackupRestoreChunk: procedure
     .input(z.object({
       restoreId: operationIdSchema,
       operationId: operationIdSchema,
@@ -151,7 +135,7 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().mergeBackupRestoreChunk(ctx.privateProIdentity.uid, input))),
 
-  getBackupRestoreIndex: deviceProcedure
+  getBackupRestoreIndex: procedure
     .input(z.object({
       restoreId: operationIdSchema,
       pageSize: z.number().int().min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
@@ -159,22 +143,22 @@ export function createPrivateProVaultRouter(
     }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getBackupRestoreIndex(ctx.privateProIdentity.uid, input.restoreId, input))),
 
-  getBackupRestoreRecords: deviceProcedure
+  getBackupRestoreRecords: procedure
     .input(z.object({
       restoreId: operationIdSchema,
       opaqueRecordIds: z.array(opaqueIdSchema).min(1).max(PRIVATE_PRO_VAULT_MAX_INDEX_PAGE_SIZE),
     }).strict())
     .query(({ ctx, input }) => vaultCall(() => service().getBackupRestoreRecords(ctx.privateProIdentity.uid, input.restoreId, input.opaqueRecordIds))),
 
-  sealBackupRestore: deviceProcedure
+  sealBackupRestore: procedure
     .input(z.object({ restoreId: operationIdSchema, operationId: operationIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().sealBackupRestore(ctx.privateProIdentity.uid, input))),
 
-  confirmBackupRestoreVerified: deviceProcedure
+  confirmBackupRestoreVerified: procedure
     .input(z.object({ restoreId: operationIdSchema, operationId: operationIdSchema, sessionFingerprint: opaqueIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().confirmBackupRestoreVerified(ctx.privateProIdentity.uid, input))),
 
-  deleteRecord: deviceProcedure
+  deleteRecord: procedure
     .input(z.object({
       operationId: operationIdSchema,
       opaqueRecordId: opaqueIdSchema,
@@ -183,7 +167,7 @@ export function createPrivateProVaultRouter(
     }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().deleteRecord(ctx.privateProIdentity.uid, input))),
 
-  putKeyset: putKeysetProcedure
+  putKeyset: procedure
     .input(z.object({
       operationId: operationIdSchema,
       baseWrappingVersion: baseVersionSchema,
@@ -194,13 +178,9 @@ export function createPrivateProVaultRouter(
         type: z.enum(['recovery-password-reset', 'password-changed']),
       }).strict().optional(),
     }).strict())
-    .mutation(({ ctx, input }) => vaultCall(() => {
-      if (input.securityEvent && ctx.privateProDeviceId !== input.securityEvent.deviceId)
-        throw new TRPCError({ code: 'FORBIDDEN', message: 'Private Pro vault device is not authorized.' });
-      return service().putKeyset(ctx.privateProIdentity.uid, input);
-    })),
+    .mutation(({ ctx, input }) => vaultCall(() => service().putKeyset(ctx.privateProIdentity.uid, input))),
 
-  revokeDevice: deviceProcedure
+  revokeDevice: procedure
     .input(z.object({ operationId: operationIdSchema, deviceId: opaqueIdSchema }).strict())
     .mutation(({ ctx, input }) => vaultCall(() => service().revokeDevice(ctx.privateProIdentity.uid, input))),
 

@@ -48,6 +48,10 @@ export async function clearPrivateProPlaintextDBlobPersistence(): Promise<void> 
   await assetsTable.clear();
 }
 
+export async function clearPrivateProLegacyPlaintextDBlobPersistence(): Promise<void> {
+  await assetsTable.clear();
+}
+
 
 // CRUD
 

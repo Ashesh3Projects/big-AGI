@@ -17,11 +17,12 @@ import type { PrivateProBootstrap } from './privatePro.auth.service';
 type PrivateProAuthState = 'loading' | 'signed-out' | 'bootstrapping' | 'signed-in' | 'denied' | 'misconfigured' | 'error';
 
 interface PrivateProAuthContextValue {
+  enabled: boolean;
   state: PrivateProAuthState;
   user: User | null;
   bootstrap: PrivateProBootstrap | null;
   signIn: () => Promise<void>;
-  signOut: () => Promise<void>;
+  firebaseSignOut: () => Promise<void>;
 }
 
 const PrivateProAuthContext = React.createContext<PrivateProAuthContextValue | null>(null);
@@ -83,21 +84,14 @@ export function ProviderPrivatePro(props: { children: React.ReactNode }) {
     }
   }, []);
 
-  const signOutCurrent = React.useCallback(async () => {
-    deniedEmailRef.current = undefined;
-    setBootstrap(null);
-    setUser(null);
-    setState(privateProClientConfig.enabled ? 'signed-out' : 'signed-in');
-    await privateProSignOut();
-  }, []);
-
   const value = React.useMemo<PrivateProAuthContextValue>(() => ({
+    enabled: privateProClientConfig.enabled,
     state,
     user,
     bootstrap,
     signIn,
-    signOut: signOutCurrent,
-  }), [bootstrap, signIn, signOutCurrent, state, user]);
+    firebaseSignOut: privateProSignOut,
+  }), [bootstrap, signIn, state, user]);
 
   if (state !== 'signed-in')
     return <PrivateProAuthScreen state={state} error={error} deniedEmail={deniedEmailRef.current} onSignIn={() => void signIn()} />;

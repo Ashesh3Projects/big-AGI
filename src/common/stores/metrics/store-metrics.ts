@@ -23,6 +23,10 @@ export function metricsStoreAddChatGenerate(costs: MetricsChatGenerateCost_Md, i
   useMetricsStore.getState().addChatGenerateCostEntry(costs, inputTokens, outputTokens, llm.sId || null, debugCostSource);
 }
 
+export function metricsResetPrivateProRuntime(): void {
+  useMetricsStore.setState({ serviceMetrics: {} });
+}
+
 export function useCostMetricsForLLMService(serviceId?: DModelsServiceId) {
   return useMetricsStore((state) =>
     serviceId ? state.getAggregateMetricsForService(serviceId) ?? fallbackEmptyServiceMetricsAggregate

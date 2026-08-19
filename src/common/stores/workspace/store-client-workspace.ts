@@ -154,3 +154,7 @@ export const useClientWorkspaceStore = create<WorkspaceState & WorkspaceActions>
 export function workspaceActions(): Readonly<WorkspaceActions> {
   return useClientWorkspaceStore.getState();
 }
+
+export function workspaceResetPrivateProRuntime(): void {
+  useClientWorkspaceStore.setState({ liveFilesByWorkspace: {} });
+}

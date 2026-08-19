@@ -119,11 +119,11 @@ describe('Private Pro sync engine', () => {
         db: { pendingCount: async () => 0 }, runSuppressed: callback => callback(),
         assets: { ensureUploaded: async () => {}, hydrate: async () => { hydrateStarted = true; await hydrate; } },
         createOutbound: () => ({ start: async () => {}, retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {} }),
-        createReconciler: input => { hooks = input; return { applyCached: async () => {}, handle: async (_event, epoch) => { hooks.onHydrate?.(['asset-1'], epoch); order.push('projected'); } }; },
+        createReconciler: input => { hooks = input; return { applyCached: async () => {}, handle: async (_event, epoch = 0) => { hooks.onHydrate?.(['asset-1'], epoch); order.push('projected'); } }; },
       });
     await engine.start();
 
-    base.transport.emit({ type: 'invalid-document', collection: 'records', recordKey: 'record-1', reason: 'invalid-payload' });
+    base.transport.emit({ type: 'invalid-document', collection: 'records', recordKey: 'record-1', reason: 'invalid-document' });
     await settle();
 
     assert.equal(hydrateStarted, true);

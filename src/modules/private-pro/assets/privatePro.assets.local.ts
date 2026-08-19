@@ -57,12 +57,14 @@ interface ActivePrivateProAssetPersistence {
 let activationGeneration = 0;
 let active: ActivePrivateProAssetPersistence | null = null;
 let transition: Promise<void> | null = null;
+let requestedUid: string | null = null;
 
 function abortError(): DOMException {
   return new DOMException('Private Pro asset persistence changed.', 'AbortError');
 }
 
 export function activatePrivateProAssetPersistence(uid: string | null, port: PrivateProAssetLocalPort | null, deleteAsset?: PrivateProAssetDelete): Promise<void> {
+  requestedUid = uid;
   const transitionId = ++activationGeneration;
   const previous = active;
   const priorTransition = transition;
@@ -81,6 +83,15 @@ export function activatePrivateProAssetPersistence(uid: string | null, port: Pri
   const settled = barrier.finally(() => { if (transition === settled) transition = null; });
   transition = settled;
   return transition;
+}
+
+export async function deactivatePrivateProAssetPersistence(uid: string): Promise<boolean> {
+  if (requestedUid !== uid) {
+    await transition;
+    return false;
+  }
+  await activatePrivateProAssetPersistence(null, null);
+  return true;
 }
 
 export async function runActivePrivateProAssetOperation<T>(

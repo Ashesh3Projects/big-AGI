@@ -129,7 +129,6 @@ export const env = createEnv({
 
     // Private Pro: Firebase Admin and allowlist
     PRIVATE_PRO_ALLOWED_EMAILS: z.string().optional(),
-    PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES: z.string().regex(/^\d+$/).optional(),
     PRIVATE_PRO_MAX_FILE_BYTES: z.string().regex(/^\d+$/).optional(),
     PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS: z.string().regex(/^\d+$/).optional(),
     PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS: z.string().regex(/^\d+$/).optional(),

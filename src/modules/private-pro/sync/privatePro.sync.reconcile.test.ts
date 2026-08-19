@@ -46,8 +46,8 @@ function createDB(t: TestContext): PrivateProSyncDB {
 
 function serializer(recordType: 'settings' | 'chat-meta' | 'chat-message', calls: ProjectionCall[], suppression: { active: boolean }): PrivateProSyncSerializer<unknown> {
   const projection: PrivateProSyncProjection = {
-    apply: async (projectionKey, records) => calls.push({ kind: 'apply', projectionKey, records: structuredClone(records), suppressed: suppression.active }),
-    remove: async projectionKey => calls.push({ kind: 'remove', projectionKey, records: [], suppressed: suppression.active }),
+    apply: async (projectionKey, records) => { calls.push({ kind: 'apply', projectionKey, records: structuredClone(records), suppressed: suppression.active }); },
+    remove: async projectionKey => { calls.push({ kind: 'remove', projectionKey, records: [], suppressed: suppression.active }); },
   };
   return {
     recordType,

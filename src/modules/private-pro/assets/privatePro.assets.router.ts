@@ -3,8 +3,7 @@ import { TRPCError } from '@trpc/server';
 
 import { createTRPCRouter } from '~/server/trpc/trpc.server';
 
-import { createPrivateProVaultProcedure, privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
-import { getFirebasePrivateProVaultService } from '../vault/privatePro.vault.repository.firebase';
+import { privateProNodePremiumProcedure } from '../auth/privatePro.auth.procedures.server';
 import { getFirebasePrivateProVaultAssetsService } from '../vault/privatePro.vault.assets.firebase';
 import { PrivateProVaultAssetRateLimitError } from '../vault/privatePro.vault.assets.service';
 
@@ -20,21 +19,9 @@ const encryptedChunkSchema = z.object({
   objectSha256: sha256Schema,
 }).strict();
 
-const vaultService = () => getFirebasePrivateProVaultService();
-const vaultProcedure = createPrivateProVaultProcedure(privateProNodePremiumProcedure, {
-  async getVaultAccess(uid, deviceId) {
-    const [keyset, devices] = await Promise.all([vaultService().getKeyset(uid), vaultService().listDevices(uid)]);
-    return { keyset: keyset?.keyset ?? null, device: devices.find(device => device.deviceId === deviceId) ?? null };
-  },
-});
-
 export const privateProVaultAssetsRouter = createTRPCRouter({
-  reserveEncryptedUpload: vaultProcedure
-    .input(z.object({
-      operationId: operationIdSchema,
-      opaqueAssetId: opaqueIdSchema,
-      chunks: z.array(encryptedChunkSchema).min(1).max(32),
-    }).strict())
+  reserveEncryptedUpload: privateProNodePremiumProcedure
+    .input(z.object({ operationId: operationIdSchema, opaqueAssetId: opaqueIdSchema, chunks: z.array(encryptedChunkSchema).min(1).max(32) }).strict())
     .mutation(async ({ ctx, input }) => {
       try {
         return await getFirebasePrivateProVaultAssetsService().reserveUpload(ctx.privateProIdentity.uid, input);
@@ -44,17 +31,10 @@ export const privateProVaultAssetsRouter = createTRPCRouter({
         throw error;
       }
     }),
-
-  finalizeEncryptedUpload: vaultProcedure
-    .input(z.object({ operationId: operationIdSchema }).strict())
+  finalizeEncryptedUpload: privateProNodePremiumProcedure.input(z.object({ operationId: operationIdSchema }).strict())
     .mutation(({ ctx, input }) => getFirebasePrivateProVaultAssetsService().finalizeUpload(ctx.privateProIdentity.uid, input.operationId)),
-
-  getEncryptedDownload: vaultProcedure
-    .input(z.object({ opaqueAssetId: opaqueIdSchema }).strict())
+  getEncryptedDownload: privateProNodePremiumProcedure.input(z.object({ opaqueAssetId: opaqueIdSchema }).strict())
     .query(({ ctx, input }) => getFirebasePrivateProVaultAssetsService().getDownload(ctx.privateProIdentity.uid, input.opaqueAssetId)),
-
-  releaseEncryptedReservation: vaultProcedure
-    .input(z.object({ operationId: operationIdSchema }).strict())
+  releaseEncryptedReservation: privateProNodePremiumProcedure.input(z.object({ operationId: operationIdSchema }).strict())
     .mutation(({ ctx, input }) => getFirebasePrivateProVaultAssetsService().releaseReservation(ctx.privateProIdentity.uid, input.operationId)),
-
 });

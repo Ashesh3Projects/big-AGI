@@ -163,7 +163,7 @@ describe('Private Pro sync serializers', () => {
 
   test('splits one conversation into one metadata record and finalized message records', async () => {
     await resetChat();
-    chatSyncUpsert(conversationFixture());
+    chatSyncUpsert(conversationFixture() as Parameters<typeof chatSyncUpsert>[0]);
 
     const records = await snapshotChatRecords();
 
@@ -181,7 +181,7 @@ describe('Private Pro sync serializers', () => {
 
   test('stages a message before metadata without changing an existing conversation', async () => {
     await resetChat();
-    chatSyncUpsert(conversationFixture());
+    chatSyncUpsert(conversationFixture() as Parameters<typeof chatSyncUpsert>[0]);
     const before = chatSyncSnapshot();
 
     await privateProSyncChatProjection.stage(messageRecord('chat-1', 'remote-message', 30));
@@ -222,7 +222,7 @@ describe('Private Pro sync serializers', () => {
       recordType: 'asset' as const,
       schemaVersion: 1,
       conflictPolicy: 'replace' as const,
-      snapshot: () => [],
+      snapshot: async () => [],
       validate: async (_logicalId: string, value: unknown) => value,
       project: (logicalId: string) => ({ projectionKey: logicalId, referencedAssetIds: [] }),
       projection: { apply: async () => {}, remove: async () => {} },

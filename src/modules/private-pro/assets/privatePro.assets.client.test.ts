@@ -1,7 +1,7 @@
 import 'fake-indexeddb/auto';
 
 import assert from 'node:assert/strict';
-import { describe, test, type TestContext } from 'node:test';
+import { describe, mock, test, type TestContext } from 'node:test';
 import Dexie from 'dexie';
 
 import { DBlobAssetType, DBlobMimeType, type DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
@@ -30,7 +30,7 @@ function base64(input: Uint8Array): string {
   return btoa(binary);
 }
 
-function fixture(id = 'asset-1', withThumb = true): DBlobDBAsset {
+function fixture(id = 'asset-1', withThumb = true): Extract<DBlobDBAsset, { assetType: DBlobAssetType.IMAGE }> {
   return {
     id,
     contextId: 'global',
@@ -53,7 +53,7 @@ class FakeStorage implements PrivateProAssetStoragePort {
   failUploadPath: string | null = null;
   failDeletePaths = new Set<string>();
 
-  async uploadBytesResumable(path: string, input: Uint8Array, metadata: PrivateProAssetStorageMetadata): Promise<void> {
+  async uploadBytesResumable(path: string, input: Uint8Array, metadata: PrivateProAssetStorageMetadata, _signal?: AbortSignal): Promise<void> {
     this.uploads.push({ path, bytes: Uint8Array.from(input), metadata: structuredClone(metadata) });
     if (path === this.failUploadPath) throw new Error('upload unavailable');
     this.objects.set(path, { bytes: Uint8Array.from(input), metadata: structuredClone(metadata) });
@@ -84,6 +84,7 @@ class MissingObjectError extends Error {
 
 class FakeLocks implements PrivateProAssetLockPort {
   private readonly tails = new Map<string, Promise<void>>();
+  private readonly activeCallbacks = new Map<string, number>();
   async request<T>(name: string, signal: AbortSignal | undefined, callback: (lockSignal: AbortSignal | undefined) => Promise<T>): Promise<T> {
     const previous = this.tails.get(name) ?? Promise.resolve();
     let release!: () => void;
@@ -92,9 +93,18 @@ class FakeLocks implements PrivateProAssetLockPort {
     this.tails.set(name, queued);
     await previous.catch(() => {});
     if (signal?.aborted) { release(); throw new DOMException('aborted', 'AbortError'); }
+    this.activeCallbacks.set(name, (this.activeCallbacks.get(name) ?? 0) + 1);
     try { return await callback(signal); }
-    finally { release(); if (this.tails.get(name) === queued) this.tails.delete(name); }
+    finally {
+      const active = (this.activeCallbacks.get(name) ?? 1) - 1;
+      if (active) this.activeCallbacks.set(name, active);
+      else this.activeCallbacks.delete(name);
+      release();
+      if (this.tails.get(name) === queued) this.tails.delete(name);
+    }
   }
+
+  active(name: string): number { return this.activeCallbacks.get(name) ?? 0; }
 }
 
 function harness(t: TestContext) {
@@ -464,6 +474,7 @@ describe('Private Pro direct assets', () => {
     };
 
     const staleUpload = staleClient.ensureUploaded([oldAsset.id]);
+    staleUpload.catch(() => {});
     await Promise.all([staleStorageStarted.promise, renewalStarted.promise]);
     const newAsset = { ...oldAsset, data: { ...oldAsset.data, base64: base64(bytes('successor-generation-two')) } };
     await local.putAsset(newAsset);
@@ -477,6 +488,70 @@ describe('Private Pro direct assets', () => {
     assert.equal(staleWrote, false);
     assert.equal(new TextDecoder().decode(storage.objects.get(`users/${UID}/workspace-v1/assets/${oldAsset.id}/original`)!.bytes), 'successor-generation-two');
     assert.equal((await local.getManifest(oldAsset.id))?.contentGeneration, 2);
+  });
+
+  test('a renewal that never settles cannot pin upload cleanup or its Web Lock', async (t) => {
+    mock.timers.enable({ apis: ['setTimeout', 'Date'], now: 0 });
+    t.after(() => mock.timers.reset());
+    const { db, local, storage, locks } = harness(t);
+    const asset = fixture('asset-never-renewed', false);
+    await local.putAsset(asset);
+    const renewalStarted = deferred();
+    const never = new Promise<never>(() => {});
+    const stalledLeasePort: PrivateProAssetUploadLeasePort = {
+      acquireAssetUploadLease: (...args) => db.acquireAssetUploadLease(...args),
+      renewAssetUploadLease: async () => { renewalStarted.resolve(); return never; },
+      releaseAssetUploadLease: (...args) => db.releaseAssetUploadLease(...args),
+      ownsAssetUploadLease: (...args) => db.ownsAssetUploadLease(...args),
+    };
+    const leaseConfig = {
+      leaseMs: 60,
+      renewEveryMs: 10,
+      retryEveryMs: 2,
+      now: Date.now,
+    };
+    const stalledClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks, { port: stalledLeasePort, ...leaseConfig });
+    const successorClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks, { port: db, ...leaseConfig });
+    const upload = FakeStorage.prototype.uploadBytesResumable.bind(storage);
+    const storageStarted = deferred();
+    let storageAborted = false;
+    let firstCall = true;
+    storage.uploadBytesResumable = async (...args) => {
+      if (!firstCall) return upload(...args);
+      firstCall = false;
+      storageStarted.resolve();
+      const signal = args[3];
+      await new Promise<void>((_resolve, reject) => {
+        const abort = () => {
+          storageAborted = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        };
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
+      });
+    };
+
+    let stalledSettled = false;
+    const stalledUpload = stalledClient.ensureUploaded([asset.id]).finally(() => { stalledSettled = true; });
+    stalledUpload.catch(() => {});
+    await storageStarted.promise;
+    mock.timers.tick(10);
+    await Promise.resolve();
+    await renewalStarted.promise;
+    mock.timers.tick(50);
+    for (let index = 0; index < 10; index++) {
+      await Promise.resolve();
+      await new Promise<void>(resolve => setImmediate(resolve));
+    }
+
+    const lockName = `private-pro-asset-upload:${UID}:${asset.id}`;
+    assert.equal(storageAborted, true);
+    assert.equal(stalledSettled, true);
+    assert.equal(locks.active(lockName), 0);
+    await assert.rejects(stalledUpload, { name: 'AbortError' });
+
+    await successorClient.ensureUploaded([asset.id]);
+    assert.equal((await local.getManifest(asset.id))?.contentGeneration, 1);
   });
 
   test('successful renewals reschedule expiry fencing for a long Web-Locked upload', async (t) => {

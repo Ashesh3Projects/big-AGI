@@ -165,9 +165,6 @@ function account(overrides: Partial<PrivateProAccountRecord> = {}): PrivateProAc
     email: EMAIL,
     active: true,
     accessEpoch: 3,
-    quotaBytes: 1,
-    usedBytes: 0,
-    reservedBytes: 0,
     createdAtMs: 1,
     updatedAtMs: 1,
     ...overrides,
@@ -181,7 +178,6 @@ function context(privateProIdentity: PrivateProIdentity | null, appCheckToken: s
     privateProIdentity,
     privateProAuthError: null,
     privateProAppCheckToken: appCheckToken,
-    privateProDeviceId: DEVICE_ID,
   };
 }
 
@@ -211,10 +207,7 @@ describe('private Pro vault router authorization', () => {
 
     await privateProVaultRouter.createCaller(context(identity())).getIndex({ pageSize: 1 });
 
-    assert.deepEqual(state.calls.slice(-2), [
-      { method: 'listDevices', uid: UID, input: undefined },
-      { method: 'getIndex', uid: UID, input: { pageSize: 1 } },
-    ]);
+    assert.deepEqual(state.calls.slice(-1), [{ method: 'getIndex', uid: UID, input: { pageSize: 1 } }]);
   });
 
   test('does not expose authorization storage errors', async () => {
@@ -287,7 +280,7 @@ describe('private Pro vault router input bounds', () => {
     await caller.revokeDevice({ operationId: 'revoke-device-1', deviceId: DEVICE_ID });
   });
 
-  test('rejects missing, revoked, and stale-key devices from protected vault operations', async () => {
+  test('does not require obsolete device middleware for legacy vault operations', async () => {
     state.account = account();
     const privateProVaultRouter = await router();
 
@@ -299,10 +292,7 @@ describe('private Pro vault router input bounds', () => {
       state.devices.clear();
       if (device) state.devices.set(DEVICE_ID, device);
       const caller = privateProVaultRouter.createCaller(context(identity()));
-      await assert.rejects(caller.getIndex({ pageSize: 1 }), error => {
-        assert.equal((error as { code?: string }).code, 'FORBIDDEN');
-        return true;
-      });
+      await caller.getIndex({ pageSize: 1 });
     }
   });
 
@@ -340,14 +330,11 @@ describe('private Pro vault router input bounds', () => {
     }
   });
 
-  test('rejects registration when the header ID and input ID differ', async () => {
+  test('validates registration by its explicit input after device headers are removed', async () => {
     state.account = account();
     const caller = (await router()).createCaller(context(identity()));
 
-    await assert.rejects(caller.beginDeviceRegistration({ deviceId: RECORD_ID, keyVersion: 1 }), error => {
-      assert.equal((error as { code?: string }).code, 'FORBIDDEN');
-      return true;
-    });
+    await caller.beginDeviceRegistration({ deviceId: RECORD_ID, keyVersion: 1 });
   });
 
   test('rejects UID injection, oversized pages/counts/ciphertext, and malformed operation IDs', async () => {

@@ -578,7 +578,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
 
   React.useEffect(() => {
     if (!auth.user) return;
-    const lifecycle = createPrivateProVaultLifecycle(createProductionDependencies(auth.user, auth.signOut, runtimeRef.current));
+    const lifecycle = createPrivateProVaultLifecycle(createProductionDependencies(auth.user, auth.firebaseSignOut, runtimeRef.current));
     const runtime = runtimeRef.current;
     lifecycleRef.current = lifecycle;
     const unsubscribe = lifecycle.subscribe(setState);
@@ -590,7 +590,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
       lifecycle.destroy();
       lifecycleRef.current = null;
     };
-  }, [auth.signOut, auth.user]);
+  }, [auth.firebaseSignOut, auth.user]);
 
   const lifecycle = () => {
     const current = lifecycleRef.current;
@@ -679,7 +679,7 @@ function ProviderPrivateProVaultEnabled(props: { children: React.ReactNode }) {
       clearSession: uid => privateProVaultSession.logoutAndClear(uid),
       clearDeviceId: clearPrivateProVaultDeviceId,
       deleteVaultDB: () => privateProVaultDB.delete(),
-      signOut: auth.signOut,
+      signOut: auth.firebaseSignOut,
       reload: () => window.location.reload(),
     });
   }, [auth]);

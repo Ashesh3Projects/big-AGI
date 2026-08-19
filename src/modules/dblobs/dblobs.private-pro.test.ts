@@ -7,6 +7,7 @@ import Dexie from 'dexie';
 import {
   activatePrivateProAssetPersistence,
   createPrivateProAssetLocalPort,
+  deactivatePrivateProAssetPersistence,
   type PrivateProAssetLocalPort,
 } from '~/modules/private-pro/assets/privatePro.assets.local';
 import { createPrivateProAssetClient, type PrivateProAssetStorageMetadata, type PrivateProAssetStoragePort } from '~/modules/private-pro/assets/privatePro.assets.client';
@@ -166,6 +167,16 @@ test('does not expose the new UID until the old native transaction settles', asy
   await switching;
   assert.equal(switched, true);
   assert.equal(await dbModule.getDBAsset('asset-transition-barrier'), undefined);
+});
+
+test('stale UID cleanup cannot deactivate the current account asset port', async () => {
+  const dbModule = await dbModulePromise;
+  const asset = imageAsset('asset-current-account');
+  await activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
+  await dbModule.putDBAsset(asset);
+
+  assert.equal(await deactivatePrivateProAssetPersistence('uid-a'), false);
+  assert.deepEqual(await dbModule.getDBAsset(asset.id), asset);
 });
 
 test('routes a DBlob operation through the latest chained activation without contaminating Open Dexie', async () => {

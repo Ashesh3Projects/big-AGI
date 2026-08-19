@@ -111,10 +111,10 @@ class ManualScheduler {
   setInterval = (callback: () => void): ReturnType<typeof globalThis.setInterval> => {
     const id = this.nextId++;
     this.timers.set(id, callback);
-    return id;
+    return id as unknown as ReturnType<typeof globalThis.setInterval>;
   };
   clearInterval = (id: ReturnType<typeof globalThis.setInterval>): void => {
-    this.timers.delete(id);
+    this.timers.delete(id as unknown as number);
   };
 
   activeTimerCount(): number {
@@ -192,7 +192,7 @@ function options(uid: string, extra: Partial<PrivateProSyncCoordinatorOptions> =
 function leaderRunner(started: string[], id: string): (context: PrivateProSyncLeaderContext) => Promise<void> {
   return context => new Promise(resolve => {
     started.push(`${id}:${context.coordinatorFence}`);
-    context.signal.addEventListener('abort', resolve, { once: true });
+    context.signal.addEventListener('abort', () => resolve(), { once: true });
   });
 }
 
@@ -253,6 +253,7 @@ describe('Private Pro sync coordinator', () => {
 
     await Promise.all([sender.start(async () => {}), receiver.start(async () => {})]);
     sender.wake();
+    sender.broadcastSignedOut?.();
     await sender.stop();
 
     assert.deepEqual(received, ['wake', 'signed-out']);

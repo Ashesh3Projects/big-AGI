@@ -14,9 +14,6 @@ export interface PrivateProAccountRecord {
   email: string;
   active: boolean;
   accessEpoch: number;
-  quotaBytes: number;
-  usedBytes: number;
-  reservedBytes: number;
   createdAtMs: number;
   updatedAtMs: number;
 }
@@ -25,16 +22,12 @@ export interface PrivateProBootstrap {
   uid: string;
   email: string;
   accessEpoch: number;
-  quotaBytes: number;
-  usedBytes: number;
-  reservedBytes: number;
 }
 
 export interface PrivateProAuthAdminPort {
   activateAccount(input: {
     uid: string;
     email: string;
-    quotaBytes: number;
     nowMs: number;
   }): Promise<PrivateProAccountRecord>;
   setClaims(uid: string, claims: { privatePro: true; privateProEpoch: number }): Promise<void>;
@@ -43,13 +36,12 @@ export interface PrivateProAuthAdminPort {
 
 export interface PrivateProBootstrapOptions {
   allowedEmails: ReadonlySet<string>;
-  attachmentQuotaBytes: number;
   nowMs: number;
 }
 
 export function activatePrivateProAccountRecord(
   existing: PrivateProAccountRecord | null,
-  input: { uid: string; email: string; quotaBytes: number; nowMs: number },
+  input: { uid: string; email: string; nowMs: number },
 ): PrivateProAccountRecord {
   const accessEpoch = existing
     ? existing.active ? Math.max(1, existing.accessEpoch) : Math.max(1, existing.accessEpoch + 1)
@@ -59,9 +51,6 @@ export function activatePrivateProAccountRecord(
     email: input.email,
     active: true,
     accessEpoch,
-    quotaBytes: input.quotaBytes,
-    usedBytes: existing?.usedBytes ?? 0,
-    reservedBytes: existing?.reservedBytes ?? 0,
     createdAtMs: existing?.createdAtMs ?? input.nowMs,
     updatedAtMs: input.nowMs,
   };
@@ -79,7 +68,6 @@ export async function bootstrapPrivateProAccount(
   const account = await admin.activateAccount({
     uid: identity.uid,
     email: identity.email,
-    quotaBytes: options.attachmentQuotaBytes,
     nowMs: options.nowMs,
   });
   await admin.setClaims(identity.uid, { privatePro: true, privateProEpoch: account.accessEpoch });
@@ -88,9 +76,6 @@ export async function bootstrapPrivateProAccount(
     uid: account.uid,
     email: account.email,
     accessEpoch: account.accessEpoch,
-    quotaBytes: account.quotaBytes,
-    usedBytes: account.usedBytes,
-    reservedBytes: account.reservedBytes,
   };
 }
 
