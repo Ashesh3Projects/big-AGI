@@ -341,6 +341,51 @@ describe('Private Pro seamless sync outbound', () => {
     assert.equal(privateProSyncRetryDelay(99, () => 1), 60_000);
   });
 
+  test('continues durable retry attempts after an outbound restart', async (t) => {
+    const name = `private-pro-sync-outbound-restart-${crypto.randomUUID()}`;
+    const db = new PrivateProSyncDB(name);
+    const clock = new ManualClock();
+    const serializer = new FakeSerializer();
+    const firstCoordinator = new FakeCoordinator();
+    const firstTransport = new FakeTransport();
+    firstTransport.results.push(new PrivateProSyncTransportError('offline'));
+    const first = createPrivateProSyncOutbound({
+      uid: UID, writerId: WRITER_ID, serializers: [serializer], db, coordinator: firstCoordinator,
+      transport: firstTransport, now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+      random: () => 0,
+    });
+    t.after(async () => {
+      await first.stop();
+      db.close();
+      await Dexie.delete(name);
+    });
+    await first.start();
+    const pending = await first.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'retry' }, referencedAssetIds: [],
+    } });
+    await clock.advance(60_000);
+    assert.equal((await db.getOutbox(UID, pending.recordKey))?.retryAttempt, 1);
+    await first.stop();
+
+    const secondCoordinator = new FakeCoordinator();
+    const secondTransport = new FakeTransport();
+    secondTransport.results.push(new PrivateProSyncTransportError('offline'));
+    const second = createPrivateProSyncOutbound({
+      uid: UID, writerId: WRITER_ID, serializers: [], db, coordinator: secondCoordinator,
+      transport: secondTransport, now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+      random: () => 0,
+    });
+    await second.start();
+    await clock.advance(500);
+
+    const retried = await db.getOutbox(UID, pending.recordKey);
+    assert.equal(secondTransport.writes.length, 1);
+    assert.equal(retried?.retryAttempt, 2);
+    assert.equal(retried?.dueAtMs, 61_500);
+    await second.stop();
+  });
+
   test('durably blocks a permission failure and reports only its sanitized category', async (t) => {
     const { outbound, transport, clock, db, statuses } = createHarness(t);
     transport.results.push(new PrivateProSyncTransportError('permission'));
@@ -451,6 +496,39 @@ describe('Private Pro seamless sync outbound', () => {
     assert.equal(released?.leaseUntilMs, null);
     assert.equal(released?.dueAtMs, 60_000);
     assert.equal(clock.activeTimerCount(), 0);
+  });
+
+  test('stop releases a lease without waiting for a stalled asset upload', async (t) => {
+    const name = `private-pro-sync-outbound-assets-${crypto.randomUUID()}`;
+    const db = new PrivateProSyncDB(name);
+    const clock = new ManualClock();
+    const coordinator = new FakeCoordinator();
+    const transport = new FakeTransport();
+    const stalled = deferred<void>();
+    const outbound = createPrivateProSyncOutbound({
+      uid: UID, writerId: WRITER_ID, serializers: [new FakeSerializer()], db, coordinator, transport,
+      assets: { ensureUploaded: () => stalled.promise },
+      now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+    });
+    t.after(async () => {
+      stalled.resolve();
+      await outbound.stop();
+      db.close();
+      await Dexie.delete(name);
+    });
+    await outbound.start();
+    const pending = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'asset' }, referencedAssetIds: ['asset-1'],
+    } });
+    await clock.advance(60_000);
+
+    await outbound.stop();
+    const released = await db.getOutbox(UID, pending.recordKey);
+    assert.equal(released?.leaseToken, null);
+    assert.equal(released?.retryAttempt, 0);
+    assert.equal(released?.dueAtMs, 60_000);
+    assert.equal(transport.writes.length, 0);
   });
 
   test('classifies only fixed safe error categories', () => {

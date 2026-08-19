@@ -36,6 +36,7 @@ export interface PrivateProOutboxState extends PrivateProSyncRecordIdentity {
   generation: number;
   baseRevision: number;
   dueAtMs: number;
+  retryAttempt: number;
   leaseUntilMs: number | null;
   leaseToken: string | null;
   leaseFence: number | null;
@@ -85,7 +86,7 @@ export interface PrivateProSyncMetaState {
 
 
 function cloneOutbox(state: PrivateProOutboxState): PrivateProOutboxState {
-  return { ...state, referencedAssetIds: [...state.referencedAssetIds] };
+  return { ...state, retryAttempt: state.retryAttempt ?? 0, referencedAssetIds: [...state.referencedAssetIds] };
 }
 
 function cloneLocalRecord(state: PrivateProLocalRecordState): PrivateProLocalRecordState {
@@ -155,7 +156,7 @@ export class PrivateProSyncDB extends Dexie {
     const due = (await this.outbox.where('uid').equals(uid).toArray())
       .filter(entry => !entry.blocked)
       .reduce<number | null>((earliest, entry) => {
-        const schedulableAt = entry.leaseUntilMs ?? entry.dueAtMs;
+        const schedulableAt = entry.leaseUntilMs === null ? entry.dueAtMs : Math.max(entry.dueAtMs, entry.leaseUntilMs);
         return earliest === null ? schedulableAt : Math.min(earliest, schedulableAt);
       }, null);
     return due;
@@ -180,6 +181,9 @@ export class PrivateProSyncDB extends Dexie {
       ]);
       const generation = await this.nextGeneration(uid, record.recordKey);
       const baseRevision = remoteBase?.revision ?? previousLocal?.baseRevision ?? 0;
+      const startsPostLeaseGeneration = previousOutbox?.leasedGeneration !== null
+        && previousOutbox?.leasedGeneration !== undefined
+        && previousOutbox.generation === previousOutbox.leasedGeneration;
       const localRecord: PrivateProLocalRecordState = {
         uid,
         ...asIdentity(record),
@@ -201,7 +205,8 @@ export class PrivateProSyncDB extends Dexie {
         mutationId: crypto.randomUUID(),
         generation,
         baseRevision,
-        dueAtMs: previousOutbox?.leaseToken ? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS : previousOutbox?.dueAtMs ?? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS,
+        dueAtMs: startsPostLeaseGeneration ? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS : previousOutbox?.dueAtMs ?? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS,
+        retryAttempt: 0,
         leaseUntilMs: previousOutbox?.leaseUntilMs ?? null,
         leaseToken: previousOutbox?.leaseToken ?? null,
         leaseFence: previousOutbox?.leaseFence ?? null,
@@ -223,6 +228,9 @@ export class PrivateProSyncDB extends Dexie {
       ]);
       const generation = await this.nextGeneration(uid, identity.recordKey);
       const baseRevision = remoteBase?.revision ?? previousLocal?.baseRevision ?? 0;
+      const startsPostLeaseGeneration = previousOutbox?.leasedGeneration !== null
+        && previousOutbox?.leasedGeneration !== undefined
+        && previousOutbox.generation === previousOutbox.leasedGeneration;
       const localRecord: PrivateProLocalRecordState = {
         uid,
         ...identity,
@@ -244,7 +252,8 @@ export class PrivateProSyncDB extends Dexie {
         mutationId: crypto.randomUUID(),
         generation,
         baseRevision,
-        dueAtMs: previousOutbox?.leaseToken ? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS : previousOutbox?.dueAtMs ?? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS,
+        dueAtMs: startsPostLeaseGeneration ? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS : previousOutbox?.dueAtMs ?? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS,
+        retryAttempt: 0,
         leaseUntilMs: previousOutbox?.leaseUntilMs ?? null,
         leaseToken: previousOutbox?.leaseToken ?? null,
         leaseFence: previousOutbox?.leaseFence ?? null,
@@ -276,9 +285,24 @@ export class PrivateProSyncDB extends Dexie {
     await this.transaction('rw', this.outbox, async () => {
       const pending = await this.outbox.get([uid, recordKey]);
       if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
+      if (pending.generation !== generation) {
+        clearOutboxLease(pending);
+        await this.outbox.put(pending);
+        return;
+      }
       pending.dueAtMs = nowMs + delayMs;
+      pending.retryAttempt = (pending.retryAttempt ?? 0) + 1;
       clearOutboxLease(pending);
       pending.errorCode = errorCode;
+      await this.outbox.put(pending);
+    });
+  }
+
+  async releaseLease(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number): Promise<void> {
+    await this.transaction('rw', this.outbox, async () => {
+      const pending = await this.outbox.get([uid, recordKey]);
+      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
+      clearOutboxLease(pending);
       await this.outbox.put(pending);
     });
   }
@@ -289,7 +313,6 @@ export class PrivateProSyncDB extends Dexie {
       if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
       if (pending.generation !== generation) {
         clearOutboxLease(pending);
-        pending.errorCode = null;
         await this.outbox.put(pending);
         return;
       }
@@ -306,7 +329,6 @@ export class PrivateProSyncDB extends Dexie {
       if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
       if (pending.generation !== generation) {
         clearOutboxLease(pending);
-        pending.errorCode = null;
         await this.outbox.put(pending);
         return;
       }
@@ -329,7 +351,6 @@ export class PrivateProSyncDB extends Dexie {
       if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
       if (pending.generation !== generation) {
         clearOutboxLease(pending);
-        pending.errorCode = null;
         await this.outbox.put(pending);
         return;
       }
@@ -340,6 +361,7 @@ export class PrivateProSyncDB extends Dexie {
       }
       pending.baseRevision = effectiveBase.revision;
       pending.dueAtMs = nowMs + delayMs;
+      pending.retryAttempt = (pending.retryAttempt ?? 0) + 1;
       clearOutboxLease(pending);
       pending.errorCode = null;
       await this.outbox.put(pending);
@@ -375,6 +397,28 @@ export class PrivateProSyncDB extends Dexie {
       const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
       const pending = await this.outbox.get([uid, recordKey]);
       if (!effectiveBase.deleted || !pending || pending.kind !== 'put' || pending.baseRevision >= effectiveBase.revision) return;
+      await Promise.all([
+        this.localRecords.delete([uid, recordKey]),
+        this.outbox.delete([uid, recordKey]),
+      ]);
+    });
+  }
+
+  async discardLeasedAcrossTombstone(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, remoteBase: PrivateProRemoteBaseState): Promise<void> {
+    await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
+      const pending = await this.outbox.get([uid, recordKey]);
+      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
+      if (pending.generation !== generation) {
+        clearOutboxLease(pending);
+        await this.outbox.put(pending);
+        return;
+      }
+      if (!remoteBase.deleted || pending.kind !== 'put' || pending.baseRevision >= remoteBase.revision) {
+        clearOutboxLease(pending);
+        await this.outbox.put(pending);
+        return;
+      }
+      await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
       await Promise.all([
         this.localRecords.delete([uid, recordKey]),
         this.outbox.delete([uid, recordKey]),

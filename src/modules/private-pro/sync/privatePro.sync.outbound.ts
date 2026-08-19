@@ -80,6 +80,11 @@ interface ActiveSend {
   sentAtMs: number;
 }
 
+type AbortRace<T> =
+  | { type: 'result'; result: T }
+  | { type: 'error'; error: unknown }
+  | { type: 'aborted' };
+
 function waitForAbort(signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve();
   return new Promise(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
@@ -113,7 +118,6 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   const cancelTimeout = dependencies.clearTimeout ?? (handle => globalThis.clearTimeout(handle));
   const assets = dependencies.assets ?? { ensureUploaded: async () => {} };
   const serializers = new Map(dependencies.serializers.map(serializer => [serializer.recordType, serializer]));
-  const retryAttempts = new Map<string, number>();
   const activeSends = new Map<string, ActiveSend>();
   const unsubscribers: Array<() => void> = [];
 
@@ -196,7 +200,6 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
         schemaVersion: mutation.schemaVersion,
       }, now());
     }
-    retryAttempts.delete(pending.recordKey);
     dependencies.onCaptured?.({ ...notice, generation: pending.generation, mutationId: pending.mutationId });
     dependencies.coordinator.wake();
     void reschedule();
@@ -219,11 +222,9 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     return result;
   }
 
-  async function retry(row: PrivateProOutboxState, category: PrivateProOutboundErrorCategory, immediate = false): Promise<number> {
+  async function retry(row: PrivateProOutboxState, category: PrivateProOutboundErrorCategory): Promise<number> {
     if (!row.leaseToken || row.leaseFence === null || row.leasedGeneration === null) return 0;
-    const attempt = (retryAttempts.get(row.recordKey) ?? 0) + 1;
-    retryAttempts.set(row.recordKey, attempt);
-    const delayMs = immediate ? 0 : privateProSyncRetryDelay(attempt, random);
+    const delayMs = privateProSyncRetryDelay((row.retryAttempt ?? 0) + 1, random);
     await dependencies.db.retry(
       dependencies.uid,
       row.recordKey,
@@ -237,6 +238,17 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     return delayMs;
   }
 
+  async function release(row: PrivateProOutboxState): Promise<void> {
+    if (!row.leaseToken || row.leaseFence === null || row.leasedGeneration === null) return;
+    await dependencies.db.releaseLease(
+      dependencies.uid,
+      row.recordKey,
+      row.leasedGeneration,
+      row.leaseToken,
+      row.leaseFence,
+    );
+  }
+
   async function acknowledge(row: PrivateProOutboxState, base: PrivateProRemoteBaseState, sentAtMs: number): Promise<void> {
     if (!row.leaseToken || row.leaseFence === null || row.leasedGeneration === null) return;
     await dependencies.db.acknowledge(
@@ -248,11 +260,18 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       base,
       sentAtMs,
     );
-    retryAttempts.delete(row.recordKey);
   }
 
-  async function raceWrite(row: PrivateProOutboxState, signal: AbortSignal) {
-    const request = dependencies.transport.write({
+  async function raceAbortable<T>(request: Promise<T>, signal: AbortSignal): Promise<AbortRace<T>> {
+    request.catch(() => {});
+    return Promise.race([
+      request.then(result => ({ type: 'result' as const, result }), error => ({ type: 'error' as const, error })),
+      waitForAbort(signal).then(() => ({ type: 'aborted' as const })),
+    ]);
+  }
+
+  function raceWrite(row: PrivateProOutboxState, signal: AbortSignal): Promise<AbortRace<Awaited<ReturnType<PrivateProSyncTransport['write']>>>> {
+    return raceAbortable(dependencies.transport.write({
       recordKey: row.recordKey,
       recordType: row.recordType,
       logicalId: row.logicalId,
@@ -263,12 +282,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       baseRevision: row.baseRevision,
       mutationId: row.mutationId,
       writerId: dependencies.writerId,
-    });
-    request.catch(() => {});
-    return Promise.race([
-      request.then(result => ({ type: 'result' as const, result }), error => ({ type: 'error' as const, error })),
-      waitForAbort(signal).then(() => ({ type: 'aborted' as const })),
-    ]);
+    }), signal);
   }
 
   async function processRow(row: PrivateProOutboxState, context: PrivateProSyncLeaderContext): Promise<void> {
@@ -277,14 +291,13 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     const sentAtMs = now();
     activeSends.set(row.mutationId, { row, sentAtMs });
     try {
-      try {
-        await assets.ensureUploaded(row.referencedAssetIds);
-      } catch (error) {
-        const category = privateProClassifySyncError(error);
-        if (context.signal.aborted) {
-          await retry(row, 'offline', true);
-          return;
-        }
+      const assetsOutcome = await raceAbortable(assets.ensureUploaded(row.referencedAssetIds), context.signal);
+      if (assetsOutcome.type === 'aborted') {
+        await release(row);
+        return;
+      }
+      if (assetsOutcome.type === 'error') {
+        const category = privateProClassifySyncError(assetsOutcome.error);
         if (category === 'permission' || category === 'quota' || category === 'schema' || category === 'unknown') {
           await dependencies.db.block(dependencies.uid, row.recordKey, row.leasedGeneration, row.leaseToken, row.leaseFence, category);
           report(category);
@@ -295,12 +308,12 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       }
 
       if (context.signal.aborted) {
-        await retry(row, 'offline', true);
+        await release(row);
         return;
       }
       const outcome = await raceWrite(row, context.signal);
       if (outcome.type === 'aborted') {
-        await retry(row, 'offline', true);
+        await release(row);
         return;
       }
       if (outcome.type === 'error') {
@@ -328,8 +341,14 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
           await acknowledge(row, remoteBase(result.canonical), sentAtMs);
           return;
         }
-        await dependencies.db.discardAcrossTombstone(dependencies.uid, row.recordKey, remoteBase(result.canonical));
-        retryAttempts.delete(row.recordKey);
+        await dependencies.db.discardLeasedAcrossTombstone(
+          dependencies.uid,
+          row.recordKey,
+          row.leasedGeneration,
+          row.leaseToken,
+          row.leaseFence,
+          remoteBase(result.canonical),
+        );
         return;
       }
 
@@ -352,9 +371,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
         return;
       }
 
-      const attempt = (retryAttempts.get(row.recordKey) ?? 0) + 1;
-      retryAttempts.set(row.recordKey, attempt);
-      const delayMs = privateProSyncRetryDelay(attempt, random);
+      const delayMs = privateProSyncRetryDelay((row.retryAttempt ?? 0) + 1, random);
       await dependencies.db.rebase(
         dependencies.uid,
         row.recordKey,

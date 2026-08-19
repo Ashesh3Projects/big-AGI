@@ -87,14 +87,39 @@ describe('Private Pro seamless sync database', () => {
   test('starts and preserves a newer generation first-window deadline while the older generation is leased', async (t) => {
     const db = createDB(t);
     const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    await db.outbox.update([UID_A, first.recordKey], { retryAttempt: 3, errorCode: 'prior', blocked: false });
     const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
     if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
     await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":3}'), 63_000);
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":4}'), 64_000);
     assert.equal((await db.getOutbox(UID_A, first.recordKey))?.dueAtMs, 122_000);
 
     await db.acknowledge(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, remoteBase(1), 61_000);
 
     assert.equal((await db.getOutbox(UID_A, first.recordKey))?.dueAtMs, 122_000);
+  });
+
+  test('preserves the first post-lease delete deadline through repeated local mutations', async (t) => {
+    const db = createDB(t);
+    const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+    const identity = {
+      recordType: first.recordType,
+      logicalId: first.logicalId,
+      recordKey: first.recordKey,
+      projectionKey: first.projectionKey,
+      schemaVersion: first.schemaVersion,
+    };
+
+    await db.recordLocalDelete(UID_A, identity, 62_000);
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 63_000);
+    await db.recordLocalDelete(UID_A, identity, 64_000);
+
+    const pending = await db.getOutbox(UID_A, first.recordKey);
+    assert.equal(pending?.kind, 'delete');
+    assert.equal(pending?.dueAtMs, 122_000);
   });
 
   test('clears only one UID namespace', async (t) => {
@@ -163,32 +188,23 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(await db.getRemoteBase(UID_A, oldLease.recordKey), null);
   });
 
-  test('retries and rebases the newest pending generation after an older sent generation changes locally', async (t) => {
+  test('a stale retry releases the inherited lease without changing the newer generation', async (t) => {
     const db = createDB(t);
     const sent = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
     const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
     if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected a sent lease.');
     const latest = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+    await db.outbox.update([UID_A, sent.recordKey], { retryAttempt: 4, errorCode: 'prior', blocked: true });
 
     await db.retry(UID_A, sent.recordKey, sent.generation, lease.leaseToken, lease.leaseFence, 63_000, 1_000, 'offline');
-    let pending = await db.getOutbox(UID_A, sent.recordKey);
+    const pending = await db.getOutbox(UID_A, sent.recordKey);
     assert.equal(pending?.generation, latest.generation);
     assert.equal(pending?.payload, '{"value":2}');
-    assert.equal(pending?.dueAtMs, 64_000);
+    assert.equal(pending?.dueAtMs, 122_000);
+    assert.equal(pending?.retryAttempt, 4);
+    assert.equal(pending?.errorCode, 'prior');
+    assert.equal(pending?.blocked, true);
     assert.equal(pending?.leaseToken, null);
-    assert.equal(pending?.leasedGeneration, null);
-
-    const rebaseLease = await db.leaseDue(UID_A, 64_000, 5_000, 1);
-    if (!rebaseLease?.leaseToken || rebaseLease.leaseFence === null) assert.fail('Expected rebase lease.');
-    await db.rebase(UID_A, latest.recordKey, rebaseLease.generation, rebaseLease.leaseToken, rebaseLease.leaseFence, remoteBase(4), 65_000);
-    pending = await db.getOutbox(UID_A, latest.recordKey);
-    assert.equal(pending?.generation, latest.generation);
-    assert.equal(pending?.payload, '{"value":2}');
-    assert.equal(pending?.baseRevision, 4);
-    assert.equal(pending?.dueAtMs, 65_000);
-    assert.equal(pending?.leaseUntilMs, null);
-    assert.equal(pending?.leaseToken, null);
-    assert.equal(pending?.leaseFence, null);
     assert.equal(pending?.leasedGeneration, null);
   });
 
@@ -272,6 +288,16 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(await db.nextDueAt(UID_A), 66_000);
   });
 
+  test('reports the later of due time and active lease expiry', async (t) => {
+    const db = createDB(t);
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 30_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+
+    assert.equal(await db.nextDueAt(UID_A), 122_000);
+  });
+
   test('persists conflict retry timing while rebasing the exact leased generation', async (t) => {
     const db = createDB(t);
     const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
@@ -281,6 +307,59 @@ describe('Private Pro seamless sync database', () => {
     await db.rebase(UID_A, pending.recordKey, pending.generation, lease.leaseToken, lease.leaseFence, remoteBase(3), 61_000, 500);
 
     assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.dueAtMs, 61_500);
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.retryAttempt, 1);
+  });
+
+  test('persists retry attempts across leases and resets them on a fresh local generation', async (t) => {
+    const db = createDB(t);
+    const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const firstLease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!firstLease?.leaseToken || firstLease.leaseFence === null) assert.fail('Expected first lease.');
+    await db.retry(UID_A, pending.recordKey, pending.generation, firstLease.leaseToken, firstLease.leaseFence, 61_000, 500, 'offline');
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.retryAttempt, 1);
+
+    const secondLease = await db.leaseDue(UID_A, 61_500, 5_000, 2);
+    if (!secondLease?.leaseToken || secondLease.leaseFence === null) assert.fail('Expected second lease.');
+    await db.retry(UID_A, pending.recordKey, pending.generation, secondLease.leaseToken, secondLease.leaseFence, 61_500, 1_000, 'offline');
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.retryAttempt, 2);
+
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.retryAttempt, 0);
+  });
+
+  test('fenced tombstone discard releases late generation N without deleting generation N plus one', async (t) => {
+    const db = createDB(t);
+    const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+    const latest = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+
+    await db.discardLeasedAcrossTombstone(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, {
+      revision: 2, mutationId: 'tombstone-2', deleted: true,
+    });
+
+    const pending = await db.getOutbox(UID_A, first.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.payload, '{"value":2}');
+    assert.equal(pending?.leaseToken, null);
+    assert.equal(await db.getRemoteBase(UID_A, first.recordKey), null);
+  });
+
+  test('fenced tombstone discard cannot affect a re-leased owner', async (t) => {
+    const db = createDB(t);
+    const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const oldLease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    const currentLease = await db.leaseDue(UID_A, 66_000, 5_000, 2);
+    if (!oldLease?.leaseToken || oldLease.leaseFence === null || !currentLease?.leaseToken || currentLease.leaseFence === null)
+      assert.fail('Expected both leases.');
+
+    await db.discardLeasedAcrossTombstone(UID_A, pending.recordKey, pending.generation, oldLease.leaseToken, oldLease.leaseFence, {
+      revision: 2, mutationId: 'tombstone-2', deleted: true,
+    });
+
+    const current = await db.getOutbox(UID_A, pending.recordKey);
+    assert.equal(current?.leaseToken, currentLease.leaseToken);
+    assert.equal(await db.getRemoteBase(UID_A, pending.recordKey), null);
   });
 
   test('does not rebase a newer generation from an older leased conflict', async (t) => {
