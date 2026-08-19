@@ -3,7 +3,7 @@ import * as z from 'zod/v4';
 
 const PrivateProSyncLogicalIdSchema = z.string().min(1).max(512);
 const PrivateProSyncContentHashSchema = z.string().regex(/^[a-f0-9]{64}$/);
-const PrivateProSyncRecordKeySchema = z.string().min(1).max(1024).regex(/^[A-Za-z0-9_-]+$/);
+export const PrivateProSyncRecordKeySchema = z.string().min(1).max(1024).regex(/^[A-Za-z0-9_-]+$/);
 
 export const PrivateProSyncRecordTypeSchema = z.enum([
   'credential-service',

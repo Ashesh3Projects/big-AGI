@@ -15,6 +15,7 @@ import {
 import {
   PrivateProSyncMutationReceiptSchema,
   PrivateProSyncRecordDocumentSchema,
+  PrivateProSyncRecordKeySchema,
   PrivateProSyncTombstoneDocumentSchema,
   SyncChatMessageSchema,
   SyncChatMetaSchema,
@@ -44,6 +45,15 @@ describe('Private Pro sync v1 protocol', () => {
       assert.doesNotMatch(key, /\//);
       assert.match(key, /^[A-Za-z0-9_-]+$/);
     }
+  });
+
+  test('bounds non-ASCII logical IDs into valid deterministic record keys', () => {
+    const logicalId = '\u2603'.repeat(512);
+    const key = privateProRecordKey('settings', logicalId);
+
+    assert.equal(key, privateProRecordKey('settings', logicalId));
+    assert.notEqual(key, privateProRecordKey('settings', `${logicalId.slice(0, -1)}a`));
+    assert.equal(PrivateProSyncRecordKeySchema.parse(key), key);
   });
 
   test('canonical JSON is ASCII and stable across object key order', () => {
