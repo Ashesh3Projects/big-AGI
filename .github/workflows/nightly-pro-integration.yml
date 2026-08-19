@@ -86,6 +86,10 @@ jobs:
       - name: Install pinned Copilot CLI
         run: npm install --global --ignore-scripts @github/copilot@1.0.80
 
+      - name: Record trusted Node path
+        id: node_bin
+        run: echo "path=$(command -v node)" >> "$GITHUB_OUTPUT"
+
       - name: Prepare upstream integration range
         id: prepare
         env:
@@ -108,8 +112,54 @@ jobs:
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
         run: |
+          trusted_node_bin="$(command -v node)"
+          trusted_runner_temp_identity="$(stat -Lc '%d:%i' -- "$RUNNER_TEMP")"
+          trusted_git_dir_identity="$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")"
+          GIT_HEAD_FILE="$(realpath "$(/usr/bin/git rev-parse --git-path HEAD)")"
+          trusted_git_head_b64="$(base64 -w0 "$GIT_HEAD_FILE")"
+          trusted_git_head_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$GIT_HEAD_FILE")")"
+          restore_trusted_file() {
+            local source_name="$1"
+            local target_name="$2"
+            local expected_parent_identity="${3:-$trusted_runner_temp_identity}"
+            local target
+            local target_parent
+            local temp
+            local expected_digest
+            local actual_digest
+            if [[ "$target_name" = /* ]]; then
+              target="$target_name"
+            else
+              target="$RUNNER_TEMP/$target_name"
+            fi
+            target_parent="$(dirname -- "$target")"
+            if [[ "$(stat -Lc '%d:%i' -- "$target_parent")" != "$expected_parent_identity" ]]; then
+              echo "Trusted target parent identity changed: $target_name" >&2
+              exit 1
+            fi
+            temp="$(mktemp "$target_parent/.nightly-restore.XXXXXX")"
+            printf '%s' "${!source_name}" | base64 --decode > "$temp"
+            expected_digest="$(printf '%s' "${!source_name}" | sha256sum | cut -d' ' -f1)"
+            actual_digest="$(base64 -w0 "$temp" | sha256sum | cut -d' ' -f1)"
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "Restored trusted file digest mismatch: $target_name" >&2
+              exit 1
+            fi
+            chmod 600 "$temp"
+            /usr/bin/mv -Tf -- "$temp" "$target"
+            test -f "$target"
+            test ! -L "$target"
+            test "$(base64 -w0 "$target" | sha256sum | cut -d' ' -f1)" = "$expected_digest"
+          }
           copilot_home="$RUNNER_TEMP/copilot-home"
           mkdir -p "$copilot_home"
+          trusted_coordinator_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-pro-integration.ts")"
+          trusted_commits_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-commits.txt")"
+          trusted_files_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-files.txt")"
+          trusted_conflict_prompt_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-copilot-conflict-prompt.txt")"
+          trusted_git_index_file="$(realpath "$(/usr/bin/git rev-parse --git-path index)")"
+          trusted_git_index_parent_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$trusted_git_index_file")")"
+          trusted_git_index_b64="$(base64 -w0 "$trusted_git_index_file")"
           for attempt in $(seq 1 100); do
             state="$(< "$RUNNER_TEMP/nightly-minimal-state.txt")"
             if [[ "$state" == 'complete' ]]; then
@@ -119,10 +169,14 @@ jobs:
               echo "Invalid minimal integration state: $state" >&2
               exit 1
             fi
+            trusted_state_b64="$(printf '%s\n' "$state" | base64 -w0)"
+            trusted_conflict_index_file="$(mktemp "$RUNNER_TEMP/nightly-copilot-index.XXXXXX")"
+            cp "$trusted_git_index_file" "$trusted_conflict_index_file"
             env -i \
               HOME="$copilot_home" \
               PATH="$PATH" \
               CI=true \
+              GIT_INDEX_FILE="$trusted_conflict_index_file" \
               COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
               copilot \
               --prompt "$(< "$RUNNER_TEMP/nightly-copilot-conflict-prompt.txt")" \
@@ -137,32 +191,24 @@ jobs:
               --no-remote \
               --no-remote-export \
               --disable-builtin-mcps \
-              --disallow-temp-dir \
+              --yolo \
               --secret-env-vars=COPILOT_GITHUB_TOKEN \
-              --allow-tool='write' \
-              --allow-tool='shell(git status:*)' \
-              --allow-tool='shell(git diff:*)' \
-              --allow-tool='shell(git add:*)' \
-              --allow-tool='shell(cat:*)' \
-              --allow-tool='shell(grep:*)' \
-              --allow-tool='shell(rg:*)' \
-              --allow-tool='shell(head:*)' \
-              --allow-tool='shell(tail:*)' \
-              --deny-tool='shell(git push)' \
-              --deny-tool='shell(git reset)' \
-              --deny-tool='shell(git checkout)' \
-              --deny-tool='shell(git switch)' \
-              --deny-tool='shell(git merge)' \
-              --deny-tool='shell(git rebase)' \
-              --deny-tool='shell(git commit)' \
-              --deny-tool='shell(git clean)' \
-              --deny-tool='shell(git restore)' \
-              --deny-tool='shell(git fetch)' \
-              --deny-tool='shell(git pull)' \
-              --deny-tool='shell(git remote)' \
-              --deny-tool='shell(git init)' \
-              --deny-tool='shell(git clone)'
-            node "$RUNNER_TEMP/nightly-pro-integration.ts" finish-minimal
+              --silent
+            restore_trusted_file trusted_coordinator_b64 nightly-pro-integration.ts
+            restore_trusted_file trusted_commits_b64 nightly-upstream-commits.txt
+            restore_trusted_file trusted_files_b64 nightly-upstream-files.txt
+            restore_trusted_file trusted_conflict_prompt_b64 nightly-copilot-conflict-prompt.txt
+            restore_trusted_file trusted_state_b64 nightly-minimal-state.txt
+            restore_trusted_file trusted_git_head_b64 "$GIT_HEAD_FILE" "$trusted_git_head_identity"
+            if [[ "$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")" != "$trusted_git_dir_identity" ]]; then
+              echo 'Git directory identity changed during Copilot execution' >&2
+              exit 1
+            fi
+            GIT_INDEX_FILE="$trusted_conflict_index_file" "$trusted_node_bin" "$RUNNER_TEMP/nightly-pro-integration.ts" finish-minimal
+            restore_trusted_file trusted_git_index_b64 "$trusted_git_index_file" "$trusted_git_index_parent_identity"
+            cp "$trusted_conflict_index_file" "$trusted_git_index_file"
+            rm -f "$trusted_conflict_index_file"
+            trusted_git_index_b64="$(base64 -w0 "$trusted_git_index_file")"
           done
           test "$(< "$RUNNER_TEMP/nightly-minimal-state.txt")" = 'complete'
 
@@ -171,8 +217,57 @@ jobs:
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
         run: |
+          trusted_node_bin="$(command -v node)"
+          trusted_runner_temp_identity="$(stat -Lc '%d:%i' -- "$RUNNER_TEMP")"
+          trusted_git_dir_identity="$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")"
+          GIT_HEAD_FILE="$(realpath "$(/usr/bin/git rev-parse --git-path HEAD)")"
+          trusted_git_head_b64="$(base64 -w0 "$GIT_HEAD_FILE")"
+          trusted_git_head_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$GIT_HEAD_FILE")")"
+          restore_trusted_file() {
+            local source_name="$1"
+            local target_name="$2"
+            local expected_parent_identity="${3:-$trusted_runner_temp_identity}"
+            local target
+            local target_parent
+            local temp
+            local expected_digest
+            local actual_digest
+            if [[ "$target_name" = /* ]]; then
+              target="$target_name"
+            else
+              target="$RUNNER_TEMP/$target_name"
+            fi
+            target_parent="$(dirname -- "$target")"
+            if [[ "$(stat -Lc '%d:%i' -- "$target_parent")" != "$expected_parent_identity" ]]; then
+              echo "Trusted target parent identity changed: $target_name" >&2
+              exit 1
+            fi
+            temp="$(mktemp "$target_parent/.nightly-restore.XXXXXX")"
+            printf '%s' "${!source_name}" | base64 --decode > "$temp"
+            expected_digest="$(printf '%s' "${!source_name}" | sha256sum | cut -d' ' -f1)"
+            actual_digest="$(base64 -w0 "$temp" | sha256sum | cut -d' ' -f1)"
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "Restored trusted file digest mismatch: $target_name" >&2
+              exit 1
+            fi
+            chmod 600 "$temp"
+            /usr/bin/mv -Tf -- "$temp" "$target"
+            test -f "$target"
+            test ! -L "$target"
+            test "$(base64 -w0 "$target" | sha256sum | cut -d' ' -f1)" = "$expected_digest"
+          }
           copilot_home="$RUNNER_TEMP/copilot-home-report"
           mkdir -p "$copilot_home"
+          trusted_coordinator_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-pro-integration.ts")"
+          trusted_commits_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-commits.txt")"
+          trusted_files_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-files.txt")"
+          trusted_report_prompt_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-copilot-report-prompt.txt")"
+          trusted_state_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-minimal-state.txt")"
+          trusted_patch_hash_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-minimal-patch.sha256")"
+          GIT_INDEX_FILE="$(realpath "$(/usr/bin/git rev-parse --git-path index)")"
+          trusted_git_index_parent_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$GIT_INDEX_FILE")")"
+          trusted_git_index_b64="$(base64 -w0 "$GIT_INDEX_FILE")"
+          trusted_workspace_status_b64="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all | base64 -w0)"
           env -i \
             HOME="$copilot_home" \
             PATH="$PATH" \
@@ -191,40 +286,34 @@ jobs:
             --no-remote \
             --no-remote-export \
             --disable-builtin-mcps \
-            --disallow-temp-dir \
+            --yolo \
             --secret-env-vars=COPILOT_GITHUB_TOKEN \
-            --allow-tool='write' \
-            --allow-tool='shell(git status:*)' \
-            --allow-tool='shell(git log:*)' \
-            --allow-tool='shell(git show:*)' \
-            --allow-tool='shell(git diff:*)' \
-            --allow-tool='shell(cat:*)' \
-            --allow-tool='shell(grep:*)' \
-            --allow-tool='shell(rg:*)' \
-            --allow-tool='shell(head:*)' \
-            --allow-tool='shell(tail:*)' \
-            --deny-tool='shell(git push)' \
-            --deny-tool='shell(git reset)' \
-            --deny-tool='shell(git checkout)' \
-            --deny-tool='shell(git switch)' \
-            --deny-tool='shell(git merge)' \
-            --deny-tool='shell(git rebase)' \
-            --deny-tool='shell(git commit)' \
-            --deny-tool='shell(git add)' \
-            --deny-tool='shell(git clean)' \
-            --deny-tool='shell(git restore)' \
-            --deny-tool='shell(git fetch)' \
-            --deny-tool='shell(git pull)' \
-            --deny-tool='shell(git remote)' \
-            --deny-tool='shell(git init)' \
-            --deny-tool='shell(git clone)' \
             --share .nightly-copilot-session.md
+          restore_trusted_file trusted_coordinator_b64 nightly-pro-integration.ts
+          restore_trusted_file trusted_commits_b64 nightly-upstream-commits.txt
+          restore_trusted_file trusted_files_b64 nightly-upstream-files.txt
+          restore_trusted_file trusted_report_prompt_b64 nightly-copilot-report-prompt.txt
+          restore_trusted_file trusted_state_b64 nightly-minimal-state.txt
+          restore_trusted_file trusted_patch_hash_b64 nightly-minimal-patch.sha256
+          restore_trusted_file trusted_git_index_b64 "$GIT_INDEX_FILE" "$trusted_git_index_parent_identity"
+          restore_trusted_file trusted_git_head_b64 "$GIT_HEAD_FILE" "$trusted_git_head_identity"
+          if [[ "$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")" != "$trusted_git_dir_identity" ]]; then
+            echo 'Git directory identity changed during Copilot execution' >&2
+            exit 1
+          fi
+          workspace_status="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all)"
+          if [[ "$(printf '%s' "$workspace_status" | base64 -w0)" != "$trusted_workspace_status_b64" ]]; then
+            echo 'Copilot modified the integration workspace during report generation' >&2
+            exit 1
+          fi
 
       - name: Verify and package integration
         if: steps.prepare.outputs.has_upstream_changes == 'true'
         env:
           NODE_ENV: development
-        run: node "$RUNNER_TEMP/nightly-pro-integration.ts" verify-package
+          TRUSTED_NODE_BIN: ${{ steps.node_bin.outputs.path }}
+        run: |
+          "$TRUSTED_NODE_BIN" "$RUNNER_TEMP/nightly-pro-integration.ts" verify-package
 
       - name: Upload verified integration package
         if: steps.prepare.outputs.has_upstream_changes == 'true'
