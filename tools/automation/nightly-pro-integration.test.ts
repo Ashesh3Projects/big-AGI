@@ -35,6 +35,9 @@ test('runs the pinned Copilot CLI with the requested model and maximum effort', 
   assert.match(workflow, /npm install --global --ignore-scripts @github\/copilot@1\.0\.80/);
   assert.match(workflow, /--model gpt-5\.6-sol/);
   assert.match(workflow, /--effort max/);
+  assert.match(workflow, /--max-autopilot-continues 50/);
+  assert.match(workflow, /--mode autopilot/);
+  assert.match(workflow, /--plan/);
   assert.match(workflow, /--no-ask-user/);
   assert.match(workflow, /--no-remote/);
   assert.match(workflow, /--no-remote-export/);

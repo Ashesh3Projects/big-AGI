@@ -116,6 +116,9 @@ jobs:
             --model gpt-5.6-sol \
             --effort max \
             --context long_context \
+            --mode autopilot \
+            --plan \
+            --max-autopilot-continues 50 \
             --no-ask-user \
             --no-auto-update \
             --no-custom-instructions \
