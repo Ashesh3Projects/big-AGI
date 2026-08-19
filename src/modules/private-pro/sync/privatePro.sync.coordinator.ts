@@ -143,6 +143,7 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       leader = false;
       leaderAbort = null;
       clearFallbackRenewTimer();
+      clearFallbackPollTimer();
       if (!stopped) {
         await releaseFallbackIdentity(identity);
         if (sameLeaseIdentity(fallbackIdentity, identity)) {

@@ -117,6 +117,10 @@ class ManualScheduler {
     this.timers.delete(id);
   };
 
+  activeTimerCount(): number {
+    return this.timers.size;
+  }
+
   async advance(ms: number): Promise<void> {
     this.nowMs += ms;
     for (const callback of [...this.timers.values()]) callback();
@@ -309,6 +313,7 @@ describe('Private Pro sync coordinator', () => {
 
     assert.deepEqual(leases.releases, [{ fence: 1, ownerToken: 'owner-1' }]);
     assert.equal(leases.isAvailable(scheduler.nowMs), true);
+    assert.equal(scheduler.activeTimerCount(), 0);
     await coordinator.stop();
   });
 
@@ -327,6 +332,7 @@ describe('Private Pro sync coordinator', () => {
 
     assert.equal(coordinator.isLeader(), false);
     assert.equal(leases.isAvailable(scheduler.nowMs), true);
+    assert.equal(scheduler.activeTimerCount(), 0);
   });
 
   test('takes over an expired fallback lease and rejects the stale fenced owner renewal', async () => {
