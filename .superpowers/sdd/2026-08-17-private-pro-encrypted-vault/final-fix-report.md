@@ -39,8 +39,8 @@ Code HEAD before this report commit: `af4211c3f`
    - Kept composer startup text transient and discarded. Added `enableFolders` as its own encrypted settings record so a clean PC reconstructs both true and false independently of folder records.
    - Added a tRPC-aware ambiguous transport classifier. Only wrapped fetch/network failures replay the exact same operation; server validation and conflict responses do not retry.
    - Replaced the single 200-record backup merge with resumable restore sessions. Each chunk remains atomic at 200 records and 4 MiB, while the authenticated backup format remains bounded at 100,000 records and 128 MiB.
-   - The active restore marker blocks normal vault reads and mutations. Session-authorized progress, index, record, chunk, and finalization procedures support exact resume and verification. A middle conflict leaves the marker and prior chunks intact, and finalization clears the marker only after all declared chunks and records commit.
-   - Added 1,001-record client and service tests, active-session restart coverage, realistic `TRPCClientError` tests, and Firebase denial coverage for restore session/completion receipts.
+   - The active restore marker blocks normal vault reads and mutations. A bounded manifest binds ordered per-chunk counts, canonical fingerprints, total ciphertext bytes, and authenticated backup totals. Seal retains the marker in `awaiting-verification`; exact authorized verification and hydration precede transactional confirmation and marker deletion.
+   - Added 1,001-record client and service tests, active and sealed restart coverage, zero-record and overcommit tests, actual `httpLink` parse-failure tests, and Firebase denial coverage for restore session/completion receipts.
 
 ## Commits
 

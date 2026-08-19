@@ -38,7 +38,7 @@ Code HEAD before this report commit: `af4211c3f`
 - Normal vault index reads and content mutations are blocked while the marker exists. The restoring client uses restore-authorized status, index, and record procedures.
 - Each chunk is all-or-none. A chunk conflict writes nothing for that chunk, keeps prior chunks and the marker, and reports the same next chunk index.
 - An ambiguous network response retries the exact same chunk operation once. If ambiguity remains, the application stays blocked and restart uses the authenticated backup fingerprint to query and resume the same restore.
-- Finalization requires all declared chunks and record counts, creates a completion receipt, and deletes the active marker in the same transaction.
+- Sealing requires all manifest-bound chunks, record counts, and ciphertext bytes, but retains the active marker in `awaiting-verification`. The client verifies and hydrates through session-authorized reads. Only exact verified confirmation creates a completion receipt and deletes the marker in the same transaction.
 - There is no destructive cancel. Once a chunk commits, cancellation cannot safely restore the prior cloud state. Resume or reconcile is required.
 
 Production deployment remains blocked by the existing live-state and approval-gated controls. No cloud mutation, deployment, push, server start, real-account action, or automatic device revocation was performed.
