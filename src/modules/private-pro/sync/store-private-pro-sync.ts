@@ -3,7 +3,7 @@ import { createStore, type StoreApi } from 'zustand/vanilla';
 import type { PrivateProOutboundErrorCategory } from './privatePro.sync.outbound';
 
 
-export type PrivateProSyncPhase = 'local' | 'synced' | 'offline' | 'error';
+export type PrivateProSyncPhase = 'local' | 'syncing' | 'synced' | 'offline' | 'error';
 
 export interface PrivateProSyncState {
   phase: PrivateProSyncPhase;

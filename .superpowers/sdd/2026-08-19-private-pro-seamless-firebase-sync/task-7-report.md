@@ -75,3 +75,44 @@ GREEN:
 ## Concerns
 
 None.
+
+## Fix round 1
+
+### Findings addressed
+
+- Engine-owned synchronous and asynchronous suppression depth now gates outbound capture in both the default and injected outbound paths.
+- Per-projection edit versions fence cache, record, and tombstone work before every projection callback and across DB/list awaits.
+- Capture completion uses unique `captureId` correlation. Failed latest captures remain local-dirty without binding the next successful completion.
+- Synthetic transaction acknowledgements emit exact record key, generation, mutation ID, revision, and deletion identity. Bounded committed markers suppress only the exact listener echo and are pruned by higher revisions or newer local captures.
+- Listener errors include collection identity, invalidate current state, close the listener set, and require a fresh listener epoch on retry or online recovery.
+- Malformed committed documents emit sanitized `invalid-document` events with collection and record key only. Reconciliation quarantines the sanitized reason and continues queue order.
+- Lifecycle epochs fence cache, event, status, and projection work. Stop closes listeners first, waits for running engine-owned projection scopes, and does not hang on arbitrary listener work.
+- Each engine now owns an isolated status store by default. Added `syncing` for all-current state with durable pending work.
+- Outbound `retryNow` only wakes and reschedules due work. Only `flushNow` expedites the 60-second write window.
+
+### RED evidence
+
+- Outbound/Firebase suite: 8 failures for missing capture IDs, failed-capture correlation, synthetic commit notice, `retryNow`, collection-scoped errors, and invalid-document events.
+- Engine suite: 5 failures for missing suppression hooks, shared default store, missing listener reattachment, stale lifecycle callbacks, and missing failed-capture correlation.
+- Reconciler race: local edit during remote DB commit applied stale runtime data, `1 !== 0`.
+- Lifecycle regression: stop hung on an arbitrary remote handler until event and projection task classes were separated.
+
+### GREEN evidence
+
+- Modified DB, serializer, Firebase, outbound, reconciler, and engine suites: 117 tests, 6 suites, 117 passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for all modified sync source and tests, exit 0 with no warnings.
+- `git diff --check`, exit 0. Git printed only LF-to-CRLF conversion notices.
+
+### Self-review
+
+- Projection callbacks cannot re-enter capture while any nested async suppression scope is active.
+- Local edits during initial cache listing, DB commit, projection listing, and tombstone persistence win without stale runtime apply/remove.
+- Old synthetic commits cannot recreate a marker after a newer local capture.
+- Old listener epochs cannot mutate current state or status after retry or restart.
+- Stop invalidates lifecycle state before closing transport and outbound, then waits only for engine-owned projection scopes.
+- Status ownership and retry callback cleanup are per engine.
+
+### Concerns
+
+None.

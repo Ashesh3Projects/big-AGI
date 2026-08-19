@@ -13,7 +13,10 @@ import {
   createPrivateProSyncOutbound,
   privateProClassifySyncError,
   privateProSyncRetryDelay,
+  type PrivateProSyncCaptureFailure,
   type PrivateProSyncCaptureNotice,
+  type PrivateProSyncCommittedNotice,
+  type PrivateProSyncDurableCapture,
 } from './privatePro.sync.outbound';
 import type {
   PrivateProSyncLocalMutation,
@@ -189,6 +192,9 @@ interface Harness {
   serializer: FakeSerializer;
   transport: FakeTransport;
   notices: PrivateProSyncCaptureNotice[];
+  captured: PrivateProSyncDurableCapture[];
+  failed: PrivateProSyncCaptureFailure[];
+  committed: PrivateProSyncCommittedNotice[];
   statuses: string[];
   assetCalls: readonly string[][];
   outbound: ReturnType<typeof createPrivateProSyncOutbound>;
@@ -217,6 +223,9 @@ function createHarness(t: TestContext, serializer = new FakeSerializer()): Harne
   const coordinator = new FakeCoordinator();
   const transport = new FakeTransport();
   const notices: PrivateProSyncCaptureNotice[] = [];
+  const captured: PrivateProSyncDurableCapture[] = [];
+  const failed: PrivateProSyncCaptureFailure[] = [];
+  const committed: PrivateProSyncCommittedNotice[] = [];
   const statuses: string[] = [];
   const assetCalls: string[][] = [];
   const outbound = createPrivateProSyncOutbound({
@@ -232,6 +241,9 @@ function createHarness(t: TestContext, serializer = new FakeSerializer()): Harne
     clearTimeout: clock.clearTimeout,
     random: () => 0,
     onCapture: notice => notices.push(notice),
+    onCaptured: notice => captured.push(notice),
+    onCaptureFailed: notice => failed.push(notice),
+    onCommitted: notice => committed.push(notice),
     onStatus: status => statuses.push(status.category),
   });
   t.after(async () => {
@@ -239,7 +251,7 @@ function createHarness(t: TestContext, serializer = new FakeSerializer()): Harne
     db.close();
     await Dexie.delete(name);
   });
-  return { db, clock, coordinator, serializer, transport, notices, statuses, assetCalls, outbound };
+  return { db, clock, coordinator, serializer, transport, notices, captured, failed, committed, statuses, assetCalls, outbound };
 }
 
 describe('Private Pro seamless sync outbound', () => {
@@ -300,7 +312,7 @@ describe('Private Pro seamless sync outbound', () => {
   });
 
   test('notifies local origin synchronously before durable capture completes', async (t) => {
-    const { outbound, notices, coordinator } = createHarness(t);
+    const { outbound, notices, captured, coordinator } = createHarness(t);
     let returned = false;
     const capture = outbound.capture({ kind: 'put', record: {
       recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
@@ -309,11 +321,64 @@ describe('Private Pro seamless sync outbound', () => {
     returned = true;
 
     assert.equal(returned, true);
-    assert.deepEqual(notices, [{ kind: 'put', recordType: 'settings', logicalId: 'main', recordKey: privateProRecordKey('settings', 'main') }]);
+    assert.equal(notices.length, 1);
+    assert.match(notices[0].captureId, /^[0-9a-f-]{36}$/);
     assert.equal(coordinator.wakeCount, 0);
     const durable = await capture;
     assert.equal(durable.generation, 1);
+    assert.equal(captured[0].captureId, notices[0].captureId);
     assert.equal(coordinator.wakeCount, 1);
+  });
+
+  test('correlates a failed capture and the next successful capture by unique capture ID', async (t) => {
+    const { outbound, notices, captured, failed } = createHarness(t);
+    await assert.rejects(outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 2,
+      value: { value: 'invalid' }, referencedAssetIds: [],
+    } }));
+    const valid = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'valid' }, referencedAssetIds: [],
+    } });
+
+    assert.equal(new Set(notices.map(notice => notice.captureId)).size, 2);
+    assert.equal(failed[0].captureId, notices[0].captureId);
+    assert.equal(failed[0].category, 'schema');
+    assert.equal(captured[0].captureId, notices[1].captureId);
+    assert.equal(captured[0].generation, valid.generation);
+  });
+
+  test('reports exact synthetic commit identity after accepted write', async (t) => {
+    const { outbound, transport, clock, committed } = createHarness(t);
+    await outbound.start();
+    const pending = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'commit' }, referencedAssetIds: [],
+    } });
+    transport.results.push({ status: 'accepted', revision: 3 });
+
+    await clock.advance(60_000);
+
+    assert.deepEqual(committed, [{
+      recordKey: pending.recordKey, generation: pending.generation, mutationId: pending.mutationId,
+      revision: 3, deleted: false,
+    }]);
+  });
+
+  test('retryNow preserves the normal first-minute deadline', async (t) => {
+    const { outbound, transport, clock, db } = createHarness(t);
+    await outbound.start();
+    const pending = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'later' }, referencedAssetIds: [],
+    } });
+
+    await outbound.retryNow();
+
+    assert.equal(transport.writes.length, 0);
+    assert.equal((await db.getOutbox(UID, pending.recordKey))?.dueAtMs, 60_000);
+    await clock.advance(60_000);
+    assert.equal(transport.writes.length, 1);
   });
 
   test('sign-out flush drains a normal write before its first minute', async (t) => {

@@ -14,9 +14,20 @@ import type { PrivateProSyncRemoteEvent, PrivateProSyncRemoteRecord } from './pr
 
 
 export interface PrivateProSyncLocalOrigin {
-  sequence: number;
+  captureId: string;
+  projectionKey: string;
+  editVersion: number;
   generation: number | null;
   mutationId: string | null;
+  dirty: boolean;
+}
+
+export interface PrivateProSyncCommittedMarker {
+  recordKey: string;
+  generation: number;
+  mutationId: string;
+  revision: number;
+  deleted: boolean;
 }
 
 export interface PrivateProSyncReconcilerDependencies {
@@ -25,16 +36,18 @@ export interface PrivateProSyncReconcilerDependencies {
   serializers: readonly PrivateProSyncSerializer<unknown>[];
   db: PrivateProSyncDB;
   localOrigins: Map<string, PrivateProSyncLocalOrigin>;
+  committedMarkers?: Map<string, PrivateProSyncCommittedMarker>;
+  projectionVersions?: Map<string, number>;
   outbound: Pick<{ handleCommitted(mutationId: string, revision: number): Promise<void> }, 'handleCommitted'>;
   runSuppressed<T>(callback: () => Promise<T> | T): Promise<T> | T;
-  shouldApply?: () => boolean;
+  isEpochActive?: (epoch: number) => boolean;
   now?: () => number;
   onError?: (category: 'schema' | 'offline' | 'permission' | 'quota' | 'unknown') => void;
 }
 
 export interface PrivateProSyncReconciler {
-  applyCached(): Promise<void>;
-  handle(event: PrivateProSyncRemoteEvent): Promise<void>;
+  applyCached(epoch?: number): Promise<void>;
+  handle(event: PrivateProSyncRemoteEvent, epoch?: number): Promise<void>;
 }
 
 interface ValidatedRecord {
@@ -72,7 +85,8 @@ function sortProjectionRecords(records: PrivateProSyncSerializedRecord[]): void 
 export function createPrivateProSyncReconciler(dependencies: PrivateProSyncReconcilerDependencies): PrivateProSyncReconciler {
   const now = dependencies.now ?? Date.now;
   const serializers = new Map(dependencies.serializers.map(serializer => [serializer.recordType, serializer]));
-  const projectionVersions = new Map<string, number>();
+  const projectionVersions = dependencies.projectionVersions ?? new Map<string, number>();
+  const committedMarkers = dependencies.committedMarkers ?? new Map<string, PrivateProSyncCommittedMarker>();
 
   function advanceProjection(projectionKey: string): number {
     const version = (projectionVersions.get(projectionKey) ?? 0) + 1;
@@ -146,10 +160,14 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
   async function materialize(
     projectionKey: string,
     preferredSerializer?: PrivateProSyncSerializer<unknown>,
-    options: { override?: PrivateProSyncSerializedRecord; excludeRecordKey?: string } = {},
+    options: { override?: PrivateProSyncSerializedRecord; excludeRecordKey?: string; epoch?: number } = {},
   ): Promise<void> {
     const version = projectionVersions.get(projectionKey) ?? 0;
-    if (dependencies.shouldApply && !dependencies.shouldApply()) return;
+    const originVersions = new Map([...dependencies.localOrigins.entries()]
+      .filter(([, origin]) => origin.projectionKey === projectionKey)
+      .map(([recordKey, origin]) => [recordKey, origin.editVersion]));
+    const epoch = options.epoch ?? 0;
+    if (dependencies.isEpochActive && !dependencies.isEpochActive(epoch)) return;
     const records = await projectionRecords(projectionKey, options.override, options.excludeRecordKey);
     const isChat = records.some(record => record.recordType === 'chat-meta' || record.recordType === 'chat-message') ||
       preferredSerializer?.recordType === 'chat-meta' || preferredSerializer?.recordType === 'chat-message';
@@ -159,11 +177,15 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     if (preferredSerializer) projections.add(preferredSerializer.projection);
     for (const projection of projections) {
       if ((projectionVersions.get(projectionKey) ?? 0) !== version) return;
-      if (dependencies.shouldApply && !dependencies.shouldApply()) return;
+      if ([...dependencies.localOrigins.entries()].some(([recordKey, origin]) =>
+        origin.projectionKey === projectionKey && origin.editVersion !== originVersions.get(recordKey))) return;
+      if (dependencies.isEpochActive && !dependencies.isEpochActive(epoch)) return;
       const applying = dependencies.runSuppressed(() => records.length && !missingChatMeta
         ? projection.apply(projectionKey, records)
         : projection.remove(projectionKey));
       await applying;
+      if ((projectionVersions.get(projectionKey) ?? 0) !== version) return;
+      if (dependencies.isEpochActive && !dependencies.isEpochActive(epoch)) return;
     }
   }
 
@@ -172,7 +194,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     dependencies.onError?.('schema');
   }
 
-  async function handleRecord(canonical: PrivateProSyncRemoteRecord): Promise<void> {
+  async function handleRecord(canonical: PrivateProSyncRemoteRecord, epoch: number): Promise<void> {
     const currentBase = await dependencies.db.getRemoteBase(dependencies.uid, canonical.recordKey);
     if (currentBase && currentBase.revision > canonical.revision) return;
     let validated: ValidatedRecord;
@@ -182,6 +204,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
       await quarantine(canonical.recordKey, 'invalid-payload');
       return;
     }
+    const editVersion = projectionVersions.get(validated.prepared.projectionKey) ?? 0;
 
     const existing = await dependencies.db.getLocalRecord(dependencies.uid, canonical.recordKey);
     if (canonical.recordType === 'chat-message' && existing && !existing.deleted &&
@@ -191,7 +214,11 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     }
 
     const origin = dependencies.localOrigins.get(canonical.recordKey);
+    const marker = committedMarkers.get(canonical.recordKey);
+    if (marker && canonical.revision > marker.revision) committedMarkers.delete(canonical.recordKey);
+    const exactMarker = canonical.writerId === dependencies.writerId && marker?.mutationId === canonical.mutationId && marker.revision === canonical.revision;
     const sameTabMutation = canonical.writerId === dependencies.writerId && origin?.mutationId === canonical.mutationId;
+    if (exactMarker) return;
     if (sameTabMutation) {
       await dependencies.db.setEffectiveRemoteBase(dependencies.uid, canonical.recordKey, {
         revision: canonical.revision,
@@ -200,6 +227,10 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
       });
       await dependencies.outbound.handleCommitted(canonical.mutationId, canonical.revision);
       if (dependencies.localOrigins.get(canonical.recordKey) === origin) dependencies.localOrigins.delete(canonical.recordKey);
+      committedMarkers.set(canonical.recordKey, {
+        recordKey: canonical.recordKey, generation: origin.generation ?? 0, mutationId: canonical.mutationId,
+        revision: canonical.revision, deleted: false,
+      });
       return;
     }
 
@@ -209,12 +240,13 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
       deleted: false,
     }, now());
     if (effectiveBase.revision !== canonical.revision || effectiveBase.deleted) return;
+    if ((projectionVersions.get(validated.prepared.projectionKey) ?? 0) !== editVersion) return;
     if (origin) return;
     advanceProjection(validated.prepared.projectionKey);
-    await materialize(validated.prepared.projectionKey, validated.serializer, { override: validated.serialized });
+    await materialize(validated.prepared.projectionKey, validated.serializer, { override: validated.serialized, epoch });
   }
 
-  async function handleTombstone(event: Extract<PrivateProSyncRemoteEvent, { type: 'tombstone' }>): Promise<void> {
+  async function handleTombstone(event: Extract<PrivateProSyncRemoteEvent, { type: 'tombstone' }>, epoch: number): Promise<void> {
     const { tombstone } = event;
     if (privateProRecordKey(tombstone.recordType, tombstone.logicalId) !== tombstone.recordKey) {
       await quarantine(tombstone.recordKey, 'invalid-tombstone');
@@ -227,6 +259,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     }
     const local = await dependencies.db.getLocalRecord(dependencies.uid, tombstone.recordKey);
     const projectionKey = local?.projectionKey ?? chatProjectionKey(tombstone.recordType, tombstone.logicalId) ?? tombstone.logicalId;
+    const editVersion = projectionVersions.get(projectionKey) ?? 0;
     const identity: PrivateProSyncRecordIdentity = {
       recordType: tombstone.recordType,
       logicalId: tombstone.logicalId,
@@ -238,6 +271,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     const effectiveBase = await dependencies.db.commitRemoteTombstone(dependencies.uid, identity, remoteBase, now());
     if (effectiveBase.revision !== remoteBase.revision || !effectiveBase.deleted) return;
     await dependencies.db.discardAcrossTombstone(dependencies.uid, tombstone.recordKey, remoteBase);
+    if ((projectionVersions.get(projectionKey) ?? 0) !== editVersion) return;
     const origin = dependencies.localOrigins.get(tombstone.recordKey);
     if (tombstone.writerId === dependencies.writerId && origin?.mutationId === tombstone.mutationId) {
       await dependencies.outbound.handleCommitted(tombstone.mutationId, tombstone.deletedRevision);
@@ -245,11 +279,11 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     }
     if (origin) return;
     advanceProjection(projectionKey);
-    await materialize(projectionKey, serializer, { excludeRecordKey: tombstone.recordKey });
+    await materialize(projectionKey, serializer, { excludeRecordKey: tombstone.recordKey, epoch });
   }
 
   return {
-    async applyCached(): Promise<void> {
+    async applyCached(epoch = 0): Promise<void> {
       const local = (await dependencies.db.listLocalRecords(dependencies.uid)).filter(record => !record.deleted);
       const projections = new Map<string, PrivateProLocalRecordState[]>();
       for (const record of local) {
@@ -260,16 +294,17 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
       for (const [projectionKey, records] of projections) {
         if (records.some(record => dependencies.localOrigins.has(record.recordKey))) continue;
         try {
-          await materialize(projectionKey, serializerFor(records[0].recordType));
+          await materialize(projectionKey, serializerFor(records[0].recordType), { epoch });
         } catch {
           await quarantine(records[0].recordKey, 'invalid-cache');
         }
       }
     },
 
-    async handle(event): Promise<void> {
-      if (event.type === 'record') return handleRecord(event.canonical);
-      if (event.type === 'tombstone') return handleTombstone(event);
+    async handle(event, epoch = 0): Promise<void> {
+      if (event.type === 'record') return handleRecord(event.canonical, epoch);
+      if (event.type === 'tombstone') return handleTombstone(event, epoch);
+      if (event.type === 'invalid-document') return quarantine(event.recordKey, event.reason);
       if (event.type === 'error') dependencies.onError?.(event.category);
     },
   };

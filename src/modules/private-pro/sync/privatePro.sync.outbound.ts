@@ -29,15 +29,29 @@ type TimeoutHandle = ReturnType<typeof globalThis.setTimeout>;
 export type PrivateProOutboundErrorCategory = PrivateProSyncErrorCategory | 'schema';
 
 export interface PrivateProSyncCaptureNotice {
+  captureId: string;
   kind: 'put' | 'delete';
   recordType: PrivateProSyncRecordType;
   logicalId: string;
   recordKey: string;
+  projectionKey: string;
 }
 
 export interface PrivateProSyncDurableCapture extends PrivateProSyncCaptureNotice {
   generation: number;
   mutationId: string;
+}
+
+export interface PrivateProSyncCaptureFailure extends PrivateProSyncCaptureNotice {
+  category: PrivateProOutboundErrorCategory;
+}
+
+export interface PrivateProSyncCommittedNotice {
+  recordKey: string;
+  generation: number;
+  mutationId: string;
+  revision: number;
+  deleted: boolean;
 }
 
 export interface PrivateProSyncOutboundStatus {
@@ -59,6 +73,8 @@ export interface PrivateProSyncOutboundDependencies {
   shouldCapture?: (mutation: PrivateProSyncLocalMutation) => boolean;
   onCapture?: (notice: PrivateProSyncCaptureNotice) => void;
   onCaptured?: (notice: PrivateProSyncDurableCapture) => void;
+  onCaptureFailed?: (notice: PrivateProSyncCaptureFailure) => void;
+  onCommitted?: (notice: PrivateProSyncCommittedNotice) => void;
   onStatus?: (status: PrivateProSyncOutboundStatus) => void;
   now?: () => number;
   random?: () => number;
@@ -70,6 +86,7 @@ export interface PrivateProSyncOutbound {
   start(): Promise<void>;
   capture(mutation: PrivateProSyncLocalMutation): Promise<PrivateProOutboxState>;
   handleCommitted(mutationId: string, revision: number): Promise<void>;
+  retryNow(): Promise<void>;
   wake(): void;
   flushNow(): Promise<void>;
   stop(): Promise<void>;
@@ -209,15 +226,19 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   function capture(mutation: PrivateProSyncLocalMutation): Promise<PrivateProOutboxState> {
     const identity = mutation.kind === 'put' ? mutation.record : mutation;
     const notice: PrivateProSyncCaptureNotice = {
+      captureId: crypto.randomUUID(),
       kind: mutation.kind,
       recordType: identity.recordType,
       logicalId: identity.logicalId,
       recordKey: privateProRecordKey(identity.recordType, identity.logicalId),
+      projectionKey: identity.projectionKey,
     };
     dependencies.onCapture?.(notice);
     const result = captureQueue.then(() => persistMutation(mutation, notice));
     captureQueue = result.then(() => undefined, error => {
-      report(privateProClassifySyncError(error));
+      const category = privateProClassifySyncError(error);
+      dependencies.onCaptureFailed?.({ ...notice, category });
+      report(category);
     });
     return result;
   }
@@ -334,6 +355,13 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
           mutationId: row.mutationId,
           deleted: row.kind === 'delete',
         }, sentAtMs);
+        dependencies.onCommitted?.({
+          recordKey: row.recordKey,
+          generation: row.leasedGeneration,
+          mutationId: row.mutationId,
+          revision: result.revision,
+          deleted: row.kind === 'delete',
+        });
         return;
       }
       if (result.status === 'deleted') {
@@ -438,6 +466,12 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       if (!active || !Number.isInteger(revision) || revision <= 0) return;
       await acknowledge(active.row, { revision, mutationId, deleted: active.row.kind === 'delete' }, active.sentAtMs);
       void reschedule();
+    },
+
+    async retryNow(): Promise<void> {
+      dependencies.coordinator.wake();
+      await reschedule();
+      await requestDrain();
     },
 
     wake(): void {

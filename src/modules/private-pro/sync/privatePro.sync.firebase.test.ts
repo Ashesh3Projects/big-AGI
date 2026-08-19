@@ -318,7 +318,7 @@ describe('Private Pro direct Firebase sync transport', () => {
     firestore.listeners.get(`${ROOT}/assets`)!.next([{
       type: 'added', id: input.recordKey, data: { secret: 'not a record' }, hasPendingWrites: false,
     }]);
-    assert.deepEqual(events.at(-1), { type: 'error', category: 'unknown' });
+    assert.deepEqual(events.at(-1), { type: 'invalid-document', collection: 'assets', recordKey: input.recordKey, reason: 'invalid-document' });
 
     unsubscribe();
     assert.deepEqual(firestore.unsubscribed.sort(), [`${ROOT}/assets`, `${ROOT}/records`, `${ROOT}/tombstones`]);
@@ -354,7 +354,7 @@ describe('Private Pro direct Firebase sync transport', () => {
     ]);
 
     assert.deepEqual(events, [
-      { type: 'error', category: 'unknown' },
+      { type: 'invalid-document', collection: 'records', recordKey: input.recordKey, reason: 'invalid-document' },
       { type: 'record', canonical: { recordKey: input.recordKey, ...canonical(input, 2) } },
     ]);
   });
@@ -377,7 +377,7 @@ describe('Private Pro direct Firebase sync transport', () => {
     ]);
 
     assert.deepEqual(events, [
-      { type: 'error', category: 'unknown' },
+      { type: 'invalid-document', collection: 'tombstones', recordKey: input.recordKey, reason: 'invalid-document' },
       { type: 'tombstone', tombstone: { recordKey: input.recordKey, recordType: input.recordType, logicalId: input.logicalId, deletedRevision: 2, mutationId: MUTATION_ID, writerId: WRITER_ID, deletedAt: 'server-time' } },
     ]);
   });
@@ -396,7 +396,7 @@ describe('Private Pro direct Firebase sync transport', () => {
     ]);
 
     assert.deepEqual(events, [
-      { type: 'error', category: 'unknown' },
+      { type: 'invalid-document', collection: 'assets', recordKey: recordInput.recordKey, reason: 'invalid-document' },
       { type: 'record', canonical: { recordKey: assetInput.recordKey, ...canonical(assetInput, 2) } },
     ]);
   });
@@ -412,10 +412,10 @@ describe('Private Pro direct Firebase sync transport', () => {
     firestore.listeners.get(`${ROOT}/records`)!.error(new Error('raw unknown detail'));
 
     assert.deepEqual(events, [
-      { type: 'error', category: 'permission' },
-      { type: 'error', category: 'offline' },
-      { type: 'error', category: 'quota' },
-      { type: 'error', category: 'unknown' },
+      { type: 'error', collection: 'records', category: 'permission' },
+      { type: 'error', collection: 'assets', category: 'offline' },
+      { type: 'error', collection: 'tombstones', category: 'quota' },
+      { type: 'error', collection: 'records', category: 'unknown' },
     ]);
     assert.doesNotMatch(JSON.stringify(events), /raw|credential|detail/);
   });

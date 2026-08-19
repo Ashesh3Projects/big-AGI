@@ -30,6 +30,7 @@ export type PrivateProSyncWriteResult =
   | { status: 'deleted'; canonical: PrivateProSyncRemoteRecord };
 
 export type PrivateProSyncErrorCategory = 'permission' | 'offline' | 'quota' | 'unknown';
+export type PrivateProSyncCollection = 'records' | 'assets' | 'tombstones';
 
 export class PrivateProSyncTransportError extends Error {
   constructor(readonly category: PrivateProSyncErrorCategory) {
@@ -41,8 +42,9 @@ export class PrivateProSyncTransportError extends Error {
 export type PrivateProSyncRemoteEvent =
   | { type: 'record'; canonical: PrivateProSyncRemoteRecord }
   | { type: 'tombstone'; tombstone: PrivateProSyncTombstoneDocument }
-  | { type: 'current'; collection: 'records' | 'assets' | 'tombstones' }
-  | { type: 'error'; category: PrivateProSyncErrorCategory };
+  | { type: 'current'; collection: PrivateProSyncCollection }
+  | { type: 'invalid-document'; collection: PrivateProSyncCollection; recordKey: string; reason: 'invalid-document' }
+  | { type: 'error'; collection: PrivateProSyncCollection; category: PrivateProSyncErrorCategory };
 
 export interface PrivateProSyncTransport {
   write(input: PrivateProSyncWriteInput): Promise<PrivateProSyncWriteResult>;

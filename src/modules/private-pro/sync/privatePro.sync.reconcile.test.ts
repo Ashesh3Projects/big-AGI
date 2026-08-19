@@ -149,7 +149,7 @@ describe('Private Pro sync reconciler', () => {
       recordType: 'settings', logicalId: 'settings-1', recordKey, projectionKey: 'settings-1', schemaVersion: 1,
       payload: '{"id":"settings-1","value":"cached"}', contentHash: 'a'.repeat(64), referencedAssetIds: [],
     }, { revision: 1, mutationId: MUTATION_ID, deleted: false }, 1_000);
-    localOrigins.set(recordKey, { sequence: 1, generation: null, mutationId: null });
+    localOrigins.set(recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 1, generation: null, mutationId: null, dirty: true });
 
     await reconciler.applyCached();
 
@@ -170,7 +170,7 @@ describe('Private Pro sync reconciler', () => {
   test('updates the durable base but not runtime when a newer local origin exists', async (t) => {
     const { db, calls, localOrigins, reconciler } = createHarness(t);
     const canonical = await remoteRecord({ revision: 2 });
-    localOrigins.set(canonical.recordKey, { sequence: 2, generation: 3, mutationId: crypto.randomUUID() });
+    localOrigins.set(canonical.recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 2, generation: 3, mutationId: crypto.randomUUID(), dirty: true });
 
     await reconciler.handle({ type: 'record', canonical });
 
@@ -191,7 +191,7 @@ describe('Private Pro sync reconciler', () => {
   test('acknowledges a same-tab committed mutation without applying its snapshot', async (t) => {
     const { calls, localOrigins, committed, reconciler } = createHarness(t);
     const canonical = await remoteRecord({ writerId: WRITER_ID });
-    localOrigins.set(canonical.recordKey, { sequence: 1, generation: 1, mutationId: canonical.mutationId });
+    localOrigins.set(canonical.recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 1, generation: 1, mutationId: canonical.mutationId, dirty: true });
 
     await reconciler.handle({ type: 'record', canonical });
 
@@ -254,6 +254,130 @@ describe('Private Pro sync reconciler', () => {
     assert.equal((calls.at(-1)?.records[0].value as { value: string }).value, 'remote');
   });
 
+  test('a local edit during a remote projection read prevents the apply', async (t) => {
+    const { db, calls, localOrigins, reconciler } = createHarness(t);
+    const canonical = await remoteRecord();
+    const listProjectionRecords = db.listProjectionRecords.bind(db);
+    let release!: () => void;
+    let started!: () => void;
+    const readStarted = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    db.listProjectionRecords = async (uid, projectionKey) => {
+      started();
+      await gate;
+      return listProjectionRecords(uid, projectionKey);
+    };
+
+    const handling = reconciler.handle({ type: 'record', canonical });
+    await readStarted;
+    localOrigins.set(canonical.recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 1, generation: null, mutationId: null, dirty: true });
+    release();
+    await handling;
+
+    assert.equal(calls.length, 0);
+  });
+
+  test('a local edit during remote DB commit prevents the later projection apply', async (t) => {
+    const db = createDB(t);
+    const calls: ProjectionCall[] = [];
+    const suppression = { active: false };
+    const localOrigins = new Map<string, PrivateProSyncLocalOrigin>();
+    const projectionVersions = new Map<string, number>();
+    const canonical = await remoteRecord();
+    const commitRemoteRecord = db.commitRemoteRecord.bind(db);
+    let release!: () => void;
+    let started!: () => void;
+    const commitStarted = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    db.commitRemoteRecord = async (...args) => {
+      started();
+      await gate;
+      return commitRemoteRecord(...args);
+    };
+    const reconciler = createPrivateProSyncReconciler({
+      uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
+      localOrigins, projectionVersions, outbound: { handleCommitted: async () => {} },
+      runSuppressed: async callback => callback(), now: () => 9_000,
+    });
+
+    const handling = reconciler.handle({ type: 'record', canonical });
+    await commitStarted;
+    projectionVersions.set('settings-1', 1);
+    localOrigins.set(canonical.recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 1, generation: null, mutationId: null, dirty: true });
+    release();
+    await handling;
+
+    assert.equal(calls.length, 0);
+  });
+
+  test('a local edit during the initial cache list prevents hydration apply', async (t) => {
+    const db = createDB(t);
+    const calls: ProjectionCall[] = [];
+    const suppression = { active: false };
+    const localOrigins = new Map<string, PrivateProSyncLocalOrigin>();
+    const projectionVersions = new Map<string, number>();
+    const recordKey = privateProRecordKey('settings', 'settings-1');
+    await db.commitRemoteRecord(UID, {
+      recordType: 'settings', logicalId: 'settings-1', recordKey, projectionKey: 'settings-1', schemaVersion: 1,
+      payload: '{"id":"settings-1","value":"cached"}', contentHash: 'a'.repeat(64), referencedAssetIds: [],
+    }, { revision: 1, mutationId: MUTATION_ID, deleted: false }, 1_000);
+    const listLocalRecords = db.listLocalRecords.bind(db);
+    let release!: () => void;
+    let started!: () => void;
+    const listStarted = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    db.listLocalRecords = async uid => {
+      started();
+      await gate;
+      return listLocalRecords(uid);
+    };
+    const reconciler = createPrivateProSyncReconciler({
+      uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
+      localOrigins, projectionVersions, outbound: { handleCommitted: async () => {} },
+      runSuppressed: async callback => callback(), now: () => 9_000,
+    });
+
+    const hydration = reconciler.applyCached();
+    await listStarted;
+    projectionVersions.set('settings-1', 1);
+    localOrigins.set(recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 1, generation: null, mutationId: null, dirty: true });
+    release();
+    await hydration;
+
+    assert.equal(calls.length, 0);
+  });
+
+  test('quarantines a sanitized invalid-document event by record key', async (t) => {
+    const { db, reconciler } = createHarness(t);
+
+    await reconciler.handle({ type: 'invalid-document', collection: 'records', recordKey: 'bad-key', reason: 'invalid-document' });
+
+    assert.deepEqual(await db.quarantine.where('uid').equals(UID).toArray(), [{
+      id: 1, uid: UID, recordKey: 'bad-key', reasonCode: 'invalid-document', createdAtMs: 9_000,
+    }]);
+  });
+
+  test('an exact synthetic commit marker suppresses its listener but a higher revision applies', async (t) => {
+    const db = createDB(t);
+    const calls: ProjectionCall[] = [];
+    const suppression = { active: false };
+    const committedMarkers = new Map();
+    const mutationId = crypto.randomUUID();
+    const recordKey = privateProRecordKey('settings', 'settings-1');
+    committedMarkers.set(recordKey, { recordKey, generation: 1, mutationId, revision: 1, deleted: false });
+    const reconciler = createPrivateProSyncReconciler({
+      uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
+      localOrigins: new Map(), committedMarkers, outbound: { handleCommitted: async () => {} },
+      runSuppressed: async callback => callback(), now: () => 9_000,
+    });
+
+    await reconciler.handle({ type: 'record', canonical: await remoteRecord({ writerId: WRITER_ID, mutationId, revision: 1 }) });
+    await reconciler.handle({ type: 'record', canonical: await remoteRecord({ writerId: WRITER_ID, mutationId: crypto.randomUUID(), revision: 2, value: { id: 'settings-1', value: 'newer' } }) });
+
+    assert.equal(calls.length, 1);
+    assert.equal((calls[0].records[0].value as { value: string }).value, 'newer');
+  });
+
   test('stages chat messages until metadata exists and keeps two message IDs sorted', async (t) => {
     const { calls, reconciler } = createHarness(t);
     const second = await remoteRecord({ recordType: 'chat-message', logicalId: 'chat-1\0message-2', value: { conversationId: 'chat-1', id: 'message-2', created: 20, value: 'second' } });
@@ -289,12 +413,49 @@ describe('Private Pro sync reconciler', () => {
     const canonical = await remoteRecord();
     await reconciler.handle({ type: 'record', canonical });
     calls.length = 0;
-    localOrigins.set(canonical.recordKey, { sequence: 2, generation: 2, mutationId: crypto.randomUUID() });
+    localOrigins.set(canonical.recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 2, generation: 2, mutationId: crypto.randomUUID(), dirty: true });
 
     await reconciler.handle({ type: 'tombstone', tombstone: {
       recordKey: canonical.recordKey, recordType: canonical.recordType, logicalId: canonical.logicalId,
       deletedRevision: 2, mutationId: crypto.randomUUID(), writerId: OTHER_WRITER_ID, deletedAt: 'server-time',
     } });
+
+    assert.equal(calls.length, 0);
+  });
+
+  test('a local edit during tombstone persistence prevents runtime removal', async (t) => {
+    const db = createDB(t);
+    const calls: ProjectionCall[] = [];
+    const suppression = { active: false };
+    const localOrigins = new Map<string, PrivateProSyncLocalOrigin>();
+    const projectionVersions = new Map<string, number>();
+    const canonical = await remoteRecord();
+    const reconciler = createPrivateProSyncReconciler({
+      uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
+      localOrigins, projectionVersions, outbound: { handleCommitted: async () => {} },
+      runSuppressed: async callback => callback(), now: () => 9_000,
+    });
+    await reconciler.handle({ type: 'record', canonical });
+    calls.length = 0;
+    const commitRemoteTombstone = db.commitRemoteTombstone.bind(db);
+    let release!: () => void;
+    let started!: () => void;
+    const commitStarted = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    db.commitRemoteTombstone = async (...args) => {
+      started();
+      await gate;
+      return commitRemoteTombstone(...args);
+    };
+    const handling = reconciler.handle({ type: 'tombstone', tombstone: {
+      recordKey: canonical.recordKey, recordType: canonical.recordType, logicalId: canonical.logicalId,
+      deletedRevision: 2, mutationId: crypto.randomUUID(), writerId: OTHER_WRITER_ID, deletedAt: 'server-time',
+    } });
+    await commitStarted;
+    projectionVersions.set('settings-1', 2);
+    localOrigins.set(canonical.recordKey, { captureId: crypto.randomUUID(), projectionKey: 'settings-1', editVersion: 2, generation: null, mutationId: null, dirty: true });
+    release();
+    await handling;
 
     assert.equal(calls.length, 0);
   });

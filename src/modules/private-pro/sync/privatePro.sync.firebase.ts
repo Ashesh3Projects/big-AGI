@@ -196,6 +196,7 @@ function emitChanges(
   changes: readonly PrivateProFirestoreChange[],
   listener: (event: PrivateProSyncRemoteEvent) => void,
 ): void {
+  const collection = collectionKind === 'record' ? 'records' : collectionKind === 'asset' ? 'assets' : 'tombstones';
   for (const change of changes) {
     if (change.hasPendingWrites || change.type === 'removed') continue;
     try {
@@ -209,7 +210,7 @@ function emitChanges(
         throw new TypeError('Private Pro sync record collection identity is invalid.');
       listener({ type: 'record', canonical });
     } catch {
-      listener({ type: 'error', category: 'unknown' });
+      listener({ type: 'invalid-document', collection, recordKey: change.id, reason: 'invalid-document' });
     }
   }
 }
@@ -272,10 +273,10 @@ export function createPrivateProFirebaseSyncTransport(
       }
     },
     listen(listener) {
-      const onError = (error: unknown) => listener({ type: 'error', category: classifyFirebaseError(error) });
       const currentCollections = new Set<string>();
       const unsubscribes = (['record', 'asset', 'tombstone'] as const).map(kind => {
         const collectionName = kind === 'record' ? 'records' : kind === 'asset' ? 'assets' : 'tombstones';
+        const onError = (error: unknown) => listener({ type: 'error', collection: collectionName, category: classifyFirebaseError(error) });
         return firestore.listenCollection(`${root}/${collectionName}`, { includeMetadataChanges: true }, {
           next: (changes, current) => {
             emitChanges(kind, changes, listener);
