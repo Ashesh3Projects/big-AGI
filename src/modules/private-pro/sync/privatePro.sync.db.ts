@@ -651,6 +651,13 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
+  async ownsAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string, expiresAtMs: number, nowMs: number): Promise<boolean> {
+    return this.transaction('r', this.assetUploadLeases, async () => {
+      const lease = await this.assetUploadLeases.get([uid, assetId]);
+      return !!lease && lease.fence === fence && lease.ownerToken === ownerToken && lease.expiresAtMs === expiresAtMs && lease.expiresAtMs > nowMs;
+    });
+  }
+
   async releaseAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string): Promise<void> {
     await this.transaction('rw', this.assetUploadLeases, async () => {
       const lease = await this.assetUploadLeases.get([uid, assetId]);

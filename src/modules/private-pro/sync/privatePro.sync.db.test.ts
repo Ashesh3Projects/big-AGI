@@ -282,6 +282,20 @@ describe('Private Pro seamless sync database', () => {
     assert.notEqual(replacement?.ownerToken, stopped.ownerToken);
   });
 
+  test('verifies the exact current asset upload lease identity and expiry', async (t) => {
+    const db = createDB(t);
+    const first = await db.acquireAssetUploadLease(UID_A, 'asset-owned', 1_000, 5_000);
+    if (!first) assert.fail('Expected the first asset upload lease.');
+
+    assert.equal(await db.ownsAssetUploadLease(UID_A, 'asset-owned', first.fence, first.ownerToken, first.expiresAtMs, 2_000), true);
+    assert.equal(await db.ownsAssetUploadLease(UID_A, 'asset-owned', first.fence, first.ownerToken, first.expiresAtMs + 1, 2_000), false);
+    const successor = await db.acquireAssetUploadLease(UID_A, 'asset-owned', first.expiresAtMs, 5_000);
+    if (!successor) assert.fail('Expected the successor asset upload lease.');
+
+    assert.equal(await db.ownsAssetUploadLease(UID_A, 'asset-owned', first.fence, first.ownerToken, first.expiresAtMs, first.expiresAtMs), false);
+    assert.equal(await db.ownsAssetUploadLease(UID_A, 'asset-owned', successor.fence, successor.ownerToken, successor.expiresAtMs, first.expiresAtMs + 1), true);
+  });
+
   test('does not let a stale outbox lease retry, rebase, or acknowledge after re-lease', async (t) => {
     const db = createDB(t);
     await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);

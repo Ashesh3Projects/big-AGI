@@ -220,3 +220,37 @@ None.
 ### Concerns
 
 None.
+
+## Fix round 5
+
+### Findings addressed
+
+- Every direct asset upload now acquires the durable UID plus asset ID DB lease. A Web Lock may wrap that acquisition to reduce same-browser contention, but it is never an alternate ownership domain. A client with Web Locks and a client without them serialize through the same durable lease.
+- Missing durable lease injection fails before snapshot or Storage access even when Web Locks are available.
+- Each acquired lease owns an AbortController and an expiry watchdog tied to its exact `expiresAtMs`. A renewal pending at expiry grants no grace. Only a completed valid renewal before the prior expiry updates the lease and reschedules the watchdog.
+- Renewals are serialized. Null, stale, malformed, late, or failed renewals abort the Storage signal immediately. Cleanup stops timers, aborts the callback, awaits any in-flight renewal, then releases the exact fence and owner token.
+- Storage boundaries and manifest publication verify the exact current fence, owner token, and expiry through `ownsAssetUploadLease`. A stale callback cannot publish after replacement ownership.
+
+### RED evidence
+
+- The round-5 asset and DB RED run had 6 failures. A Web-Locked client reached Storage without a DB lease, mixed Web-Locked and no-Web-Locks clients overlapped at maximum concurrency 2, stalled renewal did not cancel stale Storage, long upload made no ownership checks, and the DB ownership method did not exist. One separate fixture failure was corrected by destructuring its existing DB test dependency.
+- The stalled-renewal regression let generation 1 continue after expiry while generation 2 acquired the lease and published, proving a pending renewal previously granted implicit grace.
+
+### GREEN evidence
+
+- Focused asset client and sync DB suites: 58 passed, 0 failed, exit 0.
+- Exact DBlob, asset client, sync DB, outbound, serializer, and engine test files: 128 passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for asset, sync DB, serializer, and DBlob source and tests: exit 0.
+- `git diff --check`: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- The mixed-domain test holds a Web-Locked generation 1 upload, starts a no-Web-Locks generation 2 client, observes maximum Storage concurrency 1, cancels generation 1, and verifies only generation 2 bytes and manifest remain.
+- The expiry test stalls renewal beyond the exact lease expiry, lets a successor publish generation 2, and verifies the stale generation 1 Storage task is cancelled before it can write.
+- The renewal-success test keeps a Web-Locked upload active beyond multiple original lease durations, observes repeated successful renewals and ownership checks, and publishes normally.
+- Deterministic Storage paths, generation fencing, manifest ordering, the 60-second outbound window, DBlob activation behavior, and Open-build behavior remain unchanged.
+
+### Concerns
+
+None.

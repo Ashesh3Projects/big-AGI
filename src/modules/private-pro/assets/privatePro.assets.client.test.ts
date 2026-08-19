@@ -12,6 +12,7 @@ import {
   type PrivateProAssetStorageMetadata,
   type PrivateProAssetLockPort,
   type PrivateProAssetStoragePort,
+  type PrivateProAssetUploadLeasePort,
 } from './privatePro.assets.client';
 import { createPrivateProAssetLocalPort } from './privatePro.assets.local';
 import type { PrivateProAssetManifest } from './privatePro.assets.schemas';
@@ -103,7 +104,7 @@ function harness(t: TestContext) {
   const storage = new FakeStorage();
   let wakes = 0;
   const locks = new FakeLocks();
-  const client = createPrivateProAssetClient(UID, storage, { wake: () => { wakes++; } }, local, locks);
+  const client = createPrivateProAssetClient(UID, storage, { wake: () => { wakes++; } }, local, locks, leaseFallback(db));
   t.after(async () => {
     db.close();
     await Dexie.delete(name);
@@ -117,6 +118,12 @@ function leaseFallback(db: PrivateProSyncDB) {
 
 function delay(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function deferred() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(resolve_ => { resolve = resolve_; });
+  return { promise, resolve };
 }
 
 describe('Private Pro direct assets', () => {
@@ -158,12 +165,14 @@ describe('Private Pro direct assets', () => {
     const asset = fixture('asset-edit-upload', false);
     await local.putAsset(asset);
     let release!: () => void;
+    let started!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
+    const startedPromise = new Promise<void>(resolve => { started = resolve; });
     const upload = storage.uploadBytesResumable.bind(storage);
-    storage.uploadBytesResumable = async (...args) => { await gate; return upload(...args); };
+    storage.uploadBytesResumable = async (...args) => { started(); await gate; return upload(...args); };
 
     const uploading = client.ensureUploaded([asset.id]);
-    await new Promise(resolve => setImmediate(resolve));
+    await startedPromise;
     await local.putAsset({ ...asset, label: 'edited during upload' });
     release();
     await assert.rejects(uploading);
@@ -177,12 +186,14 @@ describe('Private Pro direct assets', () => {
     const asset = fixture('asset-late-manifest', false);
     await local.putAsset(asset);
     let release!: () => void;
+    let started!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
+    const startedPromise = new Promise<void>(resolve => { started = resolve; });
     const upload = storage.uploadBytesResumable.bind(storage);
     let calls = 0;
-    storage.uploadBytesResumable = async (...args) => { if (calls++ === 0) await gate; return upload(...args); };
+    storage.uploadBytesResumable = async (...args) => { if (calls++ === 0) { started(); await gate; } return upload(...args); };
     const oldUpload = client.ensureUploaded([asset.id]);
-    await new Promise(resolve => setImmediate(resolve));
+    await startedPromise;
     await local.putAsset({ ...asset, label: 'newer' });
     storage.uploadBytesResumable = upload;
     const newerUpload = client.ensureUploaded([asset.id]);
@@ -241,11 +252,11 @@ describe('Private Pro direct assets', () => {
   });
 
   test('serializes uploads across client instances and leadership abort releases the lock', async (t) => {
-    const { local, storage, locks } = harness(t);
+    const { db, local, storage, locks } = harness(t);
     const oldAsset = fixture('asset-cross-client', false);
     await local.putAsset(oldAsset);
-    const oldClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks);
-    const newClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks);
+    const oldClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks, leaseFallback(db));
+    const newClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks, leaseFallback(db));
     const controller = new AbortController();
     let started!: () => void;
     const startedPromise = new Promise<void>(resolve => { started = resolve; });
@@ -267,15 +278,64 @@ describe('Private Pro direct assets', () => {
     assert.equal(new TextDecoder().decode(storage.objects.get(`users/${UID}/workspace-v1/assets/${oldAsset.id}/original`)!.bytes), 'cross-client-new');
   });
 
-  test('rejects before Storage when neither Web Locks nor a durable lease is available', async (t) => {
+  test('rejects before Storage when a Web Lock exists without a durable DB lease', async (t) => {
     const { local, storage } = harness(t);
     const asset = fixture('asset-lock-unavailable', false);
     await local.putAsset(asset);
-    const client = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null);
+    const client = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, new FakeLocks());
 
-    await assert.rejects(client.ensureUploaded([asset.id]), error => error instanceof TypeError && /upload lock/i.test(error.message));
+    await assert.rejects(client.ensureUploaded([asset.id]), error => error instanceof TypeError && /upload lease/i.test(error.message));
 
     assert.equal(storage.uploads.length, 0);
+  });
+
+  test('serializes Web-Locked and no-Web-Locks clients through one durable lease domain', async (t) => {
+    const { db, local, storage, locks } = harness(t);
+    const oldAsset = fixture('asset-mixed-lock-domain', false);
+    await local.putAsset(oldAsset);
+    const webLockedClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks, leaseFallback(db));
+    const noWebLocksClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, leaseFallback(db));
+    const upload = FakeStorage.prototype.uploadBytesResumable.bind(storage);
+    const controller = new AbortController();
+    const firstStarted = deferred();
+    let firstCall = true;
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    storage.uploadBytesResumable = async (...args) => {
+      concurrent++;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      try {
+        if (firstCall) {
+          firstCall = false;
+          firstStarted.resolve();
+          const signal = args[3];
+          await new Promise<void>((_resolve, reject) => {
+            const abort = () => reject(new DOMException('aborted', 'AbortError'));
+            if (signal?.aborted) abort();
+            else signal?.addEventListener('abort', abort, { once: true });
+          });
+        }
+        await upload(...args);
+      } finally {
+        concurrent--;
+      }
+    };
+
+    const oldUpload = webLockedClient.ensureUploaded([oldAsset.id], controller.signal);
+    await firstStarted.promise;
+    const newAsset = { ...oldAsset, data: { ...oldAsset.data, base64: base64(bytes('mixed-domain-new')) } };
+    await local.putAsset(newAsset);
+    const newUpload = noWebLocksClient.ensureUploaded([oldAsset.id]);
+    await delay(20);
+    const maxBeforeCancellation = maxConcurrent;
+    controller.abort();
+    await assert.rejects(oldUpload, { name: 'AbortError' });
+    await newUpload;
+
+    assert.equal(maxBeforeCancellation, 1);
+    assert.equal(maxConcurrent, 1);
+    assert.equal(new TextDecoder().decode(storage.objects.get(`users/${UID}/workspace-v1/assets/${oldAsset.id}/original`)!.bytes), 'mixed-domain-new');
+    assert.equal((await local.getManifest(oldAsset.id))?.contentGeneration, 2);
   });
 
   test('renews a durable DB lease while two no-Web-Locks clients serialize one fixed path', async (t) => {
@@ -350,6 +410,116 @@ describe('Private Pro direct assets', () => {
 
     assert.equal(enteredBeforeAbort, false);
     assert.equal(secondEntered, true);
+  });
+
+  test('expires a stalled renewal before a successor publishes and prevents the stale fixed-path overwrite', async (t) => {
+    const { db, local, storage } = harness(t);
+    const oldAsset = fixture('asset-expired-renewal', false);
+    await local.putAsset(oldAsset);
+    const renewalStarted = deferred();
+    const releaseRenewal = deferred();
+    const stalledLeasePort: PrivateProAssetUploadLeasePort = {
+      acquireAssetUploadLease: (...args) => db.acquireAssetUploadLease(...args),
+      async renewAssetUploadLease(...args) {
+        renewalStarted.resolve();
+        await releaseRenewal.promise;
+        return db.renewAssetUploadLease(...args);
+      },
+      releaseAssetUploadLease: (...args) => db.releaseAssetUploadLease(...args),
+      ownsAssetUploadLease: (...args) => db.ownsAssetUploadLease(...args),
+    };
+    const leaseConfig = { leaseMs: 60, renewEveryMs: 10, retryEveryMs: 2 };
+    const staleClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, { port: stalledLeasePort, ...leaseConfig });
+    const successorClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, { port: db, ...leaseConfig });
+    const upload = FakeStorage.prototype.uploadBytesResumable.bind(storage);
+    const staleStorageStarted = deferred();
+    const releaseStaleStorage = deferred();
+    let firstCall = true;
+    let staleCancelled = false;
+    let staleWrote = false;
+    storage.uploadBytesResumable = async (...args) => {
+      if (!firstCall) return upload(...args);
+      firstCall = false;
+      staleStorageStarted.resolve();
+      const signal = args[3];
+      await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        const abort = () => {
+          if (settled) return;
+          settled = true;
+          staleCancelled = true;
+          reject(new DOMException('aborted', 'AbortError'));
+        };
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
+        void releaseStaleStorage.promise.then(() => {
+          if (settled) return;
+          settled = true;
+          signal?.removeEventListener('abort', abort);
+          resolve();
+        });
+      });
+      await upload(...args);
+      staleWrote = true;
+    };
+
+    const staleUpload = staleClient.ensureUploaded([oldAsset.id]);
+    await Promise.all([staleStorageStarted.promise, renewalStarted.promise]);
+    const newAsset = { ...oldAsset, data: { ...oldAsset.data, base64: base64(bytes('successor-generation-two')) } };
+    await local.putAsset(newAsset);
+    await successorClient.ensureUploaded([oldAsset.id]);
+    releaseStaleStorage.resolve();
+    await delay(5);
+    releaseRenewal.resolve();
+    await assert.rejects(staleUpload, { name: 'AbortError' });
+
+    assert.equal(staleCancelled, true);
+    assert.equal(staleWrote, false);
+    assert.equal(new TextDecoder().decode(storage.objects.get(`users/${UID}/workspace-v1/assets/${oldAsset.id}/original`)!.bytes), 'successor-generation-two');
+    assert.equal((await local.getManifest(oldAsset.id))?.contentGeneration, 2);
+  });
+
+  test('successful renewals reschedule expiry fencing for a long Web-Locked upload', async (t) => {
+    const { db, local, storage, locks } = harness(t);
+    const asset = fixture('asset-renewal-reschedule', false);
+    await local.putAsset(asset);
+    let renewals = 0;
+    let ownershipChecks = 0;
+    const observingLeasePort = {
+      acquireAssetUploadLease: (...args: Parameters<PrivateProAssetUploadLeasePort['acquireAssetUploadLease']>) => db.acquireAssetUploadLease(...args),
+      renewAssetUploadLease: (...args: Parameters<PrivateProAssetUploadLeasePort['renewAssetUploadLease']>) => {
+        renewals++;
+        return db.renewAssetUploadLease(...args);
+      },
+      releaseAssetUploadLease: (...args: Parameters<PrivateProAssetUploadLeasePort['releaseAssetUploadLease']>) => db.releaseAssetUploadLease(...args),
+      ownsAssetUploadLease: (...args: Parameters<PrivateProAssetUploadLeasePort['ownsAssetUploadLease']>) => {
+        ownershipChecks++;
+        return db.ownsAssetUploadLease(...args);
+      },
+    };
+    const client = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks, {
+      port: observingLeasePort, leaseMs: 80, renewEveryMs: 15, retryEveryMs: 2,
+    });
+    const upload = FakeStorage.prototype.uploadBytesResumable.bind(storage);
+    storage.uploadBytesResumable = async (...args) => {
+      const signal = args[3];
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(resolve, 160);
+        const abort = () => {
+          clearTimeout(timer);
+          reject(new DOMException('aborted', 'AbortError'));
+        };
+        if (signal?.aborted) abort();
+        else signal?.addEventListener('abort', abort, { once: true });
+      });
+      await upload(...args);
+    };
+
+    await client.ensureUploaded([asset.id]);
+
+    assert.ok(renewals >= 2);
+    assert.ok(ownershipChecks >= 3);
+    assert.equal((await local.getManifest(asset.id))?.contentGeneration, 1);
   });
 
   test('rejects an oversized manifest before any Storage call', async (t) => {

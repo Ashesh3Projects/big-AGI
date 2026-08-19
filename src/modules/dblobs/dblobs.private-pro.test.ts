@@ -17,6 +17,7 @@ import { DBlobAssetType, DBlobMimeType, type DBlobDBAsset } from './dblobs.types
 const DB_NAME = `private-pro-dblobs-${crypto.randomUUID()}`;
 const syncDB = new PrivateProSyncDB(DB_NAME);
 const dbModulePromise = import('./dblobs.db');
+const uploadLease = { port: syncDB, leaseMs: 80, renewEveryMs: 15, retryEveryMs: 2 };
 
 function imageAsset(id: string): DBlobDBAsset {
   return {
@@ -215,7 +216,7 @@ test('routes DBlob delete through canonical manifest deletion and both Storage o
     getMetadata: async () => ({ contentType: 'image/png', customMetadata: { uid: 'uid-a', assetId: 'asset-delete-route', kind: 'original', sha256: 'a'.repeat(64) } }),
     deleteObject: async path => { paths.push(path); },
   };
-  const client = createPrivateProAssetClient('uid-a', storage, { wake: () => {} }, port);
+  const client = createPrivateProAssetClient('uid-a', storage, { wake: () => {} }, port, undefined, uploadLease);
   const asset = imageAsset('asset-delete-route');
   await port.putAsset(asset);
   await client.ensureUploaded([asset.id]);
@@ -242,7 +243,7 @@ test('routes DBlob GC through canonical delete', async () => {
     getMetadata: async () => ({ contentType: 'image/png', customMetadata: { uid: 'uid-a', assetId: 'asset-gc-route', kind: 'original', sha256: 'a'.repeat(64) } }),
     deleteObject: async path => { paths.push(path); },
   };
-  const client = createPrivateProAssetClient('uid-a', storage, { wake: () => {} }, port);
+  const client = createPrivateProAssetClient('uid-a', storage, { wake: () => {} }, port, undefined, uploadLease);
   const asset = imageAsset('asset-gc-route');
   await port.putAsset(asset);
   await client.ensureUploaded([asset.id]);

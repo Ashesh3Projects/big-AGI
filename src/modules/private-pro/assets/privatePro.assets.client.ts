@@ -37,6 +37,7 @@ export interface PrivateProAssetLockPort {
 export interface PrivateProAssetUploadLeasePort {
   acquireAssetUploadLease(uid: string, assetId: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetUploadLease | null>;
   renewAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetUploadLease | null>;
+  ownsAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string, expiresAtMs: number, nowMs: number): Promise<boolean>;
   releaseAssetUploadLease(uid: string, assetId: string, fence: number, ownerToken: string): Promise<void>;
 }
 
@@ -53,6 +54,15 @@ export interface PrivateProAssetClient {
   hydrate(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
   delete(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
   clearLocal(): Promise<void>;
+}
+
+interface PrivateProAssetUploadLeaseGuard {
+  readonly signal: AbortSignal;
+  assertOwned(): Promise<void>;
+}
+
+interface PrivateProAssetDurableLeasePort {
+  request<T>(assetId: string, signal: AbortSignal | undefined, callback: (guard: PrivateProAssetUploadLeaseGuard) => Promise<T>): Promise<T>;
 }
 
 function objectPath(uid: string, assetId: string, kind: PrivateProAssetObjectKind): string {
@@ -97,6 +107,7 @@ function firebaseStoragePort(): PrivateProAssetStoragePort {
       signal?.removeEventListener('abort', abort);
       resolve();
     });
+    if (signal?.aborted) abort();
   });
   const toMetadata = (metadata: FullMetadata): PrivateProAssetStorageMetadata => ({
     contentType: metadata.contentType ?? '',
@@ -168,7 +179,13 @@ export function createPrivateProAssetClient(
   if (!uid) throw new TypeError('Private Pro asset UID is required.');
   const uploadQueues = new Map<string, Promise<void>>();
   const selectedLocks = locks === undefined ? browserLockPort() : locks;
-  const uploadLock = selectedLocks ?? (leaseOptions ? durableLeaseLockPort(uid, leaseOptions) : unavailableLockPort());
+  const durableLease = leaseOptions ? durableLeaseLockPort(uid, leaseOptions) : unavailableLeasePort();
+
+  function requestUploadLease<T>(assetId: string, signal: AbortSignal | undefined, callback: (guard: PrivateProAssetUploadLeaseGuard) => Promise<T>): Promise<T> {
+    const name = `private-pro-asset-upload:${uid}:${assetId}`;
+    const request = (lockSignal?: AbortSignal) => durableLease.request(assetId, signal ?? lockSignal, callback);
+    return selectedLocks ? selectedLocks.request(name, signal, request) : request(signal);
+  }
 
   function currentGeneration(assetId: string, expected: number, signal?: AbortSignal): Promise<void> {
     abortIfNeeded(signal);
@@ -180,24 +197,30 @@ export function createPrivateProAssetClient(
 
   function enqueueUpload(assetId: string, signal?: AbortSignal): Promise<void> {
     const previous = uploadQueues.get(assetId) ?? Promise.resolve();
-    const task = previous.catch(() => {}).then(() => uploadLock.request(`private-pro-asset-upload:${uid}:${assetId}`, signal, async lockSignal => {
-      abortIfNeeded(lockSignal);
+    const task = previous.catch(() => {}).then(() => requestUploadLease(assetId, signal, async leaseGuard => {
+      abortIfNeeded(leaseGuard.signal);
       const snapshot = await local.getAssetSnapshot(assetId);
       if (!snapshot) throw new Error('Private Pro attachment is unavailable locally.');
       const { manifest, manifestHash, bytes } = await manifestFromAsset(uid, snapshot.asset, snapshot.contentGeneration);
       try {
         for (const kind of ['original', 'thumb256'] as const) {
-          await currentGeneration(assetId, snapshot.contentGeneration, lockSignal);
+          await currentGeneration(assetId, snapshot.contentGeneration, leaseGuard.signal);
           const object = kind === 'original' ? manifest.objects.original : manifest.objects.thumb256;
           if (!object) continue;
+          await leaseGuard.assertOwned();
+          abortIfNeeded(leaseGuard.signal);
           await storage.uploadBytesResumable(objectPath(uid, assetId, kind), bytes.get(kind)!, {
             contentType: object.mimeType, customMetadata: { uid, assetId, kind, sha256: object.sha256 },
-          }, lockSignal);
-          await currentGeneration(assetId, snapshot.contentGeneration, lockSignal);
+          }, leaseGuard.signal);
+          abortIfNeeded(leaseGuard.signal);
+          await leaseGuard.assertOwned();
+          await currentGeneration(assetId, snapshot.contentGeneration, leaseGuard.signal);
         }
       } catch (error) {
         storageError(error);
       }
+      await leaseGuard.assertOwned();
+      abortIfNeeded(leaseGuard.signal);
       if (!await local.putManifestIfCurrent(assetId, snapshot.contentGeneration, manifest, manifestHash))
         throw new PrivateProSyncTransportError('offline');
       transport.wake();
@@ -283,8 +306,8 @@ function browserLockPort(): PrivateProAssetLockPort | null {
   return { request: (name, signal, callback) => navigator.locks.request(name, { mode: 'exclusive', signal }, () => callback(signal)) };
 }
 
-function unavailableLockPort(): PrivateProAssetLockPort {
-  return { request: async () => { throw new TypeError('Private Pro asset upload lock is unavailable.'); } };
+function unavailableLeasePort(): PrivateProAssetDurableLeasePort {
+  return { request: async () => { throw new TypeError('Private Pro asset upload lease is unavailable.'); } };
 }
 
 function delayWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
@@ -302,7 +325,16 @@ function delayWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function durableLeaseLockPort(uid: string, options: PrivateProAssetUploadLeaseOptions): PrivateProAssetLockPort {
+function waitWithSignal(promise: Promise<void>, signal: AbortSignal): Promise<void> {
+  abortIfNeeded(signal);
+  return new Promise((resolve, reject) => {
+    const abort = () => reject(new DOMException('Private Pro attachment operation aborted.', 'AbortError'));
+    signal.addEventListener('abort', abort, { once: true });
+    void promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', abort));
+  });
+}
+
+function durableLeaseLockPort(uid: string, options: PrivateProAssetUploadLeaseOptions): PrivateProAssetDurableLeasePort {
   const leaseMs = options.leaseMs ?? 15_000;
   const renewEveryMs = options.renewEveryMs ?? 5_000;
   const retryEveryMs = options.retryEveryMs ?? 250;
@@ -310,10 +342,8 @@ function durableLeaseLockPort(uid: string, options: PrivateProAssetUploadLeaseOp
   if (leaseMs <= 0 || renewEveryMs <= 0 || retryEveryMs <= 0 || renewEveryMs >= leaseMs)
     throw new TypeError('Private Pro asset upload lease configuration is invalid.');
   return {
-    async request(name, signal, callback) {
-      const prefix = `private-pro-asset-upload:${uid}:`;
-      if (!name.startsWith(prefix) || name.length === prefix.length) throw new TypeError('Private Pro asset upload lock identity is invalid.');
-      const assetId = name.slice(prefix.length);
+    async request(assetId, signal, callback) {
+      if (!assetId) throw new TypeError('Private Pro asset upload lease identity is invalid.');
       let lease: PrivateProAssetUploadLease | null = null;
       while (!lease) {
         abortIfNeeded(signal);
@@ -321,40 +351,117 @@ function durableLeaseLockPort(uid: string, options: PrivateProAssetUploadLeaseOp
         if (!lease) await delayWithSignal(retryEveryMs, signal);
       }
       const identity = { fence: lease.fence, ownerToken: lease.ownerToken };
+      let currentLease = lease;
       let stopped = false;
       let renewal: Promise<void> | null = null;
-      let renewalFailure: unknown = null;
+      let renewalTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+      let expiryTimer: ReturnType<typeof globalThis.setTimeout> | null = null;
+      let leaseFailure: unknown = null;
       const operationAbort = new AbortController();
       const abort = () => operationAbort.abort();
+      const loseLease = (error: unknown) => {
+        if (!leaseFailure) leaseFailure = error;
+        operationAbort.abort();
+      };
+      const clearRenewalTimer = () => {
+        if (renewalTimer !== null) globalThis.clearTimeout(renewalTimer);
+        renewalTimer = null;
+      };
+      const clearExpiryTimer = () => {
+        if (expiryTimer !== null) globalThis.clearTimeout(expiryTimer);
+        expiryTimer = null;
+      };
+      const scheduleExpiry = () => {
+        clearExpiryTimer();
+        if (stopped || operationAbort.signal.aborted) return;
+        const expectedExpiry = currentLease.expiresAtMs;
+        const watchdog = () => {
+          expiryTimer = null;
+          if (stopped || currentLease.expiresAtMs !== expectedExpiry || operationAbort.signal.aborted) return;
+          const remainingMs = expectedExpiry - now();
+          if (remainingMs > 0) {
+            expiryTimer = globalThis.setTimeout(watchdog, remainingMs);
+            return;
+          }
+          loseLease(new DOMException('Private Pro attachment upload lease expired.', 'AbortError'));
+        };
+        expiryTimer = globalThis.setTimeout(watchdog, Math.max(0, expectedExpiry - now()));
+      };
+      const scheduleRenewal = () => {
+        clearRenewalTimer();
+        if (stopped || operationAbort.signal.aborted) return;
+        renewalTimer = globalThis.setTimeout(() => {
+          renewalTimer = null;
+          if (stopped || renewal || operationAbort.signal.aborted) return;
+          const expectedLease = currentLease;
+          const attempt = Promise.resolve()
+            .then(() => options.port.renewAssetUploadLease(uid, assetId, identity.fence, identity.ownerToken, now(), leaseMs))
+            .then(renewed => {
+              const completedAtMs = now();
+              if (stopped) return;
+              if (!renewed || renewed.uid !== uid || renewed.assetId !== assetId || renewed.fence !== identity.fence || renewed.ownerToken !== identity.ownerToken ||
+                  renewed.expiresAtMs <= expectedLease.expiresAtMs || renewed.expiresAtMs <= completedAtMs || completedAtMs >= expectedLease.expiresAtMs) {
+                loseLease(new PrivateProSyncTransportError('offline'));
+                return;
+              }
+              currentLease = renewed;
+              scheduleExpiry();
+              scheduleRenewal();
+            })
+            .catch(() => {
+              if (!stopped) loseLease(new PrivateProSyncTransportError('offline'));
+            })
+            .finally(() => { if (renewal === attempt) renewal = null; });
+          renewal = attempt;
+        }, renewEveryMs);
+      };
+      const assertOwned = async () => {
+        for (;;) {
+          abortIfNeeded(operationAbort.signal);
+          const pendingRenewal = renewal;
+          if (pendingRenewal) {
+            await waitWithSignal(pendingRenewal, operationAbort.signal);
+            continue;
+          }
+          const expectedLease = currentLease;
+          let owned: boolean;
+          try {
+            owned = await options.port.ownsAssetUploadLease(
+              uid, assetId, identity.fence, identity.ownerToken, expectedLease.expiresAtMs, now(),
+            );
+          } catch {
+            const failure = new PrivateProSyncTransportError('offline');
+            loseLease(failure);
+            throw failure;
+          }
+          abortIfNeeded(operationAbort.signal);
+          if (currentLease.expiresAtMs !== expectedLease.expiresAtMs || renewal) continue;
+          if (!owned || now() >= expectedLease.expiresAtMs) {
+            const failure = new PrivateProSyncTransportError('offline');
+            loseLease(failure);
+            throw failure;
+          }
+          return;
+        }
+      };
       signal?.addEventListener('abort', abort, { once: true });
-      const timer = globalThis.setInterval(() => {
-        if (stopped || renewal) return;
-        renewal = options.port.renewAssetUploadLease(uid, assetId, identity.fence, identity.ownerToken, now(), leaseMs)
-          .then(renewed => {
-            if (!renewed && !stopped) {
-              renewalFailure = new PrivateProSyncTransportError('offline');
-              operationAbort.abort();
-            }
-          })
-          .catch(error => {
-            if (!stopped) {
-              renewalFailure = error;
-              operationAbort.abort();
-            }
-          })
-          .finally(() => { renewal = null; });
-      }, renewEveryMs);
+      if (signal?.aborted) abort();
+      scheduleExpiry();
+      scheduleRenewal();
       try {
-        abortIfNeeded(signal);
-        const result = await callback(operationAbort.signal);
-        if (renewalFailure) throw renewalFailure;
+        abortIfNeeded(operationAbort.signal);
+        const result = await callback({ signal: operationAbort.signal, assertOwned });
+        if (leaseFailure) throw leaseFailure;
+        abortIfNeeded(operationAbort.signal);
         return result;
       } finally {
         stopped = true;
-        globalThis.clearInterval(timer);
+        clearRenewalTimer();
+        clearExpiryTimer();
         signal?.removeEventListener('abort', abort);
         operationAbort.abort();
-        await renewal;
+        const pendingRenewal = renewal;
+        await pendingRenewal;
         await options.port.releaseAssetUploadLease(uid, assetId, identity.fence, identity.ownerToken);
       }
     },
