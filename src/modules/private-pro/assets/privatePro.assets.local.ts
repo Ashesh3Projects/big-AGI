@@ -56,10 +56,17 @@ interface ActivePrivateProAssetPersistence {
   operations: Set<Promise<unknown>>;
 }
 
+export type PrivateProAssetOperationResult<T> =
+  | { active: false; managed: false }
+  | { active: false; managed: true }
+  | { active: true; managed: true; value: T };
+
 let activationGeneration = 0;
 let active: ActivePrivateProAssetPersistence | null = null;
 let transition: Promise<void> | null = null;
 let requested: { uid: string; owner: PrivateProPersistenceOwner } | null = null;
+const managedBuild = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
+let managed = managedBuild;
 
 function abortError(): DOMException {
   return new DOMException('Private Pro asset persistence changed.', 'AbortError');
@@ -70,8 +77,10 @@ export function activatePrivateProAssetPersistence(
   owner: PrivateProPersistenceOwner | null,
   port?: PrivateProAssetLocalPort | null,
   deleteAsset?: PrivateProAssetDelete,
+  options?: { managed?: boolean },
 ): Promise<void> {
   if (uid && (!owner || !port)) throw new TypeError('Private Pro asset persistence owner and port are required.');
+  managed = options?.managed ?? (managedBuild || !!uid);
   requested = uid && owner ? { uid, owner } : null;
   const transitionId = ++activationGeneration;
   const previous = active;
@@ -98,13 +107,13 @@ export async function deactivatePrivateProAssetPersistence(uid: string, owner: P
     await transition;
     return false;
   }
-  await activatePrivateProAssetPersistence(null, null);
+  await activatePrivateProAssetPersistence(null, null, undefined, undefined, { managed: true });
   return true;
 }
 
 export async function runActivePrivateProAssetOperation<T>(
   operation: (port: PrivateProAssetLocalPort, guard: PrivateProAssetActivationGuard, deleteAsset: PrivateProAssetDelete) => Promise<T>,
-): Promise<{ active: false } | { active: true; value: T }> {
+): Promise<PrivateProAssetOperationResult<T>> {
   let selected: ActivePrivateProAssetPersistence | null;
   for (;;) {
     const observedGeneration = activationGeneration;
@@ -115,7 +124,7 @@ export async function runActivePrivateProAssetOperation<T>(
     if (!selected && transition) continue;
     break;
   }
-  if (!selected) return { active: false };
+  if (!selected) return { active: false, managed };
   const guard: PrivateProAssetActivationGuard = {
     signal: selected.controller.signal,
     assertActive() {
@@ -131,7 +140,7 @@ export async function runActivePrivateProAssetOperation<T>(
   });
   selected.operations.add(tracked);
   try {
-    return { active: true, value: await tracked };
+    return { active: true, managed: true, value: await tracked };
   } finally {
     selected.operations.delete(tracked);
   }

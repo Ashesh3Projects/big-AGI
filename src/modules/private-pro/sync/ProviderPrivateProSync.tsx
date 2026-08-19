@@ -6,7 +6,7 @@ import { activatePrivateProAssetPersistence, createPrivateProAssetLocalPort, dea
 import { createPrivateProAssetClient } from '../assets/privatePro.assets.client';
 import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { privateProClientConfig } from '../config/privatePro.config';
-import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, privateProManagedPersistenceOwnership, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
+import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, privateProManagedPersistenceOwnership, releasePrivateProManagedPersistence, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
 import { createPrivateProSyncCoordinator, type PrivateProSyncCoordinator } from './privatePro.sync.coordinator';
 import { privateProSyncDB } from './privatePro.sync.db';
 import { createPrivateProSyncEngine, type PrivateProSyncEngine } from './privatePro.sync.engine';
@@ -29,7 +29,9 @@ interface PrivateProSyncLifecycleDependencies {
   uid: string;
   statusStore: PrivateProSyncStore;
   prepare(isCurrent: () => boolean, owner: PrivateProPersistenceOwner): Promise<PreparedPrivateProSync>;
-  deactivate(uid: string, owner: PrivateProPersistenceOwner): Promise<void>;
+  release?(uid: string, owner: PrivateProPersistenceOwner): Promise<void>;
+  /** @deprecated Use release for non-destructive owner cleanup. */
+  deactivate?(uid: string, owner: PrivateProPersistenceOwner): Promise<void>;
   clear(uid: string): Promise<void>;
   firebaseSignOut(): Promise<void>;
   reload(): void;
@@ -66,10 +68,19 @@ interface PrivateProPersistencePrepareDependencies<T> {
   owner: PrivateProPersistenceOwner;
   previousOwnership: { uid: string; owner: PrivateProPersistenceOwner } | null;
   isCurrent(): boolean;
+  waitForPreviousOwner?(owner: PrivateProPersistenceOwner): Promise<void>;
   activateManaged(uid: string, owner: PrivateProPersistenceOwner): Promise<void>;
   deactivateManaged(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
   deactivateAssets(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
+  releaseManaged?(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
+  clearPrevious?(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
   prepareAssets(): Promise<T>;
+}
+
+const privateProLifecycleOwnerStops = new Map<PrivateProPersistenceOwner, () => Promise<void>>();
+
+export async function waitForPrivateProSyncLifecycleOwner(owner: PrivateProPersistenceOwner): Promise<void> {
+  await privateProLifecycleOwnerStops.get(owner)?.().catch(() => {});
 }
 
 function assertPrivateProPrepareCurrent(isCurrent: () => boolean): void {
@@ -84,11 +95,16 @@ export async function preparePrivateProPersistenceOwner<T>(
   let managedActivated = false;
   let assetsActivated = false;
   try {
+    if (previousOwnership) {
+      assertPrivateProPrepareCurrent(isCurrent);
+      await dependencies.waitForPreviousOwner?.(previousOwnership.owner);
+      assertPrivateProPrepareCurrent(isCurrent);
+    }
     if (previousOwnership && previousOwnership.uid !== uid) {
       assertPrivateProPrepareCurrent(isCurrent);
       await dependencies.deactivateAssets(previousOwnership.uid, previousOwnership.owner);
       assertPrivateProPrepareCurrent(isCurrent);
-      await dependencies.deactivateManaged(previousOwnership.uid, previousOwnership.owner);
+      await (dependencies.clearPrevious ?? dependencies.deactivateManaged)(previousOwnership.uid, previousOwnership.owner);
       assertPrivateProPrepareCurrent(isCurrent);
     }
     assertPrivateProPrepareCurrent(isCurrent);
@@ -104,7 +120,7 @@ export async function preparePrivateProPersistenceOwner<T>(
       try { await dependencies.deactivateAssets(uid, owner); } catch {}
     }
     if (managedActivated) {
-      try { await dependencies.deactivateManaged(uid, owner); } catch {}
+      try { await (dependencies.releaseManaged ?? dependencies.deactivateManaged)(uid, owner); } catch {}
     }
     throw error;
   }
@@ -119,6 +135,8 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
     engine?: PreparedPrivateProSync;
     prepareStarted?: boolean;
     stopInitiated?: boolean;
+    stopPromise?: Promise<void>;
+    stopCallback?: () => Promise<void>;
   }
 
   let generation = 0;
@@ -132,31 +150,57 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
   let closing = false;
   let decisionInProgress = false;
   let decisionGate: { promise: Promise<void>; resolve: () => void } | null = null;
+  const releaseOwner = (uid: string, owner: PrivateProPersistenceOwner) => {
+    if (dependencies.release) return dependencies.release(uid, owner);
+    if (dependencies.deactivate) return dependencies.deactivate(uid, owner);
+    return Promise.reject(new TypeError('Private Pro lifecycle release dependency is required.'));
+  };
 
   function createGate(): { promise: Promise<void>; resolve: () => void } {
     let resolve!: () => void;
     return { promise: new Promise<void>(resolve_ => { resolve = resolve_; }), resolve };
   }
 
-  function stopEngine(value: PreparedPrivateProSync | undefined, owner?: StartAttempt): void {
-    if (!value || owner?.stopInitiated) return;
-    if (owner) owner.stopInitiated = true;
+  function stopEngine(value: PreparedPrivateProSync | undefined, owner: StartAttempt): Promise<void> {
+    if (!value) return Promise.resolve();
+    if (owner.stopPromise) return owner.stopPromise;
+    owner.stopInitiated = true;
     let stopped: Promise<void>;
     try { stopped = value.engine.stop(); } catch (error) { stopped = Promise.reject(error); }
     stopped.catch(() => {});
+    owner.stopPromise = stopped;
+    return stopped;
   }
 
-  function beginDeactivate(owner: StartAttempt | null): Promise<void> {
+  function beginRelease(owner: StartAttempt | null, value?: PreparedPrivateProSync): Promise<void> {
     if (!owner) return Promise.resolve();
     const existing = ownerCleanups.get(owner.owner);
     if (existing) return existing;
-    let cleanup: Promise<void>;
-    try { cleanup = dependencies.deactivate(dependencies.uid, owner.owner); } catch (error) { cleanup = Promise.reject(error); }
-    const sanitized = cleanup.catch(() => { throw new PrivateProLifecycleError(); });
+    const cleanup = (async () => {
+      let failure: unknown = null;
+      try { await stopEngine(value, owner); } catch (error) { failure = rememberFailure(failure, error); }
+      try { await releaseOwner(dependencies.uid, owner.owner); } catch (error) { failure = rememberFailure(failure, error); }
+      if (failure) throw new PrivateProLifecycleError();
+    })();
+    const sanitized = cleanup.catch(error => { throw error instanceof PrivateProLifecycleError ? error : new PrivateProLifecycleError(); });
     ownerCleanups.set(owner.owner, sanitized);
     stopCleanup = sanitized;
-    void sanitized.finally(() => { if (stopCleanup === sanitized) stopCleanup = null; }).catch(() => {});
+    void sanitized.finally(() => {
+      if (stopCleanup === sanitized) stopCleanup = null;
+      if (privateProLifecycleOwnerStops.get(owner.owner) === owner.stopCallback) privateProLifecycleOwnerStops.delete(owner.owner);
+    }).catch(() => {});
     return sanitized;
+  }
+
+  function stopOwner(owner: StartAttempt): Promise<void> {
+    if (attempt === owner || prepared?.attempt === owner) {
+      generation++;
+      owner.cancelled = true;
+    }
+    if (attempt === owner) attempt = null;
+    const value = prepared?.attempt === owner ? prepared.value : owner.engine;
+    if (prepared?.attempt === owner) prepared = null;
+    return beginRelease(owner, value);
   }
 
   function canOwnStart(owner: StartAttempt): boolean {
@@ -181,23 +225,24 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
       owner.engine = next;
       if (canOwnStart(owner)) latestPrepared = { attempt: owner, value: next };
       if (!await waitForDecision(owner)) {
-        stopEngine(next, owner);
+        await stopEngine(next, owner).catch(() => {});
         return;
       }
       await next.engine.start();
       if (!await waitForDecision(owner)) {
-        stopEngine(next, owner);
+        await stopEngine(next, owner).catch(() => {});
         return;
       }
       prepared = { attempt: owner, value: next };
       if (attempt === owner) attempt = null;
       dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
     } catch {
-      stopEngine(next, owner);
       if (canOwnStart(owner)) {
         attempt = null;
         dependencies.statusStore.setState({ phase: 'error', lastCategory: 'unknown' });
-        try { await beginDeactivate(owner); } catch {}
+        try { await beginRelease(owner, next); } catch {}
+      } else {
+        await stopEngine(next, owner).catch(() => {});
       }
     }
   }
@@ -221,14 +266,16 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
   function start(): Promise<void> {
     if (prepared || closing) return Promise.resolve();
     if (attempt) return attempt.promise;
-    const owner = {
+    const owner: StartAttempt = {
       id: ++generation,
       owner: Symbol('private-pro-sync-owner'),
       cancelled: false,
       promise: Promise.resolve(),
-    } satisfies StartAttempt;
+    };
     attempt = owner;
     latestAttempt = owner;
+    owner.stopCallback = () => stopOwner(owner);
+    privateProLifecycleOwnerStops.set(owner.owner, owner.stopCallback);
     owner.promise = Promise.resolve().then(() => runQueuedStart(owner));
     owner.promise.catch(() => {});
     return owner.promise;
@@ -243,10 +290,8 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
     const currentPrepared = prepared;
     prepared = null;
     const owner = currentAttempt ?? currentPrepared?.attempt ?? latestAttempt;
-    stopEngine(currentPrepared?.value, currentPrepared?.attempt);
-    stopEngine(currentAttempt?.engine, currentAttempt ?? undefined);
     if (existingCleanup && !currentPrepared && currentAttempt && !currentAttempt.prepareStarted) return existingCleanup;
-    return beginDeactivate(owner);
+    return owner ? stopOwner(owner) : Promise.resolve();
   }
 
   function finishDecision(): void {
@@ -311,9 +356,13 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
         finishDecision();
         let failure: unknown = null;
         try { current?.coordinator?.broadcastSignedOut?.(); } catch (error) { failure = rememberFailure(failure, error); }
-        stopEngine(current ?? undefined, currentPrepared?.attempt ?? currentAttempt ?? undefined);
-        stopEngine(currentAttempt?.engine, currentAttempt ?? undefined);
-        try { await beginDeactivate(currentOwner); } catch (error) { failure = rememberFailure(failure, error); }
+        const cleanups = new Set<Promise<void>>();
+        if (currentPrepared) cleanups.add(beginRelease(currentPrepared.attempt, currentPrepared.value));
+        if (currentAttempt) cleanups.add(beginRelease(currentAttempt, currentAttempt.engine));
+        if (currentOwner) cleanups.add(beginRelease(currentOwner, currentOwner.engine));
+        for (const cleanup of cleanups) {
+          try { await cleanup; } catch (error) { failure = rememberFailure(failure, error); }
+        }
         try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
         try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
         try { dependencies.reload(); } catch (error) { failure = rememberFailure(failure, error); }
@@ -409,9 +458,12 @@ function createProductionLifecycle(
         owner,
         previousOwnership,
         isCurrent,
+        waitForPreviousOwner: waitForPrivateProSyncLifecycleOwner,
         activateManaged: activatePrivateProManagedPersistence,
         deactivateManaged: (uidToDeactivate, ownerToDeactivate) =>
           deactivatePrivateProManagedPersistence(uidToDeactivate, ownerToDeactivate, clearPrivateProManagedRuntimeStores),
+        releaseManaged: releasePrivateProManagedPersistence,
+        clearPrevious: uidToClear => clearPrivateProManagedPersistence(uidToClear, privateProSyncDB, clearPrivateProManagedRuntimeStores),
         deactivateAssets: deactivatePrivateProAssetPersistence,
         async prepareAssets() {
           const local = createPrivateProAssetLocalPort(uid, privateProSyncDB);
@@ -442,9 +494,9 @@ function createProductionLifecycle(
         },
       });
     },
-    deactivate: async (_uid, owner) => {
+    release: async (_uid, owner) => {
       await deactivatePrivateProAssetPersistence(uid, owner);
-      await deactivatePrivateProManagedPersistence(uid, owner, clearPrivateProManagedRuntimeStores);
+      await releasePrivateProManagedPersistence(uid, owner);
     },
     clear: uidToClear => clearPrivateProManagedPersistence(uidToClear, privateProSyncDB, clearPrivateProManagedRuntimeStores),
     firebaseSignOut,

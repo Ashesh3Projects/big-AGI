@@ -68,6 +68,42 @@ describe('Private Pro seamless sync database', () => {
     });
   }
 
+  for (const operation of ['observe', 'effective', 'record', 'tombstone', 'discard', 'quarantine'] as const) {
+    test(`aborts a remote ${operation} transaction when reconciliation stops during its final write`, async (t) => {
+      const db = createDB(t);
+      const controller = new AbortController();
+      const record = preparedRecord(`abort-remote-${operation}`, '{"value":1}');
+      const remote = operation === 'tombstone' || operation === 'discard'
+        ? { revision: 2, mutationId: `mutation-${operation}`, deleted: true } as const
+        : { revision: 2, mutationId: `mutation-${operation}`, deleted: false } as const;
+      if (operation === 'discard') {
+        await db.recordLocalPut(UID_A, record, 1_000);
+        await db.localRecords.update([UID_A, record.recordKey], { baseRevision: 1 });
+        await db.outbox.update([UID_A, record.recordKey], { baseRevision: 1 });
+      }
+      const hookTable = operation === 'quarantine' ? db.quarantine : db.remoteBases;
+      const abort = () => controller.abort();
+      hookTable.hook('creating').subscribe(abort);
+
+      const writing = operation === 'observe' ? db.observeRemoteBase(UID_A, record.recordKey, remote, controller.signal)
+        : operation === 'effective' ? db.setEffectiveRemoteBase(UID_A, record.recordKey, remote, controller.signal)
+          : operation === 'record' ? db.commitRemoteRecord(UID_A, record, remote, 2_000, controller.signal)
+            : operation === 'tombstone' ? db.commitRemoteTombstone(UID_A, record, remote, 2_000, controller.signal)
+              : operation === 'discard' ? db.discardAcrossTombstone(UID_A, record.recordKey, remote, controller.signal)
+                : db.quarantineRemote(UID_A, record.recordKey, 'invalid-payload', 2_000, controller.signal);
+      await assert.rejects(writing, { name: 'AbortError' });
+      hookTable.hook('creating').unsubscribe(abort);
+
+      assert.equal(await db.getRemoteBase(UID_A, record.recordKey), null);
+      if (operation === 'record' || operation === 'tombstone') assert.equal(await db.getLocalRecord(UID_A, record.recordKey), null);
+      if (operation === 'discard') {
+        assert.notEqual(await db.getLocalRecord(UID_A, record.recordKey), null);
+        assert.notEqual(await db.getOutbox(UID_A, record.recordKey), null);
+      }
+      if (operation === 'quarantine') assert.equal(await db.quarantine.where('uid').equals(UID_A).count(), 0);
+    });
+  }
+
   test('observes a deleted remote base without rebasing pre-delete pending work', async (t) => {
     const db = createDB(t);
     const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);

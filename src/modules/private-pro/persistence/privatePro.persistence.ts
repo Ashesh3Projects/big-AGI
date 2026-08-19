@@ -40,6 +40,7 @@ export const PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS = new Set([
 
 const managedBuild = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
 const PENDING_AUTH_UID = '__pending-auth__';
+const RETAINED_UID_OWNER = Symbol('private-pro-retained-uid');
 export type PrivateProPersistenceOwner = object | symbol;
 let managedPersistenceUid: string | null = managedBuild ? PENDING_AUTH_UID : null;
 let managedPersistenceOwner: PrivateProPersistenceOwner | null = null;
@@ -115,6 +116,15 @@ export async function deactivatePrivateProManagedPersistence(
     managedPersistenceUid = PENDING_AUTH_UID;
     managedPersistenceOwner = null;
   }
+  return true;
+}
+
+export async function releasePrivateProManagedPersistence(
+  uid: string,
+  owner: PrivateProPersistenceOwner,
+): Promise<boolean> {
+  if (managedPersistenceUid !== uid || managedPersistenceOwner !== owner) return false;
+  managedPersistenceOwner = RETAINED_UID_OWNER;
   return true;
 }
 

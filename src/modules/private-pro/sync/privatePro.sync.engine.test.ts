@@ -1,5 +1,8 @@
+import 'fake-indexeddb/auto';
+
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+import { describe, test, type TestContext } from 'node:test';
+import Dexie from 'dexie';
 
 import {
   createPrivateProSyncEngine,
@@ -8,6 +11,8 @@ import {
 import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer } from './privatePro.sync.serializers';
 import { createPrivateProSyncStore } from './store-private-pro-sync';
 import type { PrivateProSyncRemoteEvent, PrivateProSyncTransport } from './privatePro.sync.transport';
+import { privateProCanonicalJson, privateProContentHash, privateProRecordKey } from './privatePro.sync.codec';
+import { PrivateProSyncDB } from './privatePro.sync.db';
 
 
 class FakeSerializer implements PrivateProSyncSerializer<unknown> {
@@ -56,6 +61,22 @@ class FakeWindowEvents {
 
 function settle(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
+}
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(resolve_ => { resolve = resolve_; });
+  return { promise, resolve };
+}
+
+function integrationDB(t: TestContext): PrivateProSyncDB {
+  const name = `private-pro-engine-integration-${crypto.randomUUID()}`;
+  const db = new PrivateProSyncDB(name);
+  t.after(async () => {
+    db.close();
+    await Dexie.delete(name);
+  });
+  return db;
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
@@ -299,7 +320,7 @@ describe('Private Pro sync engine', () => {
     await engine.stop();
   });
 
-  test('stop waits for an already-running projection scope before it resolves', async () => {
+  test('stop abort-races an already-running projection scope instead of waiting forever', async () => {
     let projectionStarted!: () => void;
     let releaseProjection!: () => void;
     const started = new Promise<void>(resolve => { projectionStarted = resolve; });
@@ -322,7 +343,7 @@ describe('Private Pro sync engine', () => {
     let stopped = false;
     const stopping = engine.stop().then(() => { stopped = true; });
     await settle();
-    assert.equal(stopped, false);
+    assert.equal(stopped, true);
     releaseProjection();
     await stopping;
     assert.equal(stopped, true);
@@ -352,6 +373,98 @@ describe('Private Pro sync engine', () => {
       engine.stop(),
       new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop hung')))),
     ]);
+  });
+
+  test('stop aborts an in-flight remote handler before it resolves', async () => {
+    const base = harness();
+    let handlingStarted!: () => void;
+    const started = new Promise<void>(resolve => { handlingStarted = resolve; });
+    let abortObserved = false;
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-3-abort', serializers: [base.serializer], transport: base.transport, db: { pendingCount: async () => 0 },
+      runSuppressed: async callback => callback(), windowEvents: base.windowEvents,
+      createOutbound: () => ({
+        start: async () => {}, retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+      }),
+      createReconciler: () => ({
+        applyCached: async () => {},
+        handle: async (_event, _epoch, signal) => {
+          assert.ok(signal);
+          handlingStarted();
+          await new Promise<void>(resolve => signal.addEventListener('abort', () => {
+            abortObserved = true;
+            resolve();
+          }, { once: true }));
+        },
+      }),
+    });
+    await engine.start();
+    base.transport.emit({ type: 'invalid-document', collection: 'records', recordKey: 'key', reason: 'invalid-document' });
+    await started;
+
+    await engine.stop();
+
+    assert.equal(abortObserved, true);
+  });
+
+  test('a blocked old remote validation cannot mutate after stop, clear, and replacement start', async (t) => {
+    const db = integrationDB(t);
+    const transport = new FakeTransport();
+    const validationStarted = deferred<void>();
+    const releaseValidation = deferred<void>();
+    let validations = 0;
+    const serializer: PrivateProSyncSerializer<unknown> = {
+      recordType: 'settings', schemaVersion: 1, conflictPolicy: 'replace', snapshot: async () => [],
+      async validate(logicalId, input) {
+        if (++validations === 1) {
+          validationStarted.resolve();
+          await releaseValidation.promise;
+        }
+        const value = input as { id?: unknown; value?: unknown };
+        if (value.id !== logicalId || typeof value.value !== 'string') throw new TypeError('invalid settings');
+        return value;
+      },
+      project: logicalId => ({ projectionKey: logicalId, referencedAssetIds: [] }),
+      projection: { apply: async () => {}, remove: async () => {} },
+      subscribe: () => () => {},
+    };
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-integration', serializers: [serializer], transport, db, runSuppressed: callback => callback(),
+      createOutbound: () => ({
+        start: async () => {}, retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+      }),
+    });
+    const remote = async (logicalId: string, revision: number) => {
+      const payload = privateProCanonicalJson({ id: logicalId, value: `remote-${revision}` });
+      return {
+        type: 'record' as const,
+        canonical: {
+          recordKey: privateProRecordKey('settings', logicalId), recordType: 'settings' as const, logicalId, schemaVersion: 1,
+          payload, contentHash: await privateProContentHash(payload), revision, mutationId: crypto.randomUUID(),
+          writerId: crypto.randomUUID(), deleted: false, updatedAt: 'server-time',
+        },
+      };
+    };
+    const old = await remote('old', 1);
+    const replacement = await remote('replacement', 1);
+    await engine.start();
+    transport.emit(old);
+    await validationStarted.promise;
+
+    await engine.stop();
+    await db.clearUid('uid-integration');
+    await engine.start();
+    transport.emit(replacement);
+    for (let attempt = 0; attempt < 20 && !await db.getLocalRecord('uid-integration', replacement.canonical.recordKey); attempt++) await settle();
+    assert.notEqual(await db.getLocalRecord('uid-integration', replacement.canonical.recordKey), null);
+
+    releaseValidation.resolve();
+    await settle();
+    await settle();
+
+    assert.equal(await db.getLocalRecord('uid-integration', old.canonical.recordKey), null);
+    assert.equal(await db.getRemoteBase('uid-integration', old.canonical.recordKey), null);
+    await engine.stop();
   });
 
   test('a restarted listener queue processes new events while the old lifecycle handler never settles', async () => {

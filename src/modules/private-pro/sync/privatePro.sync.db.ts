@@ -1,4 +1,4 @@
-import Dexie, { type EntityTable, type Table } from 'dexie';
+import Dexie, { type EntityTable, type Table, type Transaction } from 'dexie';
 
 import { PRIVATE_PRO_SYNC_WINDOW_MS } from '../config/privatePro.config';
 import { privateProRecordKey } from './privatePro.sync.codec';
@@ -183,21 +183,52 @@ export class PrivateProSyncDB extends Dexie {
     return this.outbox.where('uid').equals(uid).count();
   }
 
-  async quarantineRemote(uid: string, recordKey: string, reasonCode: string, nowMs: number): Promise<void> {
-    await this.quarantine.add({ uid, recordKey, reasonCode, createdAtMs: nowMs });
+  private async abortAwareTransaction<T>(
+    tables: Table | readonly Table[],
+    signal: AbortSignal | undefined,
+    callback: () => Promise<T> | T,
+  ): Promise<T> {
+    let abortTransaction: (() => void) | null = null;
+    const scope = async (dexieTransaction: Transaction) => {
+      abortTransaction = () => dexieTransaction.abort();
+      signal?.addEventListener('abort', abortTransaction, { once: true });
+      throwIfCaptureAborted(signal);
+      const result = await callback();
+      throwIfCaptureAborted(signal);
+      return result;
+    };
+    let transaction: Promise<T>;
+    if (Array.isArray(tables)) transaction = this.transaction('rw', tables, scope);
+    else transaction = this.transaction('rw', tables as Table, scope);
+    try {
+      return await transaction;
+    } catch (error) {
+      if (signal?.aborted) throw captureAbortError();
+      throw error;
+    } finally {
+      if (abortTransaction) signal?.removeEventListener('abort', abortTransaction);
+    }
   }
 
-  async observeRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<PrivateProRemoteBaseState> {
-    return this.transaction('rw', this.remoteBases, () => this.storeEffectiveRemoteBase(uid, recordKey, remoteBase));
+  async quarantineRemote(uid: string, recordKey: string, reasonCode: string, nowMs: number, signal?: AbortSignal): Promise<void> {
+    await this.abortAwareTransaction(this.quarantine, signal, async () => {
+      throwIfCaptureAborted(signal);
+      await this.quarantine.add({ uid, recordKey, reasonCode, createdAtMs: nowMs });
+    });
   }
 
-  async setEffectiveRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<PrivateProRemoteBaseState> {
-    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
-      const effective = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
+  async observeRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState, signal?: AbortSignal): Promise<PrivateProRemoteBaseState> {
+    return this.abortAwareTransaction(this.remoteBases, signal, () => this.storeEffectiveRemoteBase(uid, recordKey, remoteBase, signal));
+  }
+
+  async setEffectiveRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState, signal?: AbortSignal): Promise<PrivateProRemoteBaseState> {
+    return this.abortAwareTransaction([this.localRecords, this.outbox, this.remoteBases], signal, async () => {
+      const effective = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase, signal);
       const [local, pending] = await Promise.all([
         this.localRecords.get([uid, recordKey]),
         this.outbox.get([uid, recordKey]),
       ]);
+      throwIfCaptureAborted(signal);
       if (local && local.baseRevision < effective.revision) {
         local.baseRevision = effective.revision;
         await this.localRecords.put(local);
@@ -210,14 +241,15 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
-  async commitRemoteRecord(uid: string, record: PrivateProSyncPreparedRecord, remoteBase: PrivateProRemoteBaseState, nowMs: number): Promise<PrivateProRemoteBaseState> {
-    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
-      const effective = await this.storeEffectiveRemoteBase(uid, record.recordKey, remoteBase);
+  async commitRemoteRecord(uid: string, record: PrivateProSyncPreparedRecord, remoteBase: PrivateProRemoteBaseState, nowMs: number, signal?: AbortSignal): Promise<PrivateProRemoteBaseState> {
+    return this.abortAwareTransaction([this.localRecords, this.outbox, this.remoteBases], signal, async () => {
+      const effective = await this.storeEffectiveRemoteBase(uid, record.recordKey, remoteBase, signal);
       if (effective.revision !== remoteBase.revision || effective.deleted) return effective;
       const [local, pending] = await Promise.all([
         this.localRecords.get([uid, record.recordKey]),
         this.outbox.get([uid, record.recordKey]),
       ]);
+      throwIfCaptureAborted(signal);
       if (pending) {
         if (local && local.baseRevision < effective.revision) {
           local.baseRevision = effective.revision;
@@ -244,14 +276,15 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
-  async commitRemoteTombstone(uid: string, identity: PrivateProSyncRecordIdentity, remoteBase: PrivateProRemoteBaseState, nowMs: number): Promise<PrivateProRemoteBaseState> {
-    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
-      const effective = await this.storeEffectiveRemoteBase(uid, identity.recordKey, remoteBase);
+  async commitRemoteTombstone(uid: string, identity: PrivateProSyncRecordIdentity, remoteBase: PrivateProRemoteBaseState, nowMs: number, signal?: AbortSignal): Promise<PrivateProRemoteBaseState> {
+    return this.abortAwareTransaction([this.localRecords, this.outbox, this.remoteBases], signal, async () => {
+      const effective = await this.storeEffectiveRemoteBase(uid, identity.recordKey, remoteBase, signal);
       if (effective.revision !== remoteBase.revision || !effective.deleted) return effective;
       const [local, pending] = await Promise.all([
         this.localRecords.get([uid, identity.recordKey]),
         this.outbox.get([uid, identity.recordKey]),
       ]);
+      throwIfCaptureAborted(signal);
       if (pending) {
         if (pending.baseRevision >= effective.revision) {
           if (local && local.baseRevision < effective.revision) {
@@ -575,14 +608,15 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
-  async acknowledge(uid: string, recordKey: string, sentGeneration: number, leaseToken: string, leaseFence: number, remoteBase: PrivateProRemoteBaseState, sentAtMs: number): Promise<void> {
-    await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
+  async acknowledge(uid: string, recordKey: string, sentGeneration: number, leaseToken: string, leaseFence: number, remoteBase: PrivateProRemoteBaseState, sentAtMs: number, signal?: AbortSignal): Promise<void> {
+    await this.abortAwareTransaction([this.localRecords, this.outbox, this.remoteBases], signal, async () => {
       const [local, pending] = await Promise.all([
         this.localRecords.get([uid, recordKey]),
         this.outbox.get([uid, recordKey]),
       ]);
+      throwIfCaptureAborted(signal);
       if (!this.matchesOutboxLease(pending, sentGeneration, leaseToken, leaseFence)) return;
-      const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
+      const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase, signal);
       if (local && local.generation >= sentGeneration) {
         local.baseRevision = effectiveBase.revision;
         await this.localRecords.put(local);
@@ -599,10 +633,11 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
-  async discardAcrossTombstone(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<void> {
-    await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
-      const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
+  async discardAcrossTombstone(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState, signal?: AbortSignal): Promise<void> {
+    await this.abortAwareTransaction([this.localRecords, this.outbox, this.remoteBases], signal, async () => {
+      const effectiveBase = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase, signal);
       const pending = await this.outbox.get([uid, recordKey]);
+      throwIfCaptureAborted(signal);
       if (!effectiveBase.deleted || !pending || pending.kind !== 'put' || pending.baseRevision >= effectiveBase.revision) return;
       await Promise.all([
         this.localRecords.delete([uid, recordKey]),
@@ -746,8 +781,10 @@ export class PrivateProSyncDB extends Dexie {
     return generation;
   }
 
-  private async storeEffectiveRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<PrivateProRemoteBaseState> {
+  private async storeEffectiveRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState, signal?: AbortSignal): Promise<PrivateProRemoteBaseState> {
+    throwIfCaptureAborted(signal);
     const current = await this.remoteBases.get([uid, recordKey]);
+    throwIfCaptureAborted(signal);
     if (current && current.revision > remoteBase.revision)
       return { revision: current.revision, mutationId: current.mutationId, deleted: current.deleted };
     if (current && current.revision === remoteBase.revision) {
@@ -755,6 +792,7 @@ export class PrivateProSyncDB extends Dexie {
         throw new Error('Conflicting Private Pro sync remote base identity at the same revision.');
       return { revision: current.revision, mutationId: current.mutationId, deleted: current.deleted };
     }
+    throwIfCaptureAborted(signal);
     await this.remoteBases.put({ uid, recordKey, ...remoteBase });
     return { ...remoteBase };
   }

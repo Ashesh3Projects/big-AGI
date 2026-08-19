@@ -22,6 +22,11 @@ import type { PrivateProSyncCollection, PrivateProSyncRemoteEvent, PrivateProSyn
 
 type TimeoutHandle = ReturnType<typeof globalThis.setTimeout>;
 
+function waitForAbort(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve();
+  return new Promise(resolve => signal.addEventListener('abort', () => resolve(), { once: true }));
+}
+
 export interface PrivateProSyncEngine {
   start(): Promise<void>;
   retryNow(): Promise<void>;
@@ -35,7 +40,7 @@ export interface PrivateProSyncEngineOutbound {
   retryNow(): Promise<void>;
   flushNow(): Promise<void>;
   wake(): void;
-  handleCommitted(mutationId: string, revision: number): Promise<void>;
+  handleCommitted(mutationId: string, revision: number, signal?: AbortSignal): Promise<void>;
   stop(): Promise<void>;
 }
 
@@ -114,24 +119,33 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
   let lifecycleEpoch = 0;
   let listenerEpoch = 0;
   let started = false;
+  let stopTask: Promise<void> | null = null;
   let transportUnsubscribe: (() => void) | null = null;
   let eventQueue: Promise<void> = Promise.resolve();
   let cacheTask: Promise<void> | null = null;
   const projectionTasks = new Set<Promise<unknown>>();
   const assetTasks = new Set<Promise<unknown>>();
   let assetAbort = new AbortController();
+  let lifecycleAbort = new AbortController();
+  lifecycleAbort.abort();
 
   function isEpochActive(epoch: number): boolean {
     return started && lifecycleEpoch === epoch;
   }
 
   async function runSuppressed<T>(projectionKey: string, callback: () => Promise<T> | T): Promise<T> {
+    const signal = lifecycleAbort.signal;
     suppressionDepths.set(projectionKey, (suppressionDepths.get(projectionKey) ?? 0) + 1);
     let resolveTracked!: () => void;
     const tracked = new Promise<void>(resolve => { resolveTracked = resolve; });
     projectionTasks.add(tracked);
     try {
-      return await dependencies.runSuppressed(callback);
+      const applying = Promise.resolve().then(() => dependencies.runSuppressed(callback));
+      applying.catch(() => {});
+      return await Promise.race([
+        applying,
+        waitForAbort(signal).then(() => undefined as T),
+      ]);
     } finally {
       const depth = (suppressionDepths.get(projectionKey) ?? 1) - 1;
       if (depth > 0) suppressionDepths.set(projectionKey, depth);
@@ -246,6 +260,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       onCaptureFailed,
       onCommitted,
       onStatus: status => outboundHooks.onStatus(status),
+      lifecycleSignal: () => lifecycleAbort.signal,
     });
     return implementation;
   })();
@@ -254,7 +269,10 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     localOrigins, committedMarkers, projectionVersions, outbound, runSuppressed, isEpochActive, onError: report,
     onHydrate: (assetIds, epoch) => {
       if (!assetIds.length || !dependencies.assets || !isEpochActive(epoch)) return;
-      const task = dependencies.assets.hydrate(assetIds, assetAbort.signal)
+      const signal = assetAbort.signal;
+      const hydration = dependencies.assets.hydrate(assetIds, signal);
+      hydration.catch(() => {});
+      const task = Promise.race([hydration, waitForAbort(signal)])
         .catch(() => { if (isEpochActive(epoch)) report('offline', epoch); })
         .finally(() => assetTasks.delete(task));
       assetTasks.add(task);
@@ -273,7 +291,10 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     onError: report,
     onHydrate: (assetIds, epoch) => {
       if (!assetIds.length || !dependencies.assets || !isEpochActive(epoch)) return;
-      const task = dependencies.assets.hydrate(assetIds, assetAbort.signal)
+      const signal = assetAbort.signal;
+      const hydration = dependencies.assets.hydrate(assetIds, signal);
+      hydration.catch(() => {});
+      const task = Promise.race([hydration, waitForAbort(signal)])
         .catch(() => { if (isEpochActive(epoch)) report('offline', epoch); })
         .finally(() => assetTasks.delete(task));
       assetTasks.add(task);
@@ -287,9 +308,10 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
   }
 
   function queueRemote(epoch: number, attachedEpoch: number, event: PrivateProSyncRemoteEvent): void {
+    const signal = lifecycleAbort.signal;
     const queue = eventQueue;
     eventQueue = queue.then(async () => {
-      if (!isEpochActive(epoch) || attachedEpoch !== listenerEpoch) return;
+      if (signal.aborted || !isEpochActive(epoch) || attachedEpoch !== listenerEpoch) return;
       if (event.type === 'current') {
         currentCollections.add(event.collection);
         await refreshStatus(epoch);
@@ -302,9 +324,12 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
         report(event.category, epoch);
         return;
       }
-      await reconciler.handle(event, epoch);
+      const handling = reconciler.handle(event, epoch, signal);
+      handling.catch(() => {});
+      await Promise.race([handling, waitForAbort(signal)]);
+      if (signal.aborted || !isEpochActive(epoch) || attachedEpoch !== listenerEpoch) return;
       await refreshStatus(epoch);
-    }).catch(() => report('unknown', epoch));
+    }).catch(() => { if (!signal.aborted) report('unknown', epoch); });
   }
 
   function attachListener(epoch: number): void {
@@ -329,15 +354,20 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
   const engine: PrivateProSyncEngine = {
     async start(): Promise<void> {
       if (started) return;
+      if (stopTask) await stopTask;
       started = true;
       assetAbort = new AbortController();
+      lifecycleAbort = new AbortController();
       const epoch = ++lifecycleEpoch;
       eventQueue = Promise.resolve();
       currentCollections.clear();
       statusStore.setState({ phase: 'local', retry: retryNow, lastCategory: null });
       await outbound.start();
       if (!isEpochActive(epoch)) return;
-      cacheTask = reconciler.applyCached(epoch).catch(() => report('schema', epoch));
+      const cached = reconciler.applyCached(epoch, lifecycleAbort.signal);
+      cached.catch(() => {});
+      cacheTask = Promise.race([cached, waitForAbort(lifecycleAbort.signal)])
+        .catch(() => { if (!lifecycleAbort.signal.aborted) report('schema', epoch); });
       attachListener(epoch);
       windowEvents?.addEventListener('online', onOnline);
       windowEvents?.addEventListener('offline', onOffline);
@@ -362,25 +392,35 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       return dependencies.db.pendingCount(dependencies.uid);
     },
 
-    async stop(): Promise<void> {
-      if (!started) return;
+    stop(): Promise<void> {
+      if (stopTask) return stopTask;
+      if (!started) return Promise.resolve();
       const ownedRetry = retryNow;
       started = false;
       lifecycleEpoch++;
       listenerEpoch++;
       closeListener();
       assetAbort.abort();
+      lifecycleAbort.abort();
       windowEvents?.removeEventListener('online', onOnline);
       windowEvents?.removeEventListener('offline', onOffline);
-      await outbound.stop();
-      await Promise.allSettled([...projectionTasks]);
-      eventQueue.catch(() => {});
-      cacheTask?.catch(() => {});
-      cacheTask = null;
-      captures.clear();
-      localOrigins.clear();
-      committedMarkers.clear();
-      if (statusStore.getState().retry === ownedRetry) statusStore.setState({ retry: null });
+      let outboundTask: Promise<void>;
+      try { outboundTask = outbound.stop(); } catch (error) { outboundTask = Promise.reject(error); }
+      const stopping = (async () => {
+        const tasks = [outboundTask, eventQueue, ...projectionTasks, ...assetTasks];
+        if (cacheTask) tasks.push(cacheTask);
+        const results = await Promise.allSettled(tasks);
+        cacheTask = null;
+        captures.clear();
+        localOrigins.clear();
+        committedMarkers.clear();
+        if (statusStore.getState().retry === ownedRetry) statusStore.setState({ retry: null });
+        const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (rejected) throw rejected.reason;
+      })();
+      const settled = stopping.finally(() => { if (stopTask === settled) stopTask = null; });
+      stopTask = settled;
+      return settled;
     },
   };
 

@@ -82,12 +82,13 @@ export interface PrivateProSyncOutboundDependencies {
   random?: () => number;
   setTimeout?: (callback: () => void, ms: number) => TimeoutHandle;
   clearTimeout?: (handle: TimeoutHandle) => void;
+  lifecycleSignal?: () => AbortSignal;
 }
 
 export interface PrivateProSyncOutbound {
   start(): Promise<void>;
   capture(mutation: PrivateProSyncLocalMutation): Promise<PrivateProOutboxState>;
-  handleCommitted(mutationId: string, revision: number): Promise<void>;
+  handleCommitted(mutationId: string, revision: number, signal?: AbortSignal): Promise<void>;
   retryNow(): Promise<void>;
   wake(): void;
   flushNow(): Promise<void>;
@@ -300,7 +301,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     );
   }
 
-  async function acknowledge(row: PrivateProOutboxState, base: PrivateProRemoteBaseState, sentAtMs: number): Promise<void> {
+  async function acknowledge(row: PrivateProOutboxState, base: PrivateProRemoteBaseState, sentAtMs: number, signal?: AbortSignal): Promise<void> {
     if (!row.leaseToken || row.leaseFence === null || row.leasedGeneration === null) return;
     await dependencies.db.acknowledge(
       dependencies.uid,
@@ -310,6 +311,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       row.leaseFence,
       base,
       sentAtMs,
+      signal,
     );
   }
 
@@ -491,6 +493,11 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
         captureOwner = { epoch: ++captureEpoch, controller: new AbortController() };
         captureQueue = Promise.resolve();
       }
+      const lifecycleSignal = dependencies.lifecycleSignal?.();
+      if (lifecycleSignal) {
+        if (lifecycleSignal.aborted) captureOwner.controller.abort();
+        else lifecycleSignal.addEventListener('abort', () => captureOwner.controller.abort(), { once: true });
+      }
       for (const serializer of dependencies.serializers) {
         unsubscribers.push(serializer.subscribe(mutation => {
           if (dependencies.shouldCapture && !dependencies.shouldCapture(mutation)) return;
@@ -502,10 +509,10 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
 
     capture,
 
-    async handleCommitted(mutationId: string, revision: number): Promise<void> {
+    async handleCommitted(mutationId: string, revision: number, signal?: AbortSignal): Promise<void> {
       const active = activeSends.get(mutationId);
       if (!active || !Number.isInteger(revision) || revision <= 0) return;
-      await acknowledge(active.row, { revision, mutationId, deleted: active.row.kind === 'delete' }, active.sentAtMs);
+      await acknowledge(active.row, { revision, mutationId, deleted: active.row.kind === 'delete' }, active.sentAtMs, signal);
       void reschedule();
     },
 

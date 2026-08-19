@@ -27,6 +27,12 @@ const MUTATION_ID = '123e4567-e89b-12d3-a456-426614174003';
 
 const SettingsSchema = z.object({ id: z.string(), value: z.string() }).strict();
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(resolve_ => { resolve = resolve_; });
+  return { promise, resolve };
+}
+
 interface ProjectionCall {
   kind: 'apply' | 'remove';
   projectionKey: string;
@@ -128,6 +134,45 @@ function createHarness(t: TestContext) {
 }
 
 describe('Private Pro sync reconciler', () => {
+  test('aborted remote validation cannot mutate local records, outbox, or remote bases', async (t) => {
+    const db = createDB(t);
+    const calls: ProjectionCall[] = [];
+    const suppression = { active: false };
+    const validationStarted = deferred<void>();
+    const releaseValidation = deferred<void>();
+    const settings = serializer('settings', calls, suppression);
+    settings.validate = async (logicalId, input) => {
+      validationStarted.resolve();
+      await releaseValidation.promise;
+      const value = SettingsSchema.parse(input);
+      if (value.id !== logicalId) throw new TypeError('identity');
+      return value;
+    };
+    const reconciler = createPrivateProSyncReconciler({
+      uid: UID,
+      writerId: WRITER_ID,
+      serializers: [settings],
+      db,
+      localOrigins: new Map(),
+      outbound: { handleCommitted: async () => {} },
+      runSuppressed: async (_projectionKey, callback) => callback(),
+      now: () => 9_000,
+    });
+    const canonical = await remoteRecord();
+    const controller = new AbortController();
+    const handling = reconciler.handle({ type: 'record', canonical }, 1, controller.signal);
+    await validationStarted.promise;
+
+    controller.abort();
+    releaseValidation.resolve();
+    await handling;
+
+    assert.equal(await db.getLocalRecord(UID, canonical.recordKey), null);
+    assert.equal(await db.getOutbox(UID, canonical.recordKey), null);
+    assert.equal(await db.getRemoteBase(UID, canonical.recordKey), null);
+    assert.deepEqual(calls, []);
+  });
+
   test('applies cached records under suppression', async (t) => {
     const { db, calls, reconciler } = createHarness(t);
     await db.commitRemoteRecord(UID, {

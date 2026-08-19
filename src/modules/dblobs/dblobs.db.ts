@@ -42,9 +42,14 @@ if (process.env.NODE_ENV !== 'production') globalForDexie.bigAgiDB = _db;
 
 const assetsTable = _db.largeAssets;
 
+function managedAssetPendingError(): DOMException {
+  return new DOMException('Private Pro asset persistence is pending.', 'AbortError');
+}
+
 export async function clearPrivateProPlaintextDBlobPersistence(): Promise<void> {
   const routed = await runActivePrivateProAssetOperation((port, guard) => port.clear(guard));
   if (routed.active) return;
+  if (routed.managed) throw managedAssetPendingError();
   await assetsTable.clear();
 }
 
@@ -59,6 +64,7 @@ export async function _addDBAsset<T extends DBlobAsset>(asset: T, contextId: DBl
   try {
     const routed = await runActivePrivateProAssetOperation((port, guard) => port.putAsset({ ...asset, contextId, scopeId } as DBlobDBAsset, guard));
     if (routed.active) return asset.id;
+    if (routed.managed) throw managedAssetPendingError();
     // returns the id of the added asset
     return await assetsTable.add({
       ...asset,
@@ -88,18 +94,21 @@ export async function _addDBAsset<T extends DBlobAsset>(asset: T, contextId: DBl
 export async function getDBAsset<T extends DBlobAsset = DBlobDBAsset>(id: DBlobAssetId) {
   const routed = await runActivePrivateProAssetOperation((port, guard) => port.getAsset(id, guard));
   if (routed.active) return routed.value as unknown as T | undefined;
+  if (routed.managed) return undefined;
   return await assetsTable.get(id) as T | undefined;
 }
 
 export async function getDBAssetsByIds(ids: DBlobAssetId[]): Promise<DBlobDBAsset[]> {
   const routed = await runActivePrivateProAssetOperation((port, guard) => port.getAssets(ids, guard));
   if (routed.active) return routed.value;
+  if (routed.managed) return [];
   return (await assetsTable.bulkGet(ids)).filter((asset): asset is DBlobDBAsset => !!asset);
 }
 
 export async function putDBAsset(asset: DBlobDBAsset): Promise<void> {
   const routed = await runActivePrivateProAssetOperation((port, guard) => port.putAsset(asset, guard));
   if (routed.active) return;
+  if (routed.managed) throw managedAssetPendingError();
   await assetsTable.put(asset);
 }
 
@@ -120,6 +129,7 @@ export async function getDBAssetsByScopeAndType<T extends DBlobAsset = DBlobDBAs
   if (routed.active) return routed.value
     .filter(asset => asset.assetType === assetType && asset.contextId === contextId && asset.scopeId === scopeId)
     .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()) as unknown as T[];
+  if (routed.managed) return [];
   const assets = await assetsTable.where({
     assetType: assetType, contextId: contextId, scopeId: scopeId,
   }).sortBy('createdAt');
@@ -132,6 +142,7 @@ export async function getDBAssetsByScopeAndType<T extends DBlobAsset = DBlobDBAs
 async function _updateDBAsset<T extends DBlobDBAsset = DBlobDBAsset>(id: DBlobAssetId, updates: Partial<T>) {
   const routed = await runActivePrivateProAssetOperation((port, guard) => port.updateAsset(id, updates as Partial<DBlobDBAsset>, guard));
   if (routed.active) return routed.value ? 1 : 0;
+  if (routed.managed) throw managedAssetPendingError();
   return assetsTable.update(id, updates);
 }
 
@@ -145,6 +156,7 @@ export async function transferDBAssetContextScope(id: DBlobAssetId, contextId: D
 export async function deleteDBAsset(id: DBlobAssetId) {
   const routed = await runActivePrivateProAssetOperation((_port, guard, deleteAsset) => deleteAsset(id, guard));
   if (routed.active) return;
+  if (routed.managed) throw managedAssetPendingError();
   return assetsTable.delete(id);
 }
 
@@ -171,6 +183,7 @@ export async function gcDBAssetsByScope(contextId: DBlobDBContextId, scopeId: DB
   if (routed.active) {
     return;
   }
+  if (routed.managed) throw managedAssetPendingError();
   // get all the DB keys
   const dbAssetIds = await assetsTable.where((assetType !== null) ? {
     assetType: assetType,

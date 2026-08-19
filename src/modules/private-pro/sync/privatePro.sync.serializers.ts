@@ -47,8 +47,8 @@ export interface PrivateProSyncSerializer<T> {
 }
 
 export interface PrivateProSyncProjection {
-  apply(projectionKey: string, records: readonly PrivateProSyncSerializedRecord[]): Promise<void>;
-  remove(projectionKey: string): Promise<void>;
+  apply(projectionKey: string, records: readonly PrivateProSyncSerializedRecord[], signal?: AbortSignal): Promise<void>;
+  remove(projectionKey: string, signal?: AbortSignal): Promise<void>;
 }
 
 export interface PrivateProSyncLogicalSerializer<T> {

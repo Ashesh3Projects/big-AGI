@@ -273,3 +273,41 @@ None.
 ### Concerns
 
 None.
+
+## Fix round 5
+
+### Findings addressed
+
+- Each engine start now owns a lifecycle `AbortController`. Stop closes the listener, unsubscribes outbound serializers, aborts capture, asset, cache, and reconciliation work, and awaits only engine-owned abort-raced tasks.
+- Remote reconciliation receives the lifecycle signal and checks it after every awaited validation, hash, read, commit, acknowledgement, and projection boundary. Remote-base observation, effective-base updates, remote record/tombstone commits, tombstone discard, quarantine, and reconciliation acknowledgement use abort-aware Dexie transactions through settlement.
+- A blocked old remote validation cannot mutate local records, outbox, or remote bases after stop resolves. The integration regression stops, clears, starts a replacement, then releases the old validator and proves only replacement state exists.
+- Provider stop now awaits the finite engine stop before exact-owner persistence release. Replacement prepare waits the prior lifecycle owner to settle, including a rejected stop after cleanup, so old and new coordinators never overlap.
+- Asset persistence now has an explicit managed-pending sentinel. Private Pro reads return absent and mutations fail with `AbortError` while no owner is active or a transition is pending; no operation falls through to the Open `Big-AGI` Dexie table.
+- Ordinary same-UID stop releases only the exact asset and managed owner. It preserves the UID, volatile portable values, runtime stores, and UID sync database for StrictMode or ordinary remount. Cross-account prepare and confirmed sign-out retain destructive clear behavior.
+- Released same-UID ownership remains discoverable so a later account change can clear the prior UID before activating the new account.
+
+### RED evidence
+
+- Engine stop returned before an abort-aware remote handler observed cancellation, and delayed remote validation committed after stop.
+- Remote observe/effective/record/tombstone/discard/quarantine transactions all committed when aborted from their final write hook.
+- Managed-pending DBlob reads exposed Open rows, and writes held behind a transition landed in Open Dexie.
+- Replacement prepare entered before old engine stop settled; ordinary owner release erased volatile workspace state; a rejected old stop prevented remount activation.
+
+### GREEN evidence
+
+- Final Task 9 provider, persistence, DB, outbound, engine, reconcile, coordinator, DBlob, asset, auth, cron, fail-closed route, config, single-tab, and access matrix: 265 tests passed, 0 failed.
+- Root TypeScript and tools/test TypeScript: exit 0.
+- Scoped ESLint for every round-5 source and test: exit 0 with no warnings.
+- `git diff --check`: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- Open builds still use null asset persistence and the Open DBlob table. Managed pending is selected only by the Private Pro build or an explicit managed lifecycle transition.
+- Lifecycle abort does not await arbitrary user validation, hashing, or projection promises. Their continuations are detached with same-turn rejection handling, while every owned mutation boundary is abort-fenced.
+- Asset manifest projection receives the lifecycle signal and uses the existing activation-guarded transaction path.
+- Sign-out remains single-flight, broadcasts before stop, awaits quiescence before clear, and attempts clear, Firebase sign-out, and reload even when stop or release rejects.
+- No workspace payload, credential, token, attachment content, or raw lifecycle error detail is newly logged.
+
+### Concerns
+
+None.

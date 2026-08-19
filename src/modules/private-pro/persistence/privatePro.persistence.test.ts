@@ -16,7 +16,9 @@ import {
   createPrivateProPortableLocalStorage,
   deactivatePrivateProManagedPersistence as deactivatePrivateProManagedPersistenceOwned,
   isPrivateProManagedPersistenceActive,
+  privateProManagedPersistenceOwnership,
   privateProManagedPersistenceUid,
+  releasePrivateProManagedPersistence,
 } from './privatePro.persistence';
 
 
@@ -293,6 +295,28 @@ describe('private Pro managed persistence gate', () => {
     assert.equal(storage.getItem('app-models'), 'uid-a-models');
     assert.equal(runtimeClears, 0);
     assert.equal(privateProManagedPersistenceUid(), 'uid-a');
+  });
+
+  test('ordinary same-UID owner release preserves volatile workspace state for remount', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    const oldOwner = Symbol('old-owner');
+    const replacementOwner = Symbol('replacement-owner');
+    await activatePrivateProManagedPersistenceOwned('uid-a', oldOwner);
+    storage.setItem('app-models', 'uid-a-models');
+
+    assert.equal(await releasePrivateProManagedPersistence('uid-a', oldOwner), true);
+    await activatePrivateProManagedPersistenceOwned('uid-a', replacementOwner);
+
+    assert.equal(storage.getItem('app-models'), 'uid-a-models');
+    assert.equal(privateProManagedPersistenceUid(), 'uid-a');
+  });
+
+  test('released same-UID state remains discoverable for a later cross-account clear', async () => {
+    const oldOwner = Symbol('old-owner');
+    await activatePrivateProManagedPersistenceOwned('uid-a', oldOwner);
+    await releasePrivateProManagedPersistence('uid-a', oldOwner);
+
+    assert.equal(privateProManagedPersistenceOwnership()?.uid, 'uid-a');
   });
 
   test('Private Pro deactivation returns to pending-auth volatile storage instead of Open durability', async () => {

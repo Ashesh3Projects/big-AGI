@@ -41,15 +41,21 @@ export function createPrivateProAssetSerializer(
       return { projectionKey: manifest.assetId, referencedAssetIds: [manifest.assetId] };
     },
     projection: {
-      async apply(projectionKey, records) {
+      async apply(projectionKey, records, signal) {
+        const guard = signal ? { signal, assertActive() { if (signal.aborted) throw new DOMException('Private Pro sync reconciliation stopped.', 'AbortError'); } } : undefined;
         const record = records.find(candidate => candidate.recordType === 'asset' && candidate.logicalId === projectionKey);
         if (record) {
           const manifest = PrivateProAssetManifestSchema.parse(record.value);
-          await local.putManifest(manifest, await privateProContentHash(privateProCanonicalJson(manifest)));
+          const manifestHash = await privateProContentHash(privateProCanonicalJson(manifest));
+          guard?.assertActive();
+          await local.putManifest(manifest, manifestHash, guard);
         }
-        else await local.deleteManifest(projectionKey);
+        else await local.deleteManifest(projectionKey, guard);
       },
-      remove: projectionKey => local.deleteManifest(projectionKey),
+      remove: (projectionKey, signal) => local.deleteManifest(projectionKey, signal ? {
+        signal,
+        assertActive() { if (signal.aborted) throw new DOMException('Private Pro sync reconciliation stopped.', 'AbortError'); },
+      } : undefined),
     },
     subscribe(listener) {
       let previous = new Map<string, string>();

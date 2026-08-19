@@ -208,6 +208,54 @@ test('stale same-UID owner cleanup cannot deactivate a replacement asset port', 
   assert.deepEqual(await dbModule.getDBAsset(asset.id), asset);
 });
 
+test('managed pending asset persistence never reads or writes the Open DBlob table', async () => {
+  const dbModule = await dbModulePromise;
+  const openOnly = imageAsset('asset-open-only');
+  await activatePrivateProAssetPersistenceOwned(null, null);
+  await dbModule.putDBAsset(openOnly);
+
+  await activatePrivateProAssetPersistenceOwned(null, null, undefined, undefined, { managed: true });
+  assert.equal(await dbModule.getDBAsset(openOnly.id), undefined);
+  assert.deepEqual(await dbModule.getDBAssetsByIds([openOnly.id]), []);
+  await assert.rejects(dbModule.putDBAsset(imageAsset('asset-managed-pending')), { name: 'AbortError' });
+  await assert.rejects(dbModule.deleteDBAsset(openOnly.id), { name: 'AbortError' });
+
+  await activatePrivateProAssetPersistenceOwned(null, null);
+  assert.deepEqual(await dbModule.getDBAsset(openOnly.id), openOnly);
+  assert.equal(await dbModule.getDBAsset('asset-managed-pending'), undefined);
+});
+
+test('a write held behind a managed transition never falls through to the Open DBlob table', async () => {
+  const dbModule = await dbModulePromise;
+  await activatePrivateProAssetPersistenceOwned(null, null);
+  await dbModule.clearPrivateProPlaintextDBlobPersistence();
+  const port = createPrivateProAssetLocalPort('uid-a', syncDB);
+  const gate = deferred();
+  const started = deferred();
+  const slow = new Proxy(port, {
+    get(target, property, receiver) {
+      if (property !== 'putAsset') return Reflect.get(target, property, receiver);
+      return async (...args: unknown[]) => {
+        started.resolve();
+        await gate.promise;
+        return target.putAsset(...args as Parameters<typeof target.putAsset>);
+      };
+    },
+  });
+  await activatePrivateProAssetPersistenceOwned('uid-a', assetOwner('uid-a'), slow);
+  const blocking = dbModule.putDBAsset(imageAsset('asset-managed-transition-blocker'));
+  await started.promise;
+  const pending = activatePrivateProAssetPersistenceOwned(null, null, undefined, undefined, { managed: true });
+  const held = dbModule.putDBAsset(imageAsset('asset-managed-transition-held'));
+  gate.resolve();
+
+  await assert.rejects(blocking, { name: 'AbortError' });
+  await pending;
+  await assert.rejects(held, { name: 'AbortError' });
+  await activatePrivateProAssetPersistenceOwned(null, null);
+  assert.equal(await dbModule.getDBAsset('asset-managed-transition-held'), undefined);
+});
+
 test('routes a DBlob operation through the latest chained activation without contaminating Open Dexie', async () => {
   const dbModule = await dbModulePromise;
   await activatePrivateProAssetPersistence(null, null);
