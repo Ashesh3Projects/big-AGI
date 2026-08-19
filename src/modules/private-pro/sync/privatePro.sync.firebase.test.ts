@@ -24,7 +24,7 @@ type Listener = {
     id: string;
     data: unknown;
     hasPendingWrites: boolean;
-  }[]) => void;
+  }[], current?: boolean) => void;
   error: (error: unknown) => void;
 };
 
@@ -322,6 +322,24 @@ describe('Private Pro direct Firebase sync transport', () => {
 
     unsubscribe();
     assert.deepEqual(firestore.unsubscribed.sort(), [`${ROOT}/assets`, `${ROOT}/records`, `${ROOT}/tombstones`]);
+  });
+
+  test('emits current only after each committed collection snapshot', () => {
+    const firestore = new FakeFirestore();
+    const events: unknown[] = [];
+    createPrivateProFirebaseSyncTransport(UID, firestore).listen(event => events.push(event));
+
+    firestore.listeners.get(`${ROOT}/records`)!.next([], true);
+    firestore.listeners.get(`${ROOT}/assets`)!.next([], true);
+    firestore.listeners.get(`${ROOT}/tombstones`)!.next([], true);
+
+    assert.deepEqual(events, [
+      { type: 'current', collection: 'records' },
+      { type: 'current', collection: 'assets' },
+      { type: 'current', collection: 'tombstones' },
+    ]);
+    firestore.listeners.get(`${ROOT}/records`)!.next([], true);
+    assert.equal(events.length, 3);
   });
 
   test('continues a record batch after malformed committed record data', () => {

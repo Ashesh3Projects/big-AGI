@@ -41,6 +41,7 @@ export class PrivateProSyncTransportError extends Error {
 export type PrivateProSyncRemoteEvent =
   | { type: 'record'; canonical: PrivateProSyncRemoteRecord }
   | { type: 'tombstone'; tombstone: PrivateProSyncTombstoneDocument }
+  | { type: 'current'; collection: 'records' | 'assets' | 'tombstones' }
   | { type: 'error'; category: PrivateProSyncErrorCategory };
 
 export interface PrivateProSyncTransport {

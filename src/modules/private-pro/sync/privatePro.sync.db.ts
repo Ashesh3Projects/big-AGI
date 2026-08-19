@@ -142,6 +142,116 @@ export class PrivateProSyncDB extends Dexie {
     return (await this.localRecords.where('uid').equals(uid).toArray()).map(cloneLocalRecord);
   }
 
+  async listProjectionRecords(uid: string, projectionKey: string): Promise<PrivateProLocalRecordState[]> {
+    return (await this.localRecords.where('uid').equals(uid).filter(record => record.projectionKey === projectionKey && !record.deleted).toArray())
+      .map(cloneLocalRecord);
+  }
+
+  async pendingCount(uid: string): Promise<number> {
+    return this.outbox.where('uid').equals(uid).count();
+  }
+
+  async quarantineRemote(uid: string, recordKey: string, reasonCode: string, nowMs: number): Promise<void> {
+    await this.quarantine.add({ uid, recordKey, reasonCode, createdAtMs: nowMs });
+  }
+
+  async setEffectiveRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<PrivateProRemoteBaseState> {
+    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
+      const effective = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
+      const [local, pending] = await Promise.all([
+        this.localRecords.get([uid, recordKey]),
+        this.outbox.get([uid, recordKey]),
+      ]);
+      if (local && local.baseRevision < effective.revision) {
+        local.baseRevision = effective.revision;
+        await this.localRecords.put(local);
+      }
+      if (pending && pending.baseRevision < effective.revision) {
+        pending.baseRevision = effective.revision;
+        await this.outbox.put(pending);
+      }
+      return effective;
+    });
+  }
+
+  async commitRemoteRecord(uid: string, record: PrivateProSyncPreparedRecord, remoteBase: PrivateProRemoteBaseState, nowMs: number): Promise<PrivateProRemoteBaseState> {
+    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
+      const effective = await this.storeEffectiveRemoteBase(uid, record.recordKey, remoteBase);
+      if (effective.revision !== remoteBase.revision || effective.deleted) return effective;
+      const [local, pending] = await Promise.all([
+        this.localRecords.get([uid, record.recordKey]),
+        this.outbox.get([uid, record.recordKey]),
+      ]);
+      if (pending) {
+        if (local && local.baseRevision < effective.revision) {
+          local.baseRevision = effective.revision;
+          await this.localRecords.put(local);
+        }
+        if (pending.baseRevision < effective.revision) {
+          pending.baseRevision = effective.revision;
+          await this.outbox.put(pending);
+        }
+        return effective;
+      }
+      await this.localRecords.put({
+        uid,
+        ...asIdentity(record),
+        payload: record.payload,
+        contentHash: record.contentHash,
+        referencedAssetIds: [...record.referencedAssetIds],
+        generation: local?.generation ?? 0,
+        baseRevision: effective.revision,
+        deleted: false,
+        updatedAtMs: nowMs,
+      });
+      return effective;
+    });
+  }
+
+  async commitRemoteTombstone(uid: string, identity: PrivateProSyncRecordIdentity, remoteBase: PrivateProRemoteBaseState, nowMs: number): Promise<PrivateProRemoteBaseState> {
+    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
+      const effective = await this.storeEffectiveRemoteBase(uid, identity.recordKey, remoteBase);
+      if (effective.revision !== remoteBase.revision || !effective.deleted) return effective;
+      const [local, pending] = await Promise.all([
+        this.localRecords.get([uid, identity.recordKey]),
+        this.outbox.get([uid, identity.recordKey]),
+      ]);
+      if (pending) {
+        if (pending.baseRevision >= effective.revision) {
+          if (local && local.baseRevision < effective.revision) {
+            local.baseRevision = effective.revision;
+            await this.localRecords.put(local);
+          }
+        } else {
+          await this.localRecords.put({
+            uid,
+            ...identity,
+            payload: '',
+            contentHash: null,
+            referencedAssetIds: [],
+            generation: local?.generation ?? 0,
+            baseRevision: effective.revision,
+            deleted: true,
+            updatedAtMs: nowMs,
+          });
+        }
+        return effective;
+      }
+      await this.localRecords.put({
+        uid,
+        ...identity,
+        payload: '',
+        contentHash: null,
+        referencedAssetIds: [],
+        generation: local?.generation ?? 0,
+        baseRevision: effective.revision,
+        deleted: true,
+        updatedAtMs: nowMs,
+      });
+      return effective;
+    });
+  }
+
   async getOutbox(uid: string, recordKey: string): Promise<PrivateProOutboxState | null> {
     const state = await this.outbox.get([uid, recordKey]);
     return state ? cloneOutbox(state) : null;

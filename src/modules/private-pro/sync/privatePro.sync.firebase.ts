@@ -39,7 +39,7 @@ interface PrivateProFirestoreChange {
 }
 
 interface PrivateProFirestoreListener {
-  next(changes: readonly PrivateProFirestoreChange[]): void;
+  next(changes: readonly PrivateProFirestoreChange[], current?: boolean): void;
   error(error: unknown): void;
 }
 
@@ -73,7 +73,7 @@ class FirebaseWebPrivateProFirestorePort implements PrivateProFirestorePort {
       id: change.doc.id,
       data: change.doc.data(),
       hasPendingWrites: change.doc.metadata.hasPendingWrites,
-    }))), error => listener.error(error));
+    })), !snapshot.metadata.fromCache), error => listener.error(error));
   }
 
   serverTimestamp(): unknown {
@@ -273,10 +273,17 @@ export function createPrivateProFirebaseSyncTransport(
     },
     listen(listener) {
       const onError = (error: unknown) => listener({ type: 'error', category: classifyFirebaseError(error) });
+      const currentCollections = new Set<string>();
       const unsubscribes = (['record', 'asset', 'tombstone'] as const).map(kind => {
         const collectionName = kind === 'record' ? 'records' : kind === 'asset' ? 'assets' : 'tombstones';
         return firestore.listenCollection(`${root}/${collectionName}`, { includeMetadataChanges: true }, {
-          next: changes => emitChanges(kind, changes, listener),
+          next: (changes, current) => {
+            emitChanges(kind, changes, listener);
+            if (current && !currentCollections.has(collectionName)) {
+              currentCollections.add(collectionName);
+              listener({ type: 'current', collection: collectionName });
+            }
+          },
           error: onError,
         });
       });

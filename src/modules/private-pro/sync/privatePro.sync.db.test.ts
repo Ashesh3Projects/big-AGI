@@ -48,6 +48,55 @@ async function seedUid(db: PrivateProSyncDB, uid: string): Promise<void> {
 
 
 describe('Private Pro seamless sync database', () => {
+  test('persists a committed remote record and lists its live projection', async (t) => {
+    const db = createDB(t);
+    const record = preparedRecord('record-remote', '{"value":4}');
+
+    await db.commitRemoteRecord(UID_A, record, remoteBase(4), 4_000);
+
+    assert.deepEqual(await db.listProjectionRecords(UID_A, record.projectionKey), [{
+      uid: UID_A, ...record, generation: 0, baseRevision: 4, deleted: false, updatedAtMs: 4_000,
+    }]);
+  });
+
+  test('preserves a newer local value while advancing its committed remote base', async (t) => {
+    const db = createDB(t);
+    const local = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":5}'), 5_000);
+
+    await db.commitRemoteRecord(UID_A, preparedRecord('record-1', '{"value":4}'), remoteBase(4), 6_000);
+
+    const stored = await db.getLocalRecord(UID_A, local.recordKey);
+    assert.equal(stored?.payload, '{"value":5}');
+    assert.equal(stored?.generation, 1);
+    assert.equal(stored?.baseRevision, 4);
+  });
+
+  test('persists a remote tombstone without deleting a local mutation based at that tombstone', async (t) => {
+    const db = createDB(t);
+    const local = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":5}'), 5_000);
+    await db.localRecords.update([UID_A, local.recordKey], { baseRevision: 4 });
+    await db.outbox.update([UID_A, local.recordKey], { baseRevision: 4 });
+
+    await db.commitRemoteTombstone(UID_A, local, { revision: 4, mutationId: 'mutation-4', deleted: true }, 6_000);
+    await db.discardAcrossTombstone(UID_A, local.recordKey, { revision: 4, mutationId: 'mutation-4', deleted: true });
+
+    assert.equal((await db.getLocalRecord(UID_A, local.recordKey))?.payload, '{"value":5}');
+    assert.equal((await db.getOutbox(UID_A, local.recordKey))?.generation, 1);
+  });
+
+  test('counts blocked and unblocked pending work and quarantines only a reason code', async (t) => {
+    const db = createDB(t);
+    const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"secret":"payload"}'), 1_000);
+    await db.outbox.update([UID_A, pending.recordKey], { blocked: true });
+
+    await db.quarantineRemote(UID_A, pending.recordKey, 'invalid-payload', 2_000);
+
+    assert.equal(await db.pendingCount(UID_A), 1);
+    assert.deepEqual(await db.quarantine.where('uid').equals(UID_A).toArray(), [{
+      id: 1, uid: UID_A, recordKey: pending.recordKey, reasonCode: 'invalid-payload', createdAtMs: 2_000,
+    }]);
+  });
+
   test('replaces payload and increments generation inside one 60-second window', async (t) => {
     const db = createDB(t);
     const first = preparedRecord('record-1', '{"value":1}');

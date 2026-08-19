@@ -12,6 +12,7 @@ import {
   privateProSyncChatProjection,
   type PrivateProSyncSerializedRecord,
 } from './privatePro.sync.serializers';
+import { SyncChatMessageSchema } from './privatePro.sync.schemas';
 
 
 function conversationFixture() {
@@ -68,6 +69,20 @@ async function resetChat(): Promise<void> {
 afterEach(resetChat);
 
 describe('Private Pro sync serializers', () => {
+  test('derives trusted projection metadata after validating remote values', async () => {
+    const serializer = createPrivateProSyncSerializers().find(candidate => candidate.recordType === 'chat-message');
+    if (!serializer) assert.fail('Expected the chat message serializer.');
+    const value = SyncChatMessageSchema.parse({
+      conversationId: 'chat-1',
+      message: { id: 'message-1', role: 'user', fragments: [], tokenCount: 0, created: 1, updated: null },
+    });
+
+    assert.deepEqual(serializer.project('chat-1\0message-1', value), {
+      projectionKey: 'chat-1',
+      referencedAssetIds: [],
+    });
+  });
+
   test('splits one conversation into one metadata record and finalized message records', async () => {
     await resetChat();
     chatSyncUpsert(conversationFixture());
@@ -131,6 +146,8 @@ describe('Private Pro sync serializers', () => {
       conflictPolicy: 'replace' as const,
       snapshot: () => [],
       validate: async (_logicalId: string, value: unknown) => value,
+      project: (logicalId: string) => ({ projectionKey: logicalId, referencedAssetIds: [] }),
+      projection: { apply: async () => {}, remove: async () => {} },
       subscribe: () => () => {},
     };
     const serializers = createPrivateProSyncSerializers([extra]);

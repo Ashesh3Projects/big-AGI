@@ -40,6 +40,8 @@ export interface PrivateProSyncSerializer<T> {
   conflictPolicy: 'replace' | 'message-identity';
   snapshot(): Promise<readonly PrivateProSyncSerializedRecord<T>[]>;
   validate(logicalId: string, value: unknown): Promise<T>;
+  project(logicalId: string, value: T): { projectionKey: string; referencedAssetIds: readonly string[] };
+  projection: PrivateProSyncProjection;
   subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void): () => void;
 }
 
@@ -72,6 +74,17 @@ function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): Priv
     referencedAssetIds: serializer.referencedAssetIds?.(value) ?? [],
   }));
 
+  const projection: PrivateProSyncProjection = serializer.recordType === 'chat-meta' || serializer.recordType === 'chat-message'
+    ? privateProSyncChatProjection
+    : {
+      apply: async (projectionKey, records) => {
+        const record = records.find(candidate => candidate.recordType === serializer.recordType && candidate.projectionKey === projectionKey);
+        if (record) serializer.apply(record.logicalId, serializer.schema.parse(record.value));
+        else serializer.remove(projectionKey);
+      },
+      remove: async projectionKey => serializer.remove(projectionKey),
+    };
+
   return {
     recordType: serializer.recordType,
     schemaVersion: serializer.schemaVersion,
@@ -83,6 +96,15 @@ function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): Priv
         throw new TypeError('Private Pro sync record logical ID does not match its payload.');
       return value;
     },
+    project: (logicalId, value) => {
+      if (serializer.logicalId(value) !== logicalId)
+        throw new TypeError('Private Pro sync record logical ID does not match its payload.');
+      return {
+        projectionKey: serializer.projectionKey(value),
+        referencedAssetIds: serializer.referencedAssetIds?.(value) ?? [],
+      };
+    },
+    projection,
     subscribe: listener => {
       let stopped = false;
       let emitting = false;

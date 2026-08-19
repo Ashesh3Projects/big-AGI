@@ -159,6 +159,12 @@ class FakeSerializer implements PrivateProSyncSerializer<unknown> {
     return structuredClone(value);
   }
 
+  project(logicalId: string): { projectionKey: string; referencedAssetIds: readonly string[] } {
+    return { projectionKey: logicalId, referencedAssetIds: [] };
+  }
+
+  readonly projection = { apply: async () => {}, remove: async () => {} };
+
   subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void): () => void {
     this.listener = listener;
     return () => { this.listener = null; };
