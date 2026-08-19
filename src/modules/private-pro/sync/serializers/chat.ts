@@ -69,18 +69,16 @@ function stageRecord(record: PrivateProSyncSerializedRecord): void {
   stagedRecords.set(record.projectionKey, records);
 }
 
-function applyStagedProjection(projectionKey: string): void {
+function materializeStagedProjection(projectionKey: string): boolean {
   const records = [...(stagedRecords.get(projectionKey)?.values() ?? [])];
   const metaRecord = records.find(record => record.recordType === 'chat-meta');
-  if (!metaRecord) {
-    chatSyncDelete(projectionKey);
-    return;
-  }
+  if (!metaRecord) return false;
   const meta = SyncChatMetaSchema.parse(metaRecord.value);
   chatSyncApplyMeta(meta);
   for (const record of records) {
     if (record.recordType === 'chat-message') chatSyncApplyMessage(SyncChatMessageSchema.parse(record.value));
   }
+  return true;
 }
 
 export const privateProSyncChatProjection: PrivateProSyncChatProjection = {
@@ -92,7 +90,7 @@ export const privateProSyncChatProjection: PrivateProSyncChatProjection = {
     }
     stagedRecords.set(projectionKey, staged);
     chatSyncDelete(projectionKey);
-    applyStagedProjection(projectionKey);
+    materializeStagedProjection(projectionKey);
   },
   remove: async projectionKey => {
     stagedRecords.delete(projectionKey);
@@ -101,7 +99,7 @@ export const privateProSyncChatProjection: PrivateProSyncChatProjection = {
   stage: async record => {
     if (!isPrivateProSyncChatRecord(record)) throw new TypeError('Chat projection requires a chat record.');
     stageRecord(record);
-    applyStagedProjection(record.projectionKey);
+    materializeStagedProjection(record.projectionKey);
   },
   removeMessage: async (conversationId, messageId) => {
     const records = stagedRecords.get(conversationId);

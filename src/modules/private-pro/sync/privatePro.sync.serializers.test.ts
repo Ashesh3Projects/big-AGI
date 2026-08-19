@@ -86,6 +86,16 @@ describe('Private Pro sync serializers', () => {
     assert.deepEqual(chatSyncSnapshot()[0].messages.map(message => message.id), ['message-2']);
   });
 
+  test('stages a message before metadata without changing an existing conversation', async () => {
+    await resetChat();
+    chatSyncUpsert(conversationFixture());
+    const before = chatSyncSnapshot();
+
+    await privateProSyncChatProjection.stage(messageRecord('chat-1', 'remote-message', 30));
+
+    assert.deepEqual(chatSyncSnapshot(), before);
+  });
+
   test('merges concurrent message IDs deterministically', async () => {
     await resetChat();
     await privateProSyncChatProjection.stage(metaRecord('chat-1'));
@@ -119,7 +129,7 @@ describe('Private Pro sync serializers', () => {
       recordType: 'asset' as const,
       schemaVersion: 1,
       conflictPolicy: 'replace' as const,
-      snapshot: async () => [],
+      snapshot: () => [],
       validate: async (_logicalId: string, value: unknown) => value,
       subscribe: () => () => {},
     };
@@ -128,5 +138,23 @@ describe('Private Pro sync serializers', () => {
     assert.deepEqual(serializers.map(serializer => serializer.recordType), [
       'credential-service', 'model-service', 'settings', 'chat-meta', 'chat-message', 'persona', 'folder', 'scratch', 'asset',
     ]);
+  });
+
+  test('emits projection mutations while synchronous suppression is active', async () => {
+    await resetChat();
+    let suppressing = true;
+    let emittedAfterSuppression = false;
+    const serializers = createPrivateProSyncSerializers();
+    const unsubscribe = serializers.map(serializer => serializer.subscribe(() => {
+      emittedAfterSuppression ||= !suppressing;
+    }));
+
+    const applying = privateProSyncChatProjection.apply('chat-1', [metaRecord('chat-1'), messageRecord('chat-1', 'message-1', 10)]);
+    suppressing = false;
+    await applying;
+    await new Promise(resolve => setTimeout(resolve, 0));
+    unsubscribe.forEach(stop => stop());
+
+    assert.equal(emittedAfterSuppression, false);
   });
 });

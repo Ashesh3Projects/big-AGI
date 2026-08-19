@@ -38,7 +38,7 @@ export interface PrivateProSyncSerializer<T> {
   recordType: PrivateProSyncRecordType;
   schemaVersion: number;
   conflictPolicy: 'replace' | 'message-identity';
-  snapshot(): Promise<readonly PrivateProSyncSerializedRecord<T>[]>;
+  snapshot(): readonly PrivateProSyncSerializedRecord<T>[];
   validate(logicalId: string, value: unknown): Promise<T>;
   subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void): () => void;
 }
@@ -63,7 +63,7 @@ export interface PrivateProSyncLogicalSerializer<T> {
 }
 
 function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): PrivateProSyncSerializer<T> {
-  const snapshot = async (): Promise<readonly PrivateProSyncSerializedRecord<T>[]> => serializer.snapshot().map(({ logicalId, value }) => ({
+  const snapshot = (): readonly PrivateProSyncSerializedRecord<T>[] => serializer.snapshot().map(({ logicalId, value }) => ({
     recordType: serializer.recordType,
     logicalId,
     projectionKey: serializer.projectionKey(value),
@@ -85,26 +85,38 @@ function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): Priv
     },
     subscribe: listener => {
       let stopped = false;
-      let previousPromise = snapshot();
-      let queued = Promise.resolve();
+      let emitting = false;
+      let pending = false;
+      let previous = snapshot();
       const unsubscribe = serializer.subscribe(() => {
-        queued = queued.then(async () => {
-          const previous = await previousPromise;
-          const current = await snapshot();
-          previousPromise = Promise.resolve(current);
+        if (emitting) {
+          pending = true;
+          return;
+        }
+        do {
+          pending = false;
+          const current = snapshot();
           if (stopped) return;
 
           const previousById = new Map(previous.map(record => [record.logicalId, record]));
           const currentById = new Map(current.map(record => [record.logicalId, record]));
+          const mutations: PrivateProSyncLocalMutation[] = [];
           for (const record of current) {
             const before = previousById.get(record.logicalId);
-            if (!before || privateProCanonicalJson(before.value) !== privateProCanonicalJson(record.value)) listener({ kind: 'put', record });
+            if (!before || privateProCanonicalJson(before.value) !== privateProCanonicalJson(record.value)) mutations.push({ kind: 'put', record });
           }
           for (const record of previous) {
             if (!currentById.has(record.logicalId))
-              listener({ kind: 'delete', recordType: serializer.recordType, logicalId: record.logicalId, projectionKey: record.projectionKey, schemaVersion: serializer.schemaVersion });
+              mutations.push({ kind: 'delete', recordType: serializer.recordType, logicalId: record.logicalId, projectionKey: record.projectionKey, schemaVersion: serializer.schemaVersion });
           }
-        });
+          previous = current;
+          emitting = true;
+          try {
+            mutations.forEach(listener);
+          } finally {
+            emitting = false;
+          }
+        } while (pending && !stopped);
       });
       return () => {
         stopped = true;

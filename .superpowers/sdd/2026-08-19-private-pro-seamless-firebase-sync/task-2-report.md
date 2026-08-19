@@ -72,3 +72,60 @@ git diff check: exit 0
 
 - The vault compatibility files contain narrow type boundary casts until Task 11 removes the encrypted vault. The legacy serializer test and `tsc` cover this temporary bridge.
 - Git emits the repository's existing Windows LF-to-CRLF notices when inspecting staged files. The diff check passed.
+
+## Fix round 1
+
+### Findings
+
+- A message-first chat `stage()` called the common projection materializer, which deleted an existing runtime conversation when staged records did not yet include metadata.
+- Bound serializer subscriptions placed snapshot comparison and mutation delivery behind a Promise queue. A synchronous projection update could therefore emit after the engine's future synchronous suppression scope exited.
+
+### Resolution
+
+- The staged chat materializer now returns without mutating the runtime when metadata is absent. It retains the staged message for the later metadata record.
+- Bound serializer `snapshot()` is synchronous. The subscription callback computes its diff and invokes listeners synchronously. A local `emitting` plus `pending` guard safely drains store writes triggered reentrantly by a listener without using Promise deferral.
+
+### RED evidence
+
+Command:
+
+```powershell
+npx tsx --test src/modules/private-pro/sync/privatePro.sync.serializers.test.ts
+```
+
+Result:
+
+```text
+stages a message before metadata without changing an existing conversation: failed
+emits projection mutations while synchronous suppression is active: failed
+```
+
+The first regression showed the existing conversation removed by the metadata-free staged message. The second showed notification delivery after the synchronous suppression flag was cleared.
+
+### GREEN evidence
+
+Commands:
+
+```powershell
+npx tsx --test src/modules/private-pro/sync/privatePro.sync.protocol.test.ts src/modules/private-pro/sync/privatePro.sync.serializers.test.ts
+npx tsx --test src/modules/private-pro/vault/privatePro.vault.serializers.test.ts
+npx tsc --noEmit --pretty
+npx eslint src/modules/private-pro/sync src/common/stores/chat/store-chats.ts
+git diff --check
+```
+
+Results:
+
+```text
+sync protocol plus serializer tests: 18 passed, 0 failed
+legacy vault serializer test: 1 passed, 0 failed
+TypeScript: exit 0
+ESLint: exit 0
+git diff check: exit 0
+```
+
+### Self-review
+
+- A metadata-free stage retains only internal staged records and does not call a chat runtime mutator.
+- Full projection replacement still deliberately deletes the runtime projection before materializing the supplied record set, so a committed no-metadata projection is a deletion.
+- The public serializer contract is now synchronous for `snapshot()` only. Validation remains asynchronous to preserve its established call shape.
