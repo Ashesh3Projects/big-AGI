@@ -198,7 +198,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     const currentBase = await dependencies.db.getRemoteBase(dependencies.uid, canonical.recordKey);
     if (currentBase && currentBase.revision > canonical.revision) return;
     if (canonical.deleted) {
-      await dependencies.db.setEffectiveRemoteBase(dependencies.uid, canonical.recordKey, {
+      await dependencies.db.observeRemoteBase(dependencies.uid, canonical.recordKey, {
         revision: canonical.revision,
         mutationId: canonical.mutationId,
         deleted: true,

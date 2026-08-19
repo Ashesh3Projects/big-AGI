@@ -398,6 +398,34 @@ describe('Private Pro sync reconciler', () => {
     assert.equal(calls[0].kind, 'remove');
   });
 
+  test('deleted canonical observation does not protect a pre-delete pending put from its tombstone', async (t) => {
+    const { db, reconciler } = createHarness(t);
+    const live = await remoteRecord();
+    await reconciler.handle({ type: 'record', canonical: live });
+    const pending = await db.recordLocalPut(UID, {
+      recordType: 'settings', logicalId: live.logicalId, recordKey: live.recordKey, projectionKey: live.logicalId, schemaVersion: 1,
+      payload: '{"id":"settings-1","value":"stale-put"}', contentHash: 'a'.repeat(64), referencedAssetIds: [],
+    }, 2_000);
+    await db.localRecords.update([UID, pending.recordKey], { baseRevision: 1 });
+    await db.outbox.update([UID, pending.recordKey], { baseRevision: 1 });
+    const mutationId = crypto.randomUUID();
+
+    await reconciler.handle({ type: 'record', canonical: {
+      ...live, payload: '', contentHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855',
+      revision: 2, mutationId, deleted: true,
+    } });
+    await reconciler.handle({ type: 'tombstone', tombstone: {
+      recordKey: live.recordKey, recordType: live.recordType, logicalId: live.logicalId,
+      deletedRevision: 2, mutationId, writerId: live.writerId, deletedAt: 'server-time',
+    } });
+
+    assert.equal(await db.getLocalRecord(UID, live.recordKey), null);
+    assert.equal(await db.getOutbox(UID, live.recordKey), null);
+    assert.deepEqual(await db.getRemoteBase(UID, live.recordKey), { revision: 2, mutationId, deleted: true });
+    await reconciler.handle({ type: 'record', canonical: live });
+    assert.deepEqual(await db.getRemoteBase(UID, live.recordKey), { revision: 2, mutationId, deleted: true });
+  });
+
   test('an exact synthetic delete marker suppresses tombstone removal and a higher tombstone proceeds', async (t) => {
     const db = createDB(t);
     const calls: ProjectionCall[] = [];

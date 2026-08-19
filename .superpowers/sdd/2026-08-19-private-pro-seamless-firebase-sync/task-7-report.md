@@ -117,6 +117,36 @@ None.
 
 None.
 
+## Fix round 3
+
+### Finding addressed
+
+- Added `observeRemoteBase` to persist a monotonic remote base without rebasing local or outbox rows. Deleted canonical observation now uses this observe-only path, preserving the pre-deletion base used by tombstone discard.
+
+### RED evidence
+
+- DB tests failed because `observeRemoteBase` did not exist.
+- Reconciler sequence failed with a retained local row whose `baseRevision` had been incorrectly advanced to deletion revision 2.
+
+### GREEN evidence
+
+- DB/reconciler/outbound targeted suites passed, including deleted-response handling after prior deletion observation.
+- Full modified DB, serializer, Firebase, outbound, reconciler, and engine suites: 125 tests, 6 suites, 125 passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for all modified sync source and tests, exit 0 with no warnings.
+- `git diff --check`, exit 0. Git printed only LF-to-CRLF conversion notices.
+
+### Self-review
+
+- Deleted canonical revision 2 is recorded monotonically while a pending put based on revision 1 remains revision 1 until its tombstone discards it.
+- A genuine pending operation explicitly based at revision 2 survives the same tombstone.
+- A later outbound deleted response cannot retain or retry the stale pre-deletion put.
+- A stale live revision 1 remains ignored after deletion revision 2 was observed.
+
+### Concerns
+
+None.
+
 ## Fix round 2
 
 ### Findings addressed

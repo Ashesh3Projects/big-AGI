@@ -619,6 +619,27 @@ describe('Private Pro seamless sync outbound', () => {
     assert.deepEqual(await db.getRemoteBase(UID, pending.recordKey), { revision: 2, mutationId: '123e4567-e89b-42d3-a456-426614174002', deleted: true });
   });
 
+  test('a deleted response cannot retain a put after deletion was observed before send', async (t) => {
+    const { outbound, transport, clock, db } = createHarness(t);
+    await outbound.start();
+    const pending = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'stale' }, referencedAssetIds: [],
+    } });
+    await db.observeRemoteBase(UID, pending.recordKey, { revision: 2, mutationId: '123e4567-e89b-42d3-a456-426614174002', deleted: true });
+    const input: PrivateProSyncWriteInput = {
+      recordKey: pending.recordKey, recordType: 'settings', logicalId: 'main', schemaVersion: 1,
+      kind: 'put', payload: pending.payload, contentHash: pending.contentHash, baseRevision: 0,
+      mutationId: pending.mutationId, writerId: WRITER_ID,
+    };
+    transport.results.push({ status: 'deleted', canonical: { ...remote(input, 2), payload: '', deleted: true } });
+
+    await clock.advance(60_000);
+
+    assert.equal(await db.getOutbox(UID, pending.recordKey), null);
+    assert.equal(await db.getLocalRecord(UID, pending.recordKey), null);
+  });
+
   test('acknowledges a delete when the canonical record is already deleted', async (t) => {
     const { outbound, transport, clock, db } = createHarness(t);
     await outbound.start();

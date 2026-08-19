@@ -48,6 +48,38 @@ async function seedUid(db: PrivateProSyncDB, uid: string): Promise<void> {
 
 
 describe('Private Pro seamless sync database', () => {
+  test('observes a deleted remote base without rebasing pre-delete pending work', async (t) => {
+    const db = createDB(t);
+    const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    await db.localRecords.update([UID_A, pending.recordKey], { baseRevision: 1 });
+    await db.outbox.update([UID_A, pending.recordKey], { baseRevision: 1 });
+
+    await db.observeRemoteBase(UID_A, pending.recordKey, { revision: 2, mutationId: 'delete-2', deleted: true });
+
+    assert.deepEqual(await db.getRemoteBase(UID_A, pending.recordKey), { revision: 2, mutationId: 'delete-2', deleted: true });
+    assert.equal((await db.getLocalRecord(UID_A, pending.recordKey))?.baseRevision, 1);
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.baseRevision, 1);
+  });
+
+  test('discards pre-delete pending put after observe-only deletion but preserves genuine post-tombstone work', async (t) => {
+    const db = createDB(t);
+    const stale = await db.recordLocalPut(UID_A, preparedRecord('stale', '{"value":1}'), 1_000);
+    await db.localRecords.update([UID_A, stale.recordKey], { baseRevision: 1 });
+    await db.outbox.update([UID_A, stale.recordKey], { baseRevision: 1 });
+    const deletion = { revision: 2, mutationId: 'delete-2', deleted: true } as const;
+    await db.observeRemoteBase(UID_A, stale.recordKey, deletion);
+    await db.discardAcrossTombstone(UID_A, stale.recordKey, deletion);
+
+    const post = await db.recordLocalPut(UID_A, preparedRecord('post', '{"value":2}'), 2_000);
+    await db.localRecords.update([UID_A, post.recordKey], { baseRevision: 2 });
+    await db.outbox.update([UID_A, post.recordKey], { baseRevision: 2 });
+    await db.observeRemoteBase(UID_A, post.recordKey, deletion);
+    await db.discardAcrossTombstone(UID_A, post.recordKey, deletion);
+
+    assert.equal(await db.getLocalRecord(UID_A, stale.recordKey), null);
+    assert.equal(await db.getOutbox(UID_A, stale.recordKey), null);
+    assert.equal((await db.getOutbox(UID_A, post.recordKey))?.baseRevision, 2);
+  });
   test('persists a committed remote record and lists its live projection', async (t) => {
     const db = createDB(t);
     const record = preparedRecord('record-remote', '{"value":4}');

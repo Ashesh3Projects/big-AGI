@@ -155,6 +155,10 @@ export class PrivateProSyncDB extends Dexie {
     await this.quarantine.add({ uid, recordKey, reasonCode, createdAtMs: nowMs });
   }
 
+  async observeRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<PrivateProRemoteBaseState> {
+    return this.transaction('rw', this.remoteBases, () => this.storeEffectiveRemoteBase(uid, recordKey, remoteBase));
+  }
+
   async setEffectiveRemoteBase(uid: string, recordKey: string, remoteBase: PrivateProRemoteBaseState): Promise<PrivateProRemoteBaseState> {
     return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases], async () => {
       const effective = await this.storeEffectiveRemoteBase(uid, recordKey, remoteBase);
