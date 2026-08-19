@@ -55,6 +55,7 @@ interface LlmsRootActions {
   removeService: (id: DModelsServiceId) => void;
   updateServiceLabel: (id: DModelsServiceId, label: string, allowEmpty?: boolean) => void;
   updateServiceSettings: <TServiceSettings>(id: DModelsServiceId, partialSettings: Partial<TServiceSettings>) => void;
+  stampServiceDefs: (id: DModelsServiceId, defsV: string) => void;
 
   setConfServiceId: (id: DModelsServiceId | null) => void;
 
@@ -428,6 +429,15 @@ export const useModelsStore = create<LlmsStore>()(persist(
         sources: state.sources.map((s: DModelsService): DModelsService =>
           s.id === id
             ? { ...s, setup: { ...s.setup, ...partialSettings } }
+            : s,
+        ),
+      })),
+
+    stampServiceDefs: (id: DModelsServiceId, defsV: string) =>
+      set(state => ({
+        sources: state.sources.map((s: DModelsService): DModelsService =>
+          s.id === id
+            ? { ...s, defsV }
             : s,
         ),
       })),
