@@ -35,9 +35,9 @@ test('runs the pinned Copilot CLI with the requested model and maximum effort', 
   assert.match(workflow, /npm install --global --ignore-scripts @github\/copilot@1\.0\.80/);
   assert.match(workflow, /--model gpt-5\.6-sol/);
   assert.match(workflow, /--effort max/);
-  assert.match(workflow, /--max-autopilot-continues 50/);
+  assert.match(workflow, /--max-autopilot-continues 8/);
   assert.match(workflow, /--mode autopilot/);
-  assert.match(workflow, /--plan/);
+  assert.doesNotMatch(workflow, /--plan/);
   assert.match(workflow, /--no-ask-user/);
   assert.match(workflow, /--no-remote/);
   assert.match(workflow, /--no-remote-export/);
@@ -54,8 +54,35 @@ test('runs the pinned Copilot CLI with the requested model and maximum effort', 
   assert.match(workflow, /--deny-tool='shell\(git switch\)'/);
   assert.match(workflow, /--deny-tool='shell\(git init\)'/);
   assert.match(workflow, /--deny-tool='shell\(git clone\)'/);
+  assert.match(workflow, /--allow-tool='shell\(git add:\*\)'/);
+  assert.doesNotMatch(workflow, /--allow-tool='shell\(npm:\*\)'/);
+  assert.doesNotMatch(workflow, /--allow-tool='shell\(npx:\*\)'/);
   assert.match(workflow, /--no-custom-instructions/);
   assert.doesNotMatch(workflow, /--allow-tool='shell\(git:\*\)'/);
+});
+
+test('keeps Copilot to a minimal upstream port without invented tests or features', () => {
+  const workflow = readRepoFile('.github/workflows/nightly-pro-integration.yml');
+  const coordinator = readRepoFile('tools/automation/nightly-pro-integration.ts');
+
+  assert.match(coordinator, /paused trusted git cherry-pick --no-commit/);
+  assert.match(coordinator, /Do not create or modify tests unless the conflicted upstream path itself is a test/);
+  assert.match(coordinator, /Do not add features, refactor, rename, reformat, or improve unrelated code/);
+  assert.match(coordinator, /changed outside the upstream file set/);
+  assert.doesNotMatch(coordinator, /Add or update tests for behavior you change/);
+  assert.match(workflow, /include-hidden-files:\s*true/g);
+  assert.match(coordinator, /Do not run git cherry-pick, commit, push/);
+  assert.doesNotMatch(workflow, /shell\(git cherry-pick:\*\)/);
+  assert.match(coordinator, /\['cherry-pick', '--quit'\]/);
+  assert.match(workflow, /nightly-minimal-state\.txt/);
+  assert.match(workflow, /nightly-copilot-conflict-prompt\.txt/);
+  assert.match(workflow, /nightly-copilot-report-prompt\.txt/);
+  assert.match(workflow, /finish-minimal/);
+  assert.match(coordinator, /minimalPatchHashPath/);
+  assert.match(coordinator, /RUNNER_TEMP/);
+  assert.match(coordinator, /trustedPath/);
+  assert.match(coordinator, /Minimal integration patch changed after trusted cherry-pick/);
+  assert.match(coordinator, /Copilot created non-upstream untracked files/);
 });
 
 test('uses a deterministic checkpoint and a separate trusted publisher', () => {

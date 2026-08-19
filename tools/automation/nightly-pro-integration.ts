@@ -9,6 +9,8 @@ const CHECKPOINT_TRAILER = 'Upstream-Main-Integrated';
 const REPORT_PATH = '.nightly-pro-integration-report.json';
 const PATCH_PATH = '.nightly-pro-integration.patch';
 const MANIFEST_PATH = '.nightly-pro-integration-manifest.json';
+const WORKSPACE_COMMITS_PATH = '.nightly-upstream-commits.txt';
+const WORKSPACE_FILES_PATH = '.nightly-upstream-files.txt';
 const PROTECTED_PATHS = new Set([
   '.gitmodules',
   'AGENTS.md',
@@ -21,6 +23,7 @@ const PROTECTED_PREFIXES = ['.github/', 'tools/automation/'];
 const MAX_PATCH_BYTES = 50 * 1024 * 1024;
 
 type IntegrationReport = {
+  extraFiles: Array<{ path: string; reason: string }>;
   status: 'changes_applied' | 'no_changes_required';
   reviewedCommits: string[];
   reviewedFiles: string[];
@@ -89,6 +92,21 @@ function sha256(path: string): string {
   return createHash('sha256').update(readFileSync(path)).digest('hex');
 }
 
+function sha256Text(value: string): string {
+  return createHash('sha256').update(value).digest('hex');
+}
+
+function trustedPath(name: string): string {
+  return resolve(env('RUNNER_TEMP'), name);
+}
+
+const trustedCommitsPath = () => trustedPath('nightly-upstream-commits.txt');
+const trustedFilesPath = () => trustedPath('nightly-upstream-files.txt');
+const minimalStatePath = () => trustedPath('nightly-minimal-state.txt');
+const minimalPatchHashPath = () => trustedPath('nightly-minimal-patch.sha256');
+const conflictPromptPath = () => trustedPath('nightly-copilot-conflict-prompt.txt');
+const reportPromptPath = () => trustedPath('nightly-copilot-report-prompt.txt');
+
 function listOutput(command: string, args: string[]): string[] {
   const output = run(command, args, { capture: true });
   return output ? output.split(/\r?\n/).filter(Boolean) : [];
@@ -130,22 +148,29 @@ function prepare(): void {
 
   const upstreamCommits = listOutput('git', ['rev-list', '--reverse', `${previousUpstreamHead}..${upstreamHead}`]);
   const upstreamFiles = listOutput('git', ['diff', '--name-only', `${previousUpstreamHead}..${upstreamHead}`]);
-  writeFileSync('.nightly-upstream-commits.txt', `${upstreamCommits.join('\n')}\n`, 'utf8');
-  writeFileSync('.nightly-upstream-files.txt', `${upstreamFiles.join('\n')}\n`, 'utf8');
+  const serializedCommits = `${upstreamCommits.join('\n')}\n`;
+  const serializedFiles = `${upstreamFiles.join('\n')}\n`;
+  writeFileSync(WORKSPACE_COMMITS_PATH, serializedCommits, 'utf8');
+  writeFileSync(WORKSPACE_FILES_PATH, serializedFiles, 'utf8');
+  writeFileSync(trustedCommitsPath(), serializedCommits, 'utf8');
+  writeFileSync(trustedFilesPath(), serializedFiles, 'utf8');
 
-  const prompt =
-    `Autonomously integrate upstream main commits ${previousUpstreamHead}..${upstreamHead} into the current customized pro working tree. ` +
-    `Read CLAUDE.md first. Review every commit in .nightly-upstream-commits.txt and every path in .nightly-upstream-files.txt. ` +
-    `Use only read-only git commands such as git status, log, show, diff, grep, rev-list, ls-files, and blame. ` +
-    `Do not run merge, rebase, cherry-pick, checkout, switch, reset, commit, push, clean, restore, fetch, pull, add, rm, or mv through git. ` +
-    `Semantically port every applicable upstream behavior while preserving all pro customizations, especially Private Pro security, encrypted vault, local persistence, analytics gates, recovery, backup restore, and cloud boundaries. ` +
-    `Add or update tests for behavior you change. Do not weaken checks or modify the automation files. ` +
-    `Write ${REPORT_PATH} as strict JSON with exactly these fields: status (changes_applied or no_changes_required), ` +
+  const conflictPrompt =
+    `Resolve only the currently unmerged files from the paused trusted git cherry-pick --no-commit. ` +
+    `Preserve the upstream change as-is and preserve Pro customizations. Use the smallest conflict-only edit, then git add each resolved path. ` +
+    `Do not create or modify tests unless the conflicted upstream path itself is a test. Do not add features, refactor, rename, reformat, or improve unrelated code. ` +
+    `Do not touch files that are not currently unmerged. Do not run git cherry-pick, commit, push, merge, rebase, reset, checkout, switch, clean, restore, fetch, pull, init, clone, or change remotes. ` +
+    `Do not write the final report. This is unattended. Do not ask questions.`;
+  writeFileSync(conflictPromptPath(), conflictPrompt, 'utf8');
+
+  const reportPrompt =
+    `Review the completed minimal upstream integration from ${previousUpstreamHead}..${upstreamHead}. Do not edit source files, tests, or git state. ` +
+    `Read every commit in .nightly-upstream-commits.txt, every upstream path in .nightly-upstream-files.txt, and the current git diff. ` +
+    `Write ${REPORT_PATH} as strict JSON with exactly these fields: extraFiles (an array of {path, reason}), status (changes_applied or no_changes_required), ` +
     `reviewedCommits (every SHA from .nightly-upstream-commits.txt in order), reviewedFiles (every path from .nightly-upstream-files.txt in order), ` +
-    `and summary (a non-empty concise explanation). Use no markdown fences. ` +
-    `If status is no_changes_required, explain why every upstream change was already present or inapplicable. ` +
+    `and summary (a non-empty concise explanation). Use no markdown fences. Every changed path outside the upstream file list needs one exact extraFiles justification. ` +
     `This is unattended. Do not ask questions.`;
-  writeFileSync('.nightly-copilot-prompt.txt', prompt, 'utf8');
+  writeFileSync(reportPromptPath(), reportPrompt, 'utf8');
 
   appendGithubEnv({
     EXPECTED_PRO_HEAD: expectedProHead,
@@ -159,11 +184,38 @@ function prepare(): void {
   );
 }
 
+function applyMinimal(): void {
+  const commits = readFileSync(trustedCommitsPath(), 'utf8').trim().split(/\r?\n/).filter(Boolean);
+  if (!commits.length) throw new Error('No upstream commits to apply');
+
+  for (let index = 0; index < commits.length; index += 1) {
+    const commit = commits[index];
+    const result = spawnSync('git', ['cherry-pick', '--no-commit', commit], { stdio: 'inherit' });
+    if (result.error) throw result.error;
+    if (result.status === 0) continue;
+
+    const unmerged = listOutput('git', ['diff', '--name-only', '--diff-filter=U']);
+    if (!unmerged.length) throw new Error(`git cherry-pick failed without unmerged paths (${result.status})`);
+    writeFileSync(minimalStatePath(), `conflict:${index}\n`, 'utf8');
+    return;
+  }
+
+  const patch = git(['diff', '--cached', '--binary', '--full-index'], true);
+  writeFileSync(minimalPatchHashPath(), `${sha256Text(patch)}\n`, 'utf8');
+  writeFileSync(minimalStatePath(), 'complete\n', 'utf8');
+}
+
 function parseReport(): IntegrationReport {
   if (!existsSync(REPORT_PATH)) throw new Error(`Copilot did not create ${REPORT_PATH}`);
   const raw = JSON.parse(readFileSync(REPORT_PATH, 'utf8')) as Partial<IntegrationReport>;
   const keys = Object.keys(raw).sort();
-  if (keys.join(',') !== 'reviewedCommits,reviewedFiles,status,summary') throw new Error('Copilot report has unexpected fields');
+  if (keys.join(',') !== 'extraFiles,reviewedCommits,reviewedFiles,status,summary') throw new Error('Copilot report has unexpected fields');
+  if (!Array.isArray(raw.extraFiles)) throw new Error('Invalid extraFiles');
+  for (const item of raw.extraFiles) {
+    if (!item || typeof item.path !== 'string' || typeof item.reason !== 'string' || !item.reason.trim()) throw new Error('Invalid extraFiles item');
+    if (item.reason.includes('\n') || item.reason.includes('\r') || item.reason.length > 300)
+      throw new Error('extraFiles reasons must be bounded single lines');
+  }
   if (raw.status !== 'changes_applied' && raw.status !== 'no_changes_required') throw new Error('Invalid report status');
   if (!Array.isArray(raw.reviewedCommits) || !raw.reviewedCommits.every((value) => typeof value === 'string')) {
     throw new Error('Invalid reviewedCommits');
@@ -178,11 +230,42 @@ function parseReport(): IntegrationReport {
   return raw as IntegrationReport;
 }
 
+function finishMinimal(): void {
+  if (git(['rev-parse', 'HEAD'], true) !== env('EXPECTED_PRO_HEAD')) throw new Error('Head changed during minimal integration');
+  const unmerged = listOutput('git', ['diff', '--name-only', '--diff-filter=U']);
+  if (unmerged.length) throw new Error(`Copilot left unresolved conflicts: ${unmerged.join(', ')}`);
+  const state = readFileSync(minimalStatePath(), 'utf8').trim();
+  const conflictMatch = /^conflict:(\d+)$/.exec(state);
+  if (!conflictMatch) throw new Error(`Invalid minimal integration state: ${state}`);
+  const commits = readFileSync(trustedCommitsPath(), 'utf8').trim().split(/\r?\n/).filter(Boolean);
+  const conflictIndex = Number(conflictMatch[1]);
+
+  git(['cherry-pick', '--quit']);
+  for (let index = conflictIndex + 1; index < commits.length; index += 1) {
+    const commit = commits[index];
+    const result = spawnSync('git', ['cherry-pick', '--no-commit', commit], { stdio: 'inherit' });
+    if (result.error) throw result.error;
+    if (result.status !== 0) {
+      const laterUnmerged = listOutput('git', ['diff', '--name-only', '--diff-filter=U']);
+      if (!laterUnmerged.length) throw new Error(`A later upstream commit failed without unmerged paths: ${commit}`);
+      writeFileSync(minimalStatePath(), `conflict:${index}\n`, 'utf8');
+      return;
+    }
+  }
+  const patch = git(['diff', '--cached', '--binary', '--full-index'], true);
+  writeFileSync(minimalPatchHashPath(), `${sha256Text(patch)}\n`, 'utf8');
+  writeFileSync(minimalStatePath(), 'complete\n', 'utf8');
+}
+
 function changedPaths(): string[] {
   const tracked = listOutput('git', ['diff', '--name-only']);
   const staged = listOutput('git', ['diff', '--cached', '--name-only']);
   const untracked = listOutput('git', ['ls-files', '--others', '--exclude-standard']);
   return [...new Set([...tracked, ...staged, ...untracked])].filter((path) => !path.startsWith('.nightly-')).sort();
+}
+
+function untrackedIntegrationPaths(): string[] {
+  return listOutput('git', ['ls-files', '--others', '--exclude-standard']).filter((path) => !path.startsWith('.nightly-'));
 }
 
 function isProtectedPath(path: string): boolean {
@@ -200,12 +283,27 @@ function stageIntegrationChanges(): void {
 
 function verifyAndPackage(): void {
   const report = parseReport();
-  const expectedCommits = readFileSync('.nightly-upstream-commits.txt', 'utf8').trim().split(/\r?\n/).filter(Boolean);
-  const expectedFiles = readFileSync('.nightly-upstream-files.txt', 'utf8').trim().split(/\r?\n/).filter(Boolean);
+  const expectedCommits = readFileSync(trustedCommitsPath(), 'utf8').trim().split(/\r?\n/).filter(Boolean);
+  const expectedFiles = readFileSync(trustedFilesPath(), 'utf8').trim().split(/\r?\n/).filter(Boolean);
+  if (readFileSync(WORKSPACE_COMMITS_PATH, 'utf8') !== readFileSync(trustedCommitsPath(), 'utf8'))
+    throw new Error('Copilot modified the upstream commit inventory');
+  if (readFileSync(WORKSPACE_FILES_PATH, 'utf8') !== readFileSync(trustedFilesPath(), 'utf8')) throw new Error('Copilot modified the upstream file inventory');
   if (JSON.stringify(report.reviewedCommits) !== JSON.stringify(expectedCommits)) throw new Error('Copilot did not review every upstream commit');
   if (JSON.stringify(report.reviewedFiles) !== JSON.stringify(expectedFiles)) throw new Error('Copilot did not review every upstream file');
 
   const proChangedFiles = changedPaths();
+  const untrackedFiles = untrackedIntegrationPaths();
+  if (untrackedFiles.length) throw new Error(`Copilot created non-upstream untracked files: ${untrackedFiles.join(', ')}`);
+  const expectedFileSet = new Set(expectedFiles);
+  const extraChangedFiles = proChangedFiles.filter((path) => !expectedFileSet.has(path));
+  const reportedExtraFiles = report.extraFiles.map((item) => item.path).sort();
+  if (new Set(reportedExtraFiles).size !== reportedExtraFiles.length || JSON.stringify(reportedExtraFiles) !== JSON.stringify(extraChangedFiles)) {
+    throw new Error('Copilot report extraFiles must exactly match paths changed outside the upstream file set');
+  }
+  if (extraChangedFiles.length > 5) throw new Error('Minimal integration may not add more than five extra files');
+  for (const path of extraChangedFiles) {
+    if (/(?:^|\/)(?:__tests__\/|[^/]+\.(?:test|spec)\.[^/]+$)/.test(path)) throw new Error(`Copilot added its own test outside the upstream file set: ${path}`);
+  }
   for (const path of proChangedFiles) {
     if (isProtectedPath(path)) throw new Error(`Copilot modified protected automation path: ${path}`);
   }
@@ -217,6 +315,15 @@ function verifyAndPackage(): void {
   if (report.status === 'no_changes_required' && proChangedFiles.length !== 0) throw new Error('Report claims no changes but the Pro tree changed');
 
   if (git(['rev-parse', 'HEAD'], true) !== env('EXPECTED_PRO_HEAD')) throw new Error('Head changed during Copilot integration');
+  const unmerged = listOutput('git', ['diff', '--name-only', '--diff-filter=U']);
+  const cherryPickHead = spawnSync('git', ['rev-parse', '--verify', '--quiet', 'CHERRY_PICK_HEAD']);
+  if (unmerged.length || cherryPickHead.status === 0) throw new Error('Copilot left the cherry-pick unresolved');
+  if (readFileSync(minimalStatePath(), 'utf8').trim() !== 'complete') throw new Error('Trusted minimal integration did not complete');
+  if (git(['diff', '--name-only'], true)) throw new Error('Copilot edited files after trusted cherry-pick completion');
+  const stagedPatchHash = sha256Text(git(['diff', '--cached', '--binary', '--full-index'], true));
+  if (stagedPatchHash !== readFileSync(minimalPatchHashPath(), 'utf8').trim()) {
+    throw new Error('Minimal integration patch changed after trusted cherry-pick');
+  }
 
   const statusBeforeInstall = git(['status', '--porcelain=v1', '-z', '--untracked-files=all'], true);
   run('npm', ['ci']);
@@ -303,9 +410,11 @@ function publish(): void {
 function main(): void {
   const command = process.argv[2];
   if (command === 'prepare') prepare();
+  else if (command === 'apply-minimal') applyMinimal();
+  else if (command === 'finish-minimal') finishMinimal();
   else if (command === 'verify-package') verifyAndPackage();
   else if (command === 'publish') publish();
-  else throw new Error('Usage: nightly-pro-integration.ts <prepare|verify-package|publish>');
+  else throw new Error('Usage: nightly-pro-integration.ts <prepare|apply-minimal|finish-minimal|verify-package|publish>');
 }
 
 const isEntrypoint = process.argv[1] && pathToFileURL(resolve(process.argv[1])).href === import.meta.url;

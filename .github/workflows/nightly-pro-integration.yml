@@ -93,18 +93,85 @@ jobs:
           UPSTREAM_URL: https://github.com/enricoros/big-AGI.git
         run: node "$RUNNER_TEMP/nightly-pro-integration.ts" prepare
 
+      - name: Apply upstream commits without committing
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        run: node "$RUNNER_TEMP/nightly-pro-integration.ts" apply-minimal
+
       - name: Remove repository credentials before Copilot
         if: steps.prepare.outputs.has_upstream_changes == 'true'
         run: |
           git config --local --unset-all http.https://github.com/.extraheader || true
           git remote set-url origin https://github.com/${{ github.repository }}.git
 
-      - name: Integrate upstream changes with Copilot
+      - name: Resolve upstream conflicts with Copilot
         if: steps.prepare.outputs.has_upstream_changes == 'true'
         env:
           COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
         run: |
           copilot_home="$RUNNER_TEMP/copilot-home"
+          mkdir -p "$copilot_home"
+          for attempt in $(seq 1 100); do
+            state="$(< "$RUNNER_TEMP/nightly-minimal-state.txt")"
+            if [[ "$state" == 'complete' ]]; then
+              break
+            fi
+            if [[ "$state" != conflict:* ]]; then
+              echo "Invalid minimal integration state: $state" >&2
+              exit 1
+            fi
+            env -i \
+              HOME="$copilot_home" \
+              PATH="$PATH" \
+              CI=true \
+              COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
+              copilot \
+              --prompt "$(< "$RUNNER_TEMP/nightly-copilot-conflict-prompt.txt")" \
+              --model gpt-5.6-sol \
+              --effort max \
+              --context long_context \
+              --mode autopilot \
+              --max-autopilot-continues 8 \
+              --no-ask-user \
+              --no-auto-update \
+              --no-custom-instructions \
+              --no-remote \
+              --no-remote-export \
+              --disable-builtin-mcps \
+              --disallow-temp-dir \
+              --secret-env-vars=COPILOT_GITHUB_TOKEN \
+              --allow-tool='write' \
+              --allow-tool='shell(git status:*)' \
+              --allow-tool='shell(git diff:*)' \
+              --allow-tool='shell(git add:*)' \
+              --allow-tool='shell(cat:*)' \
+              --allow-tool='shell(grep:*)' \
+              --allow-tool='shell(rg:*)' \
+              --allow-tool='shell(head:*)' \
+              --allow-tool='shell(tail:*)' \
+              --deny-tool='shell(git push)' \
+              --deny-tool='shell(git reset)' \
+              --deny-tool='shell(git checkout)' \
+              --deny-tool='shell(git switch)' \
+              --deny-tool='shell(git merge)' \
+              --deny-tool='shell(git rebase)' \
+              --deny-tool='shell(git commit)' \
+              --deny-tool='shell(git clean)' \
+              --deny-tool='shell(git restore)' \
+              --deny-tool='shell(git fetch)' \
+              --deny-tool='shell(git pull)' \
+              --deny-tool='shell(git remote)' \
+              --deny-tool='shell(git init)' \
+              --deny-tool='shell(git clone)'
+            node "$RUNNER_TEMP/nightly-pro-integration.ts" finish-minimal
+          done
+          test "$(< "$RUNNER_TEMP/nightly-minimal-state.txt")" = 'complete'
+
+      - name: Write minimal integration report with Copilot
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          copilot_home="$RUNNER_TEMP/copilot-home-report"
           mkdir -p "$copilot_home"
           env -i \
             HOME="$copilot_home" \
@@ -112,13 +179,12 @@ jobs:
             CI=true \
             COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
             copilot \
-            --prompt "$(< .nightly-copilot-prompt.txt)" \
+            --prompt "$(< "$RUNNER_TEMP/nightly-copilot-report-prompt.txt")" \
             --model gpt-5.6-sol \
             --effort max \
             --context long_context \
             --mode autopilot \
-            --plan \
-            --max-autopilot-continues 50 \
+            --max-autopilot-continues 8 \
             --no-ask-user \
             --no-auto-update \
             --no-custom-instructions \
@@ -132,31 +198,17 @@ jobs:
             --allow-tool='shell(git log:*)' \
             --allow-tool='shell(git show:*)' \
             --allow-tool='shell(git diff:*)' \
-            --allow-tool='shell(git grep:*)' \
-            --allow-tool='shell(git rev-list:*)' \
-            --allow-tool='shell(git ls-files:*)' \
-            --allow-tool='shell(git blame:*)' \
-            --allow-tool='shell(npm:*)' \
-            --allow-tool='shell(npx:*)' \
-            --allow-tool='shell(node:*)' \
             --allow-tool='shell(cat:*)' \
-            --allow-tool='shell(find:*)' \
             --allow-tool='shell(grep:*)' \
             --allow-tool='shell(rg:*)' \
-            --allow-tool='shell(ls:*)' \
-            --allow-tool='shell(sed:*)' \
             --allow-tool='shell(head:*)' \
             --allow-tool='shell(tail:*)' \
-            --allow-tool='shell(sort:*)' \
-            --allow-tool='shell(uniq:*)' \
-            --allow-tool='shell(wc:*)' \
             --deny-tool='shell(git push)' \
             --deny-tool='shell(git reset)' \
             --deny-tool='shell(git checkout)' \
             --deny-tool='shell(git switch)' \
             --deny-tool='shell(git merge)' \
             --deny-tool='shell(git rebase)' \
-            --deny-tool='shell(git cherry-pick)' \
             --deny-tool='shell(git commit)' \
             --deny-tool='shell(git add)' \
             --deny-tool='shell(git clean)' \
@@ -184,6 +236,7 @@ jobs:
             .nightly-pro-integration-report.json
             .nightly-pro-integration-manifest.json
           if-no-files-found: error
+          include-hidden-files: true
           retention-days: 1
 
       - name: Upload Copilot transcript
@@ -193,6 +246,7 @@ jobs:
           name: nightly-pro-integration-transcript-${{ github.run_id }}
           path: .nightly-copilot-session.md
           if-no-files-found: ignore
+          include-hidden-files: true
           retention-days: 14
 
   publish:
