@@ -194,6 +194,9 @@ const INITIAL_STATE: PrivateProVaultPublicState = {
 };
 
 const INVALID_CREDENTIALS = 'Vault password or recovery key is incorrect.';
+const DEVICE_AUTHORIZATION_FAILED = 'The vault was unlocked, but this device could not be authorized. Try again.';
+const RECOVERY_RESET_FAILED = 'The recovery key was accepted, but the vault password could not be reset. Try again.';
+const REMEMBER_UNLOCK_FAILED = 'The vault was unlocked, but this browser could not securely remember it. Try again.';
 
 
 export function privateProVaultPasswordStrength(password: string): { acceptable: boolean; label: string } {
@@ -321,8 +324,8 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
             setState({ phase: 'locked', busy: false, error: 'This vault already exists. Unlock it to continue.', recoveryKey: null });
             return;
           }
-          await deps.remember(pending.masterKey, pending.keyset);
           await deps.register(pending.keyset, pending.enrollmentKey);
+          await deps.remember(pending.masterKey, pending.keyset);
           await deps.activate(pending.masterKey, pending.keyset);
           masterKey = pending.masterKey;
           keyset = pending.keyset;
@@ -341,14 +344,26 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
     async unlockWithPassword(password) {
       if (!keyset) return start();
       setState({ phase: 'locked', busy: true, error: null });
+      let unlocked: { masterKey: TMasterKey; enrollmentKey: TEnrollmentKey };
       try {
-        const unlocked = await deps.unlockPassword(keyset, password);
-        await deps.remember(unlocked.masterKey, keyset);
-        await deps.register(keyset, unlocked.enrollmentKey);
-        await activate(unlocked.masterKey, keyset);
+        unlocked = await deps.unlockPassword(keyset, password);
       } catch {
         setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
+        return;
       }
+      try {
+        await deps.register(keyset, unlocked.enrollmentKey);
+      } catch {
+        setState({ phase: 'locked', busy: false, error: DEVICE_AUTHORIZATION_FAILED });
+        return;
+      }
+      try {
+        await deps.remember(unlocked.masterKey, keyset);
+      } catch {
+        setState({ phase: 'locked', busy: false, error: REMEMBER_UNLOCK_FAILED });
+        return;
+      }
+      await activate(unlocked.masterKey, keyset);
     },
     async unlockWithRecovery(recoveryKey, newPassword) {
       if (!keyset) return start();
@@ -357,18 +372,35 @@ export function createPrivateProVaultLifecycle<TKeyset, TMasterKey, TEnrollmentK
         return;
       }
       setState({ phase: 'locked', busy: true, error: null });
+      let unlocked: { keyset: TKeyset; masterKey: TMasterKey; enrollmentKey: TEnrollmentKey };
       try {
-        const unlocked = await deps.unlockRecovery(keyset, recoveryKey, newPassword);
-        const commit = await deps.commitRecovery(keyset, unlocked.keyset);
-        if (commit === 'conflict') throw new Error('Vault keyset changed.');
-        keyset = unlocked.keyset;
-        await deps.remember(unlocked.masterKey, unlocked.keyset);
-        await deps.register(unlocked.keyset, unlocked.enrollmentKey);
-        await activate(unlocked.masterKey, unlocked.keyset);
-        setState({ revokeOtherDevicesRecommended: true });
+        unlocked = await deps.unlockRecovery(keyset, recoveryKey, newPassword);
       } catch {
         setState({ phase: 'locked', busy: false, error: INVALID_CREDENTIALS });
+        return;
       }
+      try {
+        await deps.register(keyset, unlocked.enrollmentKey);
+      } catch {
+        setState({ phase: 'locked', busy: false, error: DEVICE_AUTHORIZATION_FAILED });
+        return;
+      }
+      try {
+        const commit = await deps.commitRecovery(keyset, unlocked.keyset);
+        if (commit === 'conflict') throw new Error('Vault keyset changed.');
+      } catch {
+        setState({ phase: 'locked', busy: false, error: RECOVERY_RESET_FAILED });
+        return;
+      }
+      keyset = unlocked.keyset;
+      try {
+        await deps.remember(unlocked.masterKey, unlocked.keyset);
+      } catch {
+        setState({ phase: 'locked', busy: false, error: REMEMBER_UNLOCK_FAILED });
+        return;
+      }
+      await activate(unlocked.masterKey, unlocked.keyset);
+      setState({ revokeOtherDevicesRecommended: true });
     },
     async logout() {
       unsubscribeRuntime?.();

@@ -372,6 +372,23 @@ describe('private Pro vault lifecycle', () => {
     assert.deepEqual(harness.operationIds, ['setup-operation-1', 'setup-operation-1']);
   });
 
+  test('initial setup authorizes the device before persisting remembered unlock state', async () => {
+    const harness = createHarness({ keyset: null });
+    let deviceAuthorized = false;
+    harness.deps.register = async () => { deviceAuthorized = true; };
+    harness.deps.remember = async () => {
+      if (!deviceAuthorized) throw new Error('Remembered an unauthorized device.');
+    };
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+    await lifecycle.setup('correct horse battery staple');
+    await lifecycle.acknowledgeRecoveryKey();
+
+    assert.equal(lifecycle.getState().phase, 'ready');
+    assert.equal(lifecycle.getState().error, null);
+  });
+
   test('remembered devices auto-unlock before the application opens', async () => {
     const harness = createHarness({ keyset: 'keyset-1', rememberedKey: 'remembered-master-key' });
     const lifecycle = createPrivateProVaultLifecycle(harness.deps);
@@ -411,6 +428,31 @@ describe('private Pro vault lifecycle', () => {
     assert.deepEqual(harness.registrationKeys, ['password-enrollment-key']);
   });
 
+  test('password unlock authorizes the device before persisting remembered unlock state', async () => {
+    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: null });
+    const order: string[] = [];
+    harness.deps.register = async () => { order.push('register'); };
+    harness.deps.remember = async () => { order.push('remember'); };
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+    await lifecycle.unlockWithPassword('vault password');
+
+    assert.deepEqual(order, ['register', 'remember']);
+  });
+
+  test('remembered-state failures do not claim that the password is incorrect', async () => {
+    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: null });
+    harness.deps.remember = async () => { throw new Error('IndexedDB write failed.'); };
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+    await lifecycle.unlockWithPassword('vault password');
+
+    assert.equal(lifecycle.getState().phase, 'locked');
+    assert.equal(lifecycle.getState().error, 'The vault was unlocked, but this browser could not securely remember it. Try again.');
+  });
+
   test('recovery keys unlock and expose no recovery secret in state', async () => {
     const harness = createHarness({ keyset: 'keyset-1', rememberedKey: null });
     const lifecycle = createPrivateProVaultLifecycle(harness.deps);
@@ -425,6 +467,61 @@ describe('private Pro vault lifecycle', () => {
     assert.equal(harness.counts.commitRecovery, 1);
     assert.deepEqual(harness.registrationKeys, ['recovery-enrollment-key']);
     assert.equal(lifecycle.getState().revokeOtherDevicesRecommended, true);
+  });
+
+  test('recovery authorizes a new device before rotating the protected keyset', async () => {
+    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: null });
+    let deviceAuthorized = false;
+    harness.deps.register = async () => { deviceAuthorized = true; };
+    harness.deps.commitRecovery = async () => {
+      if (!deviceAuthorized) throw new Error('Private Pro vault device is not authorized.');
+      return 'committed';
+    };
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+    await lifecycle.unlockWithRecovery('AAAA-BBBB-CCCC-DDDD', 'new correct horse battery staple');
+
+    assert.equal(lifecycle.getState().phase, 'ready');
+    assert.equal(lifecycle.getState().error, null);
+  });
+
+  test('recovery persists remembered unlock state only after authorization and rotation', async () => {
+    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: null });
+    const order: string[] = [];
+    harness.deps.register = async () => { order.push('register'); };
+    harness.deps.commitRecovery = async () => { order.push('rotate'); return 'committed'; };
+    harness.deps.remember = async () => { order.push('remember'); };
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+    await lifecycle.unlockWithRecovery('AAAA-BBBB-CCCC-DDDD', 'new correct horse battery staple');
+
+    assert.deepEqual(order, ['register', 'rotate', 'remember']);
+  });
+
+  test('remembered-state failures do not claim that the recovery key is incorrect', async () => {
+    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: null });
+    harness.deps.remember = async () => { throw new Error('IndexedDB write failed.'); };
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+    await lifecycle.unlockWithRecovery('AAAA-BBBB-CCCC-DDDD', 'new correct horse battery staple');
+
+    assert.equal(lifecycle.getState().phase, 'locked');
+    assert.equal(lifecycle.getState().error, 'The vault was unlocked, but this browser could not securely remember it. Try again.');
+  });
+
+  test('device enrollment failures do not claim that the password is incorrect', async () => {
+    const harness = createHarness({ keyset: 'keyset-1', rememberedKey: null });
+    harness.deps.register = async () => { throw new Error('Private Pro vault device is not authorized.'); };
+    const lifecycle = createPrivateProVaultLifecycle(harness.deps);
+
+    await lifecycle.start();
+    await lifecycle.unlockWithPassword('vault password');
+
+    assert.equal(lifecycle.getState().phase, 'locked');
+    assert.equal(lifecycle.getState().error, 'The vault was unlocked, but this device could not be authorized. Try again.');
   });
 
   test('wrong passwords stay locked and return one secret-free failure', async () => {
