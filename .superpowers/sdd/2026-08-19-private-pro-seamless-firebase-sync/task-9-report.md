@@ -157,3 +157,39 @@ GREEN:
 ### Concerns
 
 None.
+
+## Fix round 2
+
+### Findings addressed
+
+- Lifecycle start, retry, stop, and confirmed sign-out now serialize through one operation tail. A replacement start cannot enter prepare while stop is blocked.
+- Stop invalidates the active start epoch and waits its serialized operation. Stale start cleanup stops only its local engine and does not globally deactivate after a newer start owns the UID.
+- Sign-out pending detection uses flush first, then durable count. Dual failure blocks unconfirmed sign-out with a generic error, while confirmed discard proceeds with unknown pending.
+- Confirmed sign-out guards broadcast, stop, deactivation, clear, Firebase sign-out, and reload individually. A throwing broadcast cannot skip later cleanup. Single-flight remains intact.
+- The retained cron route authenticates as before, then returns sanitized 410 without constructing the legacy reservation service or calling quota code.
+- Unauthorized bootstrap wraps Firebase sign-out rejection. A current rejection becomes a generic auth error; a stale rejection after account change is ignored without an unhandled rejection.
+
+### RED evidence
+
+- Lifecycle RED: 5 failures proved replacement start overlapped blocked stop, stale start ordering was unsafe, dual pending failure leaked raw errors or blocked confirmed discard, and broadcast throw skipped cleanup.
+- Auth RED: 2 failures because current and stale unauthorized sign-out rejections escaped.
+- Cron RED: authenticated production route returned 200 and invoked legacy cleanup rather than failing closed.
+
+### GREEN evidence
+
+- Focused Task 9, auth, cron, fail-closed route, persistence, DBlob, asset, coordinator, engine, config, and access suites: 137 tests passed, 0 failed.
+- Root TypeScript and tools/test TypeScript: exit 0.
+- Scoped ESLint and diff check: exit 0.
+
+### Self-review
+
+- A start does not overlap stop-held cleanup.
+- Stale start cleanup never calls global deactivation after a newer epoch exists.
+- Confirmed sign-out attempts every cleanup step exactly once per single flight.
+- Cron factories stay lazy and untouched on the mounted production route.
+- Firebase sign-out rejection cannot leak raw details or mutate a newer UID.
+- The carried never-settling renewal and timely renewal regressions remain green.
+
+### Concerns
+
+None.

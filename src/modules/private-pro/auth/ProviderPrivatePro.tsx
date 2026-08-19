@@ -63,7 +63,13 @@ export function createPrivateProAuthBootstrapController(dependencies: PrivatePro
         const code = (error as { data?: { code?: string } })?.data?.code;
         if (code === 'UNAUTHORIZED') {
           dependencies.setDeniedEmail(nextUser.email || 'selected account');
-          await dependencies.firebaseSignOut(uid);
+          try {
+            await dependencies.firebaseSignOut(uid);
+          } catch {
+            if (!current(capturedEpoch, uid)) return;
+            dependencies.setError('Unable to complete Private Pro sign-out.');
+            dependencies.setState('error');
+          }
           return;
         }
         dependencies.setError('Unable to bootstrap Private Pro.');

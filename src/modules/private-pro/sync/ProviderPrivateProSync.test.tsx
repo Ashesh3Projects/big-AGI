@@ -100,12 +100,12 @@ describe('ProviderPrivateProSync', () => {
       clear: async () => {}, firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
     });
     const starting = lifecycle.start();
-    await lifecycle.stop();
+    const stopping = lifecycle.stop();
     prepared.resolve({ engine });
-    await starting;
+    await Promise.all([starting, stopping]);
 
-    assert.deepEqual(calls, ['stop']);
-    assert.deepEqual(deactivated, ['uid-a', 'uid-a']);
+    assert.deepEqual(calls, ['start']);
+    assert.deepEqual(deactivated, []);
   });
 
   test('sign-out drains for 5000 ms and requires explicit discard while pending remains', async () => {
@@ -289,6 +289,111 @@ describe('ProviderPrivateProSync', () => {
 
     await assert.rejects(lifecycle.stop(), error => error instanceof Error && !/secret/i.test(error.message));
     assert.deepEqual(order, ['stop', 'deactivate']);
+  });
+
+  test('start waits for a blocked stop before preparing a replacement engine', async () => {
+    const releaseStop = deferred<void>();
+    const order: string[] = [];
+    let prepareCount = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        prepareCount++;
+        const id = prepareCount;
+        order.push(`prepare:${id}`);
+        return { engine: {
+          async start() { order.push(`start:${id}`); }, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+          async stop() { order.push(`stop:${id}`); if (id === 1) await releaseStop.promise; },
+        } };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    const stopping = lifecycle.stop();
+    const starting = lifecycle.start();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(order.includes('prepare:2'), false);
+    releaseStop.resolve();
+    await Promise.all([stopping, starting]);
+
+    assert.deepEqual(order, ['prepare:1', 'start:1', 'stop:1', 'deactivate', 'prepare:2', 'start:2']);
+  });
+
+  test('stale pending start cleanup cannot deactivate a newer successful start', async () => {
+    const oldStartGate = deferred<void>();
+    const order: string[] = [];
+    let attempts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        attempts++;
+        if (attempts === 1) return { engine: {
+          async start() { await oldStartGate.promise; }, async retryNow() {}, async flushNow() { return { pending: 0 }; },
+          async pendingCount() { return 0; }, async stop() {},
+        } };
+        return { engine: {
+          async start() { order.push('new-start'); }, async retryNow() { order.push('new-retry'); },
+          async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; }, async stop() { order.push('new-stop'); },
+        } };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    const oldStart = lifecycle.start();
+    await Promise.resolve();
+    const stopping = lifecycle.stop();
+    const newStart = lifecycle.retry();
+    oldStartGate.resolve();
+    await Promise.all([oldStart, stopping, newStart]);
+    await lifecycle.retry();
+
+    assert.deepEqual(order, ['deactivate', 'new-start', 'new-retry']);
+  });
+
+  test('double pending-count failure blocks unconfirmed sign-out without cleanup', async () => {
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { throw new Error('flush failed'); }, async pendingCount() { return 0; }, async stop() { order.push('stop'); },
+      } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); }, reload: () => { order.push('reload'); }, pendingCount: async () => { throw new Error('count failed'); },
+    });
+    await lifecycle.start();
+
+    await assert.rejects(lifecycle.signOut(), error => error instanceof Error && !/flush|count/i.test(error.message));
+    assert.deepEqual(order, []);
+  });
+
+  test('double pending-count failure proceeds when discard is confirmed', async () => {
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { throw new Error('flush failed'); }, async pendingCount() { return 0; }, async stop() { order.push('stop'); },
+      }, coordinator: { broadcastSignedOut: () => { order.push('broadcast'); } } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); }, reload: () => { order.push('reload'); }, pendingCount: async () => { throw new Error('count failed'); },
+    });
+    await lifecycle.start();
+
+    await lifecycle.signOut({ discardPending: true });
+    assert.deepEqual(order, ['broadcast', 'stop', 'deactivate', 'clear', 'auth', 'reload']);
+  });
+
+  test('broadcast failure cannot skip confirmed sign-out cleanup', async () => {
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; }, async stop() { order.push('stop'); },
+      }, coordinator: { broadcastSignedOut: () => { order.push('broadcast'); throw new Error('broadcast failed'); } } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); }, reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+
+    await assert.rejects(lifecycle.signOut({ discardPending: true }));
+    assert.deepEqual(order, ['broadcast', 'stop', 'deactivate', 'clear', 'auth', 'reload']);
   });
 
 

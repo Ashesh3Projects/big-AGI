@@ -63,87 +63,112 @@ function rememberFailure(current: unknown, next: unknown): unknown {
 
 export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecycleDependencies): PrivateProSyncLifecycle {
   let epoch = 0;
-  let prepared: PreparedPrivateProSync | null = null;
+  let prepared: { epoch: number; value: PreparedPrivateProSync } | null = null;
   let startPromise: Promise<void> | null = null;
   let stopping: Promise<void> | null = null;
   let signOutPromise: Promise<void> | null = null;
+  let operationTail: Promise<void> = Promise.resolve();
+  let closing = false;
+
+  function runExclusive(operation: () => Promise<void>): Promise<void> {
+    const result = operationTail.then(operation, operation);
+    operationTail = result.then(() => {}, () => {});
+    return result;
+  }
 
   async function stopPrepared(current: PreparedPrivateProSync | null): Promise<void> {
     if (current) await current.engine.stop();
   }
 
-  async function stop(): Promise<void> {
+  function stop(): Promise<void> {
     if (stopping) return stopping;
     const stopEpoch = ++epoch;
-    const current = prepared;
+    const current = prepared?.value ?? null;
     prepared = null;
-    startPromise = null;
-    stopping = (async () => {
+    const operation = runExclusive(async () => {
       let failure: unknown = null;
       try { await stopPrepared(current); } catch (error) { failure = rememberFailure(failure, error); }
-      if (epoch === stopEpoch) {
+      if (!prepared && epoch === stopEpoch) {
         try { await dependencies.deactivate(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
       }
       if (failure) throw new PrivateProLifecycleError();
-    })().finally(() => { stopping = null; });
+    });
+    stopping = operation;
+    void operation.finally(() => { if (stopping === operation) stopping = null; }).catch(() => {});
     return stopping;
   }
 
+  async function startWork(): Promise<void> {
+    if (prepared || closing) return;
+    const startEpoch = ++epoch;
+    let next: PreparedPrivateProSync | null = null;
+    let committed = false;
+    try {
+      next = await dependencies.prepare();
+      if (epoch !== startEpoch) return;
+      await next.engine.start();
+      if (epoch !== startEpoch) return;
+      prepared = { epoch: startEpoch, value: next };
+      committed = true;
+      dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
+    } catch {
+      if (epoch === startEpoch) dependencies.statusStore.setState({ phase: 'error', lastCategory: 'unknown' });
+    } finally {
+      if (!committed) {
+        if (next) try { await next.engine.stop(); } catch {}
+        if (epoch === startEpoch) try { await dependencies.deactivate(dependencies.uid); } catch {}
+      }
+    }
+  }
+
+  function start(): Promise<void> {
+    if (prepared || closing) return Promise.resolve();
+    if (startPromise) return startPromise;
+    const operation = runExclusive(startWork);
+    startPromise = operation;
+    void operation.finally(() => { if (startPromise === operation) startPromise = null; }).catch(() => {});
+    return startPromise;
+  }
+
   return {
-    async start(): Promise<void> {
-      if (prepared || startPromise) return startPromise ?? Promise.resolve();
-      const startEpoch = ++epoch;
-      startPromise = (async () => {
-        let next: PreparedPrivateProSync | null = null;
-        try {
-          next = await dependencies.prepare();
-          if (epoch !== startEpoch) return;
-          prepared = next;
-          await next.engine.start();
-          if (epoch === startEpoch) dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
-        } catch {
-          if (epoch === startEpoch) dependencies.statusStore.setState({ phase: 'error', lastCategory: 'unknown' });
-        } finally {
-          if (epoch !== startEpoch || dependencies.statusStore.getState().phase === 'error') {
-            prepared = null;
-            if (next) try { await next.engine.stop(); } catch {}
-            try { await dependencies.deactivate(dependencies.uid); } catch {}
-          }
-        }
-      })().finally(() => { if (epoch === startEpoch) startPromise = null; });
-      return startPromise;
-    },
+    start,
 
     async retry(): Promise<void> {
-      if (!prepared) return this.start();
-      await prepared.engine.retryNow();
+      return runExclusive(async () => {
+        if (closing) return;
+        if (!prepared) return startWork();
+        await prepared.value.engine.retryNow();
+      });
     },
 
     async signOut(options = {}): Promise<void> {
       if (signOutPromise) return signOutPromise;
       signOutPromise = (async () => {
-      const current = prepared;
-      let pending: number;
+      const current = prepared?.value ?? null;
+      let pending: number | null = null;
       try {
         pending = current
           ? (await current.engine.flushNow(5_000)).pending
           : await dependencies.pendingCount();
       } catch {
-        pending = await dependencies.pendingCount();
+        try { pending = await dependencies.pendingCount(); } catch {}
       }
-      if (pending > 0 && !options.discardPending) throw new PrivateProUnsyncedChangesError(pending);
+      if (pending === null && !options.discardPending) throw new PrivateProLifecycleError();
+      if (pending !== null && pending > 0 && !options.discardPending) throw new PrivateProUnsyncedChangesError(pending);
 
+      closing = true;
       ++epoch;
       prepared = null;
-      startPromise = null;
-      current?.coordinator?.broadcastSignedOut?.();
-      let failure: unknown = null;
-      try { await stopPrepared(current); } catch (error) { failure = rememberFailure(failure, error); }
-      try { await dependencies.deactivate(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
-      try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
-      try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
-      try { dependencies.reload(); } catch (error) { failure = rememberFailure(failure, error); }
-      if (failure) throw new PrivateProLifecycleError();
+      await runExclusive(async () => {
+        let failure: unknown = null;
+        try { current?.coordinator?.broadcastSignedOut?.(); } catch (error) { failure = rememberFailure(failure, error); }
+        try { await stopPrepared(current); } catch (error) { failure = rememberFailure(failure, error); }
+        try { await dependencies.deactivate(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
+        try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
+        try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
+        try { dependencies.reload(); } catch (error) { failure = rememberFailure(failure, error); }
+        if (failure) throw new PrivateProLifecycleError();
+      });
       })().finally(() => { signOutPromise = null; });
       return signOutPromise;
     },

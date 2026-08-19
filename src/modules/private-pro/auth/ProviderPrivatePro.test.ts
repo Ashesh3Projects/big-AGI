@@ -99,4 +99,48 @@ describe('ProviderPrivatePro auth epochs', () => {
     assert.equal(applied.includes('uid-a'), false);
     assert.equal(applied.includes('refresh'), false);
   });
+
+  test('unauthorized bootstrap sign-out rejection becomes a generic current-user error', async () => {
+    const states: string[] = [];
+    const errors: Array<string | undefined> = [];
+    let currentUser: { uid: string; email: string } | null = { uid: 'uid-a', email: 'a@example.com' };
+    const controller = createPrivateProAuthBootstrapController({
+      bootstrap: async () => { throw { data: { code: 'UNAUTHORIZED' } }; }, refreshIdToken: async () => {},
+      firebaseSignOut: async () => { throw new Error('secret sign-out failure'); }, currentUser: () => currentUser,
+      setUser: () => {}, setBootstrap: () => {}, setState: state => { states.push(state); }, setError: error => { errors.push(error); },
+      setDeniedEmail: () => {}, getDeniedEmail: () => undefined,
+    });
+
+    await controller.handleAuthState(currentUser);
+
+    assert.equal(states.at(-1), 'error');
+    assert.equal(errors.at(-1), 'Unable to complete Private Pro sign-out.');
+  });
+
+  test('ignores stale unauthorized sign-out rejection after account B becomes current', async () => {
+    const signOut = deferred<void>();
+    const states: string[] = [];
+    let currentUser: { uid: string; email: string } | null = { uid: 'uid-a', email: 'a@example.com' };
+    let bootstrapCalls = 0;
+    const controller = createPrivateProAuthBootstrapController({
+      bootstrap: async uid => {
+        bootstrapCalls++;
+        if (uid === 'uid-a') throw { data: { code: 'UNAUTHORIZED' } };
+        return bootstrap(uid);
+      },
+      refreshIdToken: async () => {}, firebaseSignOut: async () => signOut.promise, currentUser: () => currentUser,
+      setUser: () => {}, setBootstrap: () => {}, setState: state => { states.push(state); }, setError: () => {},
+      setDeniedEmail: () => {}, getDeniedEmail: () => undefined,
+    });
+    const a = controller.handleAuthState(currentUser);
+    await Promise.resolve();
+    currentUser = { uid: 'uid-b', email: 'b@example.com' };
+    const b = controller.handleAuthState(currentUser);
+    signOut.reject(new Error('stale sign-out failure'));
+    await Promise.all([a, b]);
+
+    assert.equal(bootstrapCalls, 2);
+    assert.equal(states.at(-1), 'signed-in');
+    assert.equal(states.filter(state => state === 'error').length, 0);
+  });
 });

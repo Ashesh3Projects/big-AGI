@@ -73,12 +73,12 @@ test('mounted encrypted asset procedures fail closed before the legacy quota ser
   assert.equal(serviceCalls, 0);
 });
 
-test('production sweep route invokes only encrypted reservation cleanup', async () => {
+test('production sweep route fails closed without constructing legacy reservation services', async () => {
   const [route, sweep] = await Promise.all([
     import('../../../../app/api/private-pro/sweep-expired/route'),
     import('../../../../app/api/private-pro/sweep-expired/privatePro.sweep-expired'),
   ]);
-  let encryptedCalls = 0;
+  let factoryCalls = 0;
   assert.equal(sweep.privateProReservationSweepProductionFactories.encrypted, getFirebasePrivateProVaultAssetsService);
 
   const production = sweep.privateProSweepExpiredProductionDependencies;
@@ -88,9 +88,9 @@ test('production sweep route invokes only encrypted reservation cleanup', async 
     production.cronSecret = 'cron-secret';
     production.factories = {
       encrypted() {
+        factoryCalls++;
         return {
           async sweepExpiredReservations() {
-            encryptedCalls++;
             return { released: 3 };
           },
         };
@@ -100,9 +100,9 @@ test('production sweep route invokes only encrypted reservation cleanup', async 
       headers: { authorization: 'Bearer cron-secret' },
     }));
 
-    assert.equal(response.status, 200);
-    assert.deepEqual(await response.json(), { released: 3 });
-    assert.equal(encryptedCalls, 1);
+    assert.equal(response.status, 410);
+    assert.deepEqual(await response.json(), { error: 'Private Pro legacy endpoint is unavailable.' });
+    assert.equal(factoryCalls, 0);
   } finally {
     Object.assign(production, previous);
   }

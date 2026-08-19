@@ -48,9 +48,7 @@ export function createPrivateProSweepExpiredGET(dependencies: {
     if (!secret || request.headers.get('authorization') !== `Bearer ${secret}`)
       return NextResponse.json({ error: 'Unauthorized.' }, { status: 401 });
 
-    return NextResponse.json(await sweepExpiredPrivateProReservations(
-      createPrivateProReservationSweepDependencies(dependencies.factories),
-    ));
+    return NextResponse.json({ error: 'Private Pro legacy endpoint is unavailable.' }, { status: 410 });
   };
 }
 
