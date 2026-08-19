@@ -77,11 +77,24 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(pending?.generation, 2);
     assert.equal(pending?.payload, second.payload);
     assert.equal(pending?.baseRevision, 1);
-    assert.equal(pending?.dueAtMs, 121_000);
+    assert.equal(pending?.dueAtMs, 62_000);
     assert.equal(pending?.leaseUntilMs, null);
     assert.equal(pending?.leaseToken, null);
     assert.equal(pending?.leaseFence, null);
     assert.equal(pending?.leasedGeneration, null);
+  });
+
+  test('starts and preserves a newer generation first-window deadline while the older generation is leased', async (t) => {
+    const db = createDB(t);
+    const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+    assert.equal((await db.getOutbox(UID_A, first.recordKey))?.dueAtMs, 122_000);
+
+    await db.acknowledge(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, remoteBase(1), 61_000);
+
+    assert.equal((await db.getOutbox(UID_A, first.recordKey))?.dueAtMs, 122_000);
   });
 
   test('clears only one UID namespace', async (t) => {
@@ -235,5 +248,107 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(pending?.leaseToken, currentLease.leaseToken);
     assert.equal(pending?.baseRevision, 2);
     assert.deepEqual(await db.getRemoteBase(UID_A, first.recordKey), { revision: 2, mutationId: 'tombstone-2', deleted: true });
+  });
+
+  test('expedites only unblocked pending rows and reports the next schedulable due time', async (t) => {
+    const db = createDB(t);
+    const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    await db.recordLocalPut(UID_A, preparedRecord('record-2', '{"value":2}'), 2_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected first lease.');
+    await db.block(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, 'permission');
+
+    assert.equal(await db.nextDueAt(UID_A), 62_000);
+    await db.expedite(UID_A, 10_000);
+    assert.equal(await db.nextDueAt(UID_A), 10_000);
+    assert.equal((await db.getOutbox(UID_A, first.recordKey))?.dueAtMs, 61_000);
+  });
+
+  test('reports a leased row at its expiry so a restarted leader can recover it', async (t) => {
+    const db = createDB(t);
+    await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    await db.leaseDue(UID_A, 61_000, 5_000, 1);
+
+    assert.equal(await db.nextDueAt(UID_A), 66_000);
+  });
+
+  test('persists conflict retry timing while rebasing the exact leased generation', async (t) => {
+    const db = createDB(t);
+    const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+
+    await db.rebase(UID_A, pending.recordKey, pending.generation, lease.leaseToken, lease.leaseFence, remoteBase(3), 61_000, 500);
+
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.dueAtMs, 61_500);
+  });
+
+  test('does not rebase a newer generation from an older leased conflict', async (t) => {
+    const db = createDB(t);
+    const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+    const latest = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+
+    await db.rebase(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, remoteBase(3), 63_000, 500);
+
+    const pending = await db.getOutbox(UID_A, first.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.baseRevision, 0);
+    assert.equal(pending?.leaseToken, null);
+    assert.equal(await db.getRemoteBase(UID_A, first.recordKey), null);
+  });
+
+  test('blocks a terminal failure only while its exact generation and fence are leased', async (t) => {
+    const db = createDB(t);
+    const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const oldLease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    const currentLease = await db.leaseDue(UID_A, 66_000, 5_000, 2);
+    if (!oldLease?.leaseToken || oldLease.leaseFence === null || !currentLease?.leaseToken || currentLease.leaseFence === null)
+      assert.fail('Expected both leases.');
+
+    await db.block(UID_A, pending.recordKey, pending.generation, oldLease.leaseToken, oldLease.leaseFence, 'permission');
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.blocked, false);
+    await db.block(UID_A, pending.recordKey, pending.generation, currentLease.leaseToken, currentLease.leaseFence, 'permission');
+
+    const blocked = await db.getOutbox(UID_A, pending.recordKey);
+    assert.equal(blocked?.blocked, true);
+    assert.equal(blocked?.errorCode, 'permission');
+    assert.equal(blocked?.leaseToken, null);
+    assert.equal(await db.leaseDue(UID_A, 100_000, 5_000, 3), null);
+  });
+
+  test('quarantines and blocks only the exact leased message generation', async (t) => {
+    const db = createDB(t);
+    const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 4);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+
+    await db.quarantineLeased(UID_A, pending.recordKey, pending.generation, lease.leaseToken, lease.leaseFence, 'message-id-collision', 62_000);
+
+    assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.blocked, true);
+    assert.deepEqual(await db.quarantine.where('uid').equals(UID_A).toArray(), [{
+      id: 1,
+      uid: UID_A,
+      recordKey: pending.recordKey,
+      reasonCode: 'message-id-collision',
+      createdAtMs: 62_000,
+    }]);
+  });
+
+  test('does not quarantine a newer generation from an older leased collision', async (t) => {
+    const db = createDB(t);
+    const first = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 4);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
+    const latest = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
+
+    await db.quarantineLeased(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, 'message-id-collision', 63_000);
+
+    const pending = await db.getOutbox(UID_A, first.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.blocked, false);
+    assert.equal(pending?.leaseToken, null);
+    assert.equal(await db.quarantine.where('uid').equals(UID_A).count(), 0);
   });
 });
