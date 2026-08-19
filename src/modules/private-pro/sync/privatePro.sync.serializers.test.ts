@@ -145,6 +145,9 @@ describe('Private Pro sync serializers', () => {
     let suppressing = true;
     let emittedAfterSuppression = false;
     const serializers = createPrivateProSyncSerializers();
+    const snapshot = serializers[0].snapshot();
+    assert.equal(snapshot instanceof Promise, true);
+    await snapshot;
     const unsubscribe = serializers.map(serializer => serializer.subscribe(() => {
       emittedAfterSuppression ||= !suppressing;
     }));

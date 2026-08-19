@@ -129,3 +129,56 @@ git diff check: exit 0
 - A metadata-free stage retains only internal staged records and does not call a chat runtime mutator.
 - Full projection replacement still deliberately deletes the runtime projection before materializing the supplied record set, so a committed no-metadata projection is a deletion.
 - The public serializer contract is now synchronous for `snapshot()` only. Validation remains asynchronous to preserve its established call shape.
+
+## Fix round 2
+
+### Finding
+
+- Fix round 1 exposed a synchronous `PrivateProSyncSerializer.snapshot()` even though the Task 2 contract requires `Promise<readonly PrivateProSyncSerializedRecord<T>[]>`.
+
+### Resolution
+
+- Restored the exact asynchronous public `snapshot()` signature. It returns `Promise.resolve(snapshotNow())`.
+- Kept `snapshotNow()` private to `bindSerializer()`. Store subscriptions continue to use that synchronous helper for immediate diff calculation and listener delivery under suppression.
+
+### RED evidence
+
+Command:
+
+```powershell
+npx tsx --test src/modules/private-pro/sync/privatePro.sync.serializers.test.ts
+```
+
+Result:
+
+```text
+emits projection mutations while synchronous suppression is active: failed
+Expected snapshot instanceof Promise to equal true, received false
+```
+
+### GREEN evidence
+
+Commands:
+
+```powershell
+npx tsx --test src/modules/private-pro/sync/privatePro.sync.protocol.test.ts src/modules/private-pro/sync/privatePro.sync.serializers.test.ts
+npx tsx --test src/modules/private-pro/vault/privatePro.vault.serializers.test.ts
+npx tsc --noEmit --pretty
+npx eslint src/modules/private-pro/sync src/common/stores/chat/store-chats.ts
+git diff --check
+```
+
+Results:
+
+```text
+sync protocol plus serializer tests: 18 passed, 0 failed
+legacy vault serializer test: 1 passed, 0 failed
+TypeScript: exit 0
+ESLint: exit 0
+git diff check: exit 0
+```
+
+### Self-review
+
+- The regression awaits the public snapshot Promise and still proves projection notifications occur before synchronous suppression clears.
+- `snapshotNow()` is not exported, so consumers retain the required asynchronous contract.

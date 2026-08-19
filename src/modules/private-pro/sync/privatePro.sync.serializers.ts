@@ -38,7 +38,7 @@ export interface PrivateProSyncSerializer<T> {
   recordType: PrivateProSyncRecordType;
   schemaVersion: number;
   conflictPolicy: 'replace' | 'message-identity';
-  snapshot(): readonly PrivateProSyncSerializedRecord<T>[];
+  snapshot(): Promise<readonly PrivateProSyncSerializedRecord<T>[]>;
   validate(logicalId: string, value: unknown): Promise<T>;
   subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void): () => void;
 }
@@ -63,7 +63,7 @@ export interface PrivateProSyncLogicalSerializer<T> {
 }
 
 function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): PrivateProSyncSerializer<T> {
-  const snapshot = (): readonly PrivateProSyncSerializedRecord<T>[] => serializer.snapshot().map(({ logicalId, value }) => ({
+  const snapshotNow = (): readonly PrivateProSyncSerializedRecord<T>[] => serializer.snapshot().map(({ logicalId, value }) => ({
     recordType: serializer.recordType,
     logicalId,
     projectionKey: serializer.projectionKey(value),
@@ -76,7 +76,7 @@ function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): Priv
     recordType: serializer.recordType,
     schemaVersion: serializer.schemaVersion,
     conflictPolicy: serializer.conflictPolicy ?? 'replace',
-    snapshot,
+    snapshot: () => Promise.resolve(snapshotNow()),
     validate: async (logicalId, input) => {
       const value = serializer.schema.parse(input);
       if (serializer.logicalId(value) !== logicalId)
@@ -87,7 +87,7 @@ function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): Priv
       let stopped = false;
       let emitting = false;
       let pending = false;
-      let previous = snapshot();
+      let previous = snapshotNow();
       const unsubscribe = serializer.subscribe(() => {
         if (emitting) {
           pending = true;
@@ -95,7 +95,7 @@ function bindSerializer<T>(serializer: PrivateProSyncLogicalSerializer<T>): Priv
         }
         do {
           pending = false;
-          const current = snapshot();
+          const current = snapshotNow();
           if (stopped) return;
 
           const previousById = new Map(previous.map(record => [record.logicalId, record]));
