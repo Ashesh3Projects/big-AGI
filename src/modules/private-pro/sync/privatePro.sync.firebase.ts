@@ -183,6 +183,14 @@ function createTombstone(input: PrivateProSyncWriteInput, revision: number, time
   });
 }
 
+function parseTombstone(recordKey: string, value: unknown, expected?: Pick<PrivateProSyncWriteInput, 'recordType' | 'logicalId'>) {
+  const tombstone = PrivateProSyncTombstoneDocumentSchema.parse(value);
+  if (tombstone.recordKey !== recordKey || privateProRecordKey(tombstone.recordType, tombstone.logicalId) !== recordKey ||
+      (expected && (tombstone.recordType !== expected.recordType || tombstone.logicalId !== expected.logicalId)))
+    throw new TypeError('Private Pro sync tombstone identity is invalid.');
+  return tombstone;
+}
+
 function emitChanges(
   collectionKind: 'record' | 'asset' | 'tombstone',
   changes: readonly PrivateProFirestoreChange[],
@@ -190,17 +198,19 @@ function emitChanges(
 ): void {
   for (const change of changes) {
     if (change.hasPendingWrites || change.type === 'removed') continue;
-    if (collectionKind === 'tombstone') {
-      const tombstone = PrivateProSyncTombstoneDocumentSchema.parse(change.data);
-      if (tombstone.recordKey !== change.id || privateProRecordKey(tombstone.recordType, tombstone.logicalId) !== change.id)
-        throw new TypeError('Private Pro sync tombstone identity is invalid.');
-      listener({ type: 'tombstone', tombstone });
-      continue;
+    try {
+      if (collectionKind === 'tombstone') {
+        const tombstone = parseTombstone(change.id, change.data);
+        listener({ type: 'tombstone', tombstone });
+        continue;
+      }
+      const canonical = parseCanonical(change.id, change.data);
+      if ((collectionKind === 'asset') !== (canonical.recordType === 'asset'))
+        throw new TypeError('Private Pro sync record collection identity is invalid.');
+      listener({ type: 'record', canonical });
+    } catch {
+      listener({ type: 'error', category: 'unknown' });
     }
-    const canonical = parseCanonical(change.id, change.data);
-    if ((collectionKind === 'asset') !== (canonical.recordType === 'asset'))
-      throw new TypeError('Private Pro sync record collection identity is invalid.');
-    listener({ type: 'record', canonical });
   }
 }
 
@@ -226,14 +236,18 @@ async function writeMutation(
 
     const recordValue = await transaction.get(recordPath);
     const existing = recordValue === null ? null : parseCanonical(input.recordKey, recordValue, input);
-    const tombstoneValue = input.kind === 'delete' ? await transaction.get(tombstonePath) : null;
+    const tombstoneValue = await transaction.get(tombstonePath);
+    const tombstone = tombstoneValue === null ? null : parseTombstone(input.recordKey, tombstoneValue, input);
+    if (tombstone) {
+      if (!existing?.deleted || existing.revision !== tombstone.deletedRevision || existing.mutationId !== tombstone.mutationId)
+        throw new TypeError('Private Pro sync tombstone does not match the canonical deleted record.');
+      return { status: 'deleted', canonical: existing };
+    }
     if (existing?.deleted) return { status: 'deleted', canonical: existing };
     if ((existing?.revision ?? 0) !== input.baseRevision) {
       if (!existing) throw new TypeError('Private Pro sync missing canonical record conflicts with the requested base.');
       return { status: 'conflict', canonical: existing };
     }
-    if (tombstoneValue !== null)
-      throw new TypeError('Private Pro sync tombstone already exists.');
 
     const timestamp = firestore.serverTimestamp();
     transaction.set(recordPath, createCanonicalDocument(input, revision, timestamp));
@@ -262,13 +276,7 @@ export function createPrivateProFirebaseSyncTransport(
       const unsubscribes = (['record', 'asset', 'tombstone'] as const).map(kind => {
         const collectionName = kind === 'record' ? 'records' : kind === 'asset' ? 'assets' : 'tombstones';
         return firestore.listenCollection(`${root}/${collectionName}`, { includeMetadataChanges: true }, {
-          next: changes => {
-            try {
-              emitChanges(kind, changes, listener);
-            } catch {
-              listener({ type: 'error', category: 'unknown' });
-            }
-          },
+          next: changes => emitChanges(kind, changes, listener),
           error: onError,
         });
       });

@@ -183,6 +183,19 @@ describe('Private Pro direct Firebase sync transport', () => {
     assert.equal(firestore.writes.length, 0);
   });
 
+  test('rejects a mutation receipt that fails the strict receipt schema', async () => {
+    const firestore = new FakeFirestore();
+    const input = putInput();
+    firestore.documents.set(`${ROOT}/mutationReceipts/${MUTATION_ID}`, {
+      schemaVersion: 1, mutationId: MUTATION_ID, recordKey: input.recordKey, recordType: input.recordType,
+      logicalId: input.logicalId, kind: 'put', contentHash: CONTENT_HASH, revision: 1,
+      writerId: WRITER_ID, committedAt: 'earlier-server-time', unexpected: true,
+    });
+
+    await assert.rejects(createPrivateProFirebaseSyncTransport(UID, firestore).write(input), PrivateProSyncTransportError);
+    assert.equal(firestore.writes.length, 0);
+  });
+
   test('returns the parsed canonical record on a base revision conflict', async () => {
     const firestore = new FakeFirestore();
     const input = putInput();
@@ -204,6 +217,47 @@ describe('Private Pro direct Firebase sync transport', () => {
     assert.deepEqual(await createPrivateProFirebaseSyncTransport(UID, firestore).write(input), {
       status: 'deleted', canonical: { recordKey: input.recordKey, ...remote },
     });
+    assert.equal(firestore.writes.length, 0);
+  });
+
+  test('returns deleted for a put when the immutable tombstone and deleted canonical record exist', async () => {
+    const firestore = new FakeFirestore();
+    const input = putInput({ baseRevision: 2 });
+    const remote = canonical({ ...input, mutationId: OTHER_MUTATION_ID }, 2, true);
+    firestore.documents.set(`${ROOT}/records/${input.recordKey}`, remote);
+    firestore.documents.set(`${ROOT}/tombstones/${input.recordKey}`, {
+      recordKey: input.recordKey, recordType: input.recordType, logicalId: input.logicalId,
+      deletedRevision: 2, mutationId: OTHER_MUTATION_ID, writerId: WRITER_ID, deletedAt: 'server-time',
+    });
+
+    assert.deepEqual(await createPrivateProFirebaseSyncTransport(UID, firestore).write(input), {
+      status: 'deleted', canonical: { recordKey: input.recordKey, ...remote },
+    });
+    assert.equal(firestore.writes.length, 0);
+  });
+
+  test('rejects a put when a tombstone exists without a matching deleted canonical record', async () => {
+    const firestore = new FakeFirestore();
+    const input = putInput();
+    firestore.documents.set(`${ROOT}/tombstones/${input.recordKey}`, {
+      recordKey: input.recordKey, recordType: input.recordType, logicalId: input.logicalId,
+      deletedRevision: 1, mutationId: OTHER_MUTATION_ID, writerId: WRITER_ID, deletedAt: 'server-time',
+    });
+
+    await assert.rejects(createPrivateProFirebaseSyncTransport(UID, firestore).write(input), PrivateProSyncTransportError);
+    assert.equal(firestore.writes.length, 0);
+  });
+
+  test('rejects a put when a tombstone exists beside a live canonical record', async () => {
+    const firestore = new FakeFirestore();
+    const input = putInput({ baseRevision: 1 });
+    firestore.documents.set(`${ROOT}/records/${input.recordKey}`, canonical({ ...input, mutationId: OTHER_MUTATION_ID }, 1));
+    firestore.documents.set(`${ROOT}/tombstones/${input.recordKey}`, {
+      recordKey: input.recordKey, recordType: input.recordType, logicalId: input.logicalId,
+      deletedRevision: 1, mutationId: OTHER_MUTATION_ID, writerId: WRITER_ID, deletedAt: 'server-time',
+    });
+
+    await assert.rejects(createPrivateProFirebaseSyncTransport(UID, firestore).write(input), PrivateProSyncTransportError);
     assert.equal(firestore.writes.length, 0);
   });
 
@@ -268,6 +322,65 @@ describe('Private Pro direct Firebase sync transport', () => {
 
     unsubscribe();
     assert.deepEqual(firestore.unsubscribed.sort(), [`${ROOT}/assets`, `${ROOT}/records`, `${ROOT}/tombstones`]);
+  });
+
+  test('continues a record batch after malformed committed record data', () => {
+    const firestore = new FakeFirestore();
+    const input = putInput();
+    const events: unknown[] = [];
+    createPrivateProFirebaseSyncTransport(UID, firestore).listen(event => events.push(event));
+
+    firestore.listeners.get(`${ROOT}/records`)!.next([
+      { type: 'added', id: input.recordKey, data: { secret: 'not a record' }, hasPendingWrites: false },
+      { type: 'modified', id: input.recordKey, data: canonical(input, 2), hasPendingWrites: false },
+    ]);
+
+    assert.deepEqual(events, [
+      { type: 'error', category: 'unknown' },
+      { type: 'record', canonical: { recordKey: input.recordKey, ...canonical(input, 2) } },
+    ]);
+  });
+
+  test('continues a tombstone batch after malformed committed tombstone identity', () => {
+    const firestore = new FakeFirestore();
+    const input = putInput();
+    const events: unknown[] = [];
+    createPrivateProFirebaseSyncTransport(UID, firestore).listen(event => events.push(event));
+
+    firestore.listeners.get(`${ROOT}/tombstones`)!.next([
+      {
+        type: 'added', id: input.recordKey, hasPendingWrites: false,
+        data: { recordKey: privateProRecordKey('settings', 'other'), recordType: input.recordType, logicalId: input.logicalId, deletedRevision: 1, mutationId: MUTATION_ID, writerId: WRITER_ID, deletedAt: 'server-time' },
+      },
+      {
+        type: 'modified', id: input.recordKey, hasPendingWrites: false,
+        data: { recordKey: input.recordKey, recordType: input.recordType, logicalId: input.logicalId, deletedRevision: 2, mutationId: MUTATION_ID, writerId: WRITER_ID, deletedAt: 'server-time' },
+      },
+    ]);
+
+    assert.deepEqual(events, [
+      { type: 'error', category: 'unknown' },
+      { type: 'tombstone', tombstone: { recordKey: input.recordKey, recordType: input.recordType, logicalId: input.logicalId, deletedRevision: 2, mutationId: MUTATION_ID, writerId: WRITER_ID, deletedAt: 'server-time' } },
+    ]);
+  });
+
+  test('continues an asset batch after committed collection identity mismatch', () => {
+    const firestore = new FakeFirestore();
+    const recordInput = putInput();
+    const assetInput = putInput({ recordType: 'asset', logicalId: 'asset-1' });
+    assetInput.recordKey = privateProRecordKey(assetInput.recordType, assetInput.logicalId);
+    const events: unknown[] = [];
+    createPrivateProFirebaseSyncTransport(UID, firestore).listen(event => events.push(event));
+
+    firestore.listeners.get(`${ROOT}/assets`)!.next([
+      { type: 'added', id: recordInput.recordKey, data: canonical(recordInput, 1), hasPendingWrites: false },
+      { type: 'modified', id: assetInput.recordKey, data: canonical(assetInput, 2), hasPendingWrites: false },
+    ]);
+
+    assert.deepEqual(events, [
+      { type: 'error', category: 'unknown' },
+      { type: 'record', canonical: { recordKey: assetInput.recordKey, ...canonical(assetInput, 2) } },
+    ]);
   });
 
   test('sanitizes listener errors into allowed categories', () => {
