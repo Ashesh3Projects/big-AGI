@@ -1,0 +1,225 @@
+name: Nightly upstream integration to Pro
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub schedules use UTC. 18:30 UTC is 00:00 IST.
+    - cron: '30 18 * * *'
+
+concurrency:
+  group: nightly-pro-integration
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  sync_main:
+    if: github.repository == 'Ashesh3Projects/big-AGI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      automation_source_sha: ${{ steps.sync.outputs.automation_source_sha }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Rebuild fork main on upstream main
+        id: sync
+        env:
+          UPSTREAM_URL: https://github.com/enricoros/big-AGI.git
+        run: |
+          bash tools/automation/sync-upstream-main.sh
+          echo "automation_source_sha=$(git ls-remote origin refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+
+  integrate:
+    needs: sync_main
+    if: github.repository == 'Ashesh3Projects/big-AGI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      has_upstream_changes: ${{ steps.prepare.outputs.has_upstream_changes }}
+    steps:
+      - name: Checkout Pro without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: pro
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Install pinned Copilot CLI
+        run: npm install --global --ignore-scripts @github/copilot@1.0.80
+
+      - name: Prepare upstream integration range
+        id: prepare
+        env:
+          AUTOMATION_SOURCE_SHA: ${{ needs.sync_main.outputs.automation_source_sha }}
+          UPSTREAM_URL: https://github.com/enricoros/big-AGI.git
+        run: node tools/automation/nightly-pro-integration.ts prepare
+
+      - name: Remove repository credentials before Copilot
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin https://github.com/${{ github.repository }}.git
+
+      - name: Integrate upstream changes with Copilot
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          copilot_home="$RUNNER_TEMP/copilot-home"
+          mkdir -p "$copilot_home"
+          env -i \
+            HOME="$copilot_home" \
+            PATH="$PATH" \
+            CI=true \
+            COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
+            copilot \
+            --prompt "$(< .nightly-copilot-prompt.txt)" \
+            --model gpt-5.6-sol \
+            --effort max \
+            --context long_context \
+            --no-ask-user \
+            --no-auto-update \
+            --no-custom-instructions \
+            --no-remote \
+            --no-remote-export \
+            --disable-builtin-mcps \
+            --disallow-temp-dir \
+            --secret-env-vars=COPILOT_GITHUB_TOKEN \
+            --allow-tool='write' \
+            --allow-tool='shell(git status:*)' \
+            --allow-tool='shell(git log:*)' \
+            --allow-tool='shell(git show:*)' \
+            --allow-tool='shell(git diff:*)' \
+            --allow-tool='shell(git grep:*)' \
+            --allow-tool='shell(git rev-list:*)' \
+            --allow-tool='shell(git ls-files:*)' \
+            --allow-tool='shell(git blame:*)' \
+            --allow-tool='shell(npm:*)' \
+            --allow-tool='shell(npx:*)' \
+            --allow-tool='shell(node:*)' \
+            --allow-tool='shell(cat:*)' \
+            --allow-tool='shell(find:*)' \
+            --allow-tool='shell(grep:*)' \
+            --allow-tool='shell(rg:*)' \
+            --allow-tool='shell(ls:*)' \
+            --allow-tool='shell(sed:*)' \
+            --allow-tool='shell(head:*)' \
+            --allow-tool='shell(tail:*)' \
+            --allow-tool='shell(sort:*)' \
+            --allow-tool='shell(uniq:*)' \
+            --allow-tool='shell(wc:*)' \
+            --deny-tool='shell(git push)' \
+            --deny-tool='shell(git reset)' \
+            --deny-tool='shell(git checkout)' \
+            --deny-tool='shell(git switch)' \
+            --deny-tool='shell(git merge)' \
+            --deny-tool='shell(git rebase)' \
+            --deny-tool='shell(git cherry-pick)' \
+            --deny-tool='shell(git commit)' \
+            --deny-tool='shell(git add)' \
+            --deny-tool='shell(git clean)' \
+            --deny-tool='shell(git restore)' \
+            --deny-tool='shell(git fetch)' \
+            --deny-tool='shell(git pull)' \
+            --deny-tool='shell(git remote)' \
+            --deny-tool='shell(git init)' \
+            --deny-tool='shell(git clone)' \
+            --share .nightly-copilot-session.md
+
+      - name: Verify and package integration
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        env:
+          NODE_ENV: development
+        run: node tools/automation/nightly-pro-integration.ts verify-package
+
+      - name: Upload verified integration package
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-pro-integration-package
+          path: |
+            .nightly-pro-integration.patch
+            .nightly-pro-integration-report.json
+            .nightly-pro-integration-manifest.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload Copilot transcript
+        if: always() && steps.prepare.outputs.has_upstream_changes == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-pro-integration-transcript-${{ github.run_id }}
+          path: .nightly-copilot-session.md
+          if-no-files-found: ignore
+          retention-days: 14
+
+  publish:
+    needs: [sync_main, integrate]
+    if: github.repository == 'Ashesh3Projects/big-AGI' && needs.integrate.outputs.has_upstream_changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout Pro for trusted publish
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: pro
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Checkout trusted automation from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.sync_main.outputs.automation_source_sha }}
+          path: .trusted-automation
+          sparse-checkout: tools/automation/nightly-pro-integration.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Download verified integration package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nightly-pro-integration-package
+          path: .
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Commit and push Pro
+        env:
+          AUTOMATION_SOURCE_SHA: ${{ needs.sync_main.outputs.automation_source_sha }}
+        run: node .trusted-automation/tools/automation/nightly-pro-integration.ts publish
