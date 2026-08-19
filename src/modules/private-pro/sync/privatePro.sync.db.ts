@@ -307,30 +307,31 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
-  async block(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, errorCode: string): Promise<void> {
-    await this.transaction('rw', this.outbox, async () => {
+  async block(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, errorCode: string): Promise<boolean> {
+    return this.transaction('rw', this.outbox, async () => {
       const pending = await this.outbox.get([uid, recordKey]);
-      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
+      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return false;
       if (pending.generation !== generation) {
         clearOutboxLease(pending);
         await this.outbox.put(pending);
-        return;
+        return false;
       }
       clearOutboxLease(pending);
       pending.blocked = true;
       pending.errorCode = errorCode;
       await this.outbox.put(pending);
+      return true;
     });
   }
 
-  async quarantineLeased(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, reasonCode: string, nowMs: number): Promise<void> {
-    await this.transaction('rw', [this.outbox, this.quarantine], async () => {
+  async quarantineLeased(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, reasonCode: string, nowMs: number): Promise<boolean> {
+    return this.transaction('rw', [this.outbox, this.quarantine], async () => {
       const pending = await this.outbox.get([uid, recordKey]);
-      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
+      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return false;
       if (pending.generation !== generation) {
         clearOutboxLease(pending);
         await this.outbox.put(pending);
-        return;
+        return false;
       }
       clearOutboxLease(pending);
       pending.blocked = true;
@@ -339,6 +340,7 @@ export class PrivateProSyncDB extends Dexie {
         this.outbox.put(pending),
         this.quarantine.add({ uid, recordKey, reasonCode, createdAtMs: nowMs }),
       ]);
+      return true;
     });
   }
 

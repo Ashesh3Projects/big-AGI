@@ -402,6 +402,93 @@ describe('Private Pro seamless sync outbound', () => {
     assert.deepEqual(statuses, ['permission']);
   });
 
+  test('does not report a stale permission failure after a newer generation is captured', async (t) => {
+    const { outbound, transport, clock, db, statuses } = createHarness(t);
+    const write = deferred<PrivateProSyncWriteResult>();
+    transport.results.push(write.promise);
+    await outbound.start();
+    const first = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'first' }, referencedAssetIds: [],
+    } });
+    await clock.advance(60_000);
+    const latest = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'second' }, referencedAssetIds: [],
+    } });
+    write.resolve(Promise.reject(new PrivateProSyncTransportError('permission')));
+    await settle();
+
+    const pending = await db.getOutbox(UID, first.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.blocked, false);
+    assert.deepEqual(statuses, []);
+  });
+
+  test('does not report or quarantine a stale message collision after a newer generation', async (t) => {
+    const serializer = new FakeSerializer('chat-message', 'message-identity');
+    const { outbound, transport, clock, db, statuses } = createHarness(t, serializer);
+    const write = deferred<PrivateProSyncWriteResult>();
+    transport.results.push(write.promise);
+    await outbound.start();
+    const first = await outbound.capture({ kind: 'put', record: {
+      recordType: 'chat-message', logicalId: 'chat-1\0message-1', projectionKey: 'chat-1', schemaVersion: 1,
+      value: { value: 'first' }, referencedAssetIds: [],
+    } });
+    await clock.advance(60_000);
+    const latest = await outbound.capture({ kind: 'put', record: {
+      recordType: 'chat-message', logicalId: 'chat-1\0message-1', projectionKey: 'chat-1', schemaVersion: 1,
+      value: { value: 'second' }, referencedAssetIds: [],
+    } });
+    const input = transport.writes[0];
+    write.resolve({ status: 'conflict', canonical: remote(input, 1, 'b'.repeat(64)) });
+    await settle();
+
+    const pending = await db.getOutbox(UID, first.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.blocked, false);
+    assert.equal(await db.quarantine.where('uid').equals(UID).count(), 0);
+    assert.deepEqual(statuses, []);
+  });
+
+  test('does not report a stale asset permission failure after a newer generation', async (t) => {
+    const name = `private-pro-sync-outbound-stale-assets-${crypto.randomUUID()}`;
+    const db = new PrivateProSyncDB(name);
+    const clock = new ManualClock();
+    const coordinator = new FakeCoordinator();
+    const upload = deferred<void>();
+    const statuses: string[] = [];
+    const outbound = createPrivateProSyncOutbound({
+      uid: UID, writerId: WRITER_ID, serializers: [new FakeSerializer()], db, coordinator,
+      transport: new FakeTransport(), assets: { ensureUploaded: () => upload.promise },
+      now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout,
+      onStatus: status => statuses.push(status.category),
+    });
+    t.after(async () => {
+      upload.resolve();
+      await outbound.stop();
+      db.close();
+      await Dexie.delete(name);
+    });
+    await outbound.start();
+    const first = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'first' }, referencedAssetIds: ['asset-1'],
+    } });
+    await clock.advance(60_000);
+    const latest = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'second' }, referencedAssetIds: ['asset-1'],
+    } });
+    upload.resolve(Promise.reject(new PrivateProSyncTransportError('permission')));
+    await settle();
+
+    const pending = await db.getOutbox(UID, first.recordKey);
+    assert.equal(pending?.generation, latest.generation);
+    assert.equal(pending?.blocked, false);
+    assert.deepEqual(statuses, []);
+  });
+
   test('rebases a replace record and retries from the canonical revision', async (t) => {
     const { outbound, transport, clock } = createHarness(t);
     await outbound.start();

@@ -299,8 +299,8 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       if (assetsOutcome.type === 'error') {
         const category = privateProClassifySyncError(assetsOutcome.error);
         if (category === 'permission' || category === 'quota' || category === 'schema' || category === 'unknown') {
-          await dependencies.db.block(dependencies.uid, row.recordKey, row.leasedGeneration, row.leaseToken, row.leaseFence, category);
-          report(category);
+          const committed = await dependencies.db.block(dependencies.uid, row.recordKey, row.leasedGeneration, row.leaseToken, row.leaseFence, category);
+          if (committed) report(category);
           return;
         }
         await retry(row, category);
@@ -319,8 +319,8 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       if (outcome.type === 'error') {
         const category = privateProClassifySyncError(outcome.error);
         if (category === 'permission' || category === 'quota' || category === 'schema' || category === 'unknown') {
-          await dependencies.db.block(dependencies.uid, row.recordKey, row.leasedGeneration, row.leaseToken, row.leaseFence, category);
-          report(category);
+          const committed = await dependencies.db.block(dependencies.uid, row.recordKey, row.leasedGeneration, row.leaseToken, row.leaseFence, category);
+          if (committed) report(category);
           return;
         }
         await retry(row, category);
@@ -355,7 +355,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       const serializer = serializerFor(row.recordType);
       if (serializer.conflictPolicy === 'message-identity') {
         if (row.contentHash !== result.canonical.contentHash) {
-          await dependencies.db.quarantineLeased(
+          const committed = await dependencies.db.quarantineLeased(
             dependencies.uid,
             row.recordKey,
             row.leasedGeneration,
@@ -364,7 +364,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
             'message-id-collision',
             now(),
           );
-          report('schema');
+          if (committed) report('schema');
           return;
         }
         await acknowledge(row, remoteBase(result.canonical), sentAtMs);

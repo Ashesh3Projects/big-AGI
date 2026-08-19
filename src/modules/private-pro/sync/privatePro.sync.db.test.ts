@@ -386,9 +386,9 @@ describe('Private Pro seamless sync database', () => {
     if (!oldLease?.leaseToken || oldLease.leaseFence === null || !currentLease?.leaseToken || currentLease.leaseFence === null)
       assert.fail('Expected both leases.');
 
-    await db.block(UID_A, pending.recordKey, pending.generation, oldLease.leaseToken, oldLease.leaseFence, 'permission');
+    assert.equal(await db.block(UID_A, pending.recordKey, pending.generation, oldLease.leaseToken, oldLease.leaseFence, 'permission'), false);
     assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.blocked, false);
-    await db.block(UID_A, pending.recordKey, pending.generation, currentLease.leaseToken, currentLease.leaseFence, 'permission');
+    assert.equal(await db.block(UID_A, pending.recordKey, pending.generation, currentLease.leaseToken, currentLease.leaseFence, 'permission'), true);
 
     const blocked = await db.getOutbox(UID_A, pending.recordKey);
     assert.equal(blocked?.blocked, true);
@@ -403,7 +403,7 @@ describe('Private Pro seamless sync database', () => {
     const lease = await db.leaseDue(UID_A, 61_000, 5_000, 4);
     if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
 
-    await db.quarantineLeased(UID_A, pending.recordKey, pending.generation, lease.leaseToken, lease.leaseFence, 'message-id-collision', 62_000);
+    assert.equal(await db.quarantineLeased(UID_A, pending.recordKey, pending.generation, lease.leaseToken, lease.leaseFence, 'message-id-collision', 62_000), true);
 
     assert.equal((await db.getOutbox(UID_A, pending.recordKey))?.blocked, true);
     assert.deepEqual(await db.quarantine.where('uid').equals(UID_A).toArray(), [{
@@ -422,7 +422,7 @@ describe('Private Pro seamless sync database', () => {
     if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected lease.');
     const latest = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":2}'), 62_000);
 
-    await db.quarantineLeased(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, 'message-id-collision', 63_000);
+    assert.equal(await db.quarantineLeased(UID_A, first.recordKey, first.generation, lease.leaseToken, lease.leaseFence, 'message-id-collision', 63_000), false);
 
     const pending = await db.getOutbox(UID_A, first.recordKey);
     assert.equal(pending?.generation, latest.generation);
