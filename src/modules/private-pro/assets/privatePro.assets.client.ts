@@ -145,6 +145,44 @@ export function createPrivateProAssetClient(
   local: PrivateProAssetLocalPort,
 ): PrivateProAssetClient {
   if (!uid) throw new TypeError('Private Pro asset UID is required.');
+  const uploadQueues = new Map<string, Promise<void>>();
+
+  function currentGeneration(assetId: string, expected: number, signal?: AbortSignal): Promise<void> {
+    abortIfNeeded(signal);
+    return local.getAssetState(assetId).then(current => {
+      abortIfNeeded(signal);
+      if (!current?.asset || current.contentGeneration !== expected) throw new DOMException('Private Pro attachment upload superseded.', 'AbortError');
+    });
+  }
+
+  function enqueueUpload(assetId: string, signal?: AbortSignal): Promise<void> {
+    const previous = uploadQueues.get(assetId) ?? Promise.resolve();
+    const task = previous.catch(() => {}).then(async () => {
+      abortIfNeeded(signal);
+      const snapshot = await local.getAssetSnapshot(assetId);
+      if (!snapshot) throw new Error('Private Pro attachment is unavailable locally.');
+      const { manifest, manifestHash, bytes } = await manifestFromAsset(uid, snapshot.asset, snapshot.contentGeneration);
+      try {
+        for (const kind of ['original', 'thumb256'] as const) {
+          await currentGeneration(assetId, snapshot.contentGeneration, signal);
+          const object = kind === 'original' ? manifest.objects.original : manifest.objects.thumb256;
+          if (!object) continue;
+          await storage.uploadBytesResumable(objectPath(uid, assetId, kind), bytes.get(kind)!, {
+            contentType: object.mimeType, customMetadata: { uid, assetId, kind, sha256: object.sha256 },
+          }, signal);
+          await currentGeneration(assetId, snapshot.contentGeneration, signal);
+        }
+      } catch (error) {
+        storageError(error);
+      }
+      if (!await local.putManifestIfCurrent(assetId, snapshot.contentGeneration, manifest, manifestHash))
+        throw new PrivateProSyncTransportError('offline');
+      transport.wake();
+    });
+    uploadQueues.set(assetId, task);
+    task.finally(() => { if (uploadQueues.get(assetId) === task) uploadQueues.delete(assetId); }).catch(() => {});
+    return task;
+  }
 
   async function verifiedObject(manifest: PrivateProAssetManifest, kind: PrivateProAssetObjectKind, signal?: AbortSignal): Promise<Uint8Array> {
     if (manifest.uid !== uid) throw new TypeError('Private Pro asset manifest identity is invalid.');
@@ -168,33 +206,15 @@ export function createPrivateProAssetClient(
 
   return {
     async ensureUploaded(assetIds, signal) {
-      for (const assetId of new Set(assetIds)) {
-        abortIfNeeded(signal);
-        const snapshot = await local.getAssetSnapshot(assetId);
-        if (!snapshot) throw new Error('Private Pro attachment is unavailable locally.');
-        const { manifest, manifestHash, bytes } = await manifestFromAsset(uid, snapshot.asset, snapshot.contentGeneration);
-        try {
-          for (const kind of ['original', 'thumb256'] as const) {
-            const object = kind === 'original' ? manifest.objects.original : manifest.objects.thumb256;
-            if (!object) continue;
-            await storage.uploadBytesResumable(objectPath(uid, assetId, kind), bytes.get(kind)!, {
-              contentType: object.mimeType, customMetadata: { uid, assetId, kind, sha256: object.sha256 },
-            }, signal);
-          }
-        } catch (error) {
-          storageError(error);
-        }
-        if (!await local.putManifestIfCurrent(assetId, snapshot.contentGeneration, manifest, manifestHash))
-          throw new PrivateProSyncTransportError('offline');
-        transport.wake();
-      }
+      await Promise.all([...new Set(assetIds)].map(assetId => enqueueUpload(assetId, signal)));
     },
 
     async hydrate(assetIds, signal) {
       for (const assetId of new Set(assetIds)) {
         abortIfNeeded(signal);
-        if (await local.getAsset(assetId)) continue;
-        const manifest = PrivateProAssetManifestSchema.parse(await local.getManifest(assetId));
+        const snapshot = await local.getHydrationSnapshot(assetId);
+        if (!snapshot || snapshot.hasLocalAsset) continue;
+        const manifest = PrivateProAssetManifestSchema.parse(snapshot.manifest);
         if (manifest.uid !== uid || manifest.assetId !== assetId) throw new TypeError('Private Pro asset manifest identity is invalid.');
         const original = await verifiedObject(manifest, 'original', signal);
         const thumb = manifest.objects.thumb256 ? await verifiedObject(manifest, 'thumb256', signal) : undefined;
@@ -212,8 +232,7 @@ export function createPrivateProAssetClient(
           cache: thumb && manifest.objects.thumb256 ? { thumb256: { mimeType: manifest.objects.thumb256.mimeType, base64: bytesBase64(thumb) } } : {},
         } as DBlobDBAsset;
         abortIfNeeded(signal);
-        const payload = privateProCanonicalJson(manifest);
-        await local.putHydratedAsset(value, manifest, await privateProContentHash(payload));
+        await local.putHydratedAssetIfCurrent(value, snapshot);
       }
     },
 

@@ -118,3 +118,34 @@ None.
 ### Concerns
 
 None.
+
+## Fix round 2
+
+### Findings addressed
+
+- Active DBlob mutations now register the activation AbortSignal with the live Dexie transaction. A UID switch calls `transaction.abort()` while the request is active, so creating, updating, deleting, GC, and clear operations roll back instead of relying on a post-commit check. Remote hydration uses the local port without an activation guard and is not aborted by account delegation changes.
+- Direct uploads are serialized per asset ID with rejection recovery. Every object boundary rechecks the current content generation, and superseded work aborts before another fixed object or manifest publication. The next queued ensure overwrites all fixed objects before publishing its manifest.
+- Hydration snapshots manifest, published generation/hash, current generation, and local-asset presence. The final local write is an atomic compare-and-set and discards downloads when local content or manifest identity changed.
+- Asset serializer notification queues recover after rejected list/capture work. The failed notification promise rejects to its caller, while the next notification continues from a recovered queue and emits the correct delta without an unhandled rejection.
+
+### RED evidence
+
+- New fixed-path serialization, abort recovery, hydration CAS, and serializer queue tests failed against the previous client/serializer behavior.
+- Dexie hook regressions were added for creating, updating, deleting, GC, and clear, and require `staleCommitted=false` after activation switches inside the request.
+
+### GREEN evidence
+
+- Final DBlob, asset, DB, outbound, serializer, and engine suites: 115 tests, 5 suites, 115 passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for modified asset, sync, and DBlob source: exit 0.
+- `git diff --check`: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- Upload queues are scoped per client and asset ID, clean themselves only when still current, and recover from rejection.
+- Hydration compare-and-set does not use the active DBlob activation signal.
+- Serializer subscription errors are observable through the notification promise and do not poison later notifications.
+
+### Concerns
+
+None.

@@ -185,3 +185,31 @@ test('routes DBlob GC through canonical delete', async () => {
   assert.equal(await port.getAsset(asset.id), undefined);
   assert.equal(paths.length, 2);
 });
+
+for (const operation of ['put', 'update', 'delete', 'gc', 'clear'] as const) {
+  test(`rolls back ${operation} when activation switches inside the Dexie request`, async () => {
+    const dbModule = await dbModulePromise;
+    const asset = imageAsset(`asset-hook-${operation}`);
+    const portA = createPrivateProAssetLocalPort('uid-a', syncDB);
+    const portB = createPrivateProAssetLocalPort('uid-b', syncDB);
+    await portA.clear();
+    if (operation !== 'put') await portA.putAsset(asset);
+    const event = operation === 'put' ? 'creating' : operation === 'update' ? 'updating' : 'deleting';
+    const hook = () => activatePrivateProAssetPersistence('uid-b', portB);
+    syncDB.assets.hook(event).subscribe(hook);
+    activatePrivateProAssetPersistence('uid-a', portA);
+    const pending = operation === 'put' ? dbModule.putDBAsset(asset)
+      : operation === 'update' ? dbModule.transferDBAssetContextScope(asset.id, 'global', 'app-draw')
+        : operation === 'delete' ? dbModule.deleteDBAsset(asset.id)
+          : operation === 'gc' ? dbModule.gcDBAssetsByScope('global', 'app-chat', null, [])
+            : dbModule.clearPrivateProPlaintextDBlobPersistence();
+
+    await assert.rejects(pending);
+    syncDB.assets.hook(event).unsubscribe(hook);
+    const staleCommitted = operation === 'put' ? !!await portA.getAsset(asset.id)
+      : operation === 'update' ? (await portA.getAsset(asset.id))?.scopeId === 'app-draw'
+        : operation === 'clear' ? !await portA.getAsset(asset.id)
+          : !await portA.getAsset(asset.id);
+    assert.equal(staleCommitted, false);
+  });
+}

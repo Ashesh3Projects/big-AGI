@@ -59,7 +59,11 @@ export function createPrivateProAssetSerializer(uid: string, local: PrivateProAs
         mutations.forEach(listener);
       };
       let queue = local.listManifests().then(manifests => { previous = new Map(manifests.map(manifest => [manifest.assetId, JSON.stringify(manifest)])); });
-      const unsubscribe = local.subscribe(() => queue = queue.then(capture));
+      const unsubscribe = local.subscribe(() => {
+        const notification = queue.catch(() => {}).then(capture);
+        queue = notification;
+        return notification;
+      });
       return () => { stopped = true; unsubscribe(); };
     },
   };

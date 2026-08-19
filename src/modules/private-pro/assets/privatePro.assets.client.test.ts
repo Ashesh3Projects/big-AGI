@@ -138,6 +138,7 @@ describe('Private Pro direct assets', () => {
     storage.uploadBytesResumable = async (...args) => { await gate; return upload(...args); };
 
     const uploading = client.ensureUploaded([asset.id]);
+    await new Promise(resolve => setImmediate(resolve));
     await local.putAsset({ ...asset, label: 'edited during upload' });
     release();
     await assert.rejects(uploading);
@@ -156,15 +157,62 @@ describe('Private Pro direct assets', () => {
     let calls = 0;
     storage.uploadBytesResumable = async (...args) => { if (calls++ === 0) await gate; return upload(...args); };
     const oldUpload = client.ensureUploaded([asset.id]);
+    await new Promise(resolve => setImmediate(resolve));
     await local.putAsset({ ...asset, label: 'newer' });
     storage.uploadBytesResumable = upload;
-    await client.ensureUploaded([asset.id]);
-    const newer = await local.getManifest(asset.id);
+    const newerUpload = client.ensureUploaded([asset.id]);
     release();
     await assert.rejects(oldUpload);
+    await newerUpload;
+    const newer = await local.getManifest(asset.id);
 
     assert.equal((await local.getManifest(asset.id))?.contentGeneration, 2);
     assert.deepEqual(await local.getManifest(asset.id), newer);
+  });
+
+  test('serializes fixed-path uploads so a newer ensure leaves new bytes and manifest', async (t) => {
+    const { client, local, storage } = harness(t);
+    const oldAsset = fixture('asset-serialized', false);
+    await local.putAsset(oldAsset);
+    let release!: () => void;
+    let started!: () => void;
+    const startedPromise = new Promise<void>(resolve => { started = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const upload = storage.uploadBytesResumable.bind(storage);
+    let first = true;
+    storage.uploadBytesResumable = async (...args) => {
+      if (first) { first = false; started(); await gate; }
+      return upload(...args);
+    };
+    const oldEnsure = client.ensureUploaded([oldAsset.id]);
+    await startedPromise;
+    const newAsset = { ...oldAsset, label: 'new', data: { ...oldAsset.data, base64: base64(bytes('new original bytes')) } };
+    await local.putAsset(newAsset);
+    const newEnsure = client.ensureUploaded([oldAsset.id]);
+    release();
+    await assert.rejects(oldEnsure);
+    await newEnsure;
+
+    assert.equal(new TextDecoder().decode(storage.objects.get(`users/${UID}/workspace-v1/assets/${oldAsset.id}/original`)!.bytes), 'new original bytes');
+    assert.equal((await local.getManifest(oldAsset.id))?.contentGeneration, 2);
+  });
+
+  test('an aborted upload queue does not poison a later ensure', async (t) => {
+    const { client, local, storage } = harness(t);
+    const asset = fixture('asset-abort-queue', false);
+    await local.putAsset(asset);
+    const controller = new AbortController();
+    storage.uploadBytesResumable = async (_path, _bytes, _metadata, signal) => new Promise<void>((_resolve, reject) => {
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    });
+    const aborted = client.ensureUploaded([asset.id], controller.signal);
+    controller.abort();
+    await assert.rejects(aborted, { name: 'AbortError' });
+    storage.uploadBytesResumable = FakeStorage.prototype.uploadBytesResumable.bind(storage);
+
+    await client.ensureUploaded([asset.id]);
+
+    assert.equal((await local.getManifest(asset.id))?.contentGeneration, 1);
   });
 
   test('rejects an oversized manifest before any Storage call', async (t) => {
@@ -205,6 +253,26 @@ describe('Private Pro direct assets', () => {
     assert.ok((await source.local.getAsset(asset.id))?.createdAt instanceof Date);
   });
 
+  test('does not overwrite a concurrent local edit when hydration finishes', async (t) => {
+    const source = harness(t);
+    const asset = fixture('asset-hydrate-cas', false);
+    await source.local.putAsset(asset);
+    await source.client.ensureUploaded([asset.id]);
+    await source.local.deleteAsset(asset.id);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const getBytes = source.storage.getBytes.bind(source.storage);
+    source.storage.getBytes = async path => { await gate; return getBytes(path); };
+    const hydrating = source.client.hydrate([asset.id]);
+    const edited = { ...asset, label: 'local edit', data: { ...asset.data, base64: base64(bytes('local new')) } };
+    await source.local.putAsset(edited);
+    release();
+    await hydrating;
+
+    assert.deepEqual(await source.local.getAsset(asset.id), edited);
+    assert.equal((await source.local.getAssetState(asset.id))?.contentGeneration, 2);
+  });
+
   test('rejects a cross-account manifest without reading any object', async (t) => {
     const { client, local, storage } = harness(t);
     const manifest = {
@@ -224,7 +292,7 @@ describe('Private Pro direct assets', () => {
       objects: { original: { objectId: 'original', kind: 'original', mimeType: 'image/png', byteSize: 1, sha256: 'a'.repeat(64) } },
     } as PrivateProAssetManifest;
     await assert.rejects(local.putManifest(manifest), /manifest identity/i);
-    await assert.rejects(client.hydrate([manifest.assetId]));
+    await client.hydrate([manifest.assetId]);
     assert.equal(storage.objects.size, 0);
   });
 

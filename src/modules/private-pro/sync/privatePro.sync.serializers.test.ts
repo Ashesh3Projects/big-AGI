@@ -92,6 +92,29 @@ describe('Private Pro sync serializers', () => {
       projectionKey: 'asset-1', referencedAssetIds: ['asset-1'],
     });
   });
+
+  test('recovers the asset subscription queue after a transient list failure', async () => {
+    const manifest = {
+      formatVersion: 1, schemaVersion: 1, uid: 'uid-a', assetId: 'asset-recovery', contentGeneration: 1, assetType: 'image', contextId: 'global', scopeId: 'app-chat',
+      label: 'asset', origin: { ot: 'user', source: 'attachment', media: 'file-open' }, createdAt: '2026-08-19T00:00:00.000Z', updatedAt: '2026-08-19T00:00:00.000Z',
+      metadata: { width: 1, height: 1 }, objects: { original: { objectId: 'original', kind: 'original', mimeType: 'image/png', byteSize: 1, sha256: 'a'.repeat(64) } },
+    } as PrivateProAssetManifest;
+    let listener!: () => Promise<void> | void;
+    let calls = 0;
+    const local = {
+      listManifests: async () => { if (calls++ === 1) throw new Error('transient'); return calls >= 3 ? [manifest] : []; },
+      putManifest: async () => {}, deleteManifest: async () => {}, subscribe: (value: () => Promise<void> | void) => { listener = value; return () => {}; },
+    } as unknown as PrivateProAssetLocalPort;
+    const serializer = createPrivateProAssetSerializer('uid-a', local);
+    const mutations: PrivateProSyncLocalMutation[] = [];
+    serializer.subscribe(mutation => mutations.push(mutation));
+    await new Promise(resolve => setImmediate(resolve));
+
+    await assert.rejects(Promise.resolve(listener()));
+    await listener();
+
+    assert.deepEqual(mutations.map(mutation => mutation.kind === 'put' ? mutation.record.logicalId : mutation.logicalId), ['asset-recovery']);
+  });
   test('derives trusted projection metadata after validating remote values', async () => {
     const serializer = createPrivateProSyncSerializers().find(candidate => candidate.recordType === 'chat-message');
     if (!serializer) assert.fail('Expected the chat message serializer.');
