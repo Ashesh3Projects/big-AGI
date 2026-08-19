@@ -6,6 +6,7 @@ import Dexie from 'dexie';
 
 import { DBlobAssetType, DBlobMimeType, type DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import { PrivateProSyncDB } from '../sync/privatePro.sync.db';
+import { PrivateProSyncTransportError } from '../sync/privatePro.sync.transport';
 import {
   createPrivateProAssetClient,
   type PrivateProAssetStorageMetadata,
@@ -127,6 +128,66 @@ describe('Private Pro direct assets', () => {
     ]);
   });
 
+  test('does not publish an uploaded manifest when content changes during upload', async (t) => {
+    const { client, local, storage } = harness(t);
+    const asset = fixture('asset-edit-upload', false);
+    await local.putAsset(asset);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const upload = storage.uploadBytesResumable.bind(storage);
+    storage.uploadBytesResumable = async (...args) => { await gate; return upload(...args); };
+
+    const uploading = client.ensureUploaded([asset.id]);
+    await local.putAsset({ ...asset, label: 'edited during upload' });
+    release();
+    await assert.rejects(uploading);
+
+    assert.equal(await local.getManifest(asset.id), undefined);
+    assert.equal((await local.getAssetState(asset.id))?.contentGeneration, 2);
+  });
+
+  test('does not overwrite a newer published manifest when an older upload finishes late', async (t) => {
+    const { client, local, storage } = harness(t);
+    const asset = fixture('asset-late-manifest', false);
+    await local.putAsset(asset);
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const upload = storage.uploadBytesResumable.bind(storage);
+    let calls = 0;
+    storage.uploadBytesResumable = async (...args) => { if (calls++ === 0) await gate; return upload(...args); };
+    const oldUpload = client.ensureUploaded([asset.id]);
+    await local.putAsset({ ...asset, label: 'newer' });
+    storage.uploadBytesResumable = upload;
+    await client.ensureUploaded([asset.id]);
+    const newer = await local.getManifest(asset.id);
+    release();
+    await assert.rejects(oldUpload);
+
+    assert.equal((await local.getManifest(asset.id))?.contentGeneration, 2);
+    assert.deepEqual(await local.getManifest(asset.id), newer);
+  });
+
+  test('rejects an oversized manifest before any Storage call', async (t) => {
+    const { client, local, storage } = harness(t);
+    const asset = { ...fixture('asset-oversized', false), label: 'x'.repeat(513) };
+    await local.putAsset(asset);
+
+    await assert.rejects(client.ensureUploaded([asset.id]), /too|length|large/i);
+
+    assert.equal(storage.uploads.length, 0);
+  });
+
+  for (const [code, category] of [['storage/unauthorized', 'permission'], ['storage/quota-exceeded', 'quota'], ['storage/resource-exhausted', 'quota']] as const) {
+    test(`maps ${code} to ${category}`, async (t) => {
+      const { client, local, storage } = harness(t);
+      const asset = fixture(`asset-${category}-${code}`, false);
+      await local.putAsset(asset);
+      storage.uploadBytesResumable = async () => { throw Object.assign(new Error('storage failed'), { code }); };
+
+      await assert.rejects(client.ensureUploaded([asset.id]), error => error instanceof PrivateProSyncTransportError && error.category === category);
+    });
+  }
+
   test('hydrates exact DBlob values after validating metadata, hash, size, MIME, and UID', async (t) => {
     const source = harness(t);
     const asset = fixture('asset-hydrate');
@@ -151,6 +212,7 @@ describe('Private Pro direct assets', () => {
       schemaVersion: 1,
       uid: 'uid-b',
       assetId: 'asset-cross-account',
+      contentGeneration: 1,
       assetType: 'image',
       contextId: 'global',
       scopeId: 'app-chat',

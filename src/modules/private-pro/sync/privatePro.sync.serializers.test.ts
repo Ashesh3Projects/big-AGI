@@ -74,7 +74,7 @@ afterEach(resetChat);
 describe('Private Pro sync serializers', () => {
   test('snapshots validated UID-local asset manifests with asset projection identity', async () => {
     const manifest = {
-      formatVersion: 1, schemaVersion: 1, uid: 'uid-a', assetId: 'asset-1', assetType: 'image', contextId: 'global', scopeId: 'app-chat',
+      formatVersion: 1, schemaVersion: 1, uid: 'uid-a', assetId: 'asset-1', contentGeneration: 1, assetType: 'image', contextId: 'global', scopeId: 'app-chat',
       label: 'asset', origin: { ot: 'user', source: 'attachment', media: 'file-open' }, createdAt: '2026-08-19T00:00:00.000Z', updatedAt: '2026-08-19T00:00:00.000Z',
       metadata: { width: 1, height: 1 }, objects: { original: { objectId: 'original', kind: 'original', mimeType: 'image/png', byteSize: 1, sha256: 'a'.repeat(64) } },
     } as PrivateProAssetManifest;

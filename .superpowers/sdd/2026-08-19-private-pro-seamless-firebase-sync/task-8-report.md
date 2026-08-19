@@ -81,3 +81,40 @@ GREEN:
 ## Concerns
 
 None.
+
+## Fix round 1
+
+### Findings addressed
+
+- All active DBlob reads, writes, updates, deletes, clear, queries, and GC now route through one activation lease. Account switches abort the lease, and local-port Dexie transactions recheck it before committing so stale UID operations reject with `AbortError` without mutating the old namespace.
+- Asset rows now carry monotonic `contentGeneration`, `publishedContentGeneration`, and `publishedManifestHash`. User writes increment generation and clear publication identity. Hydration preserves the remote generation without emitting a user mutation.
+- Upload snapshots exact asset content and generation, validates and bounds the manifest before Storage, uploads deterministic objects, then atomically publishes only if the generation is still current. Late uploads cannot overwrite newer content or manifests.
+- Asset readiness now requires a current published manifest/hash, no asset outbox row, a matching live local sync content hash, and the matching acknowledged remote revision. Synthetic acknowledgement updates the same durable state used by readiness.
+- Active persistence registration accepts the canonical asset delete callback. DBlob delete and GC remove the manifest first, enqueue the serializer tombstone, remove local bytes, then attempt both fixed Storage objects without recursion.
+- Firebase Storage errors are converted at the client boundary to fixed sync categories. Permission and quota failures block outbound rows, while aborts and schema errors preserve their original types.
+- Manifest strings, parameter depth/count/key/value sizes, tag count, and overall canonical sync payload are bounded before any Storage operation.
+
+### RED evidence
+
+- DBlob/asset/DB RED suite: 11 failures, 40 passed, exit 1. Failures covered delayed UID read/write/update/delete/GC races, edit-during-upload publication, oversized pre-upload validation, Storage category mapping, and current-manifest readiness.
+- Additional canonical delete and GC tests initially exposed shared test data in the UID namespace, then passed after isolating the target asset.
+
+### GREEN evidence
+
+- Final DBlob, asset, DB, outbound, serializer, and engine suites: 106 tests, 5 suites, 106 passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for modified asset, sync, and DBlob source: exit 0.
+- `git diff --check`: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- Open-build Dexie branches remain unchanged when no Private Pro asset activation exists.
+- Local content changes cannot reuse an old remote revision or manifest hash.
+- Blocked, pending, or delete asset outbox rows all keep references unready.
+- Storage cleanup errors expose only sanitized client errors and never object paths or content.
+- Background hydration and exact deterministic Storage paths remain intact.
+- The 60-second normal outbox window and fenced leases remain unchanged.
+
+### Concerns
+
+None.

@@ -490,6 +490,30 @@ describe('Private Pro seamless sync outbound', () => {
     assert.deepEqual(statuses, ['permission']);
   });
 
+  test('durably blocks an asset quota failure and reports quota', async (t) => {
+    const name = `private-pro-sync-outbound-asset-quota-${crypto.randomUUID()}`;
+    const db = new PrivateProSyncDB(name);
+    const clock = new ManualClock();
+    const coordinator = new FakeCoordinator();
+    const statuses: string[] = [];
+    const outbound = createPrivateProSyncOutbound({
+      uid: UID, writerId: WRITER_ID, serializers: [new FakeSerializer()], db, coordinator, transport: new FakeTransport(),
+      assets: { ensureUploaded: async () => { throw new PrivateProSyncTransportError('quota'); } },
+      now: clock.now, setTimeout: clock.setTimeout, clearTimeout: clock.clearTimeout, onStatus: status => statuses.push(status.category),
+    });
+    t.after(async () => { await outbound.stop(); db.close(); await Dexie.delete(name); });
+    await outbound.start();
+    const pending = await outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'asset' }, referencedAssetIds: ['asset-1'],
+    } });
+
+    await clock.advance(60_000);
+
+    assert.equal((await db.getOutbox(UID, pending.recordKey))?.blocked, true);
+    assert.deepEqual(statuses, ['quota']);
+  });
+
   test('does not report a stale permission failure after a newer generation is captured', async (t) => {
     const { outbound, transport, clock, db, statuses } = createHarness(t);
     const write = deferred<PrivateProSyncWriteResult>();
@@ -684,7 +708,20 @@ describe('Private Pro seamless sync outbound', () => {
       recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
       value: { value: 'asset' }, referencedAssetIds: ['asset-1'],
     } });
-    await db.remoteBases.put({ uid: UID, recordKey: privateProRecordKey('asset', 'asset-1'), revision: 1, mutationId: 'asset-ready', deleted: false });
+    const assetKey = privateProRecordKey('asset', 'asset-1');
+    await db.assets.put({
+      uid: UID, assetId: 'asset-1', contentGeneration: 1, publishedContentGeneration: 1, publishedManifestHash: 'a'.repeat(64),
+      manifest: {
+        formatVersion: 1, schemaVersion: 1, uid: UID, assetId: 'asset-1', contentGeneration: 1, assetType: 'image', contextId: 'global', scopeId: 'app-chat',
+        label: 'asset', origin: { ot: 'user', source: 'attachment', media: 'file-open' }, createdAt: '2026-08-19T00:00:00.000Z', updatedAt: '2026-08-19T00:00:00.000Z',
+        metadata: { width: 1, height: 1 }, objects: { original: { objectId: 'original', kind: 'original', mimeType: 'image/png', byteSize: 1, sha256: 'b'.repeat(64) } },
+      }, uploadStatus: 'ready', hydrationStatus: 'ready', updatedAtMs: 1,
+    });
+    await db.localRecords.put({
+      uid: UID, recordKey: assetKey, recordType: 'asset', logicalId: 'asset-1', projectionKey: 'asset-1', schemaVersion: 1,
+      payload: '{}', contentHash: 'a'.repeat(64), referencedAssetIds: ['asset-1'], generation: 1, baseRevision: 1, deleted: false, updatedAtMs: 1,
+    });
+    await db.remoteBases.put({ uid: UID, recordKey: assetKey, revision: 1, mutationId: 'asset-ready', deleted: false });
     await clock.advance(60_000);
     assert.deepEqual(assetCalls, [['asset-1']]);
 

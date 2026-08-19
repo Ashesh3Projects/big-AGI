@@ -3,36 +3,44 @@ import { z } from 'zod/v4';
 
 const Sha256Schema = z.string().regex(/^[a-f0-9]{64}$/);
 const ISODateSchema = z.iso.datetime({ offset: true });
+const ShortStringSchema = z.string().max(512);
+const LongStringSchema = z.string().max(16_384);
+const ParameterKeySchema = z.string().min(1).max(128);
 
-const JsonValueSchema: z.ZodType<unknown> = z.lazy(() => z.union([
-  z.null(), z.boolean(), z.number().finite(), z.string(),
-  z.array(JsonValueSchema), z.record(z.string(), JsonValueSchema),
-]));
+function parameterSchema(depth: number): z.ZodType<unknown> {
+  if (depth >= 5) return z.union([z.null(), z.boolean(), z.number().finite(), LongStringSchema]);
+  const child = parameterSchema(depth + 1);
+  return z.union([
+    z.null(), z.boolean(), z.number().finite(), LongStringSchema,
+    z.array(child).max(64), z.record(ParameterKeySchema, child).refine(value => Object.keys(value).length <= 64),
+  ]);
+}
+const JsonValueSchema = parameterSchema(0);
 
 const UserOriginSchema = z.strictObject({
   ot: z.literal('user'),
   source: z.literal('attachment'),
-  media: z.string(),
-  url: z.string().optional(),
-  fileName: z.string().optional(),
+  media: ShortStringSchema,
+  url: LongStringSchema.optional(),
+  fileName: ShortStringSchema.optional(),
 });
 
 const GeneratedOriginSchema = z.strictObject({
   ot: z.literal('generated'),
   source: z.literal('ai-text-to-image'),
-  generatorName: z.string(),
-  prompt: z.string(),
-  parameters: z.record(z.string(), JsonValueSchema),
-  generatedAt: z.string().optional(),
+  generatorName: ShortStringSchema,
+  prompt: LongStringSchema,
+  parameters: z.record(ParameterKeySchema, JsonValueSchema).refine(value => Object.keys(value).length <= 64),
+  generatedAt: ShortStringSchema.optional(),
 });
 
 const ImageMetadataSchema = z.strictObject({
   width: z.number().finite().nonnegative(),
   height: z.number().finite().nonnegative(),
-  averageColor: z.string().optional(),
-  author: z.string().optional(),
-  tags: z.array(z.string()).optional(),
-  description: z.string().optional(),
+  averageColor: ShortStringSchema.optional(),
+  author: ShortStringSchema.optional(),
+  tags: z.array(ShortStringSchema).max(64).optional(),
+  description: LongStringSchema.optional(),
 });
 
 const AudioMetadataSchema = z.strictObject({
@@ -58,9 +66,10 @@ const ManifestCommonSchema = z.strictObject({
   schemaVersion: z.literal(1),
   uid: z.string().min(1),
   assetId: z.string().min(1),
+  contentGeneration: z.number().int().positive(),
   contextId: z.literal('global'),
   scopeId: z.enum(['app-chat', 'app-draw', 'attachment-drafts']),
-  label: z.string(),
+  label: ShortStringSchema,
   origin: z.union([UserOriginSchema, GeneratedOriginSchema]),
   createdAt: ISODateSchema,
   updatedAt: ISODateSchema,

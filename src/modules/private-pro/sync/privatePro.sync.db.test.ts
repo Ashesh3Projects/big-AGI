@@ -390,8 +390,55 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(await db.referencedAssetsReady(UID_A, row.referencedAssetIds), false);
     await db.deferLease(UID_A, row.recordKey, row.generation, lease.leaseToken, lease.leaseFence, 62_000);
     assert.equal((await db.getOutbox(UID_A, row.recordKey))?.dueAtMs, 62_000);
+    await db.assets.put({
+      uid: UID_A, assetId: 'asset-1', contentGeneration: 1, publishedContentGeneration: 1, publishedManifestHash: 'a'.repeat(64),
+      manifest: {
+        formatVersion: 1, schemaVersion: 1, uid: UID_A, assetId: 'asset-1', contentGeneration: 1, assetType: 'image', contextId: 'global', scopeId: 'app-chat',
+        label: 'asset', origin: { ot: 'user', source: 'attachment', media: 'file-open' }, createdAt: '2026-08-19T00:00:00.000Z', updatedAt: '2026-08-19T00:00:00.000Z',
+        metadata: { width: 1, height: 1 }, objects: { original: { objectId: 'original', kind: 'original', mimeType: 'image/png', byteSize: 1, sha256: 'b'.repeat(64) } },
+      },
+      uploadStatus: 'ready', hydrationStatus: 'ready', updatedAtMs: 1,
+    });
+    await db.localRecords.put({
+      uid: UID_A, recordKey: referenced, recordType: 'asset', logicalId: 'asset-1', projectionKey: 'asset-1', schemaVersion: 1,
+      payload: '{}', contentHash: 'a'.repeat(64), referencedAssetIds: ['asset-1'], generation: 1, baseRevision: 1, deleted: false, updatedAtMs: 1,
+    });
     await db.remoteBases.put({ uid: UID_A, recordKey: referenced, revision: 1, mutationId: 'asset-put', deleted: false });
     assert.equal(await db.referencedAssetsReady(UID_A, row.referencedAssetIds), true);
+
+    await db.outbox.put({
+      uid: UID_A, recordKey: referenced, recordType: 'asset', logicalId: 'asset-1', projectionKey: 'asset-1', schemaVersion: 1,
+      kind: 'put', payload: '{}', contentHash: 'a'.repeat(64), referencedAssetIds: ['asset-1'], mutationId: 'pending-asset', generation: 2,
+      baseRevision: 1, dueAtMs: 120_000, retryAttempt: 0, leaseUntilMs: null, leaseToken: null, leaseFence: null, leasedGeneration: null, blocked: false, errorCode: null,
+    });
+    assert.equal(await db.referencedAssetsReady(UID_A, row.referencedAssetIds), false);
+    await db.outbox.delete([UID_A, referenced]);
+    await db.assets.update([UID_A, 'asset-1'], { contentGeneration: 2, publishedContentGeneration: undefined, publishedManifestHash: undefined });
+    assert.equal(await db.referencedAssetsReady(UID_A, row.referencedAssetIds), false);
+  });
+
+  test('synthetic acknowledgement makes only the current published asset ready', async (t) => {
+    const db = createDB(t);
+    const assetId = 'asset-synthetic-ready';
+    const recordKey = privateProRecordKey('asset', assetId);
+    await db.assets.put({
+      uid: UID_A, assetId, contentGeneration: 1, publishedContentGeneration: 1, publishedManifestHash: 'c'.repeat(64),
+      manifest: {
+        formatVersion: 1, schemaVersion: 1, uid: UID_A, assetId, contentGeneration: 1, assetType: 'image', contextId: 'global', scopeId: 'app-chat',
+        label: 'asset', origin: { ot: 'user', source: 'attachment', media: 'file-open' }, createdAt: '2026-08-19T00:00:00.000Z', updatedAt: '2026-08-19T00:00:00.000Z',
+        metadata: { width: 1, height: 1 }, objects: { original: { objectId: 'original', kind: 'original', mimeType: 'image/png', byteSize: 1, sha256: 'd'.repeat(64) } },
+      }, uploadStatus: 'ready', hydrationStatus: 'ready', updatedAtMs: 1,
+    });
+    const pending = await db.recordLocalPut(UID_A, {
+      recordType: 'asset', logicalId: assetId, recordKey, projectionKey: assetId, schemaVersion: 1,
+      payload: '{}', contentHash: 'c'.repeat(64), referencedAssetIds: [assetId],
+    }, 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected asset lease.');
+
+    await db.acknowledge(UID_A, recordKey, pending.generation, lease.leaseToken, lease.leaseFence, { revision: 1, mutationId: pending.mutationId, deleted: false }, 61_000);
+
+    assert.equal(await db.referencedAssetsReady(UID_A, [assetId]), true);
   });
 
   test('reports the later of due time and active lease expiry', async (t) => {

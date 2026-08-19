@@ -2,7 +2,9 @@ import { deleteObject, getBytes, getMetadata, ref, uploadBytesResumable, type Fu
 
 import type { DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import { getPrivateProClientStorage } from '../firebase/firebase.client';
-import type { PrivateProAssetLocalPort } from './privatePro.assets.local';
+import { assertPrivateProPayloadSize, privateProCanonicalJson, privateProContentHash } from '../sync/privatePro.sync.codec';
+import { PrivateProSyncTransportError } from '../sync/privatePro.sync.transport';
+import type { PrivateProAssetActivationGuard, PrivateProAssetLocalPort } from './privatePro.assets.local';
 import {
   PrivateProAssetManifestSchema,
   PrivateProAssetStorageCustomMetadataSchema,
@@ -30,7 +32,7 @@ export interface PrivateProAssetManifestTransport {
 export interface PrivateProAssetClient {
   ensureUploaded(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
   hydrate(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
-  delete(assetId: string): Promise<void>;
+  delete(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
   clearLocal(): Promise<void>;
 }
 
@@ -103,26 +105,37 @@ async function objectManifest(kind: PrivateProAssetObjectKind, mimeType: string,
   return { objectId: kind, kind, mimeType, byteSize: bytes.byteLength, sha256: await sha256(bytes) } as const;
 }
 
-async function manifestFromAsset(uid: string, asset: DBlobDBAsset): Promise<{ manifest: PrivateProAssetManifest; bytes: Map<PrivateProAssetObjectKind, Uint8Array> }> {
+async function manifestFromAsset(uid: string, asset: DBlobDBAsset, contentGeneration: number): Promise<{ manifest: PrivateProAssetManifest; manifestHash: string; bytes: Map<PrivateProAssetObjectKind, Uint8Array> }> {
   const original = base64Bytes(asset.data.base64);
   const objects = new Map<PrivateProAssetObjectKind, Uint8Array>([['original', original]]);
   const originalManifest = await objectManifest('original', asset.data.mimeType, original);
   const common = {
-    formatVersion: 1, schemaVersion: 1, uid, assetId: asset.id, contextId: asset.contextId, scopeId: asset.scopeId,
+    formatVersion: 1, schemaVersion: 1, uid, assetId: asset.id, contentGeneration, contextId: asset.contextId, scopeId: asset.scopeId,
     label: asset.label, origin: structuredClone(asset.origin), createdAt: asset.createdAt.toISOString(), updatedAt: asset.updatedAt.toISOString(),
   } as const;
   if (asset.assetType === 'audio') {
-    return { manifest: PrivateProAssetManifestSchema.parse({ ...common, assetType: 'audio', metadata: structuredClone(asset.metadata), objects: { original: originalManifest } }), bytes: objects };
+    const manifest = PrivateProAssetManifestSchema.parse({ ...common, assetType: 'audio', metadata: structuredClone(asset.metadata), objects: { original: originalManifest } });
+    const payload = privateProCanonicalJson(manifest); assertPrivateProPayloadSize(payload);
+    return { manifest, manifestHash: await privateProContentHash(payload), bytes: objects };
   }
   const thumb = asset.cache.thumb256 ? base64Bytes(asset.cache.thumb256.base64) : undefined;
   if (thumb) objects.set('thumb256', thumb);
-  return {
-    manifest: PrivateProAssetManifestSchema.parse({
+  const manifest = PrivateProAssetManifestSchema.parse({
       ...common, assetType: 'image', metadata: structuredClone(asset.metadata),
       objects: { original: originalManifest, ...(thumb && { thumb256: await objectManifest('thumb256', asset.cache.thumb256!.mimeType, thumb) }) },
-    }),
-    bytes: objects,
-  };
+    });
+  const payload = privateProCanonicalJson(manifest); assertPrivateProPayloadSize(payload);
+  return { manifest, manifestHash: await privateProContentHash(payload), bytes: objects };
+}
+
+function storageError(error: unknown): never {
+  if (error instanceof DOMException && error.name === 'AbortError') throw error;
+  if (error instanceof TypeError || error instanceof RangeError || error instanceof PrivateProSyncTransportError) throw error;
+  const code = typeof error === 'object' && error !== null && 'code' in error ? String(error.code) : '';
+  if (code === 'storage/unauthorized' || code === 'storage/unauthenticated') throw new PrivateProSyncTransportError('permission');
+  if (code === 'storage/quota-exceeded' || code === 'storage/resource-exhausted') throw new PrivateProSyncTransportError('quota');
+  if (code === 'storage/retry-limit-exceeded' || code === 'storage/canceled' || code === 'storage/unknown') throw new PrivateProSyncTransportError('offline');
+  throw new PrivateProSyncTransportError('unknown');
 }
 
 export function createPrivateProAssetClient(
@@ -138,7 +151,13 @@ export function createPrivateProAssetClient(
     const object = kind === 'original' ? manifest.objects.original : manifest.objects.thumb256;
     if (!object || object.objectId !== kind || object.kind !== kind) throw new TypeError('Private Pro asset object identity is invalid.');
     const path = objectPath(uid, manifest.assetId, kind);
-    const [metadata, bytes] = await Promise.all([storage.getMetadata(path, signal), storage.getBytes(path, signal)]);
+    let metadata: PrivateProAssetStorageMetadata;
+    let bytes: Uint8Array;
+    try {
+      [metadata, bytes] = await Promise.all([storage.getMetadata(path, signal), storage.getBytes(path, signal)]);
+    } catch (error) {
+      storageError(error);
+    }
     abortIfNeeded(signal);
     const custom = PrivateProAssetStorageCustomMetadataSchema.parse(metadata.customMetadata);
     if (metadata.contentType !== object.mimeType || custom.uid !== uid || custom.assetId !== manifest.assetId || custom.kind !== kind || custom.sha256 !== object.sha256 ||
@@ -151,18 +170,22 @@ export function createPrivateProAssetClient(
     async ensureUploaded(assetIds, signal) {
       for (const assetId of new Set(assetIds)) {
         abortIfNeeded(signal);
-        const asset = await local.getAsset(assetId);
-        if (!asset) throw new Error('Private Pro attachment is unavailable locally.');
-        const { manifest, bytes } = await manifestFromAsset(uid, asset);
-        for (const kind of ['original', 'thumb256'] as const) {
-          const object = kind === 'original' ? manifest.objects.original : manifest.objects.thumb256;
-          if (!object) continue;
-          await storage.uploadBytesResumable(objectPath(uid, assetId, kind), bytes.get(kind)!, {
-            contentType: object.mimeType,
-            customMetadata: { uid, assetId, kind, sha256: object.sha256 },
-          }, signal);
+        const snapshot = await local.getAssetSnapshot(assetId);
+        if (!snapshot) throw new Error('Private Pro attachment is unavailable locally.');
+        const { manifest, manifestHash, bytes } = await manifestFromAsset(uid, snapshot.asset, snapshot.contentGeneration);
+        try {
+          for (const kind of ['original', 'thumb256'] as const) {
+            const object = kind === 'original' ? manifest.objects.original : manifest.objects.thumb256;
+            if (!object) continue;
+            await storage.uploadBytesResumable(objectPath(uid, assetId, kind), bytes.get(kind)!, {
+              contentType: object.mimeType, customMetadata: { uid, assetId, kind, sha256: object.sha256 },
+            }, signal);
+          }
+        } catch (error) {
+          storageError(error);
         }
-        await local.putManifest(manifest);
+        if (!await local.putManifestIfCurrent(assetId, snapshot.contentGeneration, manifest, manifestHash))
+          throw new PrivateProSyncTransportError('offline');
         transport.wake();
       }
     },
@@ -189,20 +212,24 @@ export function createPrivateProAssetClient(
           cache: thumb && manifest.objects.thumb256 ? { thumb256: { mimeType: manifest.objects.thumb256.mimeType, base64: bytesBase64(thumb) } } : {},
         } as DBlobDBAsset;
         abortIfNeeded(signal);
-        await local.putHydratedAsset(value);
+        const payload = privateProCanonicalJson(manifest);
+        await local.putHydratedAsset(value, manifest, await privateProContentHash(payload));
       }
     },
 
-    async delete(assetId) {
-      await local.deleteManifest(assetId);
-      await local.deleteAsset(assetId);
+    async delete(assetId, guard) {
+      await local.deleteManifest(assetId, guard);
+      await local.deleteAsset(assetId, guard);
+      guard?.assertActive();
       transport.wake();
       const outcomes = await Promise.allSettled([
         storage.deleteObject(objectPath(uid, assetId, 'original')),
         storage.deleteObject(objectPath(uid, assetId, 'thumb256')),
       ]);
-      if (outcomes.some(outcome => outcome.status === 'rejected' && !isObjectNotFound(outcome.reason)))
-        throw new Error('Private Pro attachment cleanup failed.');
+      const failed = outcomes.find(outcome => outcome.status === 'rejected' && !isObjectNotFound(outcome.reason));
+      if (failed?.status === 'rejected') {
+        try { storageError(failed.reason); } catch (error) { throw new Error('Private Pro attachment cleanup failed.', { cause: error }); }
+      }
     },
 
     clearLocal: () => local.clear(),

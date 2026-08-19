@@ -1,133 +1,231 @@
 import type { DBlobAssetId, DBlobAssetType, DBlobDBAsset, DBlobDBContextId, DBlobDBScopeId } from '~/modules/dblobs/dblobs.types';
-import type { PrivateProSyncDB } from '../sync/privatePro.sync.db';
+import type { PrivateProSyncAssetState, PrivateProSyncDB } from '../sync/privatePro.sync.db';
 import { PrivateProAssetManifestSchema, type PrivateProAssetManifest } from './privatePro.assets.schemas';
 
 
+export interface PrivateProAssetActivationGuard {
+  readonly signal: AbortSignal;
+  assertActive(): void;
+}
+
+export interface PrivateProAssetSnapshot {
+  asset: DBlobDBAsset;
+  contentGeneration: number;
+}
+
 export interface PrivateProAssetLocalPort {
-  getAsset(assetId: string): Promise<DBlobDBAsset | undefined>;
-  getAssets(assetIds: readonly string[]): Promise<DBlobDBAsset[]>;
-  listAssets(): Promise<DBlobDBAsset[]>;
-  putAsset(asset: DBlobDBAsset): Promise<void>;
-  putHydratedAsset(asset: DBlobDBAsset): Promise<void>;
-  updateAsset(assetId: string, updates: Partial<DBlobDBAsset>): Promise<boolean>;
-  deleteAsset(assetId: string): Promise<void>;
-  clear(): Promise<void>;
-  getManifest(assetId: string): Promise<PrivateProAssetManifest | undefined>;
-  listManifests(): Promise<PrivateProAssetManifest[]>;
-  putManifest(manifest: PrivateProAssetManifest): Promise<void>;
-  deleteManifest(assetId: string): Promise<void>;
+  getAsset(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<DBlobDBAsset | undefined>;
+  getAssetState(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<PrivateProSyncAssetState | undefined>;
+  getAssetSnapshot(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<PrivateProAssetSnapshot | undefined>;
+  getAssets(assetIds: readonly string[], guard?: PrivateProAssetActivationGuard): Promise<DBlobDBAsset[]>;
+  listAssets(guard?: PrivateProAssetActivationGuard): Promise<DBlobDBAsset[]>;
+  putAsset(asset: DBlobDBAsset, guard?: PrivateProAssetActivationGuard): Promise<void>;
+  putHydratedAsset(asset: DBlobDBAsset, manifest: PrivateProAssetManifest, manifestHash: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
+  updateAsset(assetId: string, updates: Partial<DBlobDBAsset>, guard?: PrivateProAssetActivationGuard): Promise<boolean>;
+  deleteAsset(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
+  clear(guard?: PrivateProAssetActivationGuard): Promise<void>;
+  getManifest(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<PrivateProAssetManifest | undefined>;
+  listManifests(guard?: PrivateProAssetActivationGuard): Promise<PrivateProAssetManifest[]>;
+  putManifest(manifest: PrivateProAssetManifest, manifestHash?: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
+  putManifestIfCurrent(assetId: string, contentGeneration: number, manifest: PrivateProAssetManifest, manifestHash: string, guard?: PrivateProAssetActivationGuard): Promise<boolean>;
+  deleteManifest(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
   subscribe(listener: () => Promise<void> | void): () => void;
 }
+
+export type PrivateProAssetDelete = (assetId: string, guard?: PrivateProAssetActivationGuard) => Promise<void>;
 
 interface ActivePrivateProAssetPersistence {
   generation: number;
   uid: string;
   port: PrivateProAssetLocalPort;
+  deleteAsset: PrivateProAssetDelete;
+  controller: AbortController;
 }
 
 let activationGeneration = 0;
 let active: ActivePrivateProAssetPersistence | null = null;
 
-export function activatePrivateProAssetPersistence(uid: string | null, port: PrivateProAssetLocalPort | null): void {
-  activationGeneration++;
-  active = uid && port ? { generation: activationGeneration, uid, port } : null;
+function abortError(): DOMException {
+  return new DOMException('Private Pro asset persistence changed.', 'AbortError');
 }
 
-export function getActivePrivateProAssetPersistence(): ActivePrivateProAssetPersistence | null {
-  return active;
+export function activatePrivateProAssetPersistence(uid: string | null, port: PrivateProAssetLocalPort | null, deleteAsset?: PrivateProAssetDelete): void {
+  active?.controller.abort();
+  activationGeneration++;
+  active = uid && port ? {
+    generation: activationGeneration,
+    uid,
+    port,
+    deleteAsset: deleteAsset ?? ((assetId, guard) => port.deleteAsset(assetId, guard)),
+    controller: new AbortController(),
+  } : null;
 }
 
 export async function runActivePrivateProAssetOperation<T>(
-  operation: (port: PrivateProAssetLocalPort) => Promise<T>,
-): Promise<T | undefined> {
+  operation: (port: PrivateProAssetLocalPort, guard: PrivateProAssetActivationGuard, deleteAsset: PrivateProAssetDelete) => Promise<T>,
+): Promise<{ active: false } | { active: true; value: T }> {
   const selected = active;
-  if (!selected) return undefined;
-  const result = await operation(selected.port);
-  if (active?.generation !== selected.generation || active.uid !== selected.uid)
-    throw new DOMException('Private Pro asset persistence changed.', 'AbortError');
-  return result;
+  if (!selected) return { active: false };
+  const guard: PrivateProAssetActivationGuard = {
+    signal: selected.controller.signal,
+    assertActive() {
+      if (selected.controller.signal.aborted || active !== selected || active.generation !== selected.generation || active.uid !== selected.uid) throw abortError();
+    },
+  };
+  guard.assertActive();
+  const value = await operation(selected.port, guard, selected.deleteAsset);
+  guard.assertActive();
+  return { active: true, value };
+}
+
+function cloneState(state: PrivateProSyncAssetState): PrivateProSyncAssetState {
+  return structuredClone(state);
 }
 
 export function createPrivateProAssetLocalPort(uid: string, db: PrivateProSyncDB): PrivateProAssetLocalPort {
   if (!uid) throw new TypeError('Private Pro asset UID is required.');
   const listeners = new Set<() => Promise<void> | void>();
   const emit = async () => { await Promise.all([...listeners].map(listener => listener())); };
-  const asset = async (assetId: string) => {
-    const state = await db.assets.get([uid, assetId]);
-    return state?.asset ? structuredClone(state.asset) : undefined;
+  const assert = (guard?: PrivateProAssetActivationGuard) => guard?.assertActive();
+  const state = async (assetId: string, guard?: PrivateProAssetActivationGuard) => {
+    assert(guard);
+    const value = await db.assets.get([uid, assetId]);
+    assert(guard);
+    return value ? cloneState(value) : undefined;
   };
-  const writeAsset = async (value: DBlobDBAsset, preserveManifest: boolean) => {
-    const current = await db.assets.get([uid, value.id]);
-    await db.assets.put({
-      uid, assetId: value.id, asset: structuredClone(value), manifest: preserveManifest ? current?.manifest : undefined,
-      uploadStatus: preserveManifest && current?.manifest ? 'remote' : 'pending', hydrationStatus: 'ready', updatedAtMs: Date.now(),
+  const writeUserAsset = async (value: DBlobDBAsset, guard?: PrivateProAssetActivationGuard) => {
+    await db.transaction('rw', db.assets, async () => {
+      assert(guard);
+      const current = await db.assets.get([uid, value.id]);
+      assert(guard);
+      await db.assets.put({
+        uid, assetId: value.id, asset: structuredClone(value), contentGeneration: (current?.contentGeneration ?? 0) + 1,
+        uploadStatus: 'pending', hydrationStatus: 'ready', updatedAtMs: Date.now(),
+      });
     });
     await emit();
   };
   return {
-    getAsset: asset,
-    async getAssets(assetIds) {
-      const values = await Promise.all(assetIds.map(asset));
-      return values.filter((value): value is DBlobDBAsset => !!value);
+    async getAsset(assetId, guard) { return (await state(assetId, guard))?.asset; },
+    getAssetState: state,
+    async getAssetSnapshot(assetId, guard) {
+      const current = await state(assetId, guard);
+      return current?.asset ? { asset: structuredClone(current.asset), contentGeneration: current.contentGeneration } : undefined;
     },
-    async listAssets() {
-      return (await db.assets.where('uid').equals(uid).toArray()).flatMap(state => state.asset ? [structuredClone(state.asset)] : []);
+    async getAssets(assetIds, guard) {
+      const values = await Promise.all(assetIds.map(assetId => state(assetId, guard)));
+      assert(guard);
+      return values.flatMap(value => value?.asset ? [structuredClone(value.asset)] : []);
     },
-    putAsset: value => writeAsset(value, false),
-    putHydratedAsset: value => writeAsset(value, true),
-    async updateAsset(assetId, updates) {
-      const current = await asset(assetId);
-      if (!current) return false;
-      await this.putAsset({ ...current, ...structuredClone(updates) } as DBlobDBAsset);
-      return true;
+    async listAssets(guard) {
+      assert(guard);
+      const values = await db.assets.where('uid').equals(uid).toArray();
+      assert(guard);
+      return values.flatMap(value => value.asset ? [structuredClone(value.asset)] : []);
     },
-    async deleteAsset(assetId) {
-      const current = await db.assets.get([uid, assetId]);
-      if (!current) return;
-      if (current.manifest) await db.assets.put({ ...current, asset: undefined, hydrationStatus: 'missing', updatedAtMs: Date.now() });
-      else await db.assets.delete([uid, assetId]);
-      await emit();
+    putAsset: writeUserAsset,
+    async putHydratedAsset(asset, manifest, manifestHash, guard) {
+      await db.transaction('rw', db.assets, async () => {
+        assert(guard);
+        const current = await db.assets.get([uid, asset.id]);
+        assert(guard);
+        await db.assets.put({
+          uid, assetId: asset.id, asset: structuredClone(asset), manifest: structuredClone(manifest),
+          contentGeneration: manifest.contentGeneration, publishedContentGeneration: manifest.contentGeneration,
+          publishedManifestHash: manifestHash, uploadStatus: 'remote', hydrationStatus: 'ready', updatedAtMs: Date.now(),
+        });
+      });
     },
-    async clear() {
-      await db.assets.where('uid').equals(uid).delete();
-      await emit();
+    async updateAsset(assetId, updates, guard) {
+      let changed = false;
+      await db.transaction('rw', db.assets, async () => {
+        assert(guard);
+        const current = await db.assets.get([uid, assetId]);
+        assert(guard);
+        if (!current?.asset) return;
+        changed = true;
+        await db.assets.put({
+          uid, assetId, asset: { ...current.asset, ...structuredClone(updates) } as DBlobDBAsset,
+          contentGeneration: current.contentGeneration + 1, uploadStatus: 'pending', hydrationStatus: 'ready', updatedAtMs: Date.now(),
+        });
+      });
+      if (changed) await emit();
+      return changed;
     },
-    async getManifest(assetId) {
-      const manifest = (await db.assets.get([uid, assetId]))?.manifest;
-      return manifest ? structuredClone(manifest) : undefined;
-    },
-    async listManifests() {
-      return (await db.assets.where('uid').equals(uid).toArray()).flatMap(state => state.manifest ? [structuredClone(state.manifest)] : []);
-    },
-    async putManifest(input) {
-      const manifest = PrivateProAssetManifestSchema.parse(input);
-      if (manifest.uid !== uid) throw new TypeError('Private Pro asset manifest identity is invalid.');
-      const current = await db.assets.get([uid, manifest.assetId]);
-      await db.assets.put({
-        uid, assetId: manifest.assetId, asset: current?.asset, manifest: structuredClone(manifest),
-        uploadStatus: current?.asset ? 'ready' : current?.uploadStatus ?? 'remote',
-        hydrationStatus: current?.asset ? 'ready' : current?.hydrationStatus ?? 'pending', updatedAtMs: Date.now(),
+    async deleteAsset(assetId, guard) {
+      await db.transaction('rw', db.assets, async () => {
+        assert(guard);
+        const current = await db.assets.get([uid, assetId]);
+        assert(guard);
+        if (!current) return;
+        if (current.manifest) await db.assets.put({ ...current, asset: undefined, hydrationStatus: 'missing', updatedAtMs: Date.now() });
+        else await db.assets.delete([uid, assetId]);
       });
       await emit();
     },
-    async deleteManifest(assetId) {
-      const current = await db.assets.get([uid, assetId]);
-      if (!current) return;
-      if (current.asset) await db.assets.put({ ...current, manifest: undefined, uploadStatus: 'pending', updatedAtMs: Date.now() });
-      else await db.assets.delete([uid, assetId]);
+    async clear(guard) {
+      await db.transaction('rw', db.assets, async () => { assert(guard); await db.assets.where('uid').equals(uid).delete(); });
       await emit();
     },
-    subscribe(listener) {
-      listeners.add(listener);
-      return () => listeners.delete(listener);
+    async getManifest(assetId, guard) { return (await state(assetId, guard))?.manifest; },
+    async listManifests(guard) {
+      assert(guard);
+      const values = await db.assets.where('uid').equals(uid).toArray();
+      assert(guard);
+      return values.flatMap(value => value.manifest ? [structuredClone(value.manifest)] : []);
     },
+    async putManifest(input, manifestHash = '', guard) {
+      const manifest = PrivateProAssetManifestSchema.parse(input);
+      if (manifest.uid !== uid) throw new TypeError('Private Pro asset manifest identity is invalid.');
+      await db.transaction('rw', db.assets, async () => {
+        assert(guard);
+        const current = await db.assets.get([uid, manifest.assetId]);
+        assert(guard);
+        await db.assets.put({
+          uid, assetId: manifest.assetId, asset: current?.asset, manifest: structuredClone(manifest),
+          contentGeneration: manifest.contentGeneration, publishedContentGeneration: manifest.contentGeneration,
+          publishedManifestHash: manifestHash || current?.publishedManifestHash, uploadStatus: current?.asset ? 'ready' : 'remote',
+          hydrationStatus: current?.asset ? 'ready' : current?.hydrationStatus ?? 'pending', updatedAtMs: Date.now(),
+        });
+      });
+      await emit();
+    },
+    async putManifestIfCurrent(assetId, contentGeneration, input, manifestHash, guard) {
+      const manifest = PrivateProAssetManifestSchema.parse(input);
+      if (manifest.uid !== uid || manifest.assetId !== assetId || manifest.contentGeneration !== contentGeneration)
+        throw new TypeError('Private Pro asset manifest identity is invalid.');
+      let committed = false;
+      await db.transaction('rw', db.assets, async () => {
+        assert(guard);
+        const current = await db.assets.get([uid, assetId]);
+        assert(guard);
+        if (!current?.asset || current.contentGeneration !== contentGeneration) return;
+        committed = true;
+        await db.assets.put({
+          ...current, manifest: structuredClone(manifest), publishedContentGeneration: contentGeneration,
+          publishedManifestHash: manifestHash, uploadStatus: 'ready', updatedAtMs: Date.now(),
+        });
+      });
+      if (committed) await emit();
+      return committed;
+    },
+    async deleteManifest(assetId, guard) {
+      await db.transaction('rw', db.assets, async () => {
+        assert(guard);
+        const current = await db.assets.get([uid, assetId]);
+        assert(guard);
+        if (!current) return;
+        if (current.asset) await db.assets.put({
+          uid, assetId, asset: current.asset, contentGeneration: current.contentGeneration,
+          uploadStatus: 'pending', hydrationStatus: current.hydrationStatus, updatedAtMs: Date.now(),
+        });
+        else await db.assets.delete([uid, assetId]);
+      });
+      await emit();
+    },
+    subscribe(listener) { listeners.add(listener); return () => listeners.delete(listener); },
   };
 }
 
-export type PrivateProAssetQuery = {
-  assetType: DBlobAssetType;
-  contextId: DBlobDBContextId;
-  scopeId: DBlobDBScopeId;
-};
-
+export type PrivateProAssetQuery = { assetType: DBlobAssetType; contextId: DBlobDBContextId; scopeId: DBlobDBScopeId };
 export type PrivateProAssetIdentity = DBlobAssetId;

@@ -80,6 +80,9 @@ export interface PrivateProSyncAssetState {
   assetId: string;
   asset?: DBlobDBAsset;
   manifest?: PrivateProAssetManifest;
+  contentGeneration: number;
+  publishedContentGeneration?: number;
+  publishedManifestHash?: string;
   uploadStatus: 'pending' | 'ready' | 'remote';
   hydrationStatus: 'pending' | 'ready' | 'missing' | 'error';
   updatedAtMs: number;
@@ -404,8 +407,15 @@ export class PrivateProSyncDB extends Dexie {
 
   async referencedAssetsReady(uid: string, assetIds: readonly string[]): Promise<boolean> {
     if (!assetIds.length) return true;
-    const bases = await Promise.all([...new Set(assetIds)].map(assetId => this.remoteBases.get([uid, privateProRecordKey('asset', assetId)])));
-    return bases.every(base => !!base && !base.deleted && base.revision > 0);
+    return (await Promise.all([...new Set(assetIds)].map(async assetId => {
+      const recordKey = privateProRecordKey('asset', assetId);
+      const [asset, local, pending, base] = await Promise.all([
+        this.assets.get([uid, assetId]), this.localRecords.get([uid, recordKey]), this.outbox.get([uid, recordKey]), this.remoteBases.get([uid, recordKey]),
+      ]);
+      return !!asset?.manifest && asset.publishedContentGeneration === asset.contentGeneration && !!asset.publishedManifestHash &&
+        !pending && !!local && !local.deleted && local.contentHash === asset.publishedManifestHash && local.baseRevision > 0 &&
+        !!base && !base.deleted && base.revision === local.baseRevision;
+    }))).every(Boolean);
   }
 
   async deferLease(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, dueAtMs: number): Promise<void> {

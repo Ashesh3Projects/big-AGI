@@ -1,7 +1,7 @@
 import Dexie from 'dexie';
 
 import type { DBlobAsset, DBlobAssetId, DBlobAssetType, DBlobDBAsset, DBlobDBContextId, DBlobDBScopeId } from './dblobs.types';
-import { getActivePrivateProAssetPersistence } from '~/modules/private-pro/assets/privatePro.assets.local';
+import { runActivePrivateProAssetOperation } from '~/modules/private-pro/assets/privatePro.assets.local';
 
 
 // configuration
@@ -43,7 +43,8 @@ if (process.env.NODE_ENV !== 'production') globalForDexie.bigAgiDB = _db;
 const assetsTable = _db.largeAssets;
 
 export async function clearPrivateProPlaintextDBlobPersistence(): Promise<void> {
-  await getActivePrivateProAssetPersistence()?.port.clear();
+  const routed = await runActivePrivateProAssetOperation((port, guard) => port.clear(guard));
+  if (routed.active) return;
   await assetsTable.clear();
 }
 
@@ -52,12 +53,8 @@ export async function clearPrivateProPlaintextDBlobPersistence(): Promise<void> 
 
 export async function _addDBAsset<T extends DBlobAsset>(asset: T, contextId: DBlobDBContextId, scopeId: DBlobDBScopeId): Promise<DBlobAssetId> {
   try {
-    const active = getActivePrivateProAssetPersistence();
-    if (active) {
-      const stored = { ...asset, contextId, scopeId } as DBlobDBAsset;
-      await active.port.putAsset(stored);
-      return asset.id;
-    }
+    const routed = await runActivePrivateProAssetOperation((port, guard) => port.putAsset({ ...asset, contextId, scopeId } as DBlobDBAsset, guard));
+    if (routed.active) return asset.id;
     // returns the id of the added asset
     return await assetsTable.add({
       ...asset,
@@ -85,20 +82,20 @@ export async function _addDBAsset<T extends DBlobAsset>(asset: T, contextId: DBl
 // }
 
 export async function getDBAsset<T extends DBlobAsset = DBlobDBAsset>(id: DBlobAssetId) {
-  const active = getActivePrivateProAssetPersistence();
-  if (active) return await active.port.getAsset(id) as unknown as T | undefined;
+  const routed = await runActivePrivateProAssetOperation((port, guard) => port.getAsset(id, guard));
+  if (routed.active) return routed.value as unknown as T | undefined;
   return await assetsTable.get(id) as T | undefined;
 }
 
 export async function getDBAssetsByIds(ids: DBlobAssetId[]): Promise<DBlobDBAsset[]> {
-  const active = getActivePrivateProAssetPersistence();
-  if (active) return active.port.getAssets(ids);
+  const routed = await runActivePrivateProAssetOperation((port, guard) => port.getAssets(ids, guard));
+  if (routed.active) return routed.value;
   return (await assetsTable.bulkGet(ids)).filter((asset): asset is DBlobDBAsset => !!asset);
 }
 
 export async function putDBAsset(asset: DBlobDBAsset): Promise<void> {
-  const active = getActivePrivateProAssetPersistence();
-  if (active) return active.port.putAsset(asset);
+  const routed = await runActivePrivateProAssetOperation((port, guard) => port.putAsset(asset, guard));
+  if (routed.active) return;
   await assetsTable.put(asset);
 }
 
@@ -115,8 +112,8 @@ export async function putDBAsset(asset: DBlobDBAsset): Promise<void> {
  * Warning: this function all the matching assets data in memory - not suitable for large datasets.
  */
 export async function getDBAssetsByScopeAndType<T extends DBlobAsset = DBlobDBAsset>(assetType: T['assetType'], contextId: DBlobDBContextId, scopeId: DBlobDBScopeId) {
-  const active = getActivePrivateProAssetPersistence();
-  if (active) return (await active.port.listAssets())
+  const routed = await runActivePrivateProAssetOperation((port, guard) => port.listAssets(guard));
+  if (routed.active) return routed.value
     .filter(asset => asset.assetType === assetType && asset.contextId === contextId && asset.scopeId === scopeId)
     .sort((left, right) => right.createdAt.getTime() - left.createdAt.getTime()) as unknown as T[];
   const assets = await assetsTable.where({
@@ -129,8 +126,8 @@ export async function getDBAssetsByScopeAndType<T extends DBlobAsset = DBlobDBAs
 // UPDATE
 
 async function _updateDBAsset<T extends DBlobDBAsset = DBlobDBAsset>(id: DBlobAssetId, updates: Partial<T>) {
-  const active = getActivePrivateProAssetPersistence();
-  if (active) return await active.port.updateAsset(id, updates as Partial<DBlobDBAsset>) ? 1 : 0;
+  const routed = await runActivePrivateProAssetOperation((port, guard) => port.updateAsset(id, updates as Partial<DBlobDBAsset>, guard));
+  if (routed.active) return routed.value ? 1 : 0;
   return assetsTable.update(id, updates);
 }
 
@@ -142,8 +139,8 @@ export async function transferDBAssetContextScope(id: DBlobAssetId, contextId: D
 // DELETE
 
 export async function deleteDBAsset(id: DBlobAssetId) {
-  const active = getActivePrivateProAssetPersistence();
-  if (active) return active.port.deleteAsset(id);
+  const routed = await runActivePrivateProAssetOperation((_port, guard, deleteAsset) => deleteAsset(id, guard));
+  if (routed.active) return;
   return assetsTable.delete(id);
 }
 
@@ -159,14 +156,15 @@ export async function deleteDBAsset(id: DBlobAssetId) {
 // }
 
 export async function gcDBAssetsByScope(contextId: DBlobDBContextId, scopeId: DBlobDBScopeId, assetType: DBlobAssetType | null, keepIds: DBlobAssetId[]) {
-  const active = getActivePrivateProAssetPersistence();
-  if (active) {
+  const routed = await runActivePrivateProAssetOperation(async (port, guard, deleteAsset) => {
     const keep = new Set(keepIds);
-    for (const asset of await active.port.listAssets()) {
+    for (const asset of await port.listAssets(guard)) {
       if (asset.contextId === contextId && asset.scopeId === scopeId && (assetType === null || asset.assetType === assetType) && !keep.has(asset.id)) {
-        await active.port.deleteAsset(asset.id);
+        await deleteAsset(asset.id, guard);
       }
     }
+  });
+  if (routed.active) {
     return;
   }
   // get all the DB keys

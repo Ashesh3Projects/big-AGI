@@ -1,6 +1,7 @@
 import type { PrivateProAssetLocalPort } from '../../assets/privatePro.assets.local';
 import { PrivateProAssetManifestSchema, type PrivateProAssetManifest } from '../../assets/privatePro.assets.schemas';
 import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer, PrivateProSyncSerializedRecord } from '../privatePro.sync.serializers';
+import { privateProCanonicalJson, privateProContentHash } from '../privatePro.sync.codec';
 
 
 export function createPrivateProAssetSerializer(uid: string, local: PrivateProAssetLocalPort): PrivateProSyncSerializer<PrivateProAssetManifest> {
@@ -32,7 +33,10 @@ export function createPrivateProAssetSerializer(uid: string, local: PrivateProAs
     projection: {
       async apply(projectionKey, records) {
         const record = records.find(candidate => candidate.recordType === 'asset' && candidate.logicalId === projectionKey);
-        if (record) await local.putManifest(PrivateProAssetManifestSchema.parse(record.value));
+        if (record) {
+          const manifest = PrivateProAssetManifestSchema.parse(record.value);
+          await local.putManifest(manifest, await privateProContentHash(privateProCanonicalJson(manifest)));
+        }
         else await local.deleteManifest(projectionKey);
       },
       remove: projectionKey => local.deleteManifest(projectionKey),
