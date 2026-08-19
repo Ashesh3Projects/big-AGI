@@ -43,6 +43,7 @@ export interface PrivateProSyncReconcilerDependencies {
   isEpochActive?: (epoch: number) => boolean;
   now?: () => number;
   onError?: (category: 'schema' | 'offline' | 'permission' | 'quota' | 'unknown') => void;
+  onHydrate?(assetIds: readonly string[], epoch: number): void;
 }
 
 export interface PrivateProSyncReconciler {
@@ -252,6 +253,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     if (origin) return;
     advanceProjection(validated.prepared.projectionKey);
     await materialize(validated.prepared.projectionKey, validated.serializer, { override: validated.serialized, epoch });
+    dependencies.onHydrate?.(validated.prepared.referencedAssetIds, epoch);
   }
 
   async function handleTombstone(event: Extract<PrivateProSyncRemoteEvent, { type: 'tombstone' }>, epoch: number): Promise<void> {
@@ -315,6 +317,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
         if (records.some(record => dependencies.localOrigins.has(record.recordKey))) continue;
         try {
           await materialize(projectionKey, serializerFor(records[0].recordType), { epoch });
+          dependencies.onHydrate?.([...new Set(records.flatMap(record => record.referencedAssetIds))], epoch);
         } catch {
           await quarantine(records[0].recordKey, 'invalid-cache');
         }

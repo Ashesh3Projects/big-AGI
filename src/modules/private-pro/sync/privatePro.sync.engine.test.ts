@@ -107,6 +107,30 @@ function harness(options: { cache?: Promise<void>; pending?: number; statusStore
 }
 
 describe('Private Pro sync engine', () => {
+  test('starts remote asset hydration in the background without blocking projection work', async () => {
+    let hydrateStarted = false;
+    let release!: () => void;
+    const hydrate = new Promise<void>(resolve => { release = resolve; });
+    let hooks!: Parameters<NonNullable<Parameters<typeof createPrivateProSyncEngine>[0]['createReconciler']>>[0];
+    const base = harness();
+    const order: string[] = [];
+    const engine = createPrivateProSyncEngine({
+        uid: 'uid-1', writerId: '123e4567-e89b-12d3-a456-426614174001', serializers: [base.serializer], transport: base.transport,
+        db: { pendingCount: async () => 0 }, runSuppressed: callback => callback(),
+        assets: { ensureUploaded: async () => {}, hydrate: async () => { hydrateStarted = true; await hydrate; } },
+        createOutbound: () => ({ start: async () => {}, retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {} }),
+        createReconciler: input => { hooks = input; return { applyCached: async () => {}, handle: async (_event, epoch) => { hooks.onHydrate?.(['asset-1'], epoch); order.push('projected'); } }; },
+      });
+    await engine.start();
+
+    base.transport.emit({ type: 'invalid-document', collection: 'records', recordKey: 'record-1', reason: 'invalid-payload' });
+    await settle();
+
+    assert.equal(hydrateStarted, true);
+    assert.deepEqual(order, ['projected']);
+    release();
+    await engine.stop();
+  });
   test('subscribes before cache application and starts without waiting for cache or server current', async () => {
     let resolveCache!: () => void;
     const cache = new Promise<void>(resolve => { resolveCache = resolve; });

@@ -68,6 +68,7 @@ interface ReconcilerHooks {
   runSuppressed<T>(projectionKey: string, callback: () => Promise<T> | T): Promise<T>;
   isEpochActive(epoch: number): boolean;
   onError(category: PrivateProOutboundErrorCategory): void;
+  onHydrate?(assetIds: readonly string[], epoch: number): void;
 }
 
 export interface PrivateProSyncEngineDependencies {
@@ -77,6 +78,10 @@ export interface PrivateProSyncEngineDependencies {
   db: PrivateProSyncEngineDB;
   coordinator?: PrivateProSyncCoordinator;
   transport: PrivateProSyncTransport;
+  assets?: {
+    ensureUploaded(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
+    hydrate(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
+  };
   runSuppressed<T>(callback: () => Promise<T> | T): Promise<T> | T;
   createOutbound?: (hooks: OutboundHooks) => PrivateProSyncEngineOutbound;
   createReconciler?: (hooks: ReconcilerHooks) => PrivateProSyncReconciler;
@@ -113,6 +118,8 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
   let eventQueue: Promise<void> = Promise.resolve();
   let cacheTask: Promise<void> | null = null;
   const projectionTasks = new Set<Promise<unknown>>();
+  const assetTasks = new Set<Promise<unknown>>();
+  let assetAbort = new AbortController();
 
   function isEpochActive(epoch: number): boolean {
     return started && lifecycleEpoch === epoch;
@@ -232,6 +239,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       db: dependencies.db as PrivateProSyncDB,
       coordinator: dependencies.coordinator,
       transport: dependencies.transport,
+      assets: dependencies.assets,
       shouldCapture: mutation => outboundHooks.shouldCapture(mutation),
       onCapture,
       onCaptured,
@@ -244,6 +252,13 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
 
   const reconciler = dependencies.createReconciler?.({
     localOrigins, committedMarkers, projectionVersions, outbound, runSuppressed, isEpochActive, onError: report,
+    onHydrate: (assetIds, epoch) => {
+      if (!assetIds.length || !dependencies.assets || !isEpochActive(epoch)) return;
+      const task = dependencies.assets.hydrate(assetIds, assetAbort.signal)
+        .catch(() => { if (isEpochActive(epoch)) report('offline', epoch); })
+        .finally(() => assetTasks.delete(task));
+      assetTasks.add(task);
+    },
   }) ?? createPrivateProSyncReconciler({
     uid: dependencies.uid,
     writerId,
@@ -256,6 +271,13 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     runSuppressed,
     isEpochActive,
     onError: report,
+    onHydrate: (assetIds, epoch) => {
+      if (!assetIds.length || !dependencies.assets || !isEpochActive(epoch)) return;
+      const task = dependencies.assets.hydrate(assetIds, assetAbort.signal)
+        .catch(() => { if (isEpochActive(epoch)) report('offline', epoch); })
+        .finally(() => assetTasks.delete(task));
+      assetTasks.add(task);
+    },
     now,
   });
 
@@ -308,6 +330,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     async start(): Promise<void> {
       if (started) return;
       started = true;
+      assetAbort = new AbortController();
       const epoch = ++lifecycleEpoch;
       eventQueue = Promise.resolve();
       currentCollections.clear();
@@ -346,6 +369,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       lifecycleEpoch++;
       listenerEpoch++;
       closeListener();
+      assetAbort.abort();
       windowEvents?.removeEventListener('online', onOnline);
       windowEvents?.removeEventListener('offline', onOffline);
       await outbound.stop();

@@ -271,6 +271,23 @@ describe('Private Pro seamless sync outbound', () => {
     assert.match(transport.writes[0].payload, /value-59/);
   });
 
+  test('uploads referenced assets then defers the referencing row until the manifest is acknowledged', async (t) => {
+    const { outbound, serializer, transport, clock, db, assetCalls } = createHarness(t);
+    await outbound.start();
+    serializer.emitPut('reference');
+    const key = privateProRecordKey('settings', 'main');
+    await waitFor(async () => !!await db.getOutbox(UID, key));
+    const row = await db.getOutbox(UID, key);
+    assert.ok(row);
+    await db.outbox.put({ ...row, referencedAssetIds: ['asset-1'] });
+
+    await clock.advance(60_000);
+
+    assert.deepEqual(assetCalls, [['asset-1']]);
+    assert.equal(transport.writes.length, 0);
+    assert.ok((await db.getOutbox(UID, key))!.dueAtMs > clock.nowMs);
+  });
+
   test('capturing a later record does not delay an earlier record deadline', async (t) => {
     const { outbound, transport, clock } = createHarness(t);
     await outbound.start();
@@ -667,6 +684,7 @@ describe('Private Pro seamless sync outbound', () => {
       recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
       value: { value: 'asset' }, referencedAssetIds: ['asset-1'],
     } });
+    await db.remoteBases.put({ uid: UID, recordKey: privateProRecordKey('asset', 'asset-1'), revision: 1, mutationId: 'asset-ready', deleted: false });
     await clock.advance(60_000);
     assert.deepEqual(assetCalls, [['asset-1']]);
 

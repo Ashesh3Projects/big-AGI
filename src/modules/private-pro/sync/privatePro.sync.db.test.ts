@@ -10,6 +10,7 @@ import {
   type PrivateProRemoteBaseState,
 } from './privatePro.sync.db';
 import type { PrivateProSyncPreparedRecord } from './privatePro.sync.serializers';
+import { privateProRecordKey } from './privatePro.sync.codec';
 
 
 const UID_A = 'uid-a';
@@ -367,6 +368,30 @@ describe('Private Pro seamless sync database', () => {
     await db.leaseDue(UID_A, 61_000, 5_000, 1);
 
     assert.equal(await db.nextDueAt(UID_A), 66_000);
+  });
+
+  test('leases due asset manifests before other rows at the same due time', async (t) => {
+    const db = createDB(t);
+    await db.recordLocalPut(UID_A, preparedRecord('chat-1', '{"value":1}'), 1_000);
+    await db.recordLocalPut(UID_A, { ...preparedRecord('asset-1', '{"value":2}'), recordType: 'asset' }, 2_000);
+
+    const lease = await db.leaseDue(UID_A, 62_000, 5_000, 1);
+
+    assert.equal(lease?.recordType, 'asset');
+  });
+
+  test('defers a referenced row until every asset manifest has a live acknowledged revision', async (t) => {
+    const db = createDB(t);
+    const referenced = privateProRecordKey('asset', 'asset-1');
+    const row = await db.recordLocalPut(UID_A, { ...preparedRecord('chat-1', '{"value":1}'), referencedAssetIds: ['asset-1'] }, 1_000);
+    const lease = await db.leaseDue(UID_A, 61_000, 5_000, 1);
+    if (!lease?.leaseToken || lease.leaseFence === null) assert.fail('Expected reference lease.');
+
+    assert.equal(await db.referencedAssetsReady(UID_A, row.referencedAssetIds), false);
+    await db.deferLease(UID_A, row.recordKey, row.generation, lease.leaseToken, lease.leaseFence, 62_000);
+    assert.equal((await db.getOutbox(UID_A, row.recordKey))?.dueAtMs, 62_000);
+    await db.remoteBases.put({ uid: UID_A, recordKey: referenced, revision: 1, mutationId: 'asset-put', deleted: false });
+    assert.equal(await db.referencedAssetsReady(UID_A, row.referencedAssetIds), true);
   });
 
   test('reports the later of due time and active lease expiry', async (t) => {

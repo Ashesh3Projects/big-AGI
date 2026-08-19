@@ -24,6 +24,7 @@ import {
 const OUTBOX_LEASE_MS = 15_000;
 const RETRY_BASE_MS = 1_000;
 const RETRY_CAP_MS = PRIVATE_PRO_SYNC_WINDOW_MS;
+const ASSET_READINESS_RECHECK_MS = 1_000;
 
 type TimeoutHandle = ReturnType<typeof globalThis.setTimeout>;
 export type PrivateProOutboundErrorCategory = PrivateProSyncErrorCategory | 'schema';
@@ -330,6 +331,12 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
 
       if (context.signal.aborted) {
         await release(row);
+        return;
+      }
+      if (row.recordType !== 'asset' && row.referencedAssetIds.length && !await dependencies.db.referencedAssetsReady(dependencies.uid, row.referencedAssetIds)) {
+        await dependencies.db.deferLease(
+          dependencies.uid, row.recordKey, row.leasedGeneration, row.leaseToken, row.leaseFence, now() + ASSET_READINESS_RECHECK_MS,
+        );
         return;
       }
       const outcome = await raceWrite(row, context.signal);

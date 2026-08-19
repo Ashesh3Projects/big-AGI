@@ -1,8 +1,11 @@
 import Dexie, { type EntityTable, type Table } from 'dexie';
 
 import { PRIVATE_PRO_SYNC_WINDOW_MS } from '../config/privatePro.config';
+import { privateProRecordKey } from './privatePro.sync.codec';
 import type { PrivateProSyncRecordType } from './privatePro.sync.schemas';
 import type { PrivateProSyncPreparedRecord } from './privatePro.sync.serializers';
+import type { DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
+import type { PrivateProAssetManifest } from '../assets/privatePro.assets.schemas';
 
 
 export const PRIVATE_PRO_SYNC_DB_VERSION = 1;
@@ -75,6 +78,10 @@ export interface PrivateProSyncQuarantineState {
 export interface PrivateProSyncAssetState {
   uid: string;
   assetId: string;
+  asset?: DBlobDBAsset;
+  manifest?: PrivateProAssetManifest;
+  uploadStatus: 'pending' | 'ready' | 'remote';
+  hydrationStatus: 'pending' | 'ready' | 'missing' | 'error';
   updatedAtMs: number;
 }
 
@@ -384,7 +391,7 @@ export class PrivateProSyncDB extends Dexie {
     return this.transaction('rw', this.outbox, async () => {
       const due = (await this.outbox.where('uid').equals(uid).toArray())
         .filter(entry => !entry.blocked && entry.dueAtMs <= nowMs && (entry.leaseUntilMs === null || entry.leaseUntilMs <= nowMs))
-        .sort((left, right) => left.dueAtMs - right.dueAtMs || left.recordKey.localeCompare(right.recordKey))[0];
+        .sort((left, right) => Number(right.recordType === 'asset') - Number(left.recordType === 'asset') || left.dueAtMs - right.dueAtMs || left.recordKey.localeCompare(right.recordKey))[0];
       if (!due) return null;
       due.leaseUntilMs = nowMs + leaseMs;
       due.leaseToken = crypto.randomUUID();
@@ -392,6 +399,22 @@ export class PrivateProSyncDB extends Dexie {
       due.leasedGeneration = due.generation;
       await this.outbox.put(due);
       return cloneOutbox(due);
+    });
+  }
+
+  async referencedAssetsReady(uid: string, assetIds: readonly string[]): Promise<boolean> {
+    if (!assetIds.length) return true;
+    const bases = await Promise.all([...new Set(assetIds)].map(assetId => this.remoteBases.get([uid, privateProRecordKey('asset', assetId)])));
+    return bases.every(base => !!base && !base.deleted && base.revision > 0);
+  }
+
+  async deferLease(uid: string, recordKey: string, generation: number, leaseToken: string, leaseFence: number, dueAtMs: number): Promise<void> {
+    await this.transaction('rw', this.outbox, async () => {
+      const pending = await this.outbox.get([uid, recordKey]);
+      if (!this.matchesOutboxLease(pending, generation, leaseToken, leaseFence)) return;
+      pending.dueAtMs = Math.max(pending.dueAtMs, dueAtMs);
+      clearOutboxLease(pending);
+      await this.outbox.put(pending);
     });
   }
 

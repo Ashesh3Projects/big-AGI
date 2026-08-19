@@ -8,6 +8,7 @@ import { privateProSyncCredentialSerializer, privateProSyncModelSerializer } fro
 import { privateProSyncPersonaSerializer } from './serializers/persona';
 import { privateProSyncScratchSerializer } from './serializers/scratch';
 import { privateProSyncSettingsSerializer } from './serializers/settings';
+export { createPrivateProAssetSerializer } from './serializers/asset';
 
 
 export interface PrivateProSyncSerializedRecord<T = unknown> {
