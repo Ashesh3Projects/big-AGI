@@ -39,7 +39,7 @@ export interface PrivateProSyncReconcilerDependencies {
   committedMarkers?: Map<string, PrivateProSyncCommittedMarker>;
   projectionVersions?: Map<string, number>;
   outbound: Pick<{ handleCommitted(mutationId: string, revision: number): Promise<void> }, 'handleCommitted'>;
-  runSuppressed<T>(callback: () => Promise<T> | T): Promise<T> | T;
+  runSuppressed<T>(projectionKey: string, callback: () => Promise<T> | T): Promise<T> | T;
   isEpochActive?: (epoch: number) => boolean;
   now?: () => number;
   onError?: (category: 'schema' | 'offline' | 'permission' | 'quota' | 'unknown') => void;
@@ -180,7 +180,7 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
       if ([...dependencies.localOrigins.entries()].some(([recordKey, origin]) =>
         origin.projectionKey === projectionKey && origin.editVersion !== originVersions.get(recordKey))) return;
       if (dependencies.isEpochActive && !dependencies.isEpochActive(epoch)) return;
-      const applying = dependencies.runSuppressed(() => records.length && !missingChatMeta
+      const applying = dependencies.runSuppressed(projectionKey, () => records.length && !missingChatMeta
         ? projection.apply(projectionKey, records)
         : projection.remove(projectionKey));
       await applying;
@@ -197,6 +197,14 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
   async function handleRecord(canonical: PrivateProSyncRemoteRecord, epoch: number): Promise<void> {
     const currentBase = await dependencies.db.getRemoteBase(dependencies.uid, canonical.recordKey);
     if (currentBase && currentBase.revision > canonical.revision) return;
+    if (canonical.deleted) {
+      await dependencies.db.setEffectiveRemoteBase(dependencies.uid, canonical.recordKey, {
+        revision: canonical.revision,
+        mutationId: canonical.mutationId,
+        deleted: true,
+      });
+      return;
+    }
     let validated: ValidatedRecord;
     try {
       validated = await validateRemote(canonical);
@@ -255,6 +263,18 @@ export function createPrivateProSyncReconciler(dependencies: PrivateProSyncRecon
     const serializer = serializers.get(tombstone.recordType);
     if (!serializer) {
       await quarantine(tombstone.recordKey, 'invalid-tombstone');
+      return;
+    }
+    const marker = committedMarkers.get(tombstone.recordKey);
+    if (marker && tombstone.deletedRevision > marker.revision) committedMarkers.delete(tombstone.recordKey);
+    const exactMarker = tombstone.writerId === dependencies.writerId && marker?.deleted === true &&
+      marker.mutationId === tombstone.mutationId && marker.revision === tombstone.deletedRevision;
+    if (exactMarker) {
+      await dependencies.db.setEffectiveRemoteBase(dependencies.uid, tombstone.recordKey, {
+        revision: tombstone.deletedRevision,
+        mutationId: tombstone.mutationId,
+        deleted: true,
+      });
       return;
     }
     const local = await dependencies.db.getLocalRecord(dependencies.uid, tombstone.recordKey);

@@ -58,6 +58,14 @@ function settle(): Promise<void> {
   return new Promise(resolve => setImmediate(resolve));
 }
 
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 20; attempt++) {
+    if (predicate()) return;
+    await settle();
+  }
+  assert.fail('Timed out waiting for engine state.');
+}
+
 function harness(options: { cache?: Promise<void>; pending?: number; statusStore?: ReturnType<typeof createPrivateProSyncStore> } = {}) {
   const order: string[] = [];
   const serializer = new FakeSerializer();
@@ -170,7 +178,7 @@ describe('Private Pro sync engine', () => {
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
 
-    const projection = hooks().runSuppressed(async () => {
+    const projection = hooks().runSuppressed('main', async () => {
       serializer.emit('sync-start');
       await gate;
       serializer.emit('sync-end');
@@ -182,6 +190,34 @@ describe('Private Pro sync engine', () => {
     serializer.emit('user');
 
     assert.equal(capturedMutations(), 1);
+    await engine.stop();
+  });
+
+  test('suppresses only the projection under apply while unrelated edits still capture', async () => {
+    const { engine, hooks, capturedMutations } = harness();
+    await engine.start();
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const settingsMutation: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'settings-a', projectionKey: 'settings-a', schemaVersion: 1,
+      value: { value: 'settings' }, referencedAssetIds: [],
+    } };
+    const personaMutation: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'persona', logicalId: 'persona-b', projectionKey: 'persona-b', schemaVersion: 1,
+      value: { value: 'persona' }, referencedAssetIds: [],
+    } };
+
+    const applying = hooks().runSuppressed('settings-a', async () => {
+      assert.equal(hooks().shouldCapture(settingsMutation), false);
+      assert.equal(hooks().shouldCapture(personaMutation), true);
+      await gate;
+      assert.equal(hooks().shouldCapture(settingsMutation), false);
+    });
+    assert.equal(hooks().shouldCapture(personaMutation), true);
+    release();
+    await applying;
+    assert.equal(hooks().shouldCapture(settingsMutation), true);
+    assert.equal(capturedMutations(), 0);
     await engine.stop();
   });
 
@@ -253,7 +289,7 @@ describe('Private Pro sync engine', () => {
       }),
       createReconciler: hooks => ({
         applyCached: async () => {},
-        handle: async () => hooks.runSuppressed(async () => { projectionStarted(); await gate; }),
+        handle: async () => hooks.runSuppressed('main', async () => { projectionStarted(); await gate; }),
       }),
     });
     await engine.start();
@@ -292,6 +328,41 @@ describe('Private Pro sync engine', () => {
       engine.stop(),
       new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop hung')))),
     ]);
+  });
+
+  test('a restarted listener queue processes new events while the old lifecycle handler never settles', async () => {
+    const base = harness();
+    let oldStarted!: () => void;
+    const started = new Promise<void>(resolve => { oldStarted = resolve; });
+    const never = new Promise<void>(() => {});
+    let handles = 0;
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-4', serializers: [base.serializer], transport: base.transport, db: { pendingCount: async () => 0 },
+      runSuppressed: async callback => callback(), windowEvents: base.windowEvents, statusStore: base.store,
+      createOutbound: () => ({
+        start: async () => {}, retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+      }),
+      createReconciler: () => ({
+        applyCached: async () => {},
+        handle: async () => {
+          handles++;
+          if (handles === 1) { oldStarted(); await never; }
+        },
+      }),
+    });
+    await engine.start();
+    base.transport.emit({ type: 'invalid-document', collection: 'records', recordKey: 'old', reason: 'invalid-document' });
+    await started;
+    await engine.stop();
+    await engine.start();
+
+    base.transport.emit({ type: 'invalid-document', collection: 'records', recordKey: 'new', reason: 'invalid-document' });
+    for (const collection of ['records', 'assets', 'tombstones'] as const) base.transport.emit({ type: 'current', collection });
+    await waitFor(() => base.store.getState().phase === 'synced');
+
+    assert.equal(handles, 2);
+    assert.equal(base.store.getState().phase, 'synced');
+    await engine.stop();
   });
 
   test('failed capture stays dirty and the next capture binds only its own durable completion', async () => {

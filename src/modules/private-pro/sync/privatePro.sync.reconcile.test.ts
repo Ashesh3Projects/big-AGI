@@ -117,7 +117,7 @@ function createHarness(t: TestContext) {
     db,
     localOrigins,
     outbound: { handleCommitted: async (mutationId, revision) => { committed.push({ mutationId, revision }); } },
-    runSuppressed: async callback => {
+    runSuppressed: async (_projectionKey, callback) => {
       suppression.active = true;
       try { return await callback(); }
       finally { suppression.active = false; }
@@ -297,7 +297,7 @@ describe('Private Pro sync reconciler', () => {
     const reconciler = createPrivateProSyncReconciler({
       uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
       localOrigins, projectionVersions, outbound: { handleCommitted: async () => {} },
-      runSuppressed: async callback => callback(), now: () => 9_000,
+      runSuppressed: async (_projectionKey, callback) => callback(), now: () => 9_000,
     });
 
     const handling = reconciler.handle({ type: 'record', canonical });
@@ -334,7 +334,7 @@ describe('Private Pro sync reconciler', () => {
     const reconciler = createPrivateProSyncReconciler({
       uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
       localOrigins, projectionVersions, outbound: { handleCommitted: async () => {} },
-      runSuppressed: async callback => callback(), now: () => 9_000,
+      runSuppressed: async (_projectionKey, callback) => callback(), now: () => 9_000,
     });
 
     const hydration = reconciler.applyCached();
@@ -368,7 +368,7 @@ describe('Private Pro sync reconciler', () => {
     const reconciler = createPrivateProSyncReconciler({
       uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
       localOrigins: new Map(), committedMarkers, outbound: { handleCommitted: async () => {} },
-      runSuppressed: async callback => callback(), now: () => 9_000,
+      runSuppressed: async (_projectionKey, callback) => callback(), now: () => 9_000,
     });
 
     await reconciler.handle({ type: 'record', canonical: await remoteRecord({ writerId: WRITER_ID, mutationId, revision: 1 }) });
@@ -376,6 +376,53 @@ describe('Private Pro sync reconciler', () => {
 
     assert.equal(calls.length, 1);
     assert.equal((calls[0].records[0].value as { value: string }).value, 'newer');
+  });
+
+  test('deleted canonical records before or after tombstones are idempotent and never quarantined', async (t) => {
+    const { db, calls, reconciler } = createHarness(t);
+    const live = await remoteRecord();
+    await reconciler.handle({ type: 'record', canonical: live });
+    calls.length = 0;
+    const deleted = { ...live, payload: '', contentHash: 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855', revision: 2, mutationId: crypto.randomUUID(), deleted: true };
+    const tombstone = {
+      recordKey: live.recordKey, recordType: live.recordType, logicalId: live.logicalId,
+      deletedRevision: 2, mutationId: deleted.mutationId, writerId: deleted.writerId, deletedAt: 'server-time',
+    };
+
+    await reconciler.handle({ type: 'record', canonical: deleted });
+    await reconciler.handle({ type: 'tombstone', tombstone });
+    await reconciler.handle({ type: 'record', canonical: deleted });
+
+    assert.equal((await db.quarantine.where('uid').equals(UID).count()), 0);
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].kind, 'remove');
+  });
+
+  test('an exact synthetic delete marker suppresses tombstone removal and a higher tombstone proceeds', async (t) => {
+    const db = createDB(t);
+    const calls: ProjectionCall[] = [];
+    const suppression = { active: false };
+    const mutationId = crypto.randomUUID();
+    const recordKey = privateProRecordKey('settings', 'settings-1');
+    const committedMarkers = new Map([[recordKey, { recordKey, generation: 1, mutationId, revision: 2, deleted: true }]]);
+    const reconciler = createPrivateProSyncReconciler({
+      uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
+      localOrigins: new Map(), committedMarkers, outbound: { handleCommitted: async () => {} },
+      runSuppressed: async (_projectionKey, callback) => callback(), now: () => 9_000,
+    });
+
+    await reconciler.handle({ type: 'tombstone', tombstone: {
+      recordKey, recordType: 'settings', logicalId: 'settings-1', deletedRevision: 2,
+      mutationId, writerId: WRITER_ID, deletedAt: 'server-time',
+    } });
+    assert.equal(calls.length, 0);
+    await reconciler.handle({ type: 'tombstone', tombstone: {
+      recordKey, recordType: 'settings', logicalId: 'settings-1', deletedRevision: 3,
+      mutationId: crypto.randomUUID(), writerId: WRITER_ID, deletedAt: 'server-time',
+    } });
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].kind, 'remove');
   });
 
   test('stages chat messages until metadata exists and keeps two message IDs sorted', async (t) => {
@@ -433,7 +480,7 @@ describe('Private Pro sync reconciler', () => {
     const reconciler = createPrivateProSyncReconciler({
       uid: UID, writerId: WRITER_ID, serializers: [serializer('settings', calls, suppression)], db,
       localOrigins, projectionVersions, outbound: { handleCommitted: async () => {} },
-      runSuppressed: async callback => callback(), now: () => 9_000,
+      runSuppressed: async (_projectionKey, callback) => callback(), now: () => 9_000,
     });
     await reconciler.handle({ type: 'record', canonical });
     calls.length = 0;

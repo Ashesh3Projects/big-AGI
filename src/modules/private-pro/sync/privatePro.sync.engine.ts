@@ -55,7 +55,7 @@ interface OutboundHooks {
   onCommitted(notice: PrivateProSyncCommittedNotice): void;
   onStatus(status: { category: PrivateProOutboundErrorCategory }): void;
   shouldCapture(mutation: PrivateProSyncLocalMutation): boolean;
-  runSuppressed<T>(callback: () => Promise<T> | T): Promise<T>;
+  runSuppressed<T>(projectionKey: string, callback: () => Promise<T> | T): Promise<T>;
   originFor(recordKey: string): PrivateProSyncLocalOrigin | undefined;
   committedFor(recordKey: string): PrivateProSyncCommittedMarker | undefined;
 }
@@ -65,7 +65,7 @@ interface ReconcilerHooks {
   committedMarkers: Map<string, PrivateProSyncCommittedMarker>;
   projectionVersions: Map<string, number>;
   outbound: Pick<PrivateProSyncEngineOutbound, 'handleCommitted'>;
-  runSuppressed<T>(callback: () => Promise<T> | T): Promise<T>;
+  runSuppressed<T>(projectionKey: string, callback: () => Promise<T> | T): Promise<T>;
   isEpochActive(epoch: number): boolean;
   onError(category: PrivateProOutboundErrorCategory): void;
 }
@@ -105,7 +105,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
   const projectionVersions = new Map<string, number>();
   const currentCollections = new Set<PrivateProSyncCollection>();
 
-  let suppressionDepth = 0;
+  const suppressionDepths = new Map<string, number>();
   let lifecycleEpoch = 0;
   let listenerEpoch = 0;
   let started = false;
@@ -118,15 +118,17 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     return started && lifecycleEpoch === epoch;
   }
 
-  async function runSuppressed<T>(callback: () => Promise<T> | T): Promise<T> {
-    suppressionDepth++;
+  async function runSuppressed<T>(projectionKey: string, callback: () => Promise<T> | T): Promise<T> {
+    suppressionDepths.set(projectionKey, (suppressionDepths.get(projectionKey) ?? 0) + 1);
     let resolveTracked!: () => void;
     const tracked = new Promise<void>(resolve => { resolveTracked = resolve; });
     projectionTasks.add(tracked);
     try {
       return await dependencies.runSuppressed(callback);
     } finally {
-      suppressionDepth--;
+      const depth = (suppressionDepths.get(projectionKey) ?? 1) - 1;
+      if (depth > 0) suppressionDepths.set(projectionKey, depth);
+      else suppressionDepths.delete(projectionKey);
       resolveTracked();
       projectionTasks.delete(tracked);
     }
@@ -212,7 +214,10 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     onCaptureFailed,
     onCommitted,
     onStatus: status => report(status.category),
-    shouldCapture: () => suppressionDepth === 0,
+    shouldCapture: mutation => {
+      const projectionKey = mutation.kind === 'put' ? mutation.record.projectionKey : mutation.projectionKey;
+      return !suppressionDepths.has(projectionKey);
+    },
     runSuppressed,
     originFor: recordKey => localOrigins.get(recordKey),
     committedFor: recordKey => committedMarkers.get(recordKey),
@@ -260,7 +265,8 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
   }
 
   function queueRemote(epoch: number, attachedEpoch: number, event: PrivateProSyncRemoteEvent): void {
-    eventQueue = eventQueue.then(async () => {
+    const queue = eventQueue;
+    eventQueue = queue.then(async () => {
       if (!isEpochActive(epoch) || attachedEpoch !== listenerEpoch) return;
       if (event.type === 'current') {
         currentCollections.add(event.collection);
@@ -303,6 +309,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       if (started) return;
       started = true;
       const epoch = ++lifecycleEpoch;
+      eventQueue = Promise.resolve();
       currentCollections.clear();
       statusStore.setState({ phase: 'local', retry: retryNow, lastCategory: null });
       await outbound.start();

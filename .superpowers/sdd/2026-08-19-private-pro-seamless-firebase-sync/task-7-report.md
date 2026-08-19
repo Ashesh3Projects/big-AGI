@@ -116,3 +116,37 @@ None.
 ### Concerns
 
 None.
+
+## Fix round 2
+
+### Findings addressed
+
+- Replaced the global suppression counter with nested, concurrent projection-key counters. Outbound capture derives the mutation projection key and suppresses only matching projection work.
+- Deleted canonical records now advance the deletion base without parsing or projecting the empty payload. Tombstones remain the only runtime deletion trigger.
+- Tombstones now apply the same exact committed-marker match as records, including writer, mutation, revision, and deletion identity. Exact echoes are suppressed; higher revisions prune the marker and proceed.
+- Each lifecycle start receives a fresh event queue root. New listener work no longer chains behind unresolved work from an old lifecycle.
+
+### RED evidence
+
+- Projection-scoped suppression test failed because an unrelated persona mutation was suppressed by the global counter.
+- Restart queue test failed with only one handled event because the new listener chained behind an unresolved old handler.
+- Deleted canonical ordering test produced two quarantine rows from attempts to parse the empty deleted payload.
+- Exact synthetic delete marker test removed the projection instead of suppressing the tombstone echo.
+
+### GREEN evidence
+
+- Modified DB, serializer, Firebase, outbound, reconciler, and engine suites: 121 tests, 6 suites, 121 passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for all modified sync source and tests, exit 0 with no warnings.
+- `git diff --check`, exit 0. Git printed only LF-to-CRLF conversion notices.
+
+### Self-review
+
+- Holding settings projection A suppresses settings A only; unrelated persona B remains capturable.
+- Deleted record before tombstone and tombstone before deleted record are idempotent without schema status or quarantine.
+- Exact synthetic delete tombstone echoes do not apply or remove runtime state; higher tombstone revisions proceed.
+- Old unresolved lifecycle handlers remain detached while restarted listener events and current state progress normally.
+
+### Concerns
+
+None.
