@@ -5,6 +5,11 @@ import { test } from 'node:test';
 import { NextRequest } from 'next/server';
 
 import { getFirebasePrivateProVaultAssetsService } from '../vault/privatePro.vault.assets.firebase';
+import type { PrivateProAccountRecord } from '../auth/privatePro.auth.service';
+import type { PrivateProIdentity } from '../auth/privatePro.auth.types';
+
+process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED = 'true';
+process.env.PRIVATE_PRO_ALLOWED_EMAILS = 'friend@example.com';
 
 
 interface FirestoreIndex {
@@ -33,6 +38,39 @@ test('mounts encrypted asset procedures without plaintext compatibility procedur
     'privateProVaultAssets.reserveEncryptedUpload',
   ]);
   assert.equal(procedureNames.some(name => name.startsWith('privateProSync.')), false);
+});
+
+test('mounted encrypted asset procedures fail closed before the legacy quota service', async () => {
+  const { createPrivateProVaultAssetsRouter } = await import('./privatePro.assets.router');
+  const identity: PrivateProIdentity = {
+    uid: 'uid-current', email: 'friend@example.com', emailVerified: true, privatePro: true, privateProEpoch: 3, issuedAt: 1, expiresAt: 2,
+  };
+  const account: PrivateProAccountRecord = {
+    uid: identity.uid, email: identity.email, active: true, accessEpoch: 3, createdAtMs: 1, updatedAtMs: 1,
+  };
+  let serviceCalls = 0;
+  const { privateProNodePremiumProcedure } = await import('../auth/privatePro.auth.procedures.server');
+  const router = createPrivateProVaultAssetsRouter(privateProNodePremiumProcedure, () => ({
+    async reserveUpload() { serviceCalls++; throw new Error('legacy quota reached'); },
+    async finalizeUpload() { serviceCalls++; throw new Error('legacy quota reached'); },
+    async getDownload() { serviceCalls++; throw new Error('legacy quota reached'); },
+    async releaseReservation() { serviceCalls++; throw new Error('legacy quota reached'); },
+  } as never));
+  const caller = router.createCaller({
+    hostName: 'localhost', reqSignal: new AbortController().signal, privateProIdentity: identity,
+    privateProAuthError: null, privateProAppCheckToken: 'app-check',
+  });
+  const opaqueId = 'a'.repeat(43);
+  const calls = [
+    () => caller.reserveEncryptedUpload({ operationId: 'operation-1', opaqueAssetId: opaqueId, chunks: [{
+      opaqueChunkId: opaqueId, chunkIndex: 0, ciphertextBytes: 1, objectBytes: 1, objectSha256: 'a'.repeat(64),
+    }] }),
+    () => caller.finalizeEncryptedUpload({ operationId: 'operation-1' }),
+    () => caller.getEncryptedDownload({ opaqueAssetId: opaqueId }),
+    () => caller.releaseEncryptedReservation({ operationId: 'operation-1' }),
+  ];
+  for (const call of calls) await assert.rejects(call(), error => ['NOT_FOUND', 'UNAUTHORIZED'].includes((error as { code?: string }).code ?? ''));
+  assert.equal(serviceCalls, 0);
 });
 
 test('production sweep route invokes only encrypted reservation cleanup', async () => {

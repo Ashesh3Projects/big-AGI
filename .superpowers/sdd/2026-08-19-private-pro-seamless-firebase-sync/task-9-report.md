@@ -118,3 +118,42 @@ GREEN:
 ## Concerns
 
 - The legacy encrypted vault router remains mounted until Task 11 and is now protected by current premium account and App Check authorization without the removed device header middleware. Task 11 deletes this surface completely.
+
+## Fix round 1
+
+### Findings addressed
+
+- Every retained vault and encrypted-asset procedure remains mounted for type compatibility but now throws a sanitized `NOT_FOUND` before any legacy handler or quota service runs.
+- Private Pro deactivation now returns to a pending-auth volatile sentinel. Portable localStorage and IndexedDB adapters cannot fall through to Open durable storage while the Private Pro page remains alive. Open builds retain null and durable behavior.
+- Lifecycle startup now rolls back prepare and engine-start failures, attempts engine stop and deactivation, clears partial state, reports a sanitized error, and lets retry rerun full construction.
+- Stop cleanup attempts deactivation even when engine stop rejects, and React unmount consumes the sanitized cleanup rejection.
+- Sign-out is single-flight. Pending confirmation releases the flight for a later confirmed call. Confirmed sign-out broadcasts first, then attempts stop, deactivation, UID clear, Firebase sign-out, and reload in order even when earlier steps fail. Only a generic failure reaches the UI after the reload attempt.
+- The account control renders compact generic action failure copy and never exposes raw error details.
+- Auth bootstrap now uses an epoch and exact UID guard across auth callbacks, effect disposal, bootstrap resolution, token refresh, denial, and Firebase sign-out. Stale A results cannot mutate B or signed-out state.
+- Current account and access management remain quota-free. Legacy asset quota code is unreachable through the fail-closed router.
+
+### RED evidence
+
+- Legacy route RED: 6 failures proved current premium callers could still enter vault handlers and the encrypted-asset router lacked an injectable fail-closed factory.
+- Managed persistence RED: deactivation made `isPrivateProManagedPersistenceActive()` false and allowed Open fallback.
+- Lifecycle RED: 6 failures covered duplicate concurrent sign-out cleanup, skipped cleanup after rejection, raw failure leakage, prepare failure propagation, retained failed engine state, and stop skipping deactivation.
+- Auth RED: 3 failures because the epoch controller did not exist.
+
+### GREEN evidence
+
+- Focused Task 9, auth race, persistence, retained route, DBlob, asset, coordinator, engine, config, and access suites: 130 tests passed, 0 failed.
+- Root TypeScript and tools/test TypeScript: exit 0.
+- Scoped ESLint for the round-1 source and tests: exit 0.
+
+### Self-review
+
+- Fail-closed middleware runs after current premium/App Check authorization but before each handler.
+- No legacy quota, device, vault payload, or service error is observable to a caller.
+- Pending-auth remains volatile after startup failure, cleanup, sign-out failure, and mocked reload return.
+- Retry does not silently no-op after a failed startup.
+- All sign-out cleanup steps are attempted once per flight.
+- The carried never-settling lease regression and timely-renewal regression remain in the final verification set.
+
+### Concerns
+
+None.

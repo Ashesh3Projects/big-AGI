@@ -105,7 +105,7 @@ describe('ProviderPrivateProSync', () => {
     await starting;
 
     assert.deepEqual(calls, ['stop']);
-    assert.deepEqual(deactivated, ['uid-a']);
+    assert.deepEqual(deactivated, ['uid-a', 'uid-a']);
   });
 
   test('sign-out drains for 5000 ms and requires explicit discard while pending remains', async () => {
@@ -144,7 +144,66 @@ describe('ProviderPrivateProSync', () => {
 
     await lifecycle.signOut();
 
-    assert.deepEqual(order, ['stop', 'deactivate', 'clear', 'broadcast', 'firebase-sign-out', 'reload']);
+    assert.deepEqual(order, ['broadcast', 'stop', 'deactivate', 'clear', 'firebase-sign-out', 'reload']);
+  });
+
+  test('concurrent confirmed sign-out calls share one cleanup sequence', async () => {
+    const order: string[] = [];
+    const gate = deferred<void>();
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { order.push('flush'); await gate.promise; return { pending: 0 }; },
+        async pendingCount() { return 0; }, async stop() { order.push('stop'); },
+      }, coordinator: { broadcastSignedOut: () => { order.push('broadcast'); } } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('firebase-sign-out'); }, reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    const first = lifecycle.signOut({ discardPending: true });
+    const second = lifecycle.signOut({ discardPending: true });
+    gate.resolve();
+    await Promise.all([first, second]);
+
+    assert.deepEqual(order, ['flush', 'broadcast', 'stop', 'deactivate', 'clear', 'firebase-sign-out', 'reload']);
+  });
+
+  test('pending confirmation releases the sign-out flight for one later confirmed drain', async () => {
+    const { engine, calls } = fakeEngine({ pending: 2 });
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('firebase-sign-out'); }, reload: () => { order.push('reload'); }, pendingCount: async () => 2,
+    });
+    await lifecycle.start();
+
+    const first = lifecycle.signOut();
+    const second = lifecycle.signOut();
+    await Promise.allSettled([first, second]);
+    await lifecycle.signOut({ discardPending: true });
+
+    assert.deepEqual(calls, ['start', 'flush:5000', 'flush:5000', 'stop']);
+    assert.deepEqual(order, ['deactivate', 'clear', 'firebase-sign-out', 'reload']);
+  });
+
+  test('confirmed sign-out attempts every step and reload before returning a sanitized failure', async () => {
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+        async stop() { order.push('stop'); throw new Error('secret stop'); },
+      }, coordinator: { broadcastSignedOut: () => { order.push('broadcast'); } } }),
+      deactivate: async () => { order.push('deactivate'); throw new Error('secret deactivate'); },
+      clear: async () => { order.push('clear'); throw new Error('secret clear'); },
+      firebaseSignOut: async () => { order.push('firebase-sign-out'); throw new Error('secret auth'); },
+      reload: () => { order.push('reload'); throw new Error('reload mocked'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+
+    await assert.rejects(lifecycle.signOut({ discardPending: true }), error => error instanceof Error && !/secret/i.test(error.message));
+    assert.deepEqual(order, ['broadcast', 'stop', 'deactivate', 'clear', 'firebase-sign-out', 'reload']);
   });
 
   test('sign-out falls back to the durable count when the bounded flush errors', async () => {
@@ -163,6 +222,75 @@ describe('ProviderPrivateProSync', () => {
     assert.deepEqual(order, []);
   });
 
+  test('prepare failure rolls back, reports a sanitized error, and retry reruns full startup', async () => {
+    const store = createPrivateProSyncStore();
+    const { engine, calls } = fakeEngine();
+    const order: string[] = [];
+    let attempts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: store,
+      async prepare() {
+        attempts++;
+        if (attempts === 1) throw new Error('secret prepare detail');
+        return { engine };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+
+    await lifecycle.start();
+    assert.equal(store.getState().phase, 'error');
+    assert.equal(store.getState().lastCategory, 'unknown');
+    assert.deepEqual(order, ['deactivate']);
+    await lifecycle.retry();
+
+    assert.equal(attempts, 2);
+    assert.deepEqual(calls, ['start']);
+  });
+
+  test('engine start failure attempts stop and cleanup before retry succeeds', async () => {
+    const store = createPrivateProSyncStore();
+    const order: string[] = [];
+    let attempts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: store,
+      async prepare() {
+        attempts++;
+        return { engine: {
+          async start() { order.push(`start:${attempts}`); if (attempts === 1) throw new Error('secret start detail'); },
+          async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+          async stop() { order.push(`stop:${attempts}`); },
+        } };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+
+    await lifecycle.start();
+    assert.deepEqual(order, ['start:1', 'stop:1', 'deactivate']);
+    await lifecycle.retry();
+
+    assert.deepEqual(order, ['start:1', 'stop:1', 'deactivate', 'start:2']);
+    assert.equal(store.getState().phase, 'local');
+  });
+
+  test('stop failure cannot skip deactivation and reports only after cleanup', async () => {
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+        async stop() { order.push('stop'); throw new Error('secret stop detail'); },
+      } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+
+    await assert.rejects(lifecycle.stop(), error => error instanceof Error && !/secret/i.test(error.message));
+    assert.deepEqual(order, ['stop', 'deactivate']);
+  });
+
 
   test('account content exposes only email, compact status, retry, and sign-out', () => {
     const markup = renderToStaticMarkup(React.createElement(PrivateProAccountControlContent, {
@@ -175,6 +303,16 @@ describe('ProviderPrivateProSync', () => {
     assert.match(markup, /Retry/);
     assert.match(markup, /Sign out/);
     assert.doesNotMatch(markup, /vault|password|recovery|backup|quota|device|wipe|setup|unlock/i);
+  });
+
+  test('account content shows compact generic action failure without raw detail', () => {
+    const markup = renderToStaticMarkup(React.createElement(PrivateProAccountControlContent, {
+      email: 'friend@example.com', phase: 'error', pending: 0, busy: false, confirmDiscard: false,
+      actionError: true, onRetry: () => {}, onSignOut: () => {}, onConfirmDiscard: () => {}, onCancelDiscard: () => {},
+    }));
+
+    assert.match(markup, /Unable to complete the account action/);
+    assert.doesNotMatch(markup, /secret account failure|firebase-project-secret/i);
   });
 
   test('disabled account control renders nothing without requiring auth or sync contexts', () => {

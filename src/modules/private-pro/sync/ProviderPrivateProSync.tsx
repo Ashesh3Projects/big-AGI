@@ -50,11 +50,23 @@ export class PrivateProUnsyncedChangesError extends Error {
   }
 }
 
+class PrivateProLifecycleError extends Error {
+  constructor() {
+    super('Private Pro could not complete the requested operation.');
+    this.name = 'PrivateProLifecycleError';
+  }
+}
+
+function rememberFailure(current: unknown, next: unknown): unknown {
+  return current ?? next;
+}
+
 export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecycleDependencies): PrivateProSyncLifecycle {
   let epoch = 0;
   let prepared: PreparedPrivateProSync | null = null;
   let startPromise: Promise<void> | null = null;
   let stopping: Promise<void> | null = null;
+  let signOutPromise: Promise<void> | null = null;
 
   async function stopPrepared(current: PreparedPrivateProSync | null): Promise<void> {
     if (current) await current.engine.stop();
@@ -67,8 +79,12 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
     prepared = null;
     startPromise = null;
     stopping = (async () => {
-      await stopPrepared(current);
-      if (epoch === stopEpoch) await dependencies.deactivate(dependencies.uid);
+      let failure: unknown = null;
+      try { await stopPrepared(current); } catch (error) { failure = rememberFailure(failure, error); }
+      if (epoch === stopEpoch) {
+        try { await dependencies.deactivate(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
+      }
+      if (failure) throw new PrivateProLifecycleError();
     })().finally(() => { stopping = null; });
     return stopping;
   }
@@ -78,26 +94,34 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
       if (prepared || startPromise) return startPromise ?? Promise.resolve();
       const startEpoch = ++epoch;
       startPromise = (async () => {
-        const next = await dependencies.prepare();
-        if (epoch !== startEpoch) {
-          await next.engine.stop();
-          return;
-        }
-        prepared = next;
+        let next: PreparedPrivateProSync | null = null;
         try {
+          next = await dependencies.prepare();
+          if (epoch !== startEpoch) return;
+          prepared = next;
           await next.engine.start();
+          if (epoch === startEpoch) dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
         } catch {
           if (epoch === startEpoch) dependencies.statusStore.setState({ phase: 'error', lastCategory: 'unknown' });
+        } finally {
+          if (epoch !== startEpoch || dependencies.statusStore.getState().phase === 'error') {
+            prepared = null;
+            if (next) try { await next.engine.stop(); } catch {}
+            try { await dependencies.deactivate(dependencies.uid); } catch {}
+          }
         }
       })().finally(() => { if (epoch === startEpoch) startPromise = null; });
       return startPromise;
     },
 
     async retry(): Promise<void> {
-      await prepared?.engine.retryNow();
+      if (!prepared) return this.start();
+      await prepared.engine.retryNow();
     },
 
     async signOut(options = {}): Promise<void> {
+      if (signOutPromise) return signOutPromise;
+      signOutPromise = (async () => {
       const current = prepared;
       let pending: number;
       try {
@@ -112,12 +136,16 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
       ++epoch;
       prepared = null;
       startPromise = null;
-      await stopPrepared(current);
-      await dependencies.deactivate(dependencies.uid);
-      await dependencies.clear(dependencies.uid);
       current?.coordinator?.broadcastSignedOut?.();
-      await dependencies.firebaseSignOut();
-      dependencies.reload();
+      let failure: unknown = null;
+      try { await stopPrepared(current); } catch (error) { failure = rememberFailure(failure, error); }
+      try { await dependencies.deactivate(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
+      try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
+      try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
+      try { dependencies.reload(); } catch (error) { failure = rememberFailure(failure, error); }
+      if (failure) throw new PrivateProLifecycleError();
+      })().finally(() => { signOutPromise = null; });
+      return signOutPromise;
     },
 
     stop,
@@ -169,7 +197,7 @@ export function ProviderPrivateProSyncAccount(props: {
   const signOut = React.useCallback((options?: { discardPending?: boolean }) => props.lifecycle.signOut(options), [props.lifecycle]);
   React.useEffect(() => {
     void props.lifecycle.start();
-    return () => { void props.lifecycle.stop(); };
+    return () => { void props.lifecycle.stop().catch(() => {}); };
   }, [props.lifecycle, props.uid]);
   const value = React.useMemo<PrivateProSyncContextValue>(() => ({
     phase,

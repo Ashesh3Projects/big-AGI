@@ -39,7 +39,8 @@ export const PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS = new Set([
 ] as const);
 
 const managedBuild = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
-let managedPersistenceUid: string | null = managedBuild ? '__pending-auth__' : null;
+const PENDING_AUTH_UID = '__pending-auth__';
+let managedPersistenceUid: string | null = managedBuild ? PENDING_AUTH_UID : null;
 const volatileLocalStorage = new Map<string, string>();
 const volatilePersistStorage = new Map<string, StorageValue<unknown>>();
 const patchedStorage = Symbol.for('big-agi.private-pro-portable-storage');
@@ -88,6 +89,7 @@ export function clearPrivateProVolatilePortableState(): void {
 }
 
 export async function activatePrivateProManagedPersistence(uid: string | null): Promise<void> {
+  if (managedBuild && uid === null) uid = PENDING_AUTH_UID;
   if (managedPersistenceUid !== uid) clearPrivateProVolatilePortableState();
   managedPersistenceUid = uid;
 }
@@ -99,7 +101,7 @@ export async function deactivatePrivateProManagedPersistence(
   if (managedPersistenceUid !== uid) return false;
   clearRuntime?.();
   clearPrivateProVolatilePortableState();
-  if (managedPersistenceUid === uid) managedPersistenceUid = null;
+  if (managedPersistenceUid === uid) managedPersistenceUid = PENDING_AUTH_UID;
   return true;
 }
 
@@ -202,8 +204,9 @@ export function createPrivateProSensitiveLocalStorageOptions<S>(): { storage: Pe
   return { storage: createPrivateProVolatileZustandStorage<S>(assertSensitiveLocalStorageKey) };
 }
 
-export function createPrivateProPortableIDBStorage<S>(): PersistStorage<S> | undefined {
-  const durable = createIDBPersistStorage<S>();
+export function createPrivateProPortableIDBStorage<S>(
+  durable: PersistStorage<S> | undefined = createIDBPersistStorage<S>(),
+): PersistStorage<S> | undefined {
   if (!durable) return undefined;
   return {
     getItem(name) {
@@ -243,10 +246,10 @@ export async function clearPrivateProManagedPersistence(
   clearRuntime?: () => void,
 ): Promise<void> {
   if (!uid) throw new TypeError('Private Pro managed persistence UID is required.');
-  if (managedPersistenceUid === uid || managedPersistenceUid === '__pending-auth__') {
+  if (managedPersistenceUid === uid || managedPersistenceUid === PENDING_AUTH_UID) {
     clearRuntime?.();
     clearPrivateProVolatilePortableState();
-    managedPersistenceUid = null;
+    managedPersistenceUid = managedBuild ? PENDING_AUTH_UID : null;
   }
   const database = syncDB ?? (await import('../sync/privatePro.sync.db')).privateProSyncDB;
   const tasks: Promise<unknown>[] = [database.clearUid(uid)];

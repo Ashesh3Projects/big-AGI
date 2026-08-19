@@ -48,6 +48,10 @@ export async function privateProRefreshIdToken(): Promise<string> {
   return user.getIdToken(true);
 }
 
+export function privateProCurrentAuthUser(): User | null {
+  return privateProClientConfig.enabled ? getPrivateProFirebaseAuth().currentUser : null;
+}
+
 export async function privateProGetRequestHeaders(): Promise<Record<string, string>> {
   if (!privateProClientConfig.enabled) return {};
   const user = getPrivateProFirebaseAuth().currentUser;

@@ -265,4 +265,36 @@ describe('private Pro managed persistence gate', () => {
     assert.equal(runtimeClears, 0);
     assert.equal(privateProManagedPersistenceUid(), 'uid-b');
   });
+
+  test('Private Pro deactivation returns to pending-auth volatile storage instead of Open durability', async () => {
+    const durable = new MemoryStorage();
+    const storage = createPrivateProPortableLocalStorage(() => durable);
+    await activatePrivateProManagedPersistence('uid-a');
+
+    assert.equal(await deactivatePrivateProManagedPersistence('uid-a'), true);
+    storage.setItem('app-models', 'after-deactivation');
+
+    assert.equal(isPrivateProManagedPersistenceActive(), true);
+    assert.equal(privateProManagedPersistenceUid(), null);
+    assert.equal(storage.getItem('app-models'), 'after-deactivation');
+    assert.equal(durable.getItem('app-models'), null);
+  });
+
+  test('Private Pro IDB adapter stays volatile while pending authentication', async () => {
+    const { createPrivateProPortableIDBStorage } = await import('./privatePro.persistence');
+    const durableValues = new Map<string, unknown>();
+    await activatePrivateProManagedPersistence('uid-a');
+    await deactivatePrivateProManagedPersistence('uid-a');
+    const storage = createPrivateProPortableIDBStorage<{ value: string }>({
+      getItem: async name => durableValues.get(name) as never ?? null,
+      setItem: async (name, value) => { durableValues.set(name, value); },
+      removeItem: async name => { durableValues.delete(name); },
+    });
+    if (!storage) assert.fail('Expected IndexedDB storage.');
+
+    await storage.setItem('app-chats', { state: { value: 'pending-auth' }, version: 1 });
+
+    assert.deepEqual(await storage.getItem('app-chats'), { state: { value: 'pending-auth' }, version: 1 });
+    assert.equal(durableValues.has('app-chats'), false);
+  });
 });

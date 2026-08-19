@@ -6,6 +6,7 @@ import { apiAsyncNode } from '~/common/util/trpc.client';
 import { privateProClientConfig, privateProClientConfigComplete } from '../config/privatePro.config';
 import {
   privateProOnAuthStateChanged,
+  privateProCurrentAuthUser,
   privateProRefreshIdToken,
   privateProSignInWithGoogle,
   privateProSignOut,
@@ -15,6 +16,66 @@ import type { PrivateProBootstrap } from './privatePro.auth.service';
 
 
 type PrivateProAuthState = 'loading' | 'signed-out' | 'bootstrapping' | 'signed-in' | 'denied' | 'misconfigured' | 'error';
+
+interface PrivateProAuthBootstrapUser {
+  uid: string;
+  email: string | null;
+}
+
+interface PrivateProAuthBootstrapControllerDependencies {
+  bootstrap(uid: string): Promise<PrivateProBootstrap>;
+  refreshIdToken(uid: string): Promise<void>;
+  firebaseSignOut(uid: string): Promise<void>;
+  currentUser(): PrivateProAuthBootstrapUser | null;
+  setUser(user: PrivateProAuthBootstrapUser | null): void;
+  setBootstrap(value: PrivateProBootstrap | null): void;
+  setState(state: PrivateProAuthState): void;
+  setError(error: string | undefined): void;
+  setDeniedEmail(email: string | undefined): void;
+  getDeniedEmail(): string | undefined;
+}
+
+export function createPrivateProAuthBootstrapController(dependencies: PrivateProAuthBootstrapControllerDependencies) {
+  let epoch = 0;
+  let disposed = false;
+  const current = (capturedEpoch: number, uid: string) => !disposed && epoch === capturedEpoch && dependencies.currentUser()?.uid === uid;
+  return {
+    async handleAuthState(nextUser: PrivateProAuthBootstrapUser | null): Promise<void> {
+      const capturedEpoch = ++epoch;
+      dependencies.setUser(nextUser);
+      dependencies.setBootstrap(null);
+      if (!nextUser) {
+        dependencies.setState(dependencies.getDeniedEmail() ? 'denied' : 'signed-out');
+        return;
+      }
+      const uid = nextUser.uid;
+      dependencies.setState('bootstrapping');
+      try {
+        const result = await dependencies.bootstrap(uid);
+        if (!current(capturedEpoch, uid)) return;
+        await dependencies.refreshIdToken(uid);
+        if (!current(capturedEpoch, uid)) return;
+        dependencies.setDeniedEmail(undefined);
+        dependencies.setBootstrap(result);
+        dependencies.setState('signed-in');
+      } catch (error) {
+        if (!current(capturedEpoch, uid)) return;
+        const code = (error as { data?: { code?: string } })?.data?.code;
+        if (code === 'UNAUTHORIZED') {
+          dependencies.setDeniedEmail(nextUser.email || 'selected account');
+          await dependencies.firebaseSignOut(uid);
+          return;
+        }
+        dependencies.setError('Unable to bootstrap Private Pro.');
+        dependencies.setState('error');
+      }
+    },
+    dispose(): void {
+      disposed = true;
+      epoch++;
+    },
+  };
+}
 
 interface PrivateProAuthContextValue {
   enabled: boolean;
@@ -42,34 +103,29 @@ export function ProviderPrivatePro(props: { children: React.ReactNode }) {
       return;
     }
 
-    return privateProOnAuthStateChanged((nextUser) => {
-      setUser(nextUser);
-      setBootstrap(null);
-      if (!nextUser) {
-        setState(deniedEmailRef.current ? 'denied' : 'signed-out');
-        return;
-      }
-
-      setState('bootstrapping');
-      void apiAsyncNode.privateProAuth.bootstrap.mutate()
-        .then(async result => {
-          await privateProRefreshIdToken();
-          deniedEmailRef.current = undefined;
-          setBootstrap(result);
-          setState('signed-in');
-        })
-        .catch(async authError => {
-          const code = (authError as { data?: { code?: string } })?.data?.code;
-          if (code === 'UNAUTHORIZED') {
-            deniedEmailRef.current = nextUser.email || 'selected account';
-            await privateProSignOut();
-            setState('denied');
-            return;
-          }
-          setError(authError instanceof Error ? authError.message : 'Unable to bootstrap private Pro.');
-          setState('error');
-        });
+    const controller = createPrivateProAuthBootstrapController({
+      bootstrap: () => apiAsyncNode.privateProAuth.bootstrap.mutate(),
+      refreshIdToken: async uid => {
+        if (privateProCurrentAuthUser()?.uid !== uid) return;
+        await privateProRefreshIdToken();
+      },
+      firebaseSignOut: async uid => {
+        if (privateProCurrentAuthUser()?.uid !== uid) return;
+        await privateProSignOut();
+      },
+      currentUser: privateProCurrentAuthUser,
+      setUser: nextUser => setUser(nextUser as User | null),
+      setBootstrap,
+      setState,
+      setError,
+      setDeniedEmail: email => { deniedEmailRef.current = email; },
+      getDeniedEmail: () => deniedEmailRef.current,
     });
+    const unsubscribe = privateProOnAuthStateChanged(nextUser => { void controller.handleAuthState(nextUser); });
+    return () => {
+      controller.dispose();
+      unsubscribe();
+    };
   }, []);
 
   const signIn = React.useCallback(async () => {

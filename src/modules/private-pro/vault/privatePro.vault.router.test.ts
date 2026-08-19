@@ -199,15 +199,18 @@ describe('private Pro vault router authorization', () => {
     }
   });
 
-  test('allows the current entitled caller and derives UID only from context', async () => {
+  test('fails closed for a current entitled caller before any legacy handler runs', async () => {
     state.account = account();
     state.devices.set(DEVICE_ID, { deviceId: DEVICE_ID, keyVersion: 1, revokedAtMs: null });
     state.calls = [];
     const privateProVaultRouter = await router();
 
-    await privateProVaultRouter.createCaller(context(identity())).getIndex({ pageSize: 1 });
+    await assert.rejects(
+      privateProVaultRouter.createCaller(context(identity())).getIndex({ pageSize: 1 }),
+      error => (error as { code?: string }).code === 'NOT_FOUND' && !/secret|firebase|device/i.test((error as Error).message),
+    );
 
-    assert.deepEqual(state.calls.slice(-1), [{ method: 'getIndex', uid: UID, input: { pageSize: 1 } }]);
+    assert.deepEqual(state.calls, []);
   });
 
   test('does not expose authorization storage errors', async () => {
@@ -224,45 +227,49 @@ describe('private Pro vault router authorization', () => {
 });
 
 describe('private Pro vault router input bounds', () => {
-  test('exposes every protected vault procedure for a current account', async () => {
+  test('keeps every legacy vault procedure mounted but denies every valid call', async () => {
     state.account = account();
     const caller = (await router()).createCaller(context(identity()));
 
     assert.equal('commitMigration' in caller, false);
 
-    await caller.bootstrap({ deviceId: DEVICE_ID });
-    await caller.listDevices();
-    const challenge = await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
-    await caller.completeDeviceRegistration({ operationId: 'register-device-1', ...challenge, signatureBase64: 'AA==' });
-    await caller.getIndex({ pageSize: 1 });
-    await caller.getRecords({ opaqueRecordIds: [RECORD_ID] });
-    await caller.putRecord({
+    const calls = [
+      () => caller.bootstrap({ deviceId: DEVICE_ID }),
+      () => caller.listDevices(),
+      () => caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 }),
+      () => caller.completeDeviceRegistration({
+        operationId: 'register-device-1', formatVersion: 1, deviceId: DEVICE_ID, keyVersion: 1,
+        challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==',
+      }),
+      () => caller.getIndex({ pageSize: 1 }),
+      () => caller.getRecords({ opaqueRecordIds: [RECORD_ID] }),
+      () => caller.putRecord({
       operationId: 'put-record-1',
       opaqueRecordId: RECORD_ID,
       baseRevision: 0,
       envelope: envelope(RECORD_ID, 1),
-    });
-    await caller.mergeBackup({
+      }),
+      () => caller.mergeBackup({
       operationId: 'merge-backup-1',
       records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
-    });
-    await caller.beginBackupRestore({
+      }),
+      () => caller.beginBackupRestore({
       restoreId: 'restore-1', backupFingerprint: 'f'.repeat(43), backupRecordCount: 1, backupTotalCiphertextBytes: 16,
       chunkCount: 1, recordCount: 1,
       chunkRecordCounts: [1], chunkFingerprints: ['c'.repeat(43)], totalCiphertextBytes: 16,
-    });
-    await caller.getBackupRestoreStatus({ restoreId: 'restore-1' });
-    await caller.mergeBackupRestoreChunk({
+      }),
+      () => caller.getBackupRestoreStatus({ restoreId: 'restore-1' }),
+      () => caller.mergeBackupRestoreChunk({
       restoreId: 'restore-1', operationId: 'restore-1:0', chunkIndex: 0, chunkFingerprint: 'c'.repeat(43),
       records: [{ opaqueRecordId: RECORD_ID, baseRevision: 0, envelope: envelope(RECORD_ID, 1) }],
-    });
-    await caller.getBackupRestoreIndex({ restoreId: 'restore-1', pageSize: 1 });
-    await caller.getBackupRestoreRecords({ restoreId: 'restore-1', opaqueRecordIds: [RECORD_ID] });
-    await caller.sealBackupRestore({ restoreId: 'restore-1', operationId: 'restore-1:seal' });
-    await caller.confirmBackupRestoreVerified({
+      }),
+      () => caller.getBackupRestoreIndex({ restoreId: 'restore-1', pageSize: 1 }),
+      () => caller.getBackupRestoreRecords({ restoreId: 'restore-1', opaqueRecordIds: [RECORD_ID] }),
+      () => caller.sealBackupRestore({ restoreId: 'restore-1', operationId: 'restore-1:seal' }),
+      () => caller.confirmBackupRestoreVerified({
       restoreId: 'restore-1', operationId: 'restore-1:confirm', sessionFingerprint: 's'.repeat(43),
-    });
-    await caller.deleteRecord({
+      }),
+      () => caller.deleteRecord({
       operationId: 'delete-record-1',
       opaqueRecordId: RECORD_ID,
       baseRevision: 0,
@@ -275,12 +282,15 @@ describe('private Pro vault router input bounds', () => {
         operationId: 'delete-record-1',
         deletedAtMs: 1,
       },
-    });
-    await caller.putKeyset({ operationId: 'put-keyset-1', baseWrappingVersion: 0, keyset: keyset(1) });
-    await caller.revokeDevice({ operationId: 'revoke-device-1', deviceId: DEVICE_ID });
+      }),
+      () => caller.putKeyset({ operationId: 'put-keyset-1', baseWrappingVersion: 0, keyset: keyset(1) }),
+      () => caller.revokeDevice({ operationId: 'revoke-device-1', deviceId: DEVICE_ID }),
+    ];
+    for (const call of calls) await assert.rejects(call(), error => (error as { code?: string }).code === 'NOT_FOUND');
+    assert.deepEqual(state.calls, []);
   });
 
-  test('does not require obsolete device middleware for legacy vault operations', async () => {
+  test('denies missing, revoked, and mismatched legacy device states identically', async () => {
     state.account = account();
     const privateProVaultRouter = await router();
 
@@ -292,27 +302,21 @@ describe('private Pro vault router input bounds', () => {
       state.devices.clear();
       if (device) state.devices.set(DEVICE_ID, device);
       const caller = privateProVaultRouter.createCaller(context(identity()));
-      await caller.getIndex({ pageSize: 1 });
+      await assert.rejects(caller.getIndex({ pageSize: 1 }), error => (error as { code?: string }).code === 'NOT_FOUND');
     }
   });
 
-  test('requires explicit matching device registration after the initial keyset commit', async () => {
+  test('never enters registration or keyset handlers', async () => {
     state.account = account();
     state.calls = [];
     const caller = (await router()).createCaller(context(identity()));
 
-    await caller.putKeyset({ operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) });
-    const challenge = await caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 });
-    await caller.completeDeviceRegistration({ operationId: 'register-device-initial', ...challenge, signatureBase64: 'AA==' });
-
-    assert.deepEqual(state.calls, [
-      { method: 'putKeyset', uid: UID, input: { operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) } },
-      { method: 'beginDeviceRegistration', uid: UID, input: { deviceId: DEVICE_ID, keyVersion: 1 } },
-      { method: 'completeDeviceRegistration', uid: UID, input: { operationId: 'register-device-initial', formatVersion: 1, deviceId: DEVICE_ID, keyVersion: 1, challengeId: CHALLENGE_ID, challengeBase64: CHALLENGE_BASE64, expiresAtMs: 301_000, signatureBase64: 'AA==' } },
-    ]);
+    await assert.rejects(caller.putKeyset({ operationId: 'initial-keyset', baseWrappingVersion: 0, keyset: keyset(1) }));
+    await assert.rejects(caller.beginDeviceRegistration({ deviceId: DEVICE_ID, keyVersion: 1 }));
+    assert.deepEqual(state.calls, []);
   });
 
-  test('returns only the generic vault error when a wrapping rotation violates server invariants', async () => {
+  test('fails closed before wrapping rotation invariants or service errors are observable', async () => {
     state.account = account();
     state.devices.set(DEVICE_ID, { deviceId: DEVICE_ID, keyVersion: 1, revokedAtMs: null });
     state.putKeysetError = new Error('Vault enrollment authority cannot change during password wrapping rotation.');
@@ -320,8 +324,8 @@ describe('private Pro vault router input bounds', () => {
 
     try {
       await assert.rejects(caller.putKeyset({ operationId: 'malicious-rotation', baseWrappingVersion: 1, keyset: { ...keyset(1), wrappingVersion: 2 } }), error => {
-        assert.equal((error as { code?: string }).code, 'INTERNAL_SERVER_ERROR');
-        assert.equal((error as Error).message, 'Encrypted vault operation failed.');
+        assert.equal((error as { code?: string }).code, 'NOT_FOUND');
+        assert.equal((error as Error).message, 'Private Pro legacy endpoint is unavailable.');
         assert.doesNotMatch((error as Error).message, /enrollment authority/i);
         return true;
       });
@@ -330,11 +334,11 @@ describe('private Pro vault router input bounds', () => {
     }
   });
 
-  test('validates registration by its explicit input after device headers are removed', async () => {
+  test('denies mismatched registration input before its handler', async () => {
     state.account = account();
     const caller = (await router()).createCaller(context(identity()));
 
-    await caller.beginDeviceRegistration({ deviceId: RECORD_ID, keyVersion: 1 });
+    await assert.rejects(caller.beginDeviceRegistration({ deviceId: RECORD_ID, keyVersion: 1 }), error => (error as { code?: string }).code === 'NOT_FOUND');
   });
 
   test('rejects UID injection, oversized pages/counts/ciphertext, and malformed operation IDs', async () => {

@@ -19,22 +19,33 @@ const encryptedChunkSchema = z.object({
   objectSha256: sha256Schema,
 }).strict();
 
-export const privateProVaultAssetsRouter = createTRPCRouter({
-  reserveEncryptedUpload: privateProNodePremiumProcedure
+export function createPrivateProVaultAssetsRouter(
+  procedure: typeof privateProNodePremiumProcedure = privateProNodePremiumProcedure,
+  serviceFactory = getFirebasePrivateProVaultAssetsService,
+) {
+  const removedProcedure = procedure.use(() => {
+    throw new TRPCError({ code: 'NOT_FOUND', message: 'Private Pro legacy endpoint is unavailable.' });
+  });
+  const service = () => serviceFactory();
+  return createTRPCRouter({
+  reserveEncryptedUpload: removedProcedure
     .input(z.object({ operationId: operationIdSchema, opaqueAssetId: opaqueIdSchema, chunks: z.array(encryptedChunkSchema).min(1).max(32) }).strict())
     .mutation(async ({ ctx, input }) => {
       try {
-        return await getFirebasePrivateProVaultAssetsService().reserveUpload(ctx.privateProIdentity.uid, input);
+        return await service().reserveUpload(ctx.privateProIdentity.uid, input);
       } catch (error) {
         if (error instanceof PrivateProVaultAssetRateLimitError)
           throw new TRPCError({ code: 'TOO_MANY_REQUESTS', message: error.message });
         throw error;
       }
     }),
-  finalizeEncryptedUpload: privateProNodePremiumProcedure.input(z.object({ operationId: operationIdSchema }).strict())
-    .mutation(({ ctx, input }) => getFirebasePrivateProVaultAssetsService().finalizeUpload(ctx.privateProIdentity.uid, input.operationId)),
-  getEncryptedDownload: privateProNodePremiumProcedure.input(z.object({ opaqueAssetId: opaqueIdSchema }).strict())
-    .query(({ ctx, input }) => getFirebasePrivateProVaultAssetsService().getDownload(ctx.privateProIdentity.uid, input.opaqueAssetId)),
-  releaseEncryptedReservation: privateProNodePremiumProcedure.input(z.object({ operationId: operationIdSchema }).strict())
-    .mutation(({ ctx, input }) => getFirebasePrivateProVaultAssetsService().releaseReservation(ctx.privateProIdentity.uid, input.operationId)),
+  finalizeEncryptedUpload: removedProcedure.input(z.object({ operationId: operationIdSchema }).strict())
+    .mutation(({ ctx, input }) => service().finalizeUpload(ctx.privateProIdentity.uid, input.operationId)),
+  getEncryptedDownload: removedProcedure.input(z.object({ opaqueAssetId: opaqueIdSchema }).strict())
+    .query(({ ctx, input }) => service().getDownload(ctx.privateProIdentity.uid, input.opaqueAssetId)),
+  releaseEncryptedReservation: removedProcedure.input(z.object({ operationId: operationIdSchema }).strict())
+    .mutation(({ ctx, input }) => service().releaseReservation(ctx.privateProIdentity.uid, input.operationId)),
 });
+}
+
+export const privateProVaultAssetsRouter = createPrivateProVaultAssetsRouter();

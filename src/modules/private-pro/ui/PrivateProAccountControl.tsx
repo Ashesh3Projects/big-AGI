@@ -17,6 +17,7 @@ export function PrivateProAccountControlContent(props: {
   pending: number;
   busy: boolean;
   confirmDiscard: boolean;
+  actionError?: boolean;
   onRetry: () => void;
   onSignOut: () => void;
   onConfirmDiscard: () => void;
@@ -26,6 +27,7 @@ export function PrivateProAccountControlContent(props: {
     <Stack spacing={2} sx={{ minWidth: { sm: 340 } }}>
       <Typography level='body-sm'>{props.email}</Typography>
       <PrivateProSyncStatus phase={props.phase} pending={props.pending} busy={props.busy} onRetry={props.onRetry} />
+      {props.actionError && <Alert color='danger'>Unable to complete the account action. Try again.</Alert>}
       {props.confirmDiscard && <Alert color='warning'>Some changes are still pending. Discard them from this browser and sign out?</Alert>}
       {props.confirmDiscard ? (
         <Stack direction='row' spacing={1}>
@@ -50,15 +52,18 @@ function PrivateProAccountControlEnabled(props: { mobile?: boolean }) {
   const [open, setOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const [confirmDiscard, setConfirmDiscard] = React.useState(false);
+  const [actionError, setActionError] = React.useState(false);
 
   if (!user) return null;
 
   const run = async (discardPending: boolean) => {
     setBusy(true);
+    setActionError(false);
     try {
       await sync.signOut(discardPending ? { discardPending: true } : undefined);
     } catch (error) {
       if (error instanceof PrivateProUnsyncedChangesError) setConfirmDiscard(true);
+      else setActionError(true);
     } finally {
       setBusy(false);
     }
@@ -77,7 +82,8 @@ function PrivateProAccountControlEnabled(props: { mobile?: boolean }) {
         pending={sync.pending}
         busy={busy}
         confirmDiscard={confirmDiscard}
-        onRetry={() => void sync.retry()}
+        actionError={actionError}
+        onRetry={() => void sync.retry().catch(() => setActionError(true))}
         onSignOut={() => void run(false)}
         onConfirmDiscard={() => void run(true)}
         onCancelDiscard={() => setConfirmDiscard(false)}
