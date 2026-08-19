@@ -11,10 +11,10 @@ import { get, set } from 'idb-keyval';
 import {
   PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS,
   PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS,
-  activatePrivateProManagedPersistence,
+  activatePrivateProManagedPersistence as activatePrivateProManagedPersistenceOwned,
   clearPrivateProManagedPersistence,
   createPrivateProPortableLocalStorage,
-  deactivatePrivateProManagedPersistence,
+  deactivatePrivateProManagedPersistence as deactivatePrivateProManagedPersistenceOwned,
   isPrivateProManagedPersistenceActive,
   privateProManagedPersistenceUid,
 } from './privatePro.persistence';
@@ -30,6 +30,20 @@ class MemoryStorage implements Storage {
   removeItem(key: string) { this.values.delete(key); }
   setItem(key: string, value: string) { this.values.set(key, value); }
 }
+
+const managedOwners = new Map<string, object>();
+const managedOwner = (uid: string) => {
+  let owner = managedOwners.get(uid);
+  if (!owner) {
+    owner = {};
+    managedOwners.set(uid, owner);
+  }
+  return owner;
+};
+const activatePrivateProManagedPersistence = (uid: string | null) =>
+  activatePrivateProManagedPersistenceOwned(uid, uid ? managedOwner(uid) : null);
+const deactivatePrivateProManagedPersistence = (uid: string, clearRuntime?: () => void) =>
+  deactivatePrivateProManagedPersistenceOwned(uid, managedOwner(uid), clearRuntime);
 
 
 afterEach(() => activatePrivateProManagedPersistence(null));
@@ -264,6 +278,21 @@ describe('private Pro managed persistence gate', () => {
     assert.equal(storage.getItem('app-models'), 'uid-b-models');
     assert.equal(runtimeClears, 0);
     assert.equal(privateProManagedPersistenceUid(), 'uid-b');
+  });
+
+  test('stale same-UID owner cleanup cannot deactivate a replacement runtime', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    const oldOwner = Symbol('old-owner');
+    const replacementOwner = Symbol('replacement-owner');
+    let runtimeClears = 0;
+    await activatePrivateProManagedPersistenceOwned('uid-a', oldOwner);
+    storage.setItem('app-models', 'uid-a-models');
+    await activatePrivateProManagedPersistenceOwned('uid-a', replacementOwner);
+
+    assert.equal(await deactivatePrivateProManagedPersistenceOwned('uid-a', oldOwner, () => { runtimeClears++; }), false);
+    assert.equal(storage.getItem('app-models'), 'uid-a-models');
+    assert.equal(runtimeClears, 0);
+    assert.equal(privateProManagedPersistenceUid(), 'uid-a');
   });
 
   test('Private Pro deactivation returns to pending-auth volatile storage instead of Open durability', async () => {

@@ -40,7 +40,9 @@ export const PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS = new Set([
 
 const managedBuild = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
 const PENDING_AUTH_UID = '__pending-auth__';
+export type PrivateProPersistenceOwner = object | symbol;
 let managedPersistenceUid: string | null = managedBuild ? PENDING_AUTH_UID : null;
+let managedPersistenceOwner: PrivateProPersistenceOwner | null = null;
 const volatileLocalStorage = new Map<string, string>();
 const volatilePersistStorage = new Map<string, StorageValue<unknown>>();
 const patchedStorage = Symbol.for('big-agi.private-pro-portable-storage');
@@ -83,31 +85,42 @@ export function privateProManagedPersistenceUid(): string | null {
   return managedPersistenceUid?.startsWith('__') ? null : managedPersistenceUid;
 }
 
+export function privateProManagedPersistenceOwnership(): { uid: string; owner: PrivateProPersistenceOwner } | null {
+  const uid = privateProManagedPersistenceUid();
+  return uid && managedPersistenceOwner ? { uid, owner: managedPersistenceOwner } : null;
+}
+
 export function clearPrivateProVolatilePortableState(): void {
   volatileLocalStorage.clear();
   volatilePersistStorage.clear();
 }
 
-export async function activatePrivateProManagedPersistence(uid: string | null): Promise<void> {
+export async function activatePrivateProManagedPersistence(uid: string | null, owner: PrivateProPersistenceOwner | null): Promise<void> {
   if (managedBuild && uid === null) uid = PENDING_AUTH_UID;
+  if (uid !== null && uid !== PENDING_AUTH_UID && !owner) throw new TypeError('Private Pro managed persistence owner is required.');
   if (managedPersistenceUid !== uid) clearPrivateProVolatilePortableState();
   managedPersistenceUid = uid;
+  managedPersistenceOwner = uid === null || uid === PENDING_AUTH_UID ? null : owner;
 }
 
 export async function deactivatePrivateProManagedPersistence(
   uid: string,
+  owner: PrivateProPersistenceOwner,
   clearRuntime?: () => void,
 ): Promise<boolean> {
-  if (managedPersistenceUid !== uid) return false;
+  if (managedPersistenceUid !== uid || managedPersistenceOwner !== owner) return false;
   clearRuntime?.();
   clearPrivateProVolatilePortableState();
-  if (managedPersistenceUid === uid) managedPersistenceUid = PENDING_AUTH_UID;
+  if (managedPersistenceUid === uid && managedPersistenceOwner === owner) {
+    managedPersistenceUid = PENDING_AUTH_UID;
+    managedPersistenceOwner = null;
+  }
   return true;
 }
 
 /** @deprecated Removed with the encrypted vault runtime. */
 export function setPrivateProEncryptedPersistenceActive(active: boolean): void {
-  void activatePrivateProManagedPersistence(active ? '__legacy-vault__' : null);
+  void activatePrivateProManagedPersistence(active ? '__legacy-vault__' : null, active ? setPrivateProEncryptedPersistenceActive : null);
 }
 
 /** @deprecated Removed with encrypted asset persistence. */
@@ -250,6 +263,7 @@ export async function clearPrivateProManagedPersistence(
     clearRuntime?.();
     clearPrivateProVolatilePortableState();
     managedPersistenceUid = managedBuild ? PENDING_AUTH_UID : null;
+    managedPersistenceOwner = null;
   }
   const database = syncDB ?? (await import('../sync/privatePro.sync.db')).privateProSyncDB;
   const tasks: Promise<unknown>[] = [database.clearUid(uid)];

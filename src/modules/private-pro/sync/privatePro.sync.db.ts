@@ -10,6 +10,14 @@ import type { PrivateProAssetManifest } from '../assets/privatePro.assets.schema
 
 export const PRIVATE_PRO_SYNC_DB_VERSION = 2;
 
+function throwIfCaptureAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw captureAbortError();
+}
+
+function captureAbortError(): DOMException {
+  return new DOMException('Private Pro sync capture stopped.', 'AbortError');
+}
+
 export interface PrivateProSyncRecordIdentity {
   recordType: PrivateProSyncRecordType;
   logicalId: string;
@@ -310,8 +318,17 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
-  async recordLocalPut(uid: string, record: PrivateProSyncPreparedRecord, nowMs: number): Promise<PrivateProOutboxState> {
-    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.meta], async () => {
+  async recordLocalPut(
+    uid: string,
+    record: PrivateProSyncPreparedRecord,
+    nowMs: number,
+    signal?: AbortSignal,
+  ): Promise<PrivateProOutboxState> {
+    let abortTransaction: (() => void) | null = null;
+    const transaction = this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.meta], async dexieTransaction => {
+      abortTransaction = () => dexieTransaction.abort();
+      signal?.addEventListener('abort', abortTransaction, { once: true });
+      throwIfCaptureAborted(signal);
       const [previousLocal, previousOutbox, remoteBase] = await Promise.all([
         this.localRecords.get([uid, record.recordKey]),
         this.outbox.get([uid, record.recordKey]),
@@ -352,13 +369,31 @@ export class PrivateProSyncDB extends Dexie {
         blocked: false,
         errorCode: null,
       };
+      throwIfCaptureAborted(signal);
       await Promise.all([this.localRecords.put(localRecord), this.outbox.put(outbox)]);
       return cloneOutbox(outbox);
     });
+    try {
+      return await transaction;
+    } catch (error) {
+      if (signal?.aborted) throw captureAbortError();
+      throw error;
+    } finally {
+      if (abortTransaction) signal?.removeEventListener('abort', abortTransaction);
+    }
   }
 
-  async recordLocalDelete(uid: string, identity: PrivateProSyncRecordIdentity, nowMs: number): Promise<PrivateProOutboxState> {
-    return this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.meta], async () => {
+  async recordLocalDelete(
+    uid: string,
+    identity: PrivateProSyncRecordIdentity,
+    nowMs: number,
+    signal?: AbortSignal,
+  ): Promise<PrivateProOutboxState> {
+    let abortTransaction: (() => void) | null = null;
+    const transaction = this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.meta], async dexieTransaction => {
+      abortTransaction = () => dexieTransaction.abort();
+      signal?.addEventListener('abort', abortTransaction, { once: true });
+      throwIfCaptureAborted(signal);
       const [previousLocal, previousOutbox, remoteBase] = await Promise.all([
         this.localRecords.get([uid, identity.recordKey]),
         this.outbox.get([uid, identity.recordKey]),
@@ -399,9 +434,18 @@ export class PrivateProSyncDB extends Dexie {
         blocked: false,
         errorCode: null,
       };
+      throwIfCaptureAborted(signal);
       await Promise.all([this.localRecords.put(localRecord), this.outbox.put(outbox)]);
       return cloneOutbox(outbox);
     });
+    try {
+      return await transaction;
+    } catch (error) {
+      if (signal?.aborted) throw captureAbortError();
+      throw error;
+    } finally {
+      if (abortTransaction) signal?.removeEventListener('abort', abortTransaction);
+    }
   }
 
   async leaseDue(uid: string, nowMs: number, leaseMs: number, coordinatorFence: number): Promise<PrivateProOutboxState | null> {

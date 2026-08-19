@@ -77,6 +77,7 @@ export interface PrivateProSyncOutboundDependencies {
   onCaptureFailed?: (notice: PrivateProSyncCaptureFailure) => void;
   onCommitted?: (notice: PrivateProSyncCommittedNotice) => void;
   onStatus?: (status: PrivateProSyncOutboundStatus) => void;
+  contentHash?: (payload: string) => Promise<string>;
   now?: () => number;
   random?: () => number;
   setTimeout?: (callback: () => void, ms: number) => TimeoutHandle;
@@ -96,6 +97,11 @@ export interface PrivateProSyncOutbound {
 interface ActiveSend {
   row: PrivateProOutboxState;
   sentAtMs: number;
+}
+
+interface CaptureOwner {
+  epoch: number;
+  controller: AbortController;
 }
 
 type AbortRace<T> =
@@ -135,6 +141,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   const scheduleTimeout = dependencies.setTimeout ?? ((callback, ms) => globalThis.setTimeout(callback, ms));
   const cancelTimeout = dependencies.clearTimeout ?? (handle => globalThis.clearTimeout(handle));
   const assets = dependencies.assets ?? { ensureUploaded: async () => {} };
+  const contentHash = dependencies.contentHash ?? privateProContentHash;
   const serializers = new Map(dependencies.serializers.map(serializer => [serializer.recordType, serializer]));
   const activeSends = new Map<string, ActiveSend>();
   const unsubscribers: Array<() => void> = [];
@@ -144,6 +151,8 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   let leaderContext: PrivateProSyncLeaderContext | null = null;
   let timer: TimeoutHandle | null = null;
   let scheduleVersion = 0;
+  let captureEpoch = 1;
+  let captureOwner: CaptureOwner = { epoch: captureEpoch, controller: new AbortController() };
   let captureQueue: Promise<void> = Promise.resolve();
   let drainPromise: Promise<void> | null = null;
 
@@ -187,15 +196,31 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     return serializer;
   }
 
-  async function persistMutation(mutation: PrivateProSyncLocalMutation, notice: PrivateProSyncCaptureNotice): Promise<PrivateProOutboxState> {
+  function captureAbortError(): DOMException {
+    return new DOMException('Private Pro sync capture stopped.', 'AbortError');
+  }
+
+  function assertCaptureOwner(owner: CaptureOwner): void {
+    if (captureOwner !== owner || captureEpoch !== owner.epoch || owner.controller.signal.aborted) throw captureAbortError();
+  }
+
+  async function persistMutation(
+    mutation: PrivateProSyncLocalMutation,
+    notice: PrivateProSyncCaptureNotice,
+    owner: CaptureOwner,
+  ): Promise<PrivateProOutboxState> {
+    assertCaptureOwner(owner);
     const serializer = serializerFor(notice.recordType);
     let pending: PrivateProOutboxState;
     if (mutation.kind === 'put') {
       if (mutation.record.recordType !== serializer.recordType || mutation.record.schemaVersion !== serializer.schemaVersion)
         throw new TypeError('Private Pro sync serializer identity does not match the mutation.');
       const value = await serializer.validate(mutation.record.logicalId, mutation.record.value);
+      assertCaptureOwner(owner);
       const payload = privateProCanonicalJson(value);
       assertPrivateProPayloadSize(payload);
+      const hashed = await contentHash(payload);
+      assertCaptureOwner(owner);
       const record: PrivateProSyncPreparedRecord = {
         recordType: mutation.record.recordType,
         logicalId: mutation.record.logicalId,
@@ -203,21 +228,23 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
         projectionKey: mutation.record.projectionKey,
         schemaVersion: mutation.record.schemaVersion,
         payload,
-        contentHash: await privateProContentHash(payload),
+        contentHash: hashed,
         referencedAssetIds: [...mutation.record.referencedAssetIds],
       };
-      pending = await dependencies.db.recordLocalPut(dependencies.uid, record, now());
+      pending = await dependencies.db.recordLocalPut(dependencies.uid, record, now(), owner.controller.signal);
     } else {
       if (mutation.recordType !== serializer.recordType || mutation.schemaVersion !== serializer.schemaVersion)
         throw new TypeError('Private Pro sync serializer identity does not match the mutation.');
+      assertCaptureOwner(owner);
       pending = await dependencies.db.recordLocalDelete(dependencies.uid, {
         recordType: mutation.recordType,
         logicalId: mutation.logicalId,
         recordKey: notice.recordKey,
         projectionKey: mutation.projectionKey,
         schemaVersion: mutation.schemaVersion,
-      }, now());
+      }, now(), owner.controller.signal);
     }
+    assertCaptureOwner(owner);
     dependencies.onCaptured?.({ ...notice, generation: pending.generation, mutationId: pending.mutationId });
     dependencies.coordinator.wake();
     void reschedule();
@@ -225,6 +252,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   }
 
   function capture(mutation: PrivateProSyncLocalMutation): Promise<PrivateProOutboxState> {
+    const owner = captureOwner;
     const identity = mutation.kind === 'put' ? mutation.record : mutation;
     const notice: PrivateProSyncCaptureNotice = {
       captureId: crypto.randomUUID(),
@@ -235,12 +263,13 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       projectionKey: identity.projectionKey,
     };
     dependencies.onCapture?.(notice);
-    const result = captureQueue.then(() => persistMutation(mutation, notice));
+    const result = captureQueue.then(() => persistMutation(mutation, notice, owner));
     captureQueue = result.then(() => undefined, error => {
       const category = privateProClassifySyncError(error);
       dependencies.onCaptureFailed?.({ ...notice, category });
-      report(category);
+      if (captureOwner === owner && !owner.controller.signal.aborted && !stopped) report(category);
     });
+    captureQueue.catch(() => {});
     return result;
   }
 
@@ -424,7 +453,8 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   }
 
   async function drain(context: PrivateProSyncLeaderContext): Promise<void> {
-    await captureQueue;
+    const captureOutcome = await raceAbortable(captureQueue, context.signal);
+    if (captureOutcome.type !== 'result') return;
     while (!context.signal.aborted && !stopped) {
       const row = await dependencies.db.leaseDue(dependencies.uid, now(), OUTBOX_LEASE_MS, context.coordinatorFence);
       if (!row) return;
@@ -457,6 +487,10 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       if (started) return;
       started = true;
       stopped = false;
+      if (captureOwner.controller.signal.aborted) {
+        captureOwner = { epoch: ++captureEpoch, controller: new AbortController() };
+        captureQueue = Promise.resolve();
+      }
       for (const serializer of dependencies.serializers) {
         unsubscribers.push(serializer.subscribe(mutation => {
           if (dependencies.shouldCapture && !dependencies.shouldCapture(mutation)) return;
@@ -496,7 +530,10 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       if (stopped) return;
       stopped = true;
       unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
-      await captureQueue;
+      captureOwner.controller.abort();
+      const detachedCaptureQueue = captureQueue;
+      detachedCaptureQueue.catch(() => {});
+      captureQueue = Promise.resolve();
       clearTimer();
       if (started) await dependencies.coordinator.stop();
       if (drainPromise) await drainPromise;

@@ -49,6 +49,25 @@ async function seedUid(db: PrivateProSyncDB, uid: string): Promise<void> {
 
 
 describe('Private Pro seamless sync database', () => {
+  for (const kind of ['put', 'delete'] as const) {
+    test(`aborts a local ${kind} transaction when capture ownership is cancelled during the final write`, async (t) => {
+      const db = createDB(t);
+      const controller = new AbortController();
+      const record = preparedRecord(`abort-${kind}`, '{"value":1}');
+      const abort = () => controller.abort();
+      db.localRecords.hook('creating').subscribe(abort);
+
+      const writing = kind === 'put'
+        ? db.recordLocalPut(UID_A, record, 1_000, controller.signal)
+        : db.recordLocalDelete(UID_A, record, 1_000, controller.signal);
+      await assert.rejects(writing, { name: 'AbortError' });
+      db.localRecords.hook('creating').unsubscribe(abort);
+
+      assert.equal(await db.getLocalRecord(UID_A, record.recordKey), null);
+      assert.equal(await db.getOutbox(UID_A, record.recordKey), null);
+    });
+  }
+
   test('observes a deleted remote base without rebasing pre-delete pending work', async (t) => {
     const db = createDB(t);
     const pending = await db.recordLocalPut(UID_A, preparedRecord('record-1', '{"value":1}'), 1_000);

@@ -5,9 +5,9 @@ import { after, test } from 'node:test';
 import Dexie from 'dexie';
 
 import {
-  activatePrivateProAssetPersistence,
+  activatePrivateProAssetPersistence as activatePrivateProAssetPersistenceOwned,
   createPrivateProAssetLocalPort,
-  deactivatePrivateProAssetPersistence,
+  deactivatePrivateProAssetPersistence as deactivatePrivateProAssetPersistenceOwned,
   type PrivateProAssetLocalPort,
 } from '~/modules/private-pro/assets/privatePro.assets.local';
 import { createPrivateProAssetClient, type PrivateProAssetStorageMetadata, type PrivateProAssetStoragePort } from '~/modules/private-pro/assets/privatePro.assets.client';
@@ -19,6 +19,22 @@ const DB_NAME = `private-pro-dblobs-${crypto.randomUUID()}`;
 const syncDB = new PrivateProSyncDB(DB_NAME);
 const dbModulePromise = import('./dblobs.db');
 const uploadLease = { port: syncDB, leaseMs: 80, renewEveryMs: 15, retryEveryMs: 2 };
+const assetOwners = new Map<string, object>();
+const assetOwner = (uid: string) => {
+  let owner = assetOwners.get(uid);
+  if (!owner) {
+    owner = {};
+    assetOwners.set(uid, owner);
+  }
+  return owner;
+};
+const activatePrivateProAssetPersistence = (
+  uid: string | null,
+  port: PrivateProAssetLocalPort | null,
+  deleteAsset?: Parameters<typeof activatePrivateProAssetPersistenceOwned>[3],
+) => activatePrivateProAssetPersistenceOwned(uid, uid ? assetOwner(uid) : null, port, deleteAsset);
+const deactivatePrivateProAssetPersistence = (uid: string) =>
+  deactivatePrivateProAssetPersistenceOwned(uid, assetOwner(uid));
 
 function imageAsset(id: string): DBlobDBAsset {
   return {
@@ -176,6 +192,19 @@ test('stale UID cleanup cannot deactivate the current account asset port', async
   await dbModule.putDBAsset(asset);
 
   assert.equal(await deactivatePrivateProAssetPersistence('uid-a'), false);
+  assert.deepEqual(await dbModule.getDBAsset(asset.id), asset);
+});
+
+test('stale same-UID owner cleanup cannot deactivate a replacement asset port', async () => {
+  const dbModule = await dbModulePromise;
+  const oldOwner = Symbol('old-owner');
+  const replacementOwner = Symbol('replacement-owner');
+  const asset = imageAsset('asset-current-owner');
+  await activatePrivateProAssetPersistenceOwned('uid-a', oldOwner, createPrivateProAssetLocalPort('uid-a', syncDB));
+  await activatePrivateProAssetPersistenceOwned('uid-a', replacementOwner, createPrivateProAssetLocalPort('uid-a', syncDB));
+  await dbModule.putDBAsset(asset);
+
+  assert.equal(await deactivatePrivateProAssetPersistenceOwned('uid-a', oldOwner), false);
   assert.deepEqual(await dbModule.getDBAsset(asset.id), asset);
 });
 

@@ -234,3 +234,42 @@ None.
 ### Concerns
 
 None.
+
+## Fix round 4
+
+### Findings addressed
+
+- Start and retry now synchronously allocate and register an opaque `StartAttempt` owner before waiting on either prior cleanup or the sign-out decision gate. A final stop can cancel queued work before prepare runs.
+- Managed runtime persistence and DBlob asset persistence now activate and deactivate by exact UID plus opaque owner identity. Same-UID replacement installs a new owner without clearing its volatile state, and stale cleanup cannot deactivate it.
+- Production prepare receives the lifecycle owner and current-ownership predicate. It checks ownership around every managed, cross-UID, and asset transition, and cancellation rolls back only the exact owner.
+- Each outbound start owns an abort epoch. Stop unsubscribes and aborts capture synchronously, detaches stalled validation or hashing with same-turn rejection handling, and never waits for the capture queue.
+- Outbound capture checks ownership after serializer validation and content hashing, then passes the abort signal into local put and delete transactions. Dexie listens through transaction settlement, checks immediately before the final writes, rolls back on abort, and exposes a normalized `AbortError`.
+- Stop and sign-out share exact-owner cleanup. Either ordering performs one deactivation, while confirmed sign-out still broadcasts the latest prepared coordinator, clears UID state, signs out Firebase, and reloads once.
+- When a newer owner is only preparing, sign-out broadcasts the last prepared coordinator but waits for the newer exact-owner cleanup before clear, auth, and reload.
+
+### RED evidence
+
+- Lifecycle regressions showed starts and retries queued behind cleanup or a pending decision entering prepare after a final stop.
+- Same-UID persistence and DBlob regressions showed stale owners could deactivate replacement owners.
+- Concurrent stop and sign-out duplicated deactivation or lost the prepared coordinator broadcast, including the reverse stop-first ordering and a newer preparing owner.
+- Production transition tests failed before the owner-aware atomic prepare helper existed.
+- Outbound stop waited forever for stalled serializer validation and content hashing.
+- Local put and delete transactions committed when their capture signal aborted at the final write hook.
+
+### GREEN evidence
+
+- Final Task 9 provider, persistence, DB, outbound, engine, DBlob, asset, coordinator, auth, cron, fail-closed route, config, single-tab, and access suites passed with zero failures.
+- Root TypeScript and tools/test TypeScript exited 0.
+- Scoped ESLint and `git diff --check` exited 0.
+
+### Self-review
+
+- Open builds retain null durable persistence and the single-tab gate. Private Pro pending-auth remains volatile.
+- Capture notices remain synchronous. Aborted capture failures stay sanitized and cannot report stale status or commit after stop.
+- No payload, credential, token, attachment content, or raw error detail is logged.
+- Owner tokens are process-local symbols and are never persisted, shared, or exposed.
+- Existing fail-closed routes, cron behavior, auth epoch guards, pending-decision behavior, and asset renewal liveness remain covered by the final suite.
+
+### Concerns
+
+None.

@@ -1,5 +1,6 @@
 import type { DBlobAssetId, DBlobAssetType, DBlobDBAsset, DBlobDBContextId, DBlobDBScopeId } from '~/modules/dblobs/dblobs.types';
 import type { PrivateProSyncAssetState, PrivateProSyncDB } from '../sync/privatePro.sync.db';
+import type { PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
 import { privateProCanonicalJson } from '../sync/privatePro.sync.codec';
 import { PrivateProAssetManifestSchema, type PrivateProAssetManifest } from './privatePro.assets.schemas';
 
@@ -48,6 +49,7 @@ export type PrivateProAssetDelete = (assetId: string, guard?: PrivateProAssetAct
 interface ActivePrivateProAssetPersistence {
   generation: number;
   uid: string;
+  owner: PrivateProPersistenceOwner;
   port: PrivateProAssetLocalPort;
   deleteAsset: PrivateProAssetDelete;
   controller: AbortController;
@@ -57,14 +59,20 @@ interface ActivePrivateProAssetPersistence {
 let activationGeneration = 0;
 let active: ActivePrivateProAssetPersistence | null = null;
 let transition: Promise<void> | null = null;
-let requestedUid: string | null = null;
+let requested: { uid: string; owner: PrivateProPersistenceOwner } | null = null;
 
 function abortError(): DOMException {
   return new DOMException('Private Pro asset persistence changed.', 'AbortError');
 }
 
-export function activatePrivateProAssetPersistence(uid: string | null, port: PrivateProAssetLocalPort | null, deleteAsset?: PrivateProAssetDelete): Promise<void> {
-  requestedUid = uid;
+export function activatePrivateProAssetPersistence(
+  uid: string | null,
+  owner: PrivateProPersistenceOwner | null,
+  port?: PrivateProAssetLocalPort | null,
+  deleteAsset?: PrivateProAssetDelete,
+): Promise<void> {
+  if (uid && (!owner || !port)) throw new TypeError('Private Pro asset persistence owner and port are required.');
+  requested = uid && owner ? { uid, owner } : null;
   const transitionId = ++activationGeneration;
   const previous = active;
   const priorTransition = transition;
@@ -74,8 +82,8 @@ export function activatePrivateProAssetPersistence(uid: string | null, port: Pri
     await priorTransition;
     if (previous) await Promise.allSettled([...previous.operations]);
     if (transitionId !== activationGeneration) return;
-    active = uid && port ? {
-      generation: transitionId, uid, port,
+    active = uid && owner && port ? {
+      generation: transitionId, uid, owner, port,
       deleteAsset: deleteAsset ?? ((assetId, guard) => port.deleteAsset(assetId, guard)),
       controller: new AbortController(), operations: new Set(),
     } : null;
@@ -85,8 +93,8 @@ export function activatePrivateProAssetPersistence(uid: string | null, port: Pri
   return transition;
 }
 
-export async function deactivatePrivateProAssetPersistence(uid: string): Promise<boolean> {
-  if (requestedUid !== uid) {
+export async function deactivatePrivateProAssetPersistence(uid: string, owner: PrivateProPersistenceOwner): Promise<boolean> {
+  if (requested?.uid !== uid || requested.owner !== owner) {
     await transition;
     return false;
   }
@@ -111,7 +119,8 @@ export async function runActivePrivateProAssetOperation<T>(
   const guard: PrivateProAssetActivationGuard = {
     signal: selected.controller.signal,
     assertActive() {
-      if (selected.controller.signal.aborted || active !== selected || active.generation !== selected.generation || active.uid !== selected.uid) throw abortError();
+      if (selected.controller.signal.aborted || active !== selected || active.generation !== selected.generation ||
+          active.uid !== selected.uid || active.owner !== selected.owner) throw abortError();
     },
   };
   const tracked = Promise.resolve().then(async () => {

@@ -150,6 +150,7 @@ class FakeSerializer implements PrivateProSyncSerializer<unknown> {
   constructor(
     recordType: 'settings' | 'chat-message' = 'settings',
     readonly conflictPolicy: 'replace' | 'message-identity' = 'replace',
+    private readonly validateValue: (logicalId: string, value: unknown) => Promise<unknown> = async (_logicalId, value) => structuredClone(value),
   ) {
     this.recordType = recordType;
   }
@@ -159,7 +160,7 @@ class FakeSerializer implements PrivateProSyncSerializer<unknown> {
   }
 
   async validate(_logicalId: string, value: unknown): Promise<unknown> {
-    return structuredClone(value);
+    return this.validateValue(_logicalId, value);
   }
 
   project(logicalId: string): { projectionKey: string; referencedAssetIds: readonly string[] } {
@@ -216,7 +217,11 @@ function remote(input: PrivateProSyncWriteInput, revision: number, contentHash =
   };
 }
 
-function createHarness(t: TestContext, serializer = new FakeSerializer()): Harness {
+function createHarness(
+  t: TestContext,
+  serializer = new FakeSerializer(),
+  options: { contentHash?: (payload: string) => Promise<string> } = {},
+): Harness {
   const name = `private-pro-sync-outbound-test-${crypto.randomUUID()}`;
   const db = new PrivateProSyncDB(name);
   const clock = new ManualClock();
@@ -240,6 +245,7 @@ function createHarness(t: TestContext, serializer = new FakeSerializer()): Harne
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
     random: () => 0,
+    contentHash: options.contentHash,
     onCapture: notice => notices.push(notice),
     onCaptured: notice => captured.push(notice),
     onCaptureFailed: notice => failed.push(notice),
@@ -363,6 +369,136 @@ describe('Private Pro seamless sync outbound', () => {
     assert.equal(failed[0].category, 'schema');
     assert.equal(captured[0].captureId, notices[1].captureId);
     assert.equal(captured[0].generation, valid.generation);
+  });
+
+  test('stop aborts stalled validation and a replacement capture stays authoritative', async (t) => {
+    const validationStarted = deferred<void>();
+    const validation = deferred<unknown>();
+    const serializer = new FakeSerializer('settings', 'replace', async () => {
+      validationStarted.resolve();
+      return validation.promise;
+    });
+    const { outbound, db } = createHarness(t, serializer);
+    const key = privateProRecordKey('settings', 'main');
+    await db.recordLocalPut(UID, {
+      recordType: 'settings', logicalId: 'main', recordKey: key, projectionKey: 'main', schemaVersion: 1,
+      payload: '{"value":"seed"}', contentHash: 'a'.repeat(64), referencedAssetIds: [],
+    }, 0);
+    await outbound.start();
+    const oldCapture = outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'old' }, referencedAssetIds: [],
+    } });
+    oldCapture.catch(() => {});
+    await validationStarted.promise;
+
+    let stopSettled = false;
+    const stopping = outbound.stop().then(() => { stopSettled = true; });
+    await Promise.race([stopping, new Promise(resolve => setTimeout(resolve, 100))]);
+    if (!stopSettled) {
+      validation.resolve({ value: 'old' });
+      await Promise.allSettled([oldCapture, stopping]);
+      assert.fail('stop waited stalled validation');
+    }
+    const replacement = createPrivateProSyncOutbound({
+      uid: UID, writerId: WRITER_ID, serializers: [new FakeSerializer()], db,
+      coordinator: new FakeCoordinator(), transport: new FakeTransport(), now: () => 1,
+    });
+    t.after(() => replacement.stop());
+    const fresh = await replacement.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'replacement' }, referencedAssetIds: [],
+    } });
+    validation.resolve({ value: 'old' });
+    await assert.rejects(oldCapture, { name: 'AbortError' });
+    await settle();
+
+    const durable = await db.getOutbox(UID, key);
+    assert.equal(durable?.generation, fresh.generation);
+    assert.match(durable?.payload ?? '', /replacement/);
+    assert.doesNotMatch(durable?.payload ?? '', /old/);
+  });
+
+  test('stop aborts stalled hashing and a replacement capture stays authoritative', async (t) => {
+    const hashStarted = deferred<void>();
+    const hash = deferred<string>();
+    const { outbound, db } = createHarness(t, new FakeSerializer(), {
+      contentHash: async () => {
+        hashStarted.resolve();
+        return hash.promise;
+      },
+    });
+    const key = privateProRecordKey('settings', 'main');
+    await db.recordLocalPut(UID, {
+      recordType: 'settings', logicalId: 'main', recordKey: key, projectionKey: 'main', schemaVersion: 1,
+      payload: '{"value":"seed"}', contentHash: 'a'.repeat(64), referencedAssetIds: [],
+    }, 0);
+    await outbound.start();
+    const oldCapture = outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'old' }, referencedAssetIds: [],
+    } });
+    oldCapture.catch(() => {});
+    await hashStarted.promise;
+
+    let stopSettled = false;
+    const stopping = outbound.stop().then(() => { stopSettled = true; });
+    await Promise.race([stopping, new Promise(resolve => setTimeout(resolve, 100))]);
+    if (!stopSettled) {
+      hash.resolve('b'.repeat(64));
+      await Promise.allSettled([oldCapture, stopping]);
+      assert.fail('stop waited stalled hashing');
+    }
+    const replacement = createPrivateProSyncOutbound({
+      uid: UID, writerId: WRITER_ID, serializers: [new FakeSerializer()], db,
+      coordinator: new FakeCoordinator(), transport: new FakeTransport(), now: () => 1,
+    });
+    t.after(() => replacement.stop());
+    const fresh = await replacement.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'replacement' }, referencedAssetIds: [],
+    } });
+    hash.resolve('b'.repeat(64));
+    await assert.rejects(oldCapture, { name: 'AbortError' });
+    await settle();
+
+    const durable = await db.getOutbox(UID, key);
+    assert.equal(durable?.generation, fresh.generation);
+    assert.match(durable?.payload ?? '', /replacement/);
+    assert.doesNotMatch(durable?.payload ?? '', /old/);
+  });
+
+  test('clear after stop stays empty when stalled capture later resolves', async (t) => {
+    const validationStarted = deferred<void>();
+    const validation = deferred<unknown>();
+    const serializer = new FakeSerializer('settings', 'replace', async () => {
+      validationStarted.resolve();
+      return validation.promise;
+    });
+    const { outbound, db } = createHarness(t, serializer);
+    await outbound.start();
+    const oldCapture = outbound.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'old' }, referencedAssetIds: [],
+    } });
+    oldCapture.catch(() => {});
+    await validationStarted.promise;
+
+    let stopSettled = false;
+    const stopping = outbound.stop().then(() => { stopSettled = true; });
+    await Promise.race([stopping, new Promise(resolve => setTimeout(resolve, 100))]);
+    if (!stopSettled) {
+      validation.resolve({ value: 'old' });
+      await Promise.allSettled([oldCapture, stopping]);
+      assert.fail('stop waited stalled validation');
+    }
+    await db.clearUid(UID);
+    validation.resolve({ value: 'old' });
+    await assert.rejects(oldCapture, { name: 'AbortError' });
+    await settle();
+
+    assert.equal(await db.pendingCount(UID), 0);
+    assert.equal(await db.getOutbox(UID, privateProRecordKey('settings', 'main')), null);
   });
 
   test('reports exact synthetic commit identity after accepted write', async (t) => {

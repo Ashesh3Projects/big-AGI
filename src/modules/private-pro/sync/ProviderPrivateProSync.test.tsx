@@ -6,6 +6,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { privateProClientConfig } from '../config/privatePro.config';
 import {
   createPrivateProSyncLifecycle,
+  preparePrivateProPersistenceOwner,
   PrivateProUnsyncedChangesError,
   ProviderPrivateProSync,
   ProviderPrivateProSyncAccount,
@@ -36,6 +37,73 @@ function fakeEngine(options: { pending?: number } = {}) {
 }
 
 describe('ProviderPrivateProSync', () => {
+  test('production persistence prepare stops between cross-UID cleanup transitions when ownership is cancelled', async () => {
+    const oldAssetCleanup = deferred<void>();
+    let current = true;
+    const order: string[] = [];
+    const preparing = preparePrivateProPersistenceOwner({
+      uid: 'uid-b', owner: Symbol('uid-b-owner'), previousOwnership: { uid: 'uid-a', owner: Symbol('uid-a-owner') },
+      isCurrent: () => current,
+      activateManaged: async () => { order.push('activate-managed'); },
+      deactivateManaged: async uid => { order.push(`deactivate-managed:${uid}`); },
+      deactivateAssets: async uid => { order.push(`deactivate-assets:${uid}`); await oldAssetCleanup.promise; },
+      prepareAssets: async () => { order.push('activate-assets'); return 'prepared'; },
+    });
+    await Promise.resolve();
+    current = false;
+    oldAssetCleanup.resolve();
+    await assert.rejects(preparing);
+
+    assert.deepEqual(order, ['deactivate-assets:uid-a']);
+  });
+
+  test('production persistence prepare rolls back its exact owner after managed activation is cancelled', async () => {
+    const managedActivation = deferred<void>();
+    const owner = Symbol('owner');
+    let current = true;
+    let managedOwner: object | symbol | null = null;
+    let assetOwner: object | symbol | null = null;
+    const preparing = preparePrivateProPersistenceOwner({
+      uid: 'uid-a', owner, previousOwnership: null, isCurrent: () => current,
+      activateManaged: async () => { managedOwner = owner; await managedActivation.promise; },
+      deactivateManaged: async (_uid, candidate) => { if (managedOwner === candidate) managedOwner = null; },
+      deactivateAssets: async (_uid, candidate) => { if (assetOwner === candidate) assetOwner = null; },
+      prepareAssets: async () => { assetOwner = owner; return 'prepared'; },
+    });
+    await Promise.resolve();
+    current = false;
+    managedActivation.resolve();
+    await assert.rejects(preparing);
+
+    assert.equal(managedOwner, null);
+    assert.equal(assetOwner, null);
+  });
+
+  test('stale production prepare cannot clear a newer same-UID persistence owner', async () => {
+    const oldActivation = deferred<void>();
+    const oldOwner = Symbol('old-owner');
+    const replacementOwner = Symbol('replacement-owner');
+    let oldCurrent = true;
+    let managedOwner: object | symbol | null = null;
+    let assetOwner: object | symbol | null = null;
+    const transitions = (owner: object | symbol, wait?: Promise<void>) => ({
+      uid: 'uid-a', owner, previousOwnership: null, isCurrent: () => owner === oldOwner ? oldCurrent : true,
+      activateManaged: async () => { managedOwner = owner; await wait; },
+      deactivateManaged: async (_uid: string, candidate: object | symbol) => { if (managedOwner === candidate) managedOwner = null; },
+      deactivateAssets: async (_uid: string, candidate: object | symbol) => { if (assetOwner === candidate) assetOwner = null; },
+      prepareAssets: async () => { assetOwner = owner; return owner; },
+    });
+    const oldPrepare = preparePrivateProPersistenceOwner(transitions(oldOwner, oldActivation.promise));
+    await Promise.resolve();
+    oldCurrent = false;
+    await preparePrivateProPersistenceOwner(transitions(replacementOwner));
+    oldActivation.resolve();
+    await assert.rejects(oldPrepare);
+
+    assert.equal(managedOwner, replacementOwner);
+    assert.equal(assetOwner, replacementOwner);
+  });
+
   test('disabled Private Pro renders children without constructing sync', () => {
     const enabled = privateProClientConfig.enabled;
     Object.defineProperty(privateProClientConfig, 'enabled', { configurable: true, value: false });
@@ -320,6 +388,56 @@ describe('ProviderPrivateProSync', () => {
     assert.deepEqual(order, ['prepare:1', 'start:1', 'stop:1', 'deactivate', 'prepare:2', 'start:2']);
   });
 
+  test('a final stop cancels a start queued behind prior cleanup', async () => {
+    const cleanup = deferred<void>();
+    const order: string[] = [];
+    let prepares = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        prepares++;
+        order.push(`prepare:${prepares}`);
+        return { engine: fakeEngine().engine };
+      },
+      deactivate: async () => { order.push('deactivate'); await cleanup.promise; }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    const firstStop = lifecycle.stop();
+    const queuedStart = lifecycle.start();
+    const finalStop = lifecycle.stop();
+    cleanup.resolve();
+    await Promise.all([firstStop, queuedStart, finalStop]);
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(order, ['prepare:1', 'deactivate']);
+  });
+
+  test('a final stop cancels a retry queued behind prior cleanup', async () => {
+    const cleanup = deferred<void>();
+    const order: string[] = [];
+    let prepares = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        prepares++;
+        order.push(`prepare:${prepares}`);
+        return { engine: fakeEngine().engine };
+      },
+      deactivate: async () => { order.push('deactivate'); await cleanup.promise; }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    const firstStop = lifecycle.stop();
+    const queuedRetry = lifecycle.retry();
+    const finalStop = lifecycle.stop();
+    cleanup.resolve();
+    await Promise.all([firstStop, queuedRetry, finalStop]);
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(order, ['prepare:1', 'deactivate']);
+  });
+
   test('stale pending start cleanup cannot deactivate a newer successful start', async () => {
     const oldStartGate = deferred<void>();
     const order: string[] = [];
@@ -553,6 +671,29 @@ describe('ProviderPrivateProSync', () => {
     assert.deepEqual(order, ['prepare', 'start']);
   });
 
+  test('a final stop cancels a start queued behind an unconfirmed sign-out decision', async () => {
+    const count = deferred<number>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        order.push('prepare');
+        return { engine: fakeEngine().engine };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: () => count.promise,
+    });
+    const signingOut = lifecycle.signOut();
+    const queuedStart = lifecycle.start();
+    await lifecycle.stop();
+    count.resolve(1);
+    await assert.rejects(signingOut, PrivateProUnsyncedChangesError);
+    await queuedStart;
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(order, ['deactivate']);
+  });
+
   test('unconfirmed decision pauses an existing prepare and then lets its attempt commit', async () => {
     const prepareGate = deferred<void>();
     const count = deferred<number>();
@@ -624,6 +765,126 @@ describe('ProviderPrivateProSync', () => {
     ]);
 
     assert.deepEqual(order, ['stop', 'deactivate', 'clear', 'auth', 'reload']);
+  });
+
+  test('stop during confirmed sign-out shares one deactivation and preserves the latest broadcast owner', async () => {
+    const flushed = deferred<{ pending: number }>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, flushNow: () => flushed.promise, async pendingCount() { return 0; },
+        async stop() { order.push('stop'); },
+      }, coordinator: { broadcastSignedOut: () => { order.push('broadcast'); } } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); }, reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    const signingOut = lifecycle.signOut({ discardPending: true });
+    await Promise.resolve();
+    await lifecycle.stop();
+    flushed.resolve({ pending: 0 });
+    await signingOut;
+
+    assert.deepEqual(order, ['stop', 'deactivate', 'broadcast', 'clear', 'auth', 'reload']);
+  });
+
+  test('confirmed sign-out after stop reuses cleanup and still broadcasts the detached owner', async () => {
+    const cleanup = deferred<void>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+        async stop() { order.push('stop'); },
+      }, coordinator: { broadcastSignedOut: () => { order.push('broadcast'); } } }),
+      deactivate: async () => { order.push('deactivate'); await cleanup.promise; }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); }, reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    const stopping = lifecycle.stop();
+    const signingOut = lifecycle.signOut({ discardPending: true });
+    cleanup.resolve();
+    await Promise.all([stopping, signingOut]);
+
+    assert.deepEqual(order, ['stop', 'deactivate', 'broadcast', 'clear', 'auth', 'reload']);
+  });
+
+  test('confirmed sign-out broadcasts and deactivates the newest prepared owner', async () => {
+    const secondStart = deferred<void>();
+    const order: string[] = [];
+    const ownerIds = new Map<object | symbol, number>();
+    let attempts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async (_isCurrent, owner) => {
+        const id = ++attempts;
+        ownerIds.set(owner, id);
+        return { engine: {
+          async start() { order.push(`start:${id}`); if (id === 2) await secondStart.promise; },
+          async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+          async stop() { order.push(`stop:${id}`); },
+        }, coordinator: { broadcastSignedOut: () => { order.push(`broadcast:${id}`); } } };
+      },
+      deactivate: async (_uid, owner) => { order.push(`deactivate:${ownerIds.get(owner)}`); },
+      clear: async () => { order.push('clear'); }, firebaseSignOut: async () => { order.push('auth'); },
+      reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    await lifecycle.stop();
+    order.length = 0;
+    const starting = lifecycle.start();
+    while (!order.includes('start:2')) await Promise.resolve();
+
+    await lifecycle.signOut({ discardPending: true });
+    secondStart.resolve();
+    await starting;
+
+    assert.deepEqual(order, ['start:2', 'broadcast:2', 'stop:2', 'deactivate:2', 'clear', 'auth', 'reload']);
+  });
+
+  test('sign-out after stopping a newer prepare broadcasts the old owner but awaits the newer cleanup', async () => {
+    const secondPrepareStarted = deferred<void>();
+    const secondPrepare = deferred<{ engine: PrivateProSyncLifecycleEngine }>();
+    const secondCleanup = deferred<void>();
+    const order: string[] = [];
+    const ownerIds = new Map<object | symbol, number>();
+    let attempts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async (_isCurrent, owner) => {
+        const id = ++attempts;
+        ownerIds.set(owner, id);
+        if (id === 2) {
+          order.push('prepare:2');
+          secondPrepareStarted.resolve();
+          return secondPrepare.promise;
+        }
+        return { engine: fakeEngine().engine, coordinator: { broadcastSignedOut: () => { order.push('broadcast:1'); } } };
+      },
+      deactivate: async (_uid, owner) => {
+        const id = ownerIds.get(owner);
+        order.push(`deactivate:${id}`);
+        if (id === 2) await secondCleanup.promise;
+      },
+      clear: async () => { order.push('clear'); }, firebaseSignOut: async () => { order.push('auth'); },
+      reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    await lifecycle.stop();
+    order.length = 0;
+    const starting = lifecycle.start();
+    await secondPrepareStarted.promise;
+    const stopping = lifecycle.stop();
+    const signingOut = lifecycle.signOut({ discardPending: true });
+    let signOutSettled = false;
+    void signingOut.finally(() => { signOutSettled = true; });
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(order, ['prepare:2', 'deactivate:2', 'broadcast:1']);
+    assert.equal(signOutSettled, false);
+    secondCleanup.resolve();
+    await Promise.all([stopping, signingOut]);
+    secondPrepare.resolve({ engine: fakeEngine().engine });
+    await starting;
+
+    assert.deepEqual(order, ['prepare:2', 'deactivate:2', 'broadcast:1', 'clear', 'auth', 'reload']);
   });
 
 
