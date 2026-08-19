@@ -104,8 +104,8 @@ describe('ProviderPrivateProSync', () => {
     prepared.resolve({ engine });
     await Promise.all([starting, stopping]);
 
-    assert.deepEqual(calls, ['start']);
-    assert.deepEqual(deactivated, []);
+    assert.deepEqual(calls, []);
+    assert.deepEqual(deactivated, ['uid-a']);
   });
 
   test('sign-out drains for 5000 ms and requires explicit discard while pending remains', async () => {
@@ -274,7 +274,7 @@ describe('ProviderPrivateProSync', () => {
     assert.equal(store.getState().phase, 'local');
   });
 
-  test('stop failure cannot skip deactivation and reports only after cleanup', async () => {
+  test('stop failure cannot skip deactivation and is detached from finite cleanup', async () => {
     const order: string[] = [];
     const lifecycle = createPrivateProSyncLifecycle({
       uid: 'uid-a', statusStore: createPrivateProSyncStore(),
@@ -287,11 +287,11 @@ describe('ProviderPrivateProSync', () => {
     });
     await lifecycle.start();
 
-    await assert.rejects(lifecycle.stop(), error => error instanceof Error && !/secret/i.test(error.message));
+    await lifecycle.stop();
     assert.deepEqual(order, ['stop', 'deactivate']);
   });
 
-  test('start waits for a blocked stop before preparing a replacement engine', async () => {
+  test('replacement start waits only finite deactivation while old engine stop is detached', async () => {
     const releaseStop = deferred<void>();
     const order: string[] = [];
     let prepareCount = 0;
@@ -313,9 +313,9 @@ describe('ProviderPrivateProSync', () => {
     const stopping = lifecycle.stop();
     const starting = lifecycle.start();
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(order.includes('prepare:2'), false);
-    releaseStop.resolve();
+    assert.equal(order.includes('prepare:2'), true);
     await Promise.all([stopping, starting]);
+    releaseStop.resolve();
 
     assert.deepEqual(order, ['prepare:1', 'start:1', 'stop:1', 'deactivate', 'prepare:2', 'start:2']);
   });
@@ -394,6 +394,236 @@ describe('ProviderPrivateProSync', () => {
 
     await assert.rejects(lifecycle.signOut({ discardPending: true }));
     assert.deepEqual(order, ['broadcast', 'stop', 'deactivate', 'clear', 'auth', 'reload']);
+  });
+
+  test('start then stop in the same turn never enters prepare or engine start', async () => {
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => { order.push('prepare'); return { engine: fakeEngine().engine }; },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+
+    void lifecycle.start();
+    await lifecycle.stop();
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(order, ['deactivate']);
+  });
+
+  test('retry then stop in the same turn never enters prepare or engine start', async () => {
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => { order.push('prepare'); return { engine: fakeEngine().engine }; },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+
+    void lifecycle.retry();
+    await lifecycle.stop();
+    await new Promise(resolve => setImmediate(resolve));
+
+    assert.deepEqual(order, ['deactivate']);
+  });
+
+  test('never-resolving prepare cannot block stop or a replacement start', async () => {
+    const firstPrepare = deferred<{ engine: PrivateProSyncLifecycleEngine }>();
+    const order: string[] = [];
+    let attempts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        attempts++;
+        if (attempts === 1) return firstPrepare.promise;
+        order.push('replacement-prepare');
+        return { engine: {
+          async start() { order.push('replacement-start'); }, async retryNow() {}, async flushNow() { return { pending: 0 }; },
+          async pendingCount() { return 0; }, async stop() {},
+        } };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    void lifecycle.start();
+    await Promise.resolve();
+
+    await Promise.race([
+      lifecycle.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop waited unresolved prepare')))),
+    ]);
+    await lifecycle.start();
+
+    assert.deepEqual(order, ['deactivate', 'replacement-prepare', 'replacement-start']);
+  });
+
+  test('eventual stale prepare resolution stops only its local engine', async () => {
+    const firstPrepare = deferred<{ engine: PrivateProSyncLifecycleEngine }>();
+    const order: string[] = [];
+    let attempts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        attempts++;
+        if (attempts === 1) return firstPrepare.promise;
+        return { engine: {
+          async start() { order.push('new-start'); }, async retryNow() {}, async flushNow() { return { pending: 0 }; },
+          async pendingCount() { return 0; }, async stop() { order.push('new-stop'); },
+        } };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    const oldStart = lifecycle.start();
+    await Promise.resolve();
+    await lifecycle.stop();
+    await lifecycle.start();
+    firstPrepare.resolve({ engine: {
+      async start() { order.push('old-start'); }, async retryNow() {}, async flushNow() { return { pending: 0 }; },
+      async pendingCount() { return 0; }, async stop() { order.push('old-stop'); },
+    } });
+    await oldStart;
+
+    assert.deepEqual(order, ['deactivate', 'new-start', 'old-stop']);
+  });
+
+  test('prepare receives synchronous ownership cancellation before late activation', async () => {
+    const gate = deferred<void>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async isCurrent => {
+        await gate.promise;
+        if (!isCurrent()) throw new Error('cancelled before activation');
+        order.push('activate');
+        return { engine: fakeEngine().engine };
+      },
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    const starting = lifecycle.start();
+    await Promise.resolve();
+    await lifecycle.stop();
+    gate.resolve();
+    await starting;
+
+    assert.deepEqual(order, ['deactivate']);
+  });
+
+  test('never-resolving engine stop cannot block stop deactivation', async () => {
+    const order: string[] = [];
+    const never = new Promise<void>(() => {});
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+        stop: () => { order.push('stop'); return never; },
+      } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+
+    await Promise.race([
+      lifecycle.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop waited engine stop')))),
+    ]);
+
+    assert.deepEqual(order, ['stop', 'deactivate']);
+  });
+
+  test('pending decision blocks a concurrent start until unconfirmed sign-out releases it', async () => {
+    const count = deferred<number>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => {
+        order.push('prepare');
+        return { engine: { async start() { order.push('start'); }, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; }, async stop() {} } };
+      },
+      deactivate: async () => {}, clear: async () => {}, firebaseSignOut: async () => {}, reload: () => {}, pendingCount: () => count.promise,
+    });
+    const signingOut = lifecycle.signOut();
+    const starting = lifecycle.start();
+    await Promise.resolve();
+    assert.deepEqual(order, []);
+    count.resolve(1);
+    await assert.rejects(signingOut, PrivateProUnsyncedChangesError);
+    await starting;
+
+    assert.deepEqual(order, ['prepare', 'start']);
+  });
+
+  test('unconfirmed decision pauses an existing prepare and then lets its attempt commit', async () => {
+    const prepareGate = deferred<void>();
+    const count = deferred<number>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => {
+        order.push('prepare');
+        await prepareGate.promise;
+        return { engine: {
+          async start() { order.push('start'); }, async retryNow() {}, async flushNow() { return { pending: 0 }; },
+          async pendingCount() { return 0; }, async stop() { order.push('stop'); },
+        } };
+      },
+      deactivate: async () => {}, clear: async () => {}, firebaseSignOut: async () => {}, reload: () => {}, pendingCount: () => count.promise,
+    });
+    const starting = lifecycle.start();
+    await Promise.resolve();
+    const signingOut = lifecycle.signOut();
+    prepareGate.resolve();
+    await Promise.resolve();
+    assert.deepEqual(order, ['prepare']);
+    count.resolve(1);
+    await assert.rejects(signingOut, PrivateProUnsyncedChangesError);
+    await starting;
+
+    assert.deepEqual(order, ['prepare', 'start']);
+  });
+
+  test('confirmed sign-out cancels a preparing attempt without waiting and prevents commit', async () => {
+    const prepared = deferred<{ engine: PrivateProSyncLifecycleEngine }>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: () => prepared.promise,
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); }, reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    const starting = lifecycle.start();
+    await Promise.resolve();
+
+    await Promise.race([
+      lifecycle.signOut({ discardPending: true }),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('sign-out waited prepare')))),
+    ]);
+    prepared.resolve({ engine: {
+      async start() { order.push('old-start'); }, async retryNow() {}, async flushNow() { return { pending: 0 }; },
+      async pendingCount() { return 0; }, async stop() { order.push('old-stop'); },
+    } });
+    await starting;
+
+    assert.deepEqual(order, ['deactivate', 'clear', 'auth', 'reload', 'old-stop']);
+  });
+
+  test('never-resolving engine stop cannot block confirmed sign-out cleanup or reload', async () => {
+    const never = new Promise<void>(() => {});
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(), prepare: async () => ({ engine: {
+        async start() {}, async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+        stop: () => { order.push('stop'); return never; },
+      } }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); }, reload: () => { order.push('reload'); }, pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+
+    await Promise.race([
+      lifecycle.signOut({ discardPending: true }),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('sign-out waited engine stop')))),
+    ]);
+
+    assert.deepEqual(order, ['stop', 'deactivate', 'clear', 'auth', 'reload']);
   });
 
 

@@ -28,7 +28,7 @@ interface PreparedPrivateProSync {
 interface PrivateProSyncLifecycleDependencies {
   uid: string;
   statusStore: PrivateProSyncStore;
-  prepare(): Promise<PreparedPrivateProSync>;
+  prepare(isCurrent: () => boolean): Promise<PreparedPrivateProSync>;
   deactivate(uid: string): Promise<void>;
   clear(uid: string): Promise<void>;
   firebaseSignOut(): Promise<void>;
@@ -62,113 +62,181 @@ function rememberFailure(current: unknown, next: unknown): unknown {
 }
 
 export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecycleDependencies): PrivateProSyncLifecycle {
-  let epoch = 0;
-  let prepared: { epoch: number; value: PreparedPrivateProSync } | null = null;
-  let startPromise: Promise<void> | null = null;
-  let stopping: Promise<void> | null = null;
+  interface StartAttempt {
+    id: number;
+    cancelled: boolean;
+    promise: Promise<void>;
+    engine?: PreparedPrivateProSync;
+    stopInitiated?: boolean;
+  }
+
+  let generation = 0;
+  let attempt: StartAttempt | null = null;
+  let prepared: { id: number; value: PreparedPrivateProSync } | null = null;
+  let stopCleanup: Promise<void> | null = null;
   let signOutPromise: Promise<void> | null = null;
-  let operationTail: Promise<void> = Promise.resolve();
   let closing = false;
+  let decisionInProgress = false;
+  let decisionGate: { promise: Promise<void>; resolve: () => void } | null = null;
 
-  function runExclusive(operation: () => Promise<void>): Promise<void> {
-    const result = operationTail.then(operation, operation);
-    operationTail = result.then(() => {}, () => {});
-    return result;
+  function createGate(): { promise: Promise<void>; resolve: () => void } {
+    let resolve!: () => void;
+    return { promise: new Promise<void>(resolve_ => { resolve = resolve_; }), resolve };
   }
 
-  async function stopPrepared(current: PreparedPrivateProSync | null): Promise<void> {
-    if (current) await current.engine.stop();
+  function stopEngine(value: PreparedPrivateProSync | undefined, owner?: StartAttempt): void {
+    if (!value || owner?.stopInitiated) return;
+    if (owner) owner.stopInitiated = true;
+    let stopped: Promise<void>;
+    try { stopped = value.engine.stop(); } catch (error) { stopped = Promise.reject(error); }
+    stopped.catch(() => {});
   }
 
-  function stop(): Promise<void> {
-    if (stopping) return stopping;
-    const stopEpoch = ++epoch;
-    const current = prepared?.value ?? null;
-    prepared = null;
-    const operation = runExclusive(async () => {
-      let failure: unknown = null;
-      try { await stopPrepared(current); } catch (error) { failure = rememberFailure(failure, error); }
-      if (!prepared && epoch === stopEpoch) {
-        try { await dependencies.deactivate(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
-      }
-      if (failure) throw new PrivateProLifecycleError();
-    });
-    stopping = operation;
-    void operation.finally(() => { if (stopping === operation) stopping = null; }).catch(() => {});
-    return stopping;
+  function beginDeactivate(): Promise<void> {
+    if (stopCleanup) return stopCleanup;
+    let cleanup: Promise<void>;
+    try { cleanup = dependencies.deactivate(dependencies.uid); } catch (error) { cleanup = Promise.reject(error); }
+    const sanitized = cleanup.catch(() => { throw new PrivateProLifecycleError(); });
+    stopCleanup = sanitized;
+    void sanitized.finally(() => { if (stopCleanup === sanitized) stopCleanup = null; }).catch(() => {});
+    return sanitized;
   }
 
-  async function startWork(): Promise<void> {
-    if (prepared || closing) return;
-    const startEpoch = ++epoch;
-    let next: PreparedPrivateProSync | null = null;
-    let committed = false;
+  function canOwnStart(owner: StartAttempt): boolean {
+    return attempt === owner && owner.id === generation && !owner.cancelled && !closing;
+  }
+
+  async function waitForDecision(owner: StartAttempt): Promise<boolean> {
+    while (decisionInProgress && canOwnStart(owner)) {
+      const gate = decisionGate;
+      if (!gate) break;
+      await gate.promise;
+    }
+    return canOwnStart(owner);
+  }
+
+  async function runStart(owner: StartAttempt): Promise<void> {
+    if (!canOwnStart(owner)) return;
+    let next: PreparedPrivateProSync | undefined;
     try {
-      next = await dependencies.prepare();
-      if (epoch !== startEpoch) return;
+      next = await dependencies.prepare(() => canOwnStart(owner));
+      owner.engine = next;
+      if (!await waitForDecision(owner)) {
+        stopEngine(next, owner);
+        return;
+      }
       await next.engine.start();
-      if (epoch !== startEpoch) return;
-      prepared = { epoch: startEpoch, value: next };
-      committed = true;
+      if (!await waitForDecision(owner)) {
+        stopEngine(next, owner);
+        return;
+      }
+      prepared = { id: owner.id, value: next };
+      if (attempt === owner) attempt = null;
       dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
     } catch {
-      if (epoch === startEpoch) dependencies.statusStore.setState({ phase: 'error', lastCategory: 'unknown' });
-    } finally {
-      if (!committed) {
-        if (next) try { await next.engine.stop(); } catch {}
-        if (epoch === startEpoch) try { await dependencies.deactivate(dependencies.uid); } catch {}
+      stopEngine(next, owner);
+      if (canOwnStart(owner)) {
+        attempt = null;
+        dependencies.statusStore.setState({ phase: 'error', lastCategory: 'unknown' });
+        try { await beginDeactivate(); } catch {}
       }
     }
   }
 
   function start(): Promise<void> {
     if (prepared || closing) return Promise.resolve();
-    if (startPromise) return startPromise;
-    const operation = runExclusive(startWork);
-    startPromise = operation;
-    void operation.finally(() => { if (startPromise === operation) startPromise = null; }).catch(() => {});
-    return startPromise;
+    if (decisionInProgress && decisionGate) return decisionGate.promise.then(start);
+    if (stopCleanup) {
+      const cleanup = stopCleanup;
+      return cleanup.then(() => {}, () => {}).then(() => {
+        if (stopCleanup === cleanup) stopCleanup = null;
+        return start();
+      });
+    }
+    if (attempt) return attempt.promise;
+    const owner = { id: ++generation, cancelled: false, promise: Promise.resolve() } satisfies StartAttempt;
+    attempt = owner;
+    owner.promise = Promise.resolve().then(() => runStart(owner));
+    owner.promise.catch(() => {});
+    return owner.promise;
+  }
+
+  function stop(): Promise<void> {
+    generation++;
+    const currentAttempt = attempt;
+    if (currentAttempt) currentAttempt.cancelled = true;
+    attempt = null;
+    const current = prepared?.value;
+    prepared = null;
+    stopEngine(current);
+    return beginDeactivate();
+  }
+
+  function finishDecision(): void {
+    decisionInProgress = false;
+    decisionGate?.resolve();
+    decisionGate = null;
   }
 
   return {
     start,
 
     async retry(): Promise<void> {
-      return runExclusive(async () => {
-        if (closing) return;
-        if (!prepared) return startWork();
-        await prepared.value.engine.retryNow();
-      });
+      if (closing) return;
+      if (decisionInProgress && decisionGate) {
+        await decisionGate.promise;
+        return this.retry();
+      }
+      if (stopCleanup) {
+        const cleanup = stopCleanup;
+        await cleanup.catch(() => {});
+        if (stopCleanup === cleanup) stopCleanup = null;
+        return this.retry();
+      }
+      if (!prepared) return start();
+      await prepared.value.engine.retryNow();
     },
 
     async signOut(options = {}): Promise<void> {
       if (signOutPromise) return signOutPromise;
       signOutPromise = (async () => {
-      const current = prepared?.value ?? null;
-      let pending: number | null = null;
-      try {
-        pending = current
-          ? (await current.engine.flushNow(5_000)).pending
-          : await dependencies.pendingCount();
-      } catch {
-        try { pending = await dependencies.pendingCount(); } catch {}
-      }
-      if (pending === null && !options.discardPending) throw new PrivateProLifecycleError();
-      if (pending !== null && pending > 0 && !options.discardPending) throw new PrivateProUnsyncedChangesError(pending);
+        decisionInProgress = true;
+        decisionGate = createGate();
+        const decisionOwner = prepared?.value ?? null;
+        let pending: number | null = null;
+        try {
+          pending = decisionOwner
+            ? (await decisionOwner.engine.flushNow(5_000)).pending
+            : await dependencies.pendingCount();
+        } catch {
+          try { pending = await dependencies.pendingCount(); } catch {}
+        }
+        if (pending === null && !options.discardPending) {
+          finishDecision();
+          throw new PrivateProLifecycleError();
+        }
+        if (pending !== null && pending > 0 && !options.discardPending) {
+          finishDecision();
+          throw new PrivateProUnsyncedChangesError(pending);
+        }
 
-      closing = true;
-      ++epoch;
-      prepared = null;
-      await runExclusive(async () => {
+        closing = true;
+        generation++;
+        const currentAttempt = attempt;
+        if (currentAttempt) currentAttempt.cancelled = true;
+        attempt = null;
+        const current = prepared?.value ?? null;
+        prepared = null;
+        finishDecision();
         let failure: unknown = null;
         try { current?.coordinator?.broadcastSignedOut?.(); } catch (error) { failure = rememberFailure(failure, error); }
-        try { await stopPrepared(current); } catch (error) { failure = rememberFailure(failure, error); }
-        try { await dependencies.deactivate(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
+        stopEngine(current ?? undefined);
+        stopEngine(currentAttempt?.engine, currentAttempt ?? undefined);
+        try { await beginDeactivate(); } catch (error) { failure = rememberFailure(failure, error); }
         try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
         try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
         try { dependencies.reload(); } catch (error) { failure = rememberFailure(failure, error); }
         if (failure) throw new PrivateProLifecycleError();
-      });
       })().finally(() => { signOutPromise = null; });
       return signOutPromise;
     },
@@ -237,11 +305,12 @@ function createProductionLifecycle(uid: string, previousUid: string | null, fire
   return createPrivateProSyncLifecycle({
     uid,
     statusStore,
-    async prepare() {
+    async prepare(isCurrent) {
       if (previousUid && previousUid !== uid) {
         await deactivatePrivateProAssetPersistence(previousUid);
         await deactivatePrivateProManagedPersistence(previousUid, clearPrivateProManagedRuntimeStores);
       }
+      if (!isCurrent()) throw new PrivateProLifecycleError();
       await activatePrivateProManagedPersistence(uid);
       const local = createPrivateProAssetLocalPort(uid, privateProSyncDB);
       const coordinator = createPrivateProSyncCoordinator({ uid, leases: privateProSyncDB });
@@ -250,7 +319,12 @@ function createProductionLifecycle(uid: string, previousUid: string | null, fire
         port: privateProSyncDB,
         ...ASSET_UPLOAD_LEASE_TIMING,
       });
+      if (!isCurrent()) throw new PrivateProLifecycleError();
       await activatePrivateProAssetPersistence(uid, local, (assetId, guard) => assets.delete(assetId, guard));
+      if (!isCurrent()) {
+        await deactivatePrivateProAssetPersistence(uid);
+        throw new PrivateProLifecycleError();
+      }
       const assetSerializer = createPrivateProAssetSerializer(uid, local, category => {
         statusStore.setState({ phase: category === 'offline' ? 'offline' : 'error', lastCategory: category });
       });

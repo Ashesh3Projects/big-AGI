@@ -158,6 +158,47 @@ GREEN:
 
 None.
 
+## Fix round 3
+
+### Findings addressed
+
+- Replaced the operation tail with explicit `StartAttempt` ownership, synchronous cancellation, a prepared owner, finite deactivation cleanup, a closing flag, and a sign-out decision gate.
+- Same-turn `start(); stop()` and `retry(); stop()` cancel before prepare begins.
+- Stop does not await unresolved prepare or engine stop. It detaches the prepared owner, initiates engine stop with same-turn rejection handling, runs finite deactivation, and lets replacement start wait only that cleanup.
+- A stale prepare or engine-start resolution stops only its local engine. It cannot commit or globally deactivate after cancellation or newer ownership.
+- Sign-out blocks new start/retry commits during pending decision. Unconfirmed sign-out releases the decision gate and preserves the current engine.
+- Confirmed sign-out sets closing, cancels and detaches the latest attempt and prepared owner, guards broadcast, initiates engine stop without awaiting it, then awaits only finite deactivation, clear, Firebase sign-out, and reload.
+- Never-resolving prepare and engine-stop promises cannot block stop or confirmed sign-out cleanup.
+
+### RED evidence
+
+- Same-turn start and retry tests reached prepare instead of deactivating immediately.
+- Never-resolving prepare and engine-stop tests timed out because the operation tail awaited them.
+- Pending decision allowed a concurrent start to prepare and commit.
+- Confirmed sign-out waited preparing and stopping work instead of completing finite cleanup.
+
+### GREEN evidence
+
+- Focused Task 9, auth, cron, fail-closed route, persistence, DBlob, asset, coordinator, engine, config, and access suites: 147 tests passed, 0 failed.
+- Root TypeScript and tools/test TypeScript: exit 0.
+- Scoped ESLint and diff check: exit 0.
+
+### Self-review
+
+- Only the current attempt can commit ownership.
+- Production prepare receives the current ownership predicate and checks it before managed and asset activation transitions.
+- Cancellation is synchronous and happens before queued prepare work.
+- Stale cleanup has no global deactivation path.
+- Detached stop promises receive same-turn rejection handlers.
+- Replacement starts wait only the finite deactivation promise.
+- Sign-out decision preserves current ownership until confirmed.
+- An unconfirmed decision pauses an in-flight prepare at the commit/start boundary and then lets the same attempt continue.
+- The carried never-settling renewal and timely renewal regressions remain green.
+
+### Concerns
+
+None.
+
 ## Fix round 2
 
 ### Findings addressed
