@@ -99,7 +99,7 @@ function resolveBin(name: string): string {
 }
 
 function readCheckpoint(expectedProHead: string): string {
-  const trailer = git(['log', '--format=%(trailers:key=Upstream-Main-Integrated,valueonly)', '-1', expectedProHead], true)
+  const trailer = git(['log', '--first-parent', '--format=%(trailers:key=Upstream-Main-Integrated,valueonly)', expectedProHead], true)
     .split(/\r?\n/)
     .map((line) => line.trim())
     .find(Boolean);

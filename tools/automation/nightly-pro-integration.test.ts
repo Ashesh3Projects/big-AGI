@@ -103,6 +103,13 @@ test('runs package verification from a clean reinstall and blocks generated drif
   assert.match(coordinator, /Verification commands changed the integration file set/);
 });
 
+test('finds the latest integration checkpoint through later Pro commits', () => {
+  const coordinator = readRepoFile('tools/automation/nightly-pro-integration.ts');
+
+  assert.match(coordinator, /'log', '--first-parent', '--format=%\(trailers:key=Upstream-Main-Integrated,valueonly\)', expectedProHead/);
+  assert.doesNotMatch(coordinator, /'--format=%\(trailers:key=Upstream-Main-Integrated,valueonly\)', '-1'/);
+});
+
 function git(cwd: string, ...args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8' }).trim();
 }
