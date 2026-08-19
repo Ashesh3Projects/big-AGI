@@ -60,7 +60,7 @@ export interface PrivateProSyncOutboundStatus {
 }
 
 export interface PrivateProSyncAssetPort {
-  ensureUploaded(referencedAssetIds: readonly string[]): Promise<void>;
+  ensureUploaded(referencedAssetIds: readonly string[], signal?: AbortSignal): Promise<void>;
 }
 
 export interface PrivateProSyncOutboundDependencies {
@@ -313,7 +313,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     const sentAtMs = now();
     activeSends.set(row.mutationId, { row, sentAtMs });
     try {
-      const assetsOutcome = await raceAbortable(assets.ensureUploaded(row.referencedAssetIds), context.signal);
+      const assetsOutcome = await raceAbortable(assets.ensureUploaded(row.referencedAssetIds, context.signal), context.signal);
       if (assetsOutcome.type === 'aborted') {
         await release(row);
         return;

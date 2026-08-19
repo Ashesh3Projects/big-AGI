@@ -149,3 +149,35 @@ None.
 ### Concerns
 
 None.
+
+## Fix round 3
+
+### Findings addressed
+
+- Asset persistence activation is now an asynchronous transition barrier. It clears the active port immediately, aborts the old lease, waits for all registered old operations through transaction settlement, and exposes the new UID only when the latest transition still owns the generation. Calls during transition wait instead of falling through to Open Dexie.
+- Direct asset uploads now acquire an injectable exclusive lock named `private-pro-asset-upload:{uid}:{assetId}` around snapshot, generation checks, all fixed-object uploads, and manifest publication. The per-client queue remains, and outbound passes the leadership AbortSignal into `ensureUploaded`, allowing Storage cancellation before releasing the cross-client lock.
+- Hydration uses an atomic manifest identity compare-and-set and remains independent from active DBlob activation leases.
+- The asset serializer attaches a rejection handler to the initial seed immediately, surfaces notification failures through the returned notification promise, and recovers later notifications without unhandled rejection.
+
+### RED evidence
+
+- Activation barrier regression initially observed the new UID before the old operation was registered; the test now gates on native operation start and verifies activation remains unresolved until settlement.
+- Cross-client upload, leadership abort, hydration CAS, and transient seed-failure regressions failed before the lock, signal propagation, CAS, and recovered seed changes.
+
+### GREEN evidence
+
+- Final DBlob, asset, DB, outbound, serializer, and engine suites: 117 tests, 5 suites, 117 passed, 0 failed, exit 0.
+- TypeScript: `npx tsc --noEmit --pretty`, exit 0.
+- Scoped ESLint for modified asset, sync, and DBlob source: exit 0.
+- `git diff --check`: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- Deactivation uses the same transition barrier as account switching.
+- Transition ownership is generation-fenced so an older async transition cannot publish after a newer one.
+- Upload lock callback contains every fixed-path write and conditional publication step.
+- Aborted queues and failed serializer notifications do not poison later work.
+
+### Concerns
+
+None.

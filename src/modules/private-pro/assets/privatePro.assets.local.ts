@@ -51,30 +51,42 @@ interface ActivePrivateProAssetPersistence {
   port: PrivateProAssetLocalPort;
   deleteAsset: PrivateProAssetDelete;
   controller: AbortController;
+  operations: Set<Promise<unknown>>;
 }
 
 let activationGeneration = 0;
 let active: ActivePrivateProAssetPersistence | null = null;
+let transition: Promise<void> | null = null;
 
 function abortError(): DOMException {
   return new DOMException('Private Pro asset persistence changed.', 'AbortError');
 }
 
-export function activatePrivateProAssetPersistence(uid: string | null, port: PrivateProAssetLocalPort | null, deleteAsset?: PrivateProAssetDelete): void {
-  active?.controller.abort();
-  activationGeneration++;
-  active = uid && port ? {
-    generation: activationGeneration,
-    uid,
-    port,
-    deleteAsset: deleteAsset ?? ((assetId, guard) => port.deleteAsset(assetId, guard)),
-    controller: new AbortController(),
-  } : null;
+export function activatePrivateProAssetPersistence(uid: string | null, port: PrivateProAssetLocalPort | null, deleteAsset?: PrivateProAssetDelete): Promise<void> {
+  const transitionId = ++activationGeneration;
+  const previous = active;
+  const priorTransition = transition;
+  active = null;
+  previous?.controller.abort();
+  const barrier = (async () => {
+    await priorTransition;
+    if (previous) await Promise.allSettled([...previous.operations]);
+    if (transitionId !== activationGeneration) return;
+    active = uid && port ? {
+      generation: transitionId, uid, port,
+      deleteAsset: deleteAsset ?? ((assetId, guard) => port.deleteAsset(assetId, guard)),
+      controller: new AbortController(), operations: new Set(),
+    } : null;
+  })();
+  const settled = barrier.finally(() => { if (transition === settled) transition = null; });
+  transition = settled;
+  return transition;
 }
 
 export async function runActivePrivateProAssetOperation<T>(
   operation: (port: PrivateProAssetLocalPort, guard: PrivateProAssetActivationGuard, deleteAsset: PrivateProAssetDelete) => Promise<T>,
 ): Promise<{ active: false } | { active: true; value: T }> {
+  if (!active && transition) await transition;
   const selected = active;
   if (!selected) return { active: false };
   const guard: PrivateProAssetActivationGuard = {
@@ -83,10 +95,18 @@ export async function runActivePrivateProAssetOperation<T>(
       if (selected.controller.signal.aborted || active !== selected || active.generation !== selected.generation || active.uid !== selected.uid) throw abortError();
     },
   };
-  guard.assertActive();
-  const value = await operation(selected.port, guard, selected.deleteAsset);
-  guard.assertActive();
-  return { active: true, value };
+  const tracked = Promise.resolve().then(async () => {
+    guard.assertActive();
+    const value = await operation(selected.port, guard, selected.deleteAsset);
+    guard.assertActive();
+    return value;
+  });
+  selected.operations.add(tracked);
+  try {
+    return { active: true, value: await tracked };
+  } finally {
+    selected.operations.delete(tracked);
+  }
 }
 
 function cloneState(state: PrivateProSyncAssetState): PrivateProSyncAssetState {

@@ -53,7 +53,7 @@ function delayPort(port: PrivateProAssetLocalPort, method: keyof PrivateProAsset
 }
 
 after(async () => {
-  activatePrivateProAssetPersistence(null, null);
+  await activatePrivateProAssetPersistence(null, null);
   syncDB.close();
   await Dexie.delete(DB_NAME);
   await Dexie.delete('Big-AGI');
@@ -62,11 +62,11 @@ after(async () => {
 test('persists Private Pro DBlobs for one UID across local port instances', async () => {
   const dbModule = await dbModulePromise;
   const firstPort = createPrivateProAssetLocalPort('uid-a', syncDB);
-  activatePrivateProAssetPersistence('uid-a', firstPort);
+  await activatePrivateProAssetPersistence('uid-a', firstPort);
   const asset = imageAsset('asset-durable');
 
   await dbModule.putDBAsset(asset);
-  activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
+  await activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
 
   assert.deepEqual(await dbModule.getDBAsset(asset.id), asset);
   assert.ok((await dbModule.getDBAsset(asset.id))?.createdAt instanceof Date);
@@ -75,10 +75,10 @@ test('persists Private Pro DBlobs for one UID across local port instances', asyn
 test('does not expose another UID assets after an account switch', async () => {
   const dbModule = await dbModulePromise;
   const asset = imageAsset('asset-isolated');
-  activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
+  await activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
   await dbModule.putDBAsset(asset);
 
-  activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
+  await activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
 
   assert.equal(await dbModule.getDBAsset(asset.id), undefined);
 });
@@ -87,16 +87,16 @@ test('clears only the selected UID asset namespace', async () => {
   const dbModule = await dbModulePromise;
   const assetA = imageAsset('asset-clear-a');
   const assetB = imageAsset('asset-clear-b');
-  activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
+  await activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
   await dbModule.putDBAsset(assetA);
-  activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
+  await activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
   await dbModule.putDBAsset(assetB);
 
   await dbModule.clearPrivateProPlaintextDBlobPersistence();
-  activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
+  await activatePrivateProAssetPersistence('uid-a', createPrivateProAssetLocalPort('uid-a', syncDB));
 
   assert.deepEqual(await dbModule.getDBAsset(assetA.id), assetA);
-  activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
+  await activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
   assert.equal(await dbModule.getDBAsset(assetB.id), undefined);
 });
 
@@ -106,13 +106,14 @@ test('rejects a delayed read after activation switches UID', async () => {
   const asset = imageAsset('asset-race-read');
   await portA.putAsset(asset);
   const gate = deferred();
-  activatePrivateProAssetPersistence('uid-a', delayPort(portA, 'getAsset', gate));
+  await activatePrivateProAssetPersistence('uid-a', delayPort(portA, 'getAsset', gate));
 
   const reading = dbModule.getDBAsset(asset.id);
-  activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
+  const switching = activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
   gate.resolve();
 
   await assert.rejects(reading, { name: 'AbortError' });
+  await switching;
 });
 
 for (const operation of ['put', 'update', 'delete', 'gc'] as const) {
@@ -123,18 +124,48 @@ for (const operation of ['put', 'update', 'delete', 'gc'] as const) {
     await portA.putAsset(asset);
     const method = operation === 'put' ? 'putAsset' : operation === 'update' ? 'updateAsset' : operation === 'delete' ? 'deleteAsset' : 'listAssets';
     const gate = deferred();
-    activatePrivateProAssetPersistence('uid-a', delayPort(portA, method, gate));
+    await activatePrivateProAssetPersistence('uid-a', delayPort(portA, method, gate));
     const pending = operation === 'put' ? dbModule.putDBAsset({ ...asset, label: 'changed' })
       : operation === 'update' ? dbModule.transferDBAssetContextScope(asset.id, 'global', 'app-draw')
         : operation === 'delete' ? dbModule.deleteDBAsset(asset.id)
           : dbModule.gcDBAssetsByScope('global', 'app-chat', null, []);
-    activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
+    const switching = activatePrivateProAssetPersistence('uid-b', createPrivateProAssetLocalPort('uid-b', syncDB));
     gate.resolve();
 
     await assert.rejects(pending, { name: 'AbortError' });
+    await switching;
     assert.deepEqual(await portA.getAsset(asset.id), asset);
   });
 }
+
+test('does not expose the new UID until the old native transaction settles', async () => {
+  const dbModule = await dbModulePromise;
+  const portA = createPrivateProAssetLocalPort('uid-a', syncDB);
+  const portB = createPrivateProAssetLocalPort('uid-b', syncDB);
+  await activatePrivateProAssetPersistence('uid-a', portA);
+  let release!: () => void;
+  let started!: () => void;
+  const startedPromise = new Promise<void>(resolve => { started = resolve; });
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const slow = new Proxy(portA, {
+    get(target, property, receiver) {
+      if (property !== 'putAsset') return Reflect.get(target, property, receiver);
+      return async (...args: unknown[]) => { started(); await gate; return target.putAsset(...args as Parameters<typeof target.putAsset>); };
+    },
+  });
+  await activatePrivateProAssetPersistence('uid-a', slow);
+  const writing = dbModule.putDBAsset(imageAsset('asset-transition-barrier'));
+  await startedPromise;
+  let switched = false;
+  const switching = activatePrivateProAssetPersistence('uid-b', portB).then(() => { switched = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(switched, false);
+  release();
+  await assert.rejects(writing, { name: 'AbortError' });
+  await switching;
+  assert.equal(switched, true);
+  assert.equal(await dbModule.getDBAsset('asset-transition-barrier'), undefined);
+});
 
 test('routes DBlob delete through canonical manifest deletion and both Storage objects', async () => {
   const dbModule = await dbModulePromise;
@@ -151,7 +182,7 @@ test('routes DBlob delete through canonical manifest deletion and both Storage o
   await client.ensureUploaded([asset.id]);
   const manifestEvents: number[] = [];
   port.subscribe(async () => { manifestEvents.push((await port.listManifests()).length); });
-  activatePrivateProAssetPersistence('uid-a', port, (assetId, guard) => client.delete(assetId, guard));
+  await activatePrivateProAssetPersistence('uid-a', port, (assetId, guard) => client.delete(assetId, guard));
 
   await dbModule.deleteDBAsset(asset.id);
 
@@ -178,7 +209,7 @@ test('routes DBlob GC through canonical delete', async () => {
   await client.ensureUploaded([asset.id]);
   await Promise.all((await port.listAssets()).filter(value => value.id !== asset.id).map(value => port.deleteAsset(value.id)));
   paths.length = 0;
-  activatePrivateProAssetPersistence('uid-a', port, (assetId, guard) => client.delete(assetId, guard));
+  await activatePrivateProAssetPersistence('uid-a', port, (assetId, guard) => client.delete(assetId, guard));
 
   await dbModule.gcDBAssetsByScope('global', 'app-chat', null, []);
 
@@ -195,9 +226,9 @@ for (const operation of ['put', 'update', 'delete', 'gc', 'clear'] as const) {
     await portA.clear();
     if (operation !== 'put') await portA.putAsset(asset);
     const event = operation === 'put' ? 'creating' : operation === 'update' ? 'updating' : 'deleting';
-    const hook = () => activatePrivateProAssetPersistence('uid-b', portB);
+    const hook = () => { void activatePrivateProAssetPersistence('uid-b', portB); };
     syncDB.assets.hook(event).subscribe(hook);
-    activatePrivateProAssetPersistence('uid-a', portA);
+    await activatePrivateProAssetPersistence('uid-a', portA);
     const pending = operation === 'put' ? dbModule.putDBAsset(asset)
       : operation === 'update' ? dbModule.transferDBAssetContextScope(asset.id, 'global', 'app-draw')
         : operation === 'delete' ? dbModule.deleteDBAsset(asset.id)

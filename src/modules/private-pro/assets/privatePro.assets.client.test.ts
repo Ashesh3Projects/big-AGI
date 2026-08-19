@@ -10,6 +10,7 @@ import { PrivateProSyncTransportError } from '../sync/privatePro.sync.transport'
 import {
   createPrivateProAssetClient,
   type PrivateProAssetStorageMetadata,
+  type PrivateProAssetLockPort,
   type PrivateProAssetStoragePort,
 } from './privatePro.assets.client';
 import { createPrivateProAssetLocalPort } from './privatePro.assets.local';
@@ -80,18 +81,34 @@ class MissingObjectError extends Error {
   readonly code = 'storage/object-not-found';
 }
 
+class FakeLocks implements PrivateProAssetLockPort {
+  private readonly tails = new Map<string, Promise<void>>();
+  async request<T>(name: string, signal: AbortSignal | undefined, callback: () => Promise<T>): Promise<T> {
+    const previous = this.tails.get(name) ?? Promise.resolve();
+    let release!: () => void;
+    const tail = new Promise<void>(resolve => { release = resolve; });
+    const queued = previous.catch(() => {}).then(() => tail);
+    this.tails.set(name, queued);
+    await previous.catch(() => {});
+    if (signal?.aborted) { release(); throw new DOMException('aborted', 'AbortError'); }
+    try { return await callback(); }
+    finally { release(); if (this.tails.get(name) === queued) this.tails.delete(name); }
+  }
+}
+
 function harness(t: TestContext) {
   const name = `private-pro-assets-${crypto.randomUUID()}`;
   const db = new PrivateProSyncDB(name);
   const local = createPrivateProAssetLocalPort(UID, db);
   const storage = new FakeStorage();
   let wakes = 0;
-  const client = createPrivateProAssetClient(UID, storage, { wake: () => { wakes++; } }, local);
+  const locks = new FakeLocks();
+  const client = createPrivateProAssetClient(UID, storage, { wake: () => { wakes++; } }, local, locks);
   t.after(async () => {
     db.close();
     await Dexie.delete(name);
   });
-  return { client, db, local, storage, wakes: () => wakes };
+  return { client, db, local, storage, locks, wakes: () => wakes };
 }
 
 describe('Private Pro direct assets', () => {
@@ -213,6 +230,33 @@ describe('Private Pro direct assets', () => {
     await client.ensureUploaded([asset.id]);
 
     assert.equal((await local.getManifest(asset.id))?.contentGeneration, 1);
+  });
+
+  test('serializes uploads across client instances and leadership abort releases the lock', async (t) => {
+    const { local, storage, locks } = harness(t);
+    const oldAsset = fixture('asset-cross-client', false);
+    await local.putAsset(oldAsset);
+    const oldClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks);
+    const newClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, locks);
+    const controller = new AbortController();
+    let started!: () => void;
+    const startedPromise = new Promise<void>(resolve => { started = resolve; });
+    storage.uploadBytesResumable = async (_path, _bytes, _metadata, signal) => new Promise<void>((_resolve, reject) => {
+      started();
+      signal?.addEventListener('abort', () => reject(new DOMException('aborted', 'AbortError')), { once: true });
+    });
+    const oldUpload = oldClient.ensureUploaded([oldAsset.id], controller.signal);
+    await startedPromise;
+    const newAsset = { ...oldAsset, data: { ...oldAsset.data, base64: base64(bytes('cross-client-new')) } };
+    await local.putAsset(newAsset);
+    storage.uploadBytesResumable = FakeStorage.prototype.uploadBytesResumable.bind(storage);
+    const newUpload = newClient.ensureUploaded([oldAsset.id]);
+    await new Promise(resolve => setImmediate(resolve));
+    controller.abort();
+    await assert.rejects(oldUpload, { name: 'AbortError' });
+    await newUpload;
+
+    assert.equal(new TextDecoder().decode(storage.objects.get(`users/${UID}/workspace-v1/assets/${oldAsset.id}/original`)!.bytes), 'cross-client-new');
   });
 
   test('rejects an oversized manifest before any Storage call', async (t) => {

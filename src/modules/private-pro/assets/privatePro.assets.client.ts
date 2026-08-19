@@ -29,6 +29,10 @@ export interface PrivateProAssetManifestTransport {
   wake(): void;
 }
 
+export interface PrivateProAssetLockPort {
+  request<T>(name: string, signal: AbortSignal | undefined, callback: () => Promise<T>): Promise<T>;
+}
+
 export interface PrivateProAssetClient {
   ensureUploaded(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
   hydrate(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
@@ -143,6 +147,7 @@ export function createPrivateProAssetClient(
   storage: PrivateProAssetStoragePort = firebaseStoragePort(),
   transport: PrivateProAssetManifestTransport,
   local: PrivateProAssetLocalPort,
+  locks: PrivateProAssetLockPort = browserLockPort(),
 ): PrivateProAssetClient {
   if (!uid) throw new TypeError('Private Pro asset UID is required.');
   const uploadQueues = new Map<string, Promise<void>>();
@@ -157,7 +162,7 @@ export function createPrivateProAssetClient(
 
   function enqueueUpload(assetId: string, signal?: AbortSignal): Promise<void> {
     const previous = uploadQueues.get(assetId) ?? Promise.resolve();
-    const task = previous.catch(() => {}).then(async () => {
+    const task = previous.catch(() => {}).then(() => locks.request(`private-pro-asset-upload:${uid}:${assetId}`, signal, async () => {
       abortIfNeeded(signal);
       const snapshot = await local.getAssetSnapshot(assetId);
       if (!snapshot) throw new Error('Private Pro attachment is unavailable locally.');
@@ -178,7 +183,7 @@ export function createPrivateProAssetClient(
       if (!await local.putManifestIfCurrent(assetId, snapshot.contentGeneration, manifest, manifestHash))
         throw new PrivateProSyncTransportError('offline');
       transport.wake();
-    });
+    }));
     uploadQueues.set(assetId, task);
     task.finally(() => { if (uploadQueues.get(assetId) === task) uploadQueues.delete(assetId); }).catch(() => {});
     return task;
@@ -252,6 +257,16 @@ export function createPrivateProAssetClient(
     },
 
     clearLocal: () => local.clear(),
+  };
+}
+
+function browserLockPort(): PrivateProAssetLockPort {
+  return {
+    request: async (name, signal, callback) => {
+      if (typeof navigator !== 'undefined' && navigator.locks)
+        return navigator.locks.request(name, { mode: 'exclusive', signal }, callback);
+      return callback();
+    },
   };
 }
 
