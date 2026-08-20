@@ -139,6 +139,10 @@ export interface FirestoreRestoreEvidenceEnvironmentInput {
   readonly additionalExpectedCommitSha?: string;
 }
 
+export interface SecurityAuditEnvironmentInput extends FirestoreRestoreEvidenceEnvironmentInput {
+  readonly appCheckToken?: string;
+}
+
 interface HeaderFacts {
   contentSecurityPolicy: boolean;
   strictTransportSecurity: boolean;
@@ -1188,7 +1192,8 @@ function childProcessEnvironment(): NodeJS.ProcessEnv {
   for (const name of Object.keys(environment)) {
     const upper = name.toUpperCase();
     const privateProAuditSecret = upper.startsWith('PRIVATE_PRO_')
-      && (upper.includes('RESTORE_EVIDENCE')
+      && (upper === 'PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN'
+        || upper.includes('RESTORE_EVIDENCE')
         || upper.includes('ATTEST')
         || (upper.includes('SIGN') && /(?:_PRIVATE_KEY|_SECRET|_TOKEN|_CREDENTIAL|_SIGNING_KEY)$/.test(upper))
         || (upper.includes('RESTORE') && /(?:_PRIVATE_KEY|_SECRET|_TOKEN|_CREDENTIAL)$/.test(upper))
@@ -2076,15 +2081,15 @@ async function collectDependencyAudit(): Promise<DependencyAuditFacts> {
   return inspectDependencyAudit(await runJson('npm', ['audit', '--omit=dev', '--json'], true));
 }
 
-function endpointProbeState(response: Response): ProbeState {
-  if ([401, 403, 404].includes(response.status)) return 'denied';
+function endpointProbeState(response: Response, deniedStatuses: ReadonlySet<number>): ProbeState {
+  if (deniedStatuses.has(response.status)) return 'denied';
   if (response.ok) return 'allowed';
   return 'unknown';
 }
 
-async function endpointProbe(request: () => Promise<Response>): Promise<ProbeState> {
+async function endpointProbe(request: () => Promise<Response>, deniedStatuses = new Set([403])): Promise<ProbeState> {
   try {
-    return endpointProbeState(await request());
+    return endpointProbeState(await request(), deniedStatuses);
   } catch {
     return 'unknown';
   }
@@ -2096,26 +2101,39 @@ export async function collectFirebaseEndpointProbes(input: {
   apiKey: string;
   auditUid: string;
   operationId: string;
+  origin: string;
+  appCheckToken: string;
   fetch: typeof fetch;
   cleanupFirestore?(paths: readonly string[]): Promise<boolean>;
   cleanupStorage?(paths: readonly string[]): Promise<boolean>;
 }): Promise<FirebaseRuleProbeFacts> {
+  const appCheckToken = input.appCheckToken.trim();
+  if (!appCheckToken || !ALLOWED_BUCKET_CORS_ORIGINS.has(input.origin))
+    return { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' };
   const uid = input.auditUid;
   const recordKey = privateProRecordKey('settings', 'security-audit');
   const firestorePath = `users/${uid}/workspaces/v1/records/${recordKey}`;
   const firestoreReceiptPath = `users/${uid}/workspaces/v1/mutationReceipts/${input.operationId}`;
-  const storagePath = `users/${uid}/workspace-v1/assets/audit/original`;
+  const operationSuffix = input.operationId.replaceAll('-', '').toLowerCase();
+  const assetId = `audit-${operationSuffix}`;
+  const storagePath = `users/${uid}/workspace-v1/assets/${assetId}/original`;
+  const storagePrefix = `users/${uid}/workspace-v1/assets/`;
   const firestoreCollection = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents/users/${encodeURIComponent(input.auditUid)}/workspaces/v1/records?pageSize=1&key=${encodeURIComponent(input.apiKey)}`;
   const firestoreCommit = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents:commit?key=${encodeURIComponent(input.apiKey)}`;
-  const storageObject = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o/${encodeURIComponent(storagePath)}?key=${encodeURIComponent(input.apiKey)}`;
-  const storageUpload = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?uploadType=multipart&name=${encodeURIComponent(storagePath)}&key=${encodeURIComponent(input.apiKey)}`;
+  const storageList = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?prefix=${encodeURIComponent(storagePrefix)}&delimiter=${encodeURIComponent('/')}&maxResults=1&key=${encodeURIComponent(input.apiKey)}`;
+  const storageUpload = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?name=${encodeURIComponent(storagePath)}&key=${encodeURIComponent(input.apiKey)}`;
   const documentName = `projects/${input.projectId}/databases/(default)/documents/${firestorePath}`;
   const receiptName = `projects/${input.projectId}/databases/(default)/documents/${firestoreReceiptPath}`;
-  const firestoreRead = await endpointProbe(() => input.fetch(firestoreCollection, { method: 'GET' }));
-  const storageRead = await endpointProbe(() => input.fetch(`${storageObject}&alt=media`, { method: 'GET' }));
+  const browserHeaders = {
+    Origin: input.origin,
+    Referer: `${input.origin.replace(/\/$/, '')}/`,
+    'X-Firebase-AppCheck': appCheckToken,
+  };
+  const firestoreRead = await endpointProbe(() => input.fetch(firestoreCollection, { method: 'GET', headers: browserHeaders }));
+  const storageRead = await endpointProbe(() => input.fetch(storageList, { method: 'GET', headers: browserHeaders }));
   const firestoreWrite = await endpointProbe(() => input.fetch(firestoreCommit, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { ...browserHeaders, 'Content-Type': 'application/json' },
     body: JSON.stringify({ writes: [
       { update: { name: documentName, fields: {
         recordType: { stringValue: 'settings' }, logicalId: { stringValue: 'security-audit' }, schemaVersion: { integerValue: '1' }, payload: { stringValue: '{}' }, contentHash: { stringValue: '0'.repeat(64) }, revision: { integerValue: '1' }, mutationId: { stringValue: input.operationId }, writerId: { stringValue: input.operationId }, deleted: { booleanValue: false }, updatedAt: { timestampValue: '1970-01-01T00:00:00Z' },
@@ -2125,27 +2143,34 @@ export async function collectFirebaseEndpointProbes(input: {
       } }, updateTransforms: [{ fieldPath: 'committedAt', setToServerValue: 'REQUEST_TIME' }] },
     ] }),
   }));
-  const boundary = 'private-pro-security-audit';
+  const boundary = `private-pro-security-audit-${operationSuffix}`;
   const storageMetadata = JSON.stringify({
     name: storagePath,
+    size: 1,
     contentType: 'image/png',
-    metadata: { uid, assetId: 'audit', kind: 'original', sha256: '0'.repeat(64) },
+    metadata: { uid, assetId, kind: 'original', sha256: '0'.repeat(64) },
   });
   const storageBody = `--${boundary}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n${storageMetadata}\r\n--${boundary}\r\nContent-Type: image/png\r\n\r\n0\r\n--${boundary}--`;
   const storageWrite = await endpointProbe(() => input.fetch(storageUpload, {
     method: 'POST',
-    headers: { 'content-type': `multipart/related; boundary=${boundary}` },
+    headers: {
+      ...browserHeaders,
+      'Content-Type': `multipart/related; boundary=${boundary}`,
+      'X-Goog-Upload-Protocol': 'multipart',
+    },
     body: storageBody,
   }));
-  if (firestoreWrite === 'allowed') {
-    if (!input.cleanupFirestore || !await input.cleanupFirestore([firestorePath, firestoreReceiptPath])) return { firestoreRead, firestoreWrite: 'unknown', storageRead, storageWrite };
-  }
-  if (storageWrite === 'allowed' && (!input.cleanupStorage || !await input.cleanupStorage([storagePath]))) return { firestoreRead, firestoreWrite, storageRead, storageWrite: 'unknown' };
+  let cleanedFirestoreWrite = firestoreWrite;
+  let cleanedStorageWrite = storageWrite;
+  if (firestoreWrite === 'allowed'
+    && (!input.cleanupFirestore || !await input.cleanupFirestore([firestorePath, firestoreReceiptPath]))) cleanedFirestoreWrite = 'unknown';
+  if (storageWrite === 'allowed'
+    && (!input.cleanupStorage || !await input.cleanupStorage([storagePath]))) cleanedStorageWrite = 'unknown';
   return {
     firestoreRead,
-    firestoreWrite,
+    firestoreWrite: cleanedFirestoreWrite,
     storageRead,
-    storageWrite,
+    storageWrite: cleanedStorageWrite,
   };
 }
 
@@ -2169,9 +2194,15 @@ export function assertPrivateProSecurityAuditIdentity(input: {
     || input.auth.claims.privateProEpoch !== epoch) throw new Error('Private Pro security audit identity is invalid.');
 }
 
-async function collectFirebaseRuleProbes(projectId: string, storageBucket: string): Promise<FirebaseRuleProbeFacts> {
+async function collectFirebaseRuleProbes(
+  projectId: string,
+  storageBucket: string,
+  origin: string,
+  appCheckToken: string | undefined,
+): Promise<FirebaseRuleProbeFacts> {
   const apiKey = process.env.NEXT_PUBLIC_FIREBASE_API_KEY?.trim();
   if (!apiKey) throw new Error('Firebase browser API key is missing.');
+  if (!appCheckToken?.trim()) return { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' };
   const auditUid = process.env.PRIVATE_PRO_SECURITY_AUDIT_UID?.trim();
   if (!auditUid || !/^[A-Za-z0-9_-]{1,128}$/.test(auditUid)) throw new Error('Private Pro security audit UID is missing.');
   const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
@@ -2202,6 +2233,8 @@ async function collectFirebaseRuleProbes(projectId: string, storageBucket: strin
     apiKey,
     auditUid,
     operationId: randomUUID(),
+    origin,
+    appCheckToken,
     fetch,
     cleanupFirestore: async paths => {
       for (const path of paths) {
@@ -2236,27 +2269,29 @@ function isAuditOnlyRestoreEvidenceEnvironmentName(name: string): boolean {
     && (upper.includes('RESTORE_EVIDENCE') || (upper.includes('RESTORE') && upper.includes('HMAC')));
 }
 
-function captureFirestoreRestoreEvidenceEnvironment(): Readonly<FirestoreRestoreEvidenceEnvironmentInput> {
+function captureSecurityAuditEnvironment(): Readonly<SecurityAuditEnvironmentInput> {
   const evidenceBase64 = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64;
   const expectedCommit = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim();
+  const appCheckToken = process.env.PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN?.trim();
   const input = Object.freeze({
     ...(evidenceBase64 !== undefined ? { evidenceBase64 } : {}),
     ...(expectedCommit ? { additionalExpectedCommitSha: expectedCommit } : {}),
+    ...(appCheckToken ? { appCheckToken } : {}),
   });
   for (const name of Object.keys(process.env)) {
-    if (isAuditOnlyRestoreEvidenceEnvironmentName(name)) delete process.env[name];
+    if (isAuditOnlyRestoreEvidenceEnvironmentName(name) || name.toUpperCase() === 'PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN') delete process.env[name];
   }
   return input;
 }
 
 export async function runSecurityAuditWithCollector<T>(
-  collector: (input: Readonly<FirestoreRestoreEvidenceEnvironmentInput>) => Promise<T>,
+  collector: (input: Readonly<SecurityAuditEnvironmentInput>) => Promise<T>,
 ): Promise<T> {
-  const restoreEvidenceInput = captureFirestoreRestoreEvidenceEnvironment();
-  return collector(restoreEvidenceInput);
+  const auditEnvironmentInput = captureSecurityAuditEnvironment();
+  return collector(auditEnvironmentInput);
 }
 
-async function collectReport(restoreEvidenceInput: Readonly<FirestoreRestoreEvidenceEnvironmentInput>): Promise<AuditReport> {
+async function collectReport(auditEnvironmentInput: Readonly<SecurityAuditEnvironmentInput>): Promise<AuditReport> {
   const projectId = validateProjectId(process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID?.trim() || DEFAULT_PROJECT_ID);
   const deploymentOrigin = process.env.PRIVATE_PRO_AUDIT_ORIGIN?.trim() || DEFAULT_DEPLOYMENT_ORIGIN;
   const storageBucket = validateBucket(process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET?.trim() || `${projectId}.firebasestorage.app`);
@@ -2268,7 +2303,7 @@ async function collectReport(restoreEvidenceInput: Readonly<FirestoreRestoreEvid
     collectBucketCors(storageBucket).then(classifyBucketCors),
     collectAppCheck(projectId).then(classifyAppCheck),
     collectFirestoreRecoveryState(projectId).then(classifyFirestoreRecoveryState),
-    collectFirestoreRestoreEvidence(restoreEvidenceInput).then(classifyFirestoreRestoreEvidence),
+    collectFirestoreRestoreEvidence(auditEnvironmentInput).then(classifyFirestoreRestoreEvidence),
     collectIamRoles(projectId).then(classifyIamRoles),
     collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
     collectRuntimeRoleManifest().then(classifyRuntimeRoleManifest),
@@ -2277,7 +2312,7 @@ async function collectReport(restoreEvidenceInput: Readonly<FirestoreRestoreEvid
     collectRuntimeServiceAccountPolicy(projectId).then(classifyRuntimeServiceAccountPolicy),
     collectServiceAccountKeys(projectId).then(classifyServiceAccountKeys),
     collectDependencyAudit().then(classifyDependencyAudit),
-    collectFirebaseRuleProbes(projectId, storageBucket).then(classifyFirebaseRuleProbes),
+    collectFirebaseRuleProbes(projectId, storageBucket, deploymentOrigin, auditEnvironmentInput.appCheckToken).then(classifyFirebaseRuleProbes),
   ];
   const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'bucketCors', 'appCheck', 'firestoreRecovery', 'firestoreRestoreEvidence', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
   const results = await Promise.allSettled(tasks);

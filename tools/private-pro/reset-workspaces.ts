@@ -21,6 +21,8 @@ const FIRESTORE_TARGETS = [
 const STORAGE_PREFIXES = ['vault/', 'assets/', 'chatUploads/', 'workspace-v1/'] as const;
 const PAGE_SIZE = 500;
 const DELETE_CONCURRENCY = 10;
+const RESET_LEASE_MS = 60_000;
+const RESET_LEASE_RENEW_EVERY_MS = 20_000;
 export const PRIVATE_PRO_WORKSPACE_RESET_REVISION = 1;
 const RESET_OPERATION_PATH = `privateProOperations/workspaceV1Reset-v${PRIVATE_PRO_WORKSPACE_RESET_REVISION}`;
 
@@ -129,17 +131,48 @@ export interface PrivateProResetActionResult {
 }
 
 export interface PrivateProResetExecutionPort {
+  assertLease(boundary: string): Promise<void>;
   inspect(action: PrivateProResetAction): Promise<Pick<PrivateProResetActionResult, 'uid' | 'documentCount' | 'objectCount' | 'epochTransition'>>;
   fenceAccount(action: PrivateProResetAction): Promise<void>;
   fenceClaims(action: PrivateProResetAction): Promise<void>;
   revokeFenceTokens(action: PrivateProResetAction): Promise<void>;
-  cleanupFirestore(action: PrivateProResetAction): Promise<void>;
-  cleanupStorage(action: PrivateProResetAction): Promise<void>;
+  cleanupFirestore(action: PrivateProResetAction, assertLease: (boundary: string) => Promise<void>): Promise<void>;
+  cleanupStorage(action: PrivateProResetAction, assertLease: (boundary: string) => Promise<void>): Promise<void>;
   applyFinalAccount(action: PrivateProResetAction): Promise<void>;
   applyFinalClaims(action: PrivateProResetAction): Promise<void>;
   revokeFinalTokens(action: PrivateProResetAction): Promise<void>;
   persistPhase(action: PrivateProResetAction, phase: PrivateProResetTargetPhase): Promise<void>;
   emit(result: PrivateProResetActionResult): void;
+}
+
+export interface PrivateProResetLeaseControllerPort {
+  projectId: string;
+  executorId: string;
+  leaseMs: number;
+  renewEveryMs: number;
+  now(): number;
+  schedule(callback: () => Promise<void>, delayMs: number): unknown;
+  cancel(timer: unknown): void;
+  renew(input: {
+    operation: PrivateProResetOperation;
+    projectId: string;
+    executorId: string;
+    nowMs: number;
+    leaseMs: number;
+  }): Promise<PrivateProResetOperation>;
+  assertOwned(input: {
+    operation: PrivateProResetOperation;
+    projectId: string;
+    executorId: string;
+    nowMs: number;
+    boundary: string;
+  }): Promise<PrivateProResetOperation>;
+}
+
+export interface PrivateProResetLeaseController {
+  readonly aborted: boolean;
+  assertLease(boundary: string): Promise<void>;
+  stop(): void;
 }
 
 export interface PrivateProResetBucketBinding {
@@ -354,6 +387,105 @@ const STAGE_ERRORS: Record<Exclude<PrivateProResetExecutionStage, 'complete'>, P
   'final-tokens': 'FINAL_TOKEN_REVOCATION_FAILED',
 };
 
+export function createPrivateProResetLeaseController(
+  port: PrivateProResetLeaseControllerPort,
+  initialOperation: PrivateProResetOperation,
+): PrivateProResetLeaseController {
+  if (!Number.isSafeInteger(port.leaseMs) || port.leaseMs <= 0
+    || !Number.isSafeInteger(port.renewEveryMs) || port.renewEveryMs <= 0 || port.renewEveryMs >= port.leaseMs)
+    throw new Error('Reset lease timing is invalid.');
+  let operation = initialOperation;
+  let stopped = false;
+  let aborted = false;
+  let timer: unknown;
+  let renewal: Promise<void> | undefined;
+  let leaseFailure: unknown;
+
+  const loseLease = (error: unknown) => {
+    if (!leaseFailure) leaseFailure = error;
+    aborted = true;
+    stopped = true;
+    if (timer !== undefined) {
+      port.cancel(timer);
+      timer = undefined;
+    }
+  };
+
+  const assertLocalLease = () => {
+    if (leaseFailure) throw leaseFailure;
+    if (stopped) throw new Error('Reset executor lease is unavailable.');
+    if (operation.state !== 'running'
+      || operation.projectId !== port.projectId
+      || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
+      || operation.executorId !== port.executorId
+      || operation.leaseExpiresAtMs <= port.now()) {
+      const error = new Error('Reset executor lease was lost.');
+      loseLease(error);
+      throw error;
+    }
+  };
+
+  const scheduleRenewal = () => {
+    if (stopped) return;
+    timer = port.schedule(async () => {
+      timer = undefined;
+      if (stopped) return;
+      renewal = (async () => {
+        try {
+          assertLocalLease();
+          const nowMs = port.now();
+          const renewed = await port.renew({
+            operation,
+            projectId: port.projectId,
+            executorId: port.executorId,
+            nowMs,
+            leaseMs: port.leaseMs,
+          });
+          if (stopped) return;
+          operation = renewed;
+          assertLocalLease();
+          scheduleRenewal();
+        } catch (error) {
+          loseLease(error);
+        } finally {
+          renewal = undefined;
+        }
+      })();
+      await renewal;
+    }, port.renewEveryMs);
+  };
+
+  assertLocalLease();
+  scheduleRenewal();
+  return {
+    get aborted() { return aborted; },
+    async assertLease(boundary: string) {
+      assertLocalLease();
+      const asserted = await port.assertOwned({
+        operation,
+        projectId: port.projectId,
+        executorId: port.executorId,
+        nowMs: port.now(),
+        boundary,
+      }).catch(error => {
+        loseLease(error);
+        throw error;
+      });
+      if (stopped) throw leaseFailure ?? new Error('Reset executor lease was lost.');
+      operation = asserted;
+      assertLocalLease();
+    },
+    stop() {
+      stopped = true;
+      if (timer !== undefined) {
+        port.cancel(timer);
+        timer = undefined;
+      }
+      void renewal;
+    },
+  };
+}
+
 export async function executePrivateProResetActions(actions: readonly PrivateProResetAction[], port: PrivateProResetExecutionPort): Promise<void> {
   const phaseRank: Record<PrivateProResetTargetPhase, number> = { planned: 0, fenced: 1, cleaned: 2, complete: 3 };
   for (const action of actions) {
@@ -368,27 +500,46 @@ export async function executePrivateProResetActions(actions: readonly PrivatePro
       counts = await port.inspect(action);
       if (phaseRank[action.journalPhase] < phaseRank.fenced) {
         stage = 'fence-account';
-        await port.fenceAccount(action);
+        await port.assertLease('fence-account');
+        if (action.fenceAccount) await port.fenceAccount(action);
         stage = 'fence-claims';
-        await port.fenceClaims(action);
+        if (action.claims.type !== 'none') {
+          await port.assertLease('fence-claims');
+          await port.fenceClaims(action);
+        }
         stage = 'fence-tokens';
-        await port.revokeFenceTokens(action);
+        if (action.revokeRefreshTokens) {
+          await port.assertLease('fence-tokens');
+          await port.revokeFenceTokens(action);
+        }
+        await port.assertLease('persist-phase:fenced');
         await port.persistPhase(action, 'fenced');
       }
       if (phaseRank[action.journalPhase] < phaseRank.cleaned) {
         stage = 'firestore-cleanup';
-        await port.cleanupFirestore(action);
+        await port.assertLease('firestore-cleanup');
+        await port.cleanupFirestore(action, port.assertLease);
         stage = 'storage-cleanup';
-        await port.cleanupStorage(action);
+        await port.assertLease('storage-cleanup');
+        await port.cleanupStorage(action, port.assertLease);
+        await port.assertLease('persist-phase:cleaned');
         await port.persistPhase(action, 'cleaned');
       }
       if (phaseRank[action.journalPhase] < phaseRank.complete) {
         stage = 'final-account';
+        await port.assertLease('final-account');
         await port.applyFinalAccount(action);
         stage = 'final-claims';
-        await port.applyFinalClaims(action);
+        if (action.claims.type === 'replace') {
+          await port.assertLease('final-claims');
+          await port.applyFinalClaims(action);
+        }
         stage = 'final-tokens';
-        await port.revokeFinalTokens(action);
+        if (action.revokeRefreshTokens) {
+          await port.assertLease('final-tokens');
+          await port.revokeFinalTokens(action);
+        }
+        await port.assertLease('persist-phase:complete');
         await port.persistPhase(action, 'complete');
       }
       port.emit({ ...counts, stage: 'complete', success: true });
@@ -401,12 +552,13 @@ export async function executePrivateProResetActions(actions: readonly PrivatePro
 
 export async function runPrivateProResetConvergence(port: {
   runPass(): Promise<{ relevantUids: readonly string[]; targetUids: readonly string[]; incompleteTargets: number }>;
-  refreshLease(): Promise<void>;
+  assertLease(boundary: string): Promise<void>;
   markComplete(): Promise<void>;
 }, maxPasses = 8): Promise<void> {
-  let previousSignature = '';
+  let lastCompleteSignature = '';
+  let consecutiveCompletePasses = 0;
   for (let pass = 0; pass < maxPasses; pass++) {
-    await port.refreshLease();
+    await port.assertLease('convergence-pass');
     const state = await port.runPass();
     const relevant = [...state.relevantUids].sort();
     const targets = [...state.targetUids].sort();
@@ -414,11 +566,21 @@ export async function runPrivateProResetConvergence(port: {
     const completeCoverage = state.incompleteTargets === 0
       && relevant.length === targets.length
       && relevant.every((uid, index) => uid === targets[index]);
-    if (completeCoverage && signature === previousSignature) {
+    if (!completeCoverage) {
+      lastCompleteSignature = '';
+      consecutiveCompletePasses = 0;
+      continue;
+    }
+    if (signature === lastCompleteSignature) consecutiveCompletePasses++;
+    else {
+      lastCompleteSignature = signature;
+      consecutiveCompletePasses = 1;
+    }
+    if (consecutiveCompletePasses >= 2) {
+      await port.assertLease('mark-complete');
       await port.markComplete();
       return;
     }
-    previousSignature = signature;
   }
   throw new Error('Private Pro reset did not converge.');
 }
@@ -565,20 +727,81 @@ async function ensureResetOperation(firestore: FirebaseFirestore.Firestore, proj
       if (operation.projectId !== projectId) throw new Error('Reset operation project mismatch.');
       assertPrivateProResetExecutorLease(operation, executorId, nowMs);
       if (operation.state === 'running') {
-        transaction.update(reference, { executorId, leaseExpiresAtMs: nowMs + 60_000 });
-        return { ...operation, executorId, leaseExpiresAtMs: nowMs + 60_000 };
+        transaction.update(reference, { executorId, leaseExpiresAtMs: nowMs + RESET_LEASE_MS });
+        return { ...operation, executorId, leaseExpiresAtMs: nowMs + RESET_LEASE_MS };
       }
       return operation;
     }
-    const operation: PrivateProResetOperation = { operationId: 'workspace-v1', schemaVersion: 1, revision: PRIVATE_PRO_WORKSPACE_RESET_REVISION, projectId, state: 'running', startedAtMs: nowMs, executorId, leaseExpiresAtMs: nowMs + 60_000 };
+    const operation: PrivateProResetOperation = { operationId: 'workspace-v1', schemaVersion: 1, revision: PRIVATE_PRO_WORKSPACE_RESET_REVISION, projectId, state: 'running', startedAtMs: nowMs, executorId, leaseExpiresAtMs: nowMs + RESET_LEASE_MS };
     transaction.create(reference, operation);
     return operation;
   });
 }
 
-async function ensureResetTargets(firestore: FirebaseFirestore.Firestore, actions: readonly PrivateProResetAction[], nowMs: number): Promise<void> {
+async function renewResetOperationLease(
+  firestore: FirebaseFirestore.Firestore,
+  operation: PrivateProResetOperation,
+  projectId: string,
+  executorId: string,
+  leaseMs: number,
+): Promise<PrivateProResetOperation> {
+  return firestore.runTransaction(async transaction => {
+    const nowMs = Date.now();
+    const reference = firestore.doc(RESET_OPERATION_PATH);
+    const snapshot = await transaction.get(reference);
+    if (!snapshot.exists) throw new Error('Reset operation journal is missing.');
+    const current = parsePrivateProResetOperation(snapshot.data());
+    if (current.projectId !== projectId
+      || current.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
+      || current.state !== 'running'
+      || current.executorId !== executorId
+      || current.leaseExpiresAtMs <= nowMs
+      || operation.executorId !== current.executorId) throw new Error('Reset executor lease renewal mismatch.');
+    const renewed = { ...current, leaseExpiresAtMs: nowMs + leaseMs };
+    transaction.update(reference, { leaseExpiresAtMs: renewed.leaseExpiresAtMs });
+    return renewed;
+  });
+}
+
+async function assertResetOperationLease(
+  firestore: FirebaseFirestore.Firestore,
+  projectId: string,
+  executorId: string,
+): Promise<PrivateProResetOperation> {
+  return firestore.runTransaction(async transaction => {
+    const nowMs = Date.now();
+    const snapshot = await transaction.get(firestore.doc(RESET_OPERATION_PATH));
+    if (!snapshot.exists) throw new Error('Reset operation journal is missing.');
+    const operation = parsePrivateProResetOperation(snapshot.data());
+    if (operation.projectId !== projectId
+      || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
+      || operation.state !== 'running'
+      || operation.executorId !== executorId
+      || operation.leaseExpiresAtMs <= nowMs) throw new Error('Reset executor lease ownership mismatch.');
+    return operation;
+  });
+}
+
+async function ensureResetTargets(
+  firestore: FirebaseFirestore.Firestore,
+  actions: readonly PrivateProResetAction[],
+  nowMs: number,
+  projectId: string,
+  executorId: string,
+  assertLease: (boundary: string) => Promise<void>,
+): Promise<void> {
   for (const action of actions) {
+    await assertLease(`claim-target:${action.uid}`);
     await firestore.runTransaction(async transaction => {
+      const leaseNowMs = Date.now();
+      const operationSnapshot = await transaction.get(firestore.doc(RESET_OPERATION_PATH));
+      if (!operationSnapshot.exists) throw new Error('Reset operation journal is missing.');
+      const operation = parsePrivateProResetOperation(operationSnapshot.data());
+      if (operation.projectId !== projectId
+        || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
+        || operation.state !== 'running'
+        || operation.executorId !== executorId
+        || operation.leaseExpiresAtMs <= leaseNowMs) throw new Error('Reset executor lease ownership mismatch.');
       const reference = firestore.doc(`${RESET_OPERATION_PATH}/targets/${action.uid}`);
       const snapshot = await transaction.get(reference);
       if (snapshot.exists) {
@@ -596,9 +819,25 @@ async function ensureResetTargets(firestore: FirebaseFirestore.Firestore, action
   }
 }
 
-async function persistResetPhase(firestore: FirebaseFirestore.Firestore, action: PrivateProResetAction, phase: PrivateProResetTargetPhase, nowMs: number): Promise<void> {
+async function persistResetPhase(
+  firestore: FirebaseFirestore.Firestore,
+  action: PrivateProResetAction,
+  phase: PrivateProResetTargetPhase,
+  nowMs: number,
+  projectId: string,
+  executorId: string,
+): Promise<void> {
   const ranks: Record<PrivateProResetTargetPhase, number> = { planned: 0, fenced: 1, cleaned: 2, complete: 3 };
   await firestore.runTransaction(async transaction => {
+    const leaseNowMs = Date.now();
+    const operationSnapshot = await transaction.get(firestore.doc(RESET_OPERATION_PATH));
+    if (!operationSnapshot.exists) throw new Error('Reset operation journal is missing.');
+    const operation = parsePrivateProResetOperation(operationSnapshot.data());
+    if (operation.projectId !== projectId
+      || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
+      || operation.state !== 'running'
+      || operation.executorId !== executorId
+      || operation.leaseExpiresAtMs <= leaseNowMs) throw new Error('Reset executor lease ownership mismatch.');
     const reference = firestore.doc(`${RESET_OPERATION_PATH}/targets/${action.uid}`);
     const snapshot = await transaction.get(reference);
     if (!snapshot.exists) throw new Error('Reset target journal is missing.');
@@ -611,11 +850,12 @@ async function persistResetPhase(firestore: FirebaseFirestore.Firestore, action:
 
 async function markResetComplete(firestore: FirebaseFirestore.Firestore, projectId: string, executorId: string): Promise<void> {
   await firestore.runTransaction(async transaction => {
+    const nowMs = Date.now();
     const reference = firestore.doc(RESET_OPERATION_PATH);
     const snapshot = await transaction.get(reference);
     if (!snapshot.exists) throw new Error('Reset operation journal is missing.');
     const operation = parsePrivateProResetOperation(snapshot.data());
-    if (operation.projectId !== projectId || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION || operation.state !== 'running' || operation.executorId !== executorId)
+    if (operation.projectId !== projectId || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION || operation.state !== 'running' || operation.executorId !== executorId || operation.leaseExpiresAtMs <= nowMs)
       throw new Error('Reset operation completion mismatch.');
     transaction.update(reference, { state: 'complete', leaseExpiresAtMs: 0 });
   });
@@ -680,11 +920,16 @@ async function countStorageObjects(bucket: Bucket, prefix: string): Promise<numb
   return count;
 }
 
-async function deleteStoragePrefix(bucket: Bucket, prefix: string): Promise<void> {
+async function deleteStoragePrefix(bucket: Bucket, prefix: string, assertLease: (boundary: string) => Promise<void>): Promise<void> {
   while (true) {
+    await assertLease(`storage-list:${prefix}`);
     const [files] = await bucket.getFiles({ autoPaginate: false, maxResults: PAGE_SIZE, prefix });
     if (files.length === 0) return;
-    await mapWithConcurrency(files, DELETE_CONCURRENCY, file => file.delete({ ignoreNotFound: true }).then(() => undefined));
+    await assertLease(`storage-batch:${prefix}`);
+    await mapWithConcurrency(files, DELETE_CONCURRENCY, async file => {
+      await assertLease(`storage-delete:${file.name}`);
+      await file.delete({ ignoreNotFound: true });
+    });
   }
 }
 
@@ -700,21 +945,55 @@ async function inspectAction(action: PrivateProResetAction, firestore: FirebaseF
   return { uid: action.uid, documentCount, objectCount, epochTransition: action.epochTransition };
 }
 
-async function cleanupFirestoreAction(action: PrivateProResetAction, firestore: FirebaseFirestore.Firestore) {
+async function cleanupFirestoreAction(action: PrivateProResetAction, firestore: FirebaseFirestore.Firestore, assertLease: (boundary: string) => Promise<void>) {
   for (const target of action.firestoreTargets) {
+    await assertLease(`firestore-delete:${target.path}`);
     const reference = target.kind === 'document' ? firestore.doc(target.path) : firestore.collection(target.path);
     await firestore.recursiveDelete(reference);
   }
 }
 
-async function applyAccountAction(action: PrivateProResetAction, firestore: FirebaseFirestore.Firestore) {
-  const accountReference = firestore.doc(`users/${action.uid}`);
-  if (action.account.type === 'replace') await accountReference.set(action.account.record);
-  else await accountReference.delete();
+async function applyAccountAction(
+  action: PrivateProResetAction,
+  firestore: FirebaseFirestore.Firestore,
+  projectId: string,
+  executorId: string,
+) {
+  await firestore.runTransaction(async transaction => {
+    const nowMs = Date.now();
+    const operationSnapshot = await transaction.get(firestore.doc(RESET_OPERATION_PATH));
+    if (!operationSnapshot.exists) throw new Error('Reset operation journal is missing.');
+    const operation = parsePrivateProResetOperation(operationSnapshot.data());
+    if (operation.projectId !== projectId
+      || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
+      || operation.state !== 'running'
+      || operation.executorId !== executorId
+      || operation.leaseExpiresAtMs <= nowMs) throw new Error('Reset executor lease ownership mismatch.');
+    const accountReference = firestore.doc(`users/${action.uid}`);
+    if (action.account.type === 'replace') transaction.set(accountReference, action.account.record);
+    else transaction.delete(accountReference);
+  });
 }
 
-async function fenceAccountAction(action: PrivateProResetAction, firestore: FirebaseFirestore.Firestore) {
-  if (action.fenceAccount) await firestore.doc(`users/${action.uid}`).set(action.fenceAccount);
+async function fenceAccountAction(
+  action: PrivateProResetAction,
+  firestore: FirebaseFirestore.Firestore,
+  projectId: string,
+  executorId: string,
+) {
+  if (!action.fenceAccount) return;
+  await firestore.runTransaction(async transaction => {
+    const nowMs = Date.now();
+    const operationSnapshot = await transaction.get(firestore.doc(RESET_OPERATION_PATH));
+    if (!operationSnapshot.exists) throw new Error('Reset operation journal is missing.');
+    const operation = parsePrivateProResetOperation(operationSnapshot.data());
+    if (operation.projectId !== projectId
+      || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
+      || operation.state !== 'running'
+      || operation.executorId !== executorId
+      || operation.leaseExpiresAtMs <= nowMs) throw new Error('Reset executor lease ownership mismatch.');
+    transaction.set(firestore.doc(`users/${action.uid}`), action.fenceAccount);
+  });
 }
 
 async function fenceClaimsAction(action: PrivateProResetAction, auth: ReturnType<AdminModules['getAuth']>) {
@@ -751,42 +1030,66 @@ async function main() {
   });
 
   if (plan.mode === 'execute') {
-    const operation = await ensureResetOperation(inputs.firestore, projectId, nowMs, executorId);
+    const operation = await ensureResetOperation(inputs.firestore, projectId, Date.now(), executorId);
     if (operation.state === 'complete') {
       console.log(JSON.stringify({ projectId, mode: 'execute', alreadyComplete: true }));
       return;
     }
-    await runPrivateProResetConvergence({
-      refreshLease: async () => { await ensureResetOperation(inputs.firestore, projectId, Date.now(), executorId); },
-      runPass: async () => {
-        const fresh = await collectInputs(admin, projectId, storageBucket, false, Date.now(), executorId);
-        const currentOperation = fresh.resetOperation ?? operation;
-        const journalPlan = buildPrivateProResetPlan({ projectId, ...args, authIdentities: fresh.authIdentities, accountDocuments: fresh.accountDocuments, allowedEmails, nowMs: Date.now(), resetOperation: currentOperation, resetTargets: fresh.resetTargets });
-        await ensureResetTargets(inputs.firestore, journalPlan.actions, Date.now());
-        const refreshedTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
-        const executablePlan = buildPrivateProResetPlan({ projectId, ...args, authIdentities: fresh.authIdentities, accountDocuments: fresh.accountDocuments, allowedEmails, nowMs: Date.now(), resetOperation: currentOperation, resetTargets: refreshedTargets });
-        await executePrivateProResetActions(executablePlan.actions, {
-          inspect: action => inspectAction(action, inputs.firestore, inputs.bucket, admin.FieldPath.documentId()),
-          fenceAccount: action => fenceAccountAction(action, inputs.firestore),
-          fenceClaims: action => fenceClaimsAction(action, inputs.auth),
-          revokeFenceTokens: action => revokeTokensAction(action, inputs.auth),
-          cleanupFirestore: action => cleanupFirestoreAction(action, inputs.firestore),
-          cleanupStorage: async action => { for (const prefix of action.storagePrefixes) await deleteStoragePrefix(inputs.bucket, prefix); },
-          applyFinalAccount: action => applyAccountAction(action, inputs.firestore),
-          applyFinalClaims: action => applyClaimsAction(action, inputs.auth),
-          revokeFinalTokens: action => revokeTokensAction(action, inputs.auth),
-          persistPhase: (action, phase) => persistResetPhase(inputs.firestore, action, phase, Date.now()),
-          emit: result => console.log(JSON.stringify(result)),
-        });
-        const finalTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
-        return {
-          relevantUids: executablePlan.actions.map(action => action.uid),
-          targetUids: finalTargets.map(target => target.uid),
-          incompleteTargets: finalTargets.filter(target => target.phase !== 'complete').length,
-        };
-      },
-      markComplete: () => markResetComplete(inputs.firestore, projectId, executorId),
-    });
+    const leaseController = createPrivateProResetLeaseController({
+      projectId,
+      executorId,
+      leaseMs: RESET_LEASE_MS,
+      renewEveryMs: RESET_LEASE_RENEW_EVERY_MS,
+      now: Date.now,
+      schedule: (callback, delayMs) => setTimeout(() => { void callback(); }, delayMs),
+      cancel: timer => clearTimeout(timer as ReturnType<typeof setTimeout>),
+      renew: input => renewResetOperationLease(inputs.firestore, input.operation, input.projectId, input.executorId, input.leaseMs),
+      assertOwned: input => assertResetOperationLease(inputs.firestore, input.projectId, input.executorId),
+    }, operation);
+    try {
+      await runPrivateProResetConvergence({
+        assertLease: leaseController.assertLease,
+        runPass: async () => {
+          await leaseController.assertLease('collect-inventory');
+          const fresh = await collectInputs(admin, projectId, storageBucket, false, Date.now(), executorId);
+          const currentOperation = fresh.resetOperation ?? operation;
+          const journalPlan = buildPrivateProResetPlan({ projectId, ...args, authIdentities: fresh.authIdentities, accountDocuments: fresh.accountDocuments, allowedEmails, nowMs: Date.now(), resetOperation: currentOperation, resetTargets: fresh.resetTargets });
+          await ensureResetTargets(inputs.firestore, journalPlan.actions, Date.now(), projectId, executorId, leaseController.assertLease);
+          await leaseController.assertLease('read-claimed-targets');
+          const refreshedTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
+          const executablePlan = buildPrivateProResetPlan({ projectId, ...args, authIdentities: fresh.authIdentities, accountDocuments: fresh.accountDocuments, allowedEmails, nowMs: Date.now(), resetOperation: currentOperation, resetTargets: refreshedTargets });
+          await executePrivateProResetActions(executablePlan.actions, {
+            assertLease: leaseController.assertLease,
+            inspect: action => inspectAction(action, inputs.firestore, inputs.bucket, admin.FieldPath.documentId()),
+            fenceAccount: action => fenceAccountAction(action, inputs.firestore, projectId, executorId),
+            fenceClaims: action => fenceClaimsAction(action, inputs.auth),
+            revokeFenceTokens: action => revokeTokensAction(action, inputs.auth),
+            cleanupFirestore: (action, assertLease) => cleanupFirestoreAction(action, inputs.firestore, assertLease),
+            cleanupStorage: async (action, assertLease) => {
+              for (const prefix of action.storagePrefixes) {
+                await assertLease(`storage-prefix:${prefix}`);
+                await deleteStoragePrefix(inputs.bucket, prefix, assertLease);
+              }
+            },
+            applyFinalAccount: action => applyAccountAction(action, inputs.firestore, projectId, executorId),
+            applyFinalClaims: action => applyClaimsAction(action, inputs.auth),
+            revokeFinalTokens: action => revokeTokensAction(action, inputs.auth),
+            persistPhase: (action, phase) => persistResetPhase(inputs.firestore, action, phase, Date.now(), projectId, executorId),
+            emit: result => console.log(JSON.stringify(result)),
+          });
+          await leaseController.assertLease('read-final-targets');
+          const finalTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
+          return {
+            relevantUids: executablePlan.actions.map(action => action.uid),
+            targetUids: finalTargets.map(target => target.uid),
+            incompleteTargets: finalTargets.filter(target => target.phase !== 'complete').length,
+          };
+        },
+        markComplete: () => markResetComplete(inputs.firestore, projectId, executorId),
+      });
+    } finally {
+      leaseController.stop();
+    }
     return;
   }
   const accounts = [];

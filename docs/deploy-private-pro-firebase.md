@@ -59,7 +59,10 @@ Required server configuration:
 ```dotenv
 PRIVATE_PRO_ALLOWED_EMAILS=you@example.com,friend@example.com
 PRIVATE_PRO_SECURITY_AUDIT_UID=existing-approved-firebase-uid
+PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN=short-lived-token-from-clean-approved-browser
 ```
+
+Obtain `PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN` immediately before each audit from a clean approved production browser after App Check succeeds. Keep it only in the current PowerShell process. The audit consumes it once, removes it from its environment, excludes it from child processes, and never prints it. Do not store it in Vercel, dotenv files, shell profiles, CI variables, or reports.
 
 The v1 attachment size limit is a fixed 64 MiB rule and schema constant. It is not deployment configuration.
 
@@ -119,7 +122,7 @@ Execution requires both flags and an exact match with `NEXT_PUBLIC_FIREBASE_PROJ
 npm run private-pro:reset-workspaces -- --execute --confirm <project-id>
 ```
 
-Execution refuses an empty allowlist. It never deletes Auth identities. Reset revision 1 uses the revisioned `privateProOperations/workspaceV1Reset-v1` journal and an executor lease. Firestore and Storage rules deny v1 browser access while that revision is running. Each Auth UID is fenced with an inactive fixed target epoch, cleared claims, and revoked tokens before cleanup. Approved verified identities receive a clean active account and matching claims at that same epoch after cleanup. Other account documents and all orphan account documents are deleted after cleanup. Refresh tokens are revoked again after final convergence. Reruns reuse journaled target epochs and phases. A future reset requires a new revision.
+Execution refuses an empty allowlist. It never deletes Auth identities. Reset revision 1 uses the revisioned `privateProOperations/workspaceV1Reset-v1` journal and one renewable 60-second executor lease. The executor renews every 20 seconds throughout convergence and transactionally verifies the running revision, executor ID, and unexpired lease before every target claim, fence, delete boundary, final mutation, journal phase, and completion. Lease expiry, renewal failure, or takeover aborts later mutations. Firestore and Storage rules deny v1 browser access while that revision is running. Each Auth UID is fenced with an inactive fixed target epoch, cleared claims, and revoked tokens before cleanup. Approved verified identities receive a clean active account and matching claims at that same epoch after cleanup. Other account documents and all orphan account documents are deleted after cleanup. Refresh tokens are revoked again after final convergence. Completion requires two consecutive complete passes with identical relevant and target UID signatures; an incomplete or changed pass resets the count. Reruns reuse journaled target epochs and phases. A future reset requires a new revision.
 
 Do not run reset execution against production without separate approval of the reviewed dry-run counts.
 
@@ -127,7 +130,9 @@ Do not run reset execution against production without separate approval of the r
 
 Register the two approved origins for reCAPTCHA Enterprise. Start Firestore and Storage in metrics mode. Verify valid production traffic and invalid traffic before enabling enforcement for both products.
 
-The security audit treats missing or disabled enforcement as a blocker for release. Anonymous Firestore and Storage probes must remain denied after direct authenticated browser access is enabled.
+The security audit treats missing or disabled enforcement as a blocker for release. The rule probes send the approved Origin and Referer plus a valid App Check token, but no Firebase Auth token. This isolates Firestore and Storage Rules from browser API-key and App Check rejection. Storage read uses the denied list endpoint for `users/{uid}/workspace-v1/assets/`, so an absent object cannot masquerade as an authorization denial. Storage write uses the exact installed SDK multipart request shape and a unique operation-derived asset path. Missing App Check input produces unknown blocking findings and no probe fetch. Unexpected allowed writes require Admin cleanup before the audit can pass.
+
+`--report-only` changes only the exit code. It still runs the bounded App Check-qualified, no-Auth Firestore and Storage probes and cleanup checks.
 
 ## Emulator and local checks
 

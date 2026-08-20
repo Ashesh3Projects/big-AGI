@@ -74,3 +74,22 @@
 - Resume inventory includes journal-only targets whose account document was already deleted.
 - Execute uses a bounded fresh-inventory convergence loop, requires two stable complete passes, refreshes the single-executor lease, and refuses completion while targets are incomplete or inventory is unstable.
 - Security audit separates the approved audit UID from UUID mutation IDs and keeps codec-derived Firestore shapes plus operator cleanup.
+
+## Fix round 4
+
+- Replaced pass-level lease refresh with a renewable lease controller that owns the executor ID and expiry for the full convergence run. It renews every 20 seconds against the 60-second lease and aborts on renewal failure, expiry, or takeover.
+- Added transactional ownership assertions before target claims, account and claim fences, token revocations, every recursive Firestore target deletion, every Storage prefix/list/object deletion, final account and claim mutations, every journal phase, and operation completion. The renewal timer is always cleaned up.
+- Made convergence state explicit with `lastCompleteSignature` and `consecutiveCompletePasses`. Completion now requires two consecutive complete passes with the same relevant and target UID signature. Incomplete coverage or a changed UID set resets the count.
+- Changed the Storage read probe from an absent-object read to the denied v1 asset list endpoint. All rule probes now include the approved Origin, Referer, and a transient valid App Check token while omitting Firebase Auth, which isolates Rules from API-key and App Check rejection.
+- Added `PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN` as one-run operator input. The audit consumes and removes it from the process environment, scrubs it from child processes, never logs it, and returns unknown blocking probe results without fetching when it is absent.
+- Matched the installed Firebase Storage SDK multipart request: POST bucket object endpoint, operation-derived asset ID/path, numeric one-byte `size`, exact custom metadata, `X-Goog-Upload-Protocol: multipart`, and SDK CRLF/closing boundary shape. Unexpected allowed writes still require operator Admin cleanup.
+
+## Fix round 4 verification
+
+- `npx tsx --test tools/private-pro/reset-workspaces.test.ts tools/private-pro/security-audit.test.ts`
+- `npx tsx --test src/modules/private-pro/auth/privatePro.auth.service.test.ts`
+- `npm run test:firebase:exec` with the documented JDK 21 environment
+- `npm run tscheck`
+- `npx eslint tools/private-pro`
+- Documentation placeholder and em dash validation
+- `git diff --check`

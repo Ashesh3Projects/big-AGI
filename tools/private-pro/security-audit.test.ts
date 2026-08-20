@@ -779,6 +779,7 @@ describe('private Pro security audit classifiers', () => {
       PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY: 'obsolete-hmac',
       PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE: 'obsolete-path',
       PRIVATE_PRO_RESTORE_EVIDENCE_ROOT: 'obsolete-root',
+      PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN: 'short-lived-app-check-token',
       GOOGLE_APPLICATION_CREDENTIALS: 'retained-google-credentials.json',
       GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES: '1',
       PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS: 'principal://iam.googleapis.com/projects/123456789012/locations/global/workloadIdentityPools/vercel-prod/subject/deploy',
@@ -789,7 +790,9 @@ describe('private Pro security audit classifiers', () => {
       assert.equal(Object.isFrozen(input), true);
       assert.equal(input.evidenceBase64, auditEnvironment.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64);
       assert.equal(input.additionalExpectedCommitSha, TEST_RELEASE_COMMIT);
+      assert.equal((input as { readonly appCheckToken?: string }).appCheckToken, auditEnvironment.PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN);
       for (const name of evidenceEnvironmentNames) assert.equal(process.env[name], undefined, name);
+      assert.equal(process.env.PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN, undefined);
       assert.equal(process.env.GOOGLE_APPLICATION_CREDENTIALS, auditEnvironment.GOOGLE_APPLICATION_CREDENTIALS);
       assert.equal(process.env.GOOGLE_EXTERNAL_ACCOUNT_ALLOW_EXECUTABLES, '1');
       assert.equal(process.env.PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS, auditEnvironment.PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS);
@@ -802,6 +805,7 @@ describe('private Pro security audit classifiers', () => {
             legacyHmac: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY,
             legacyPath: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE,
             legacyRoot: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_ROOT,
+            appCheckToken: !!process.env.PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN,
             googleCredentials: process.env.GOOGLE_APPLICATION_CREDENTIALS,
           }));
         `], { encoding: 'utf8' })) as Record<string, unknown>;
@@ -811,6 +815,7 @@ describe('private Pro security audit classifiers', () => {
           legacyHmac: false,
           legacyPath: false,
           legacyRoot: false,
+          appCheckToken: false,
           googleCredentials: auditEnvironment.GOOGLE_APPLICATION_CREDENTIALS,
         });
         return {
@@ -823,6 +828,7 @@ describe('private Pro security audit classifiers', () => {
           evidence: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64,
           expectedCommit: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA,
           legacyHmac: !!process.env.PRIVATE_PRO_RESTORE_EVIDENCE_HMAC_KEY,
+          appCheckToken: !!process.env.PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN,
           googleCredentials: process.env.GOOGLE_APPLICATION_CREDENTIALS,
         }));
       `])).stdout) as Record<string, unknown>;
@@ -863,6 +869,7 @@ describe('private Pro security audit classifiers', () => {
           evidence: false,
           expectedCommit: false,
           legacyHmac: false,
+          appCheckToken: false,
           googleCredentials: auditEnvironment.GOOGLE_APPLICATION_CREDENTIALS,
         },
         evidence: {
@@ -890,6 +897,7 @@ describe('private Pro security audit classifiers', () => {
       PRIVATE_PRO_FUTURE_ATTEST_PRIVATE_KEY: 'future-attest-key',
       PRIVATE_PRO_RESTORE_SIGNING_KEY: 'future-signing-key',
       PRIVATE_PRO_FIRESTORE_RESTORE_ACCESS_TOKEN: 'future-access-token',
+      PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN: 'short-lived-app-check-token',
       PRIVATE_PRO_CHILD_ENV_SENTINEL: 'ordinary-value',
     } as const;
     const previous = Object.fromEntries(Object.keys(names).map(name => [name, process.env[name]]));
@@ -905,6 +913,7 @@ describe('private Pro security audit classifiers', () => {
           futureAttestKey: !!process.env.PRIVATE_PRO_FUTURE_ATTEST_PRIVATE_KEY,
           futureSigningKey: !!process.env.PRIVATE_PRO_RESTORE_SIGNING_KEY,
           futureAccessToken: !!process.env.PRIVATE_PRO_FIRESTORE_RESTORE_ACCESS_TOKEN,
+          appCheckToken: !!process.env.PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN,
           ordinary: process.env.PRIVATE_PRO_CHILD_ENV_SENTINEL,
         }));
       `]);
@@ -918,6 +927,7 @@ describe('private Pro security audit classifiers', () => {
         futureAttestKey: false,
         futureSigningKey: false,
         futureAccessToken: false,
+        appCheckToken: false,
         ordinary: 'ordinary-value',
       });
       assert.equal(process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64, evidence);
@@ -1584,22 +1594,101 @@ describe('private Pro security audit classifiers', () => {
     assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'pass']);
   });
 
-  test('collects anonymous endpoint write denial, allowed cleanup, and unknown outcomes', async () => {
+  test('does not fetch Firebase rule probes without the transient App Check token', async () => {
+    let fetches = 0;
+    const result = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://chatgpt.ashesh.dev',
+      appCheckToken: '',
+      fetch: async () => { fetches++; return new Response('', { status: 403 }); },
+    });
+
+    assert.equal(fetches, 0);
+    assert.deepEqual(result, { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' });
+
+    const unapprovedOrigin = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://unapproved.example.com',
+      appCheckToken: 'short-lived-app-check-token',
+      fetch: async () => { fetches++; return new Response('', { status: 403 }); },
+    });
+    assert.equal(fetches, 0);
+    assert.deepEqual(unapprovedOrigin, { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' });
+  });
+
+  test('collects App Check-qualified no-Auth denials, exact SDK requests, allowed cleanup, and unknown outcomes', async () => {
     const requests: Array<{ url: string; method: string; body?: BodyInit | null; headers?: HeadersInit }> = [];
+    let operationStep = 0;
     const denied = await collectFirebaseEndpointProbes({
       projectId: 'sample-project',
       storageBucket: 'sample-project.firebasestorage.app',
       apiKey: 'secret-api-key',
       auditUid: 'firebase-uid-a',
       operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://chatgpt.ashesh.dev',
+      appCheckToken: 'short-lived-app-check-token',
       cleanupFirestore: async () => true,
       cleanupStorage: async () => true,
       fetch: async (url, init) => {
-        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET', body: init?.body, headers: init?.headers });
+        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET', body: init?.body, headers: new Headers(init?.headers) });
+        assert.deepEqual([
+          ['GET', 'firestore.googleapis.com'],
+          ['GET', 'firebasestorage.googleapis.com'],
+          ['POST', 'firestore.googleapis.com'],
+          ['POST', 'firebasestorage.googleapis.com'],
+        ][operationStep++], [init?.method ?? 'GET', new URL(String(url)).hostname]);
         return new Response('', { status: 403 });
       },
     });
+    assert.equal(operationStep, 4);
     assert.deepEqual(denied, { firestoreRead: 'denied', firestoreWrite: 'denied', storageRead: 'denied', storageWrite: 'denied' });
+    const commonHeaders = {
+      origin: 'https://chatgpt.ashesh.dev',
+      referer: 'https://chatgpt.ashesh.dev/',
+      'x-firebase-appcheck': 'short-lived-app-check-token',
+    };
+    for (const request of requests) {
+      assert.deepEqual({
+        origin: new Headers(request.headers).get('origin'),
+        referer: new Headers(request.headers).get('referer'),
+        'x-firebase-appcheck': new Headers(request.headers).get('x-firebase-appcheck'),
+      }, commonHeaders);
+      assert.equal(new Headers(request.headers).has('authorization'), false);
+    }
+    const listRequest = requests.find(request => request.method === 'GET' && request.url.includes('/v0/b/'));
+    assert.equal(listRequest?.url, 'https://firebasestorage.googleapis.com/v0/b/sample-project.firebasestorage.app/o?prefix=users%2Ffirebase-uid-a%2Fworkspace-v1%2Fassets%2F&delimiter=%2F&maxResults=1&key=<key>');
+
+    const notFound = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://chatgpt.ashesh.dev',
+      appCheckToken: 'short-lived-app-check-token',
+      fetch: async () => new Response('', { status: 404 }),
+    });
+    assert.deepEqual(notFound, { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' });
+
+    const unauthenticated = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://chatgpt.ashesh.dev',
+      appCheckToken: 'short-lived-app-check-token',
+      fetch: async () => new Response('', { status: 401 }),
+    });
+    assert.deepEqual(unauthenticated, { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' });
 
     requests.length = 0;
     const allowed = await collectFirebaseEndpointProbes({
@@ -1608,10 +1697,14 @@ describe('private Pro security audit classifiers', () => {
       apiKey: 'secret-api-key',
       auditUid: 'firebase-uid-a',
       operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://chatgpt.ashesh.dev',
+      appCheckToken: 'short-lived-app-check-token',
       cleanupFirestore: async paths => { requests.push({ url: paths.join(','), method: 'ADMIN_DELETE' }); return true; },
       cleanupStorage: async paths => { requests.push({ url: paths.join(','), method: 'ADMIN_DELETE' }); return true; },
       fetch: async (url, init) => {
-        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET', body: init?.body, headers: init?.headers });
+        const headers = new Headers(init?.headers);
+        headers.delete('x-firebase-appcheck');
+        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET', body: init?.body, headers });
         return new Response('', { status: 200 });
       },
     });
@@ -1620,12 +1713,38 @@ describe('private Pro security audit classifiers', () => {
     const commit = requests.find(request => request.url.includes('documents:commit'));
     assert.match(String(commit?.body), /security-audit/);
     assert.match(String(commit?.body), /updateTransforms/);
-    const upload = requests.find(request => request.url.includes('uploadType=multipart'));
-    assert.match((upload?.headers as Record<string, string>)['content-type'], /^multipart\/related; boundary=/);
-    assert.match(String(upload?.body), /"contentType":"image\/png"/);
-    assert.match(String(upload?.body), /"uid":"firebase-uid-a"/);
-    assert.match(String(upload?.url), /workspace-v1%2Fassets%2Faudit%2Foriginal/);
+    const upload = requests.find(request => new Headers(request.headers).get('x-goog-upload-protocol') === 'multipart');
+    const boundary = 'private-pro-security-audit-123e4567e89b42d3a456426614174000';
+    const assetId = 'audit-123e4567e89b42d3a456426614174000';
+    const storagePath = `users/firebase-uid-a/workspace-v1/assets/${assetId}/original`;
+    assert.equal(upload?.method, 'POST');
+    assert.equal(upload?.url, `https://firebasestorage.googleapis.com/v0/b/sample-project.firebasestorage.app/o?name=${encodeURIComponent(storagePath)}&key=<key>`);
+    assert.equal(new Headers(upload?.headers).get('content-type'), `multipart/related; boundary=${boundary}`);
+    assert.equal(new Headers(upload?.headers).get('x-goog-upload-protocol'), 'multipart');
+    assert.equal(String(upload?.body), `--${boundary}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n${JSON.stringify({
+      name: storagePath,
+      size: 1,
+      contentType: 'image/png',
+      metadata: { uid: 'firebase-uid-a', assetId, kind: 'original', sha256: '0'.repeat(64) },
+    })}\r\n--${boundary}\r\nContent-Type: image/png\r\n\r\n0\r\n--${boundary}--`);
     assert.doesNotMatch(JSON.stringify(requests), /secret-api-key/);
+    assert.doesNotMatch(JSON.stringify(requests), /short-lived-app-check-token/);
+
+    const cleanupAttempts: string[] = [];
+    const partialCleanup = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://chatgpt.ashesh.dev',
+      appCheckToken: 'short-lived-app-check-token',
+      cleanupFirestore: async () => { cleanupAttempts.push('firestore'); return false; },
+      cleanupStorage: async () => { cleanupAttempts.push('storage'); return true; },
+      fetch: async () => new Response('', { status: 200 }),
+    });
+    assert.deepEqual(cleanupAttempts, ['firestore', 'storage']);
+    assert.deepEqual(partialCleanup, { firestoreRead: 'allowed', firestoreWrite: 'unknown', storageRead: 'allowed', storageWrite: 'allowed' });
 
     const unknown = await collectFirebaseEndpointProbes({
       projectId: 'sample-project',
@@ -1633,6 +1752,8 @@ describe('private Pro security audit classifiers', () => {
       apiKey: 'secret-api-key',
       auditUid: 'firebase-uid-a',
       operationId: '123e4567-e89b-42d3-a456-426614174000',
+      origin: 'https://chatgpt.ashesh.dev',
+      appCheckToken: 'short-lived-app-check-token',
       cleanupFirestore: async () => true,
       cleanupStorage: async () => true,
       fetch: async () => { throw new Error('network secret'); },
