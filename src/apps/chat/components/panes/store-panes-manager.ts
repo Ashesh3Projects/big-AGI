@@ -404,6 +404,10 @@ export function panesManagerActions(): AppChatPanesActions {
   return useAppChatPanesStore.getState();
 }
 
+export function panesManagerResetPrivateProRuntime(): void {
+  useAppChatPanesStore.setState({ chatPanes: [], chatPaneFocusIndex: null });
+}
+
 export function getInstantAppChatPanesCount() {
   return useAppChatPanesStore.getState().chatPanes.length;
 }

@@ -67,12 +67,9 @@ HTTP_BASIC_AUTH_PASSWORD=
 
 # Private Pro Firebase deployment (see deploy-private-pro-firebase.md)
 PRIVATE_PRO_ALLOWED_EMAILS=
-PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES=1073741824
-PRIVATE_PRO_MAX_FILE_BYTES=67108864
-PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS=60000
-PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS=30
-PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES=268435456
-CRON_SECRET=
+PRIVATE_PRO_SECURITY_AUDIT_UID=
+# Transient short-lived token copied from a clean approved browser only for one security audit run.
+PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN=
 # Optional audit identity hint for ADC/WIF. Not a credential.
 PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL=
 PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS=
@@ -174,12 +171,8 @@ See [Private Pro Firebase deployment](deploy-private-pro-firebase.md) for the co
 | Variable                             | Description                                                                                         |
 |:-------------------------------------|:----------------------------------------------------------------------------------------------------|
 | `PRIVATE_PRO_ALLOWED_EMAILS`         | Comma-separated exact Google email allowlist.                                                       |
-| `PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES` | Attachment quota per account. Defaults to 1073741824 bytes.                                        |
-| `PRIVATE_PRO_MAX_FILE_BYTES`         | Maximum size of one synchronized attachment. Defaults to 67108864 bytes.                            |
-| `PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS`  | Per-instance upload reservation rate window per UID. Defaults to 60000 milliseconds.                |
-| `PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS` | Maximum reservation requests per UID and window. Defaults to 30.                                 |
-| `PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES`  | Maximum requested upload bytes per UID and window. Defaults to 268435456 bytes.                    |
-| `CRON_SECRET`                        | Secret Vercel sends to the scheduled expired-reservation cleanup endpoint. Server-only.             |
+| `PRIVATE_PRO_SECURITY_AUDIT_UID`     | Existing active approved account UID used only as the path target for App Check-qualified, no-Auth security audit probes. |
+| `PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN` | Required transient short-lived App Check token copied from a clean approved browser immediately before an audit. It is consumed once, removed from the audit process environment, excluded from child processes, and never logged. |
 | `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL` | Expected dedicated runtime service-account email for live ADC and IAM-policy audit. Not proof of active identity and not a credential. |
 | `PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS` | Comma-separated exact WIF subject, attribute, or group principals from one numeric project and workload identity pool. Wildcards and other IAM member types are rejected. |
 | `FIREBASE_CLIENT_EMAIL`              | Optional static-key fallback service-account email. Server-only. Must be paired with `FIREBASE_PRIVATE_KEY`. |

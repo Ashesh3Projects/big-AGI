@@ -238,3 +238,7 @@ export const useLoggerStore = create<LoggerState & LoggerActions>()(
     },
   ),
 );
+
+export function loggerResetPrivateProRuntime(): void {
+  useLoggerStore.setState({ entries: [], maxEntries: DEFAULT_MAX_ENTRIES });
+}

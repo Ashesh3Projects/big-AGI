@@ -24,7 +24,7 @@ export function PrivateProAuthScreen(props: {
           <Typography textColor='text.secondary'>Sign in with an approved Google account.</Typography>
           <Button startDecorator={<AuthGoogleIcon />} onClick={props.onSignIn}>Continue with Google</Button>
         </>}
-        {props.state === 'bootstrapping' && <Typography textColor='text.secondary'>Preparing your private vault...</Typography>}
+        {props.state === 'bootstrapping' && <Typography textColor='text.secondary'>Preparing your private workspace...</Typography>}
         {props.state === 'denied' && <>
           <Alert color='danger'>The account {props.deniedEmail || 'you selected'} is not on the allowlist for this deployment.</Alert>
           <Button startDecorator={<AuthGoogleIcon />} onClick={props.onSignIn}>Try another Google account</Button>

@@ -1,0 +1,77 @@
+{
+  "schemaVersion": 1,
+  "sdk": {
+    "package": "@firebase/storage",
+    "version": "0.14.4"
+  },
+  "mountedOperations": [
+    "deleteObject",
+    "getBytes",
+    "getMetadata",
+    "uploadBytesResumable"
+  ],
+  "sourceEvidence": [
+    "dist/index.esm.js:addAuthHeader_",
+    "dist/index.esm.js:addAppCheckHeader_",
+    "dist/index.esm.js:addGmpidHeader_",
+    "dist/index.esm.js:addVersionHeader_",
+    "dist/index.esm.js:createResumableUpload",
+    "dist/index.esm.js:continueResumableUpload",
+    "dist/index.esm.js:deleteObject$2",
+    "dist/index.esm.js:getBytes$1",
+    "dist/index.esm.js:getMetadata$2",
+    "dist/index.esm.js:getResumableUploadStatus"
+  ],
+  "requestMethods": [
+    "DELETE",
+    "GET",
+    "POST"
+  ],
+  "requestHeaders": [
+    "Authorization",
+    "Content-Type",
+    "X-Firebase-AppCheck",
+    "X-Firebase-GMPID",
+    "X-Firebase-Storage-Version",
+    "X-Goog-Upload-Command",
+    "X-Goog-Upload-Header-Content-Length",
+    "X-Goog-Upload-Header-Content-Type",
+    "X-Goog-Upload-Offset",
+    "X-Goog-Upload-Protocol"
+  ],
+  "readResponseHeaders": [
+    "Content-Type",
+    "X-Goog-Upload-Size-Received",
+    "X-Goog-Upload-Status",
+    "X-Goog-Upload-URL"
+  ],
+  "expectedCors": [
+    {
+      "origin": [
+        "https://chatgpt.ashesh.dev",
+        "https://big-agi-243b6.firebaseapp.com"
+      ],
+      "method": [
+        "DELETE",
+        "GET",
+        "POST"
+      ],
+      "responseHeader": [
+        "Authorization",
+        "Content-Type",
+        "X-Firebase-AppCheck",
+        "X-Firebase-GMPID",
+        "X-Firebase-Storage-Version",
+        "X-Goog-Upload-Command",
+        "X-Goog-Upload-Header-Content-Length",
+        "X-Goog-Upload-Header-Content-Type",
+        "X-Goog-Upload-Offset",
+        "X-Goog-Upload-Protocol",
+        "X-Goog-Upload-Size-Received",
+        "X-Goog-Upload-Status",
+        "X-Goog-Upload-URL"
+      ],
+      "maxAgeSeconds": 3600
+    }
+  ]
+}

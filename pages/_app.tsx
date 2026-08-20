@@ -18,6 +18,7 @@ import '~/common/styles/GithubMarkdown.css';
 import '~/common/styles/NProgress.css';
 import '~/common/styles/agi.effects.css';
 import '~/common/styles/app.styles.css';
+import '~/common/logic/sherpa.css';
 
 import { ErrorBoundary } from '~/common/components/ErrorBoundary';
 import { Is } from '~/common/util/pwaUtils';
@@ -31,7 +32,7 @@ import { hasGoogleAnalytics, OptionalGoogleAnalytics } from '~/common/components
 import { hasPostHogAnalytics, OptionalPostHogAnalytics } from '~/common/components/3rdparty/PostHogAnalytics';
 import { OptionalUrlTrackingCleaner } from '~/common/components/3rdparty/UrlTrackingCleaner';
 import { ProviderPrivatePro } from '~/modules/private-pro/auth/ProviderPrivatePro';
-import { ProviderPrivateProVault } from '~/modules/private-pro/vault/ProviderPrivateProVault';
+import { ProviderPrivateProSync } from '~/modules/private-pro/sync/ProviderPrivateProSync';
 import { privateProClientConfig } from '~/modules/private-pro/config/privatePro.config';
 
 
@@ -40,7 +41,7 @@ const ApplicationWithTRPC = apiQuery.withTRPC(({ Component, pageProps }: MyAppPr
   const getLayout = Component.getLayout ?? ((page: any) => page);
 
   return (
-    <ProviderSingleTab>
+    <ProviderSingleTab enabled={!privateProClientConfig.enabled}>
       <ProviderBackendCapabilities>
         {/* ^ Backend capabilities & SSR boundary */}
         <ErrorBoundary outer>
@@ -69,9 +70,9 @@ const Big_AGI_App = (props: MyAppProps) => {
 
     <ProviderTheming emotionCache={props.emotionCache}>
       <ProviderPrivatePro>
-        <ProviderPrivateProVault>
+        <ProviderPrivateProSync>
           <ApplicationWithTRPC {...props} />
-        </ProviderPrivateProVault>
+        </ProviderPrivateProSync>
       </ProviderPrivatePro>
     </ProviderTheming>
 

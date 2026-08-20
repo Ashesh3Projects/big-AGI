@@ -107,7 +107,7 @@ export default defineConfig([{
     // rebinds `this` - the destructure-heavy house style is only safe with this guard.
     // Annotate genuinely 'detach-safe' declarations with `this: void` (or declare them property-style).
     files: ["src/**/*.ts", "src/**/*.tsx"], // pages/ + app/ are in the program too, but hold ~no logic
-    ignores: ["**/*.test.ts"], // in the tools program, not this one
+    ignores: ["**/*.test.ts", "**/*.test.tsx"], // in the tools program, not this one
     languageOptions: {
         parser: tsParser,
         parserOptions: { projectService: true, tsconfigRootDir: __dirname },

@@ -4,8 +4,6 @@ import { getFirestore } from 'firebase-admin/firestore';
 import { pathToFileURL } from 'node:url';
 
 
-const DEFAULT_QUOTA_BYTES = 1024 * 1024 * 1024;
-
 export interface PrivateProAccessUser {
   uid: string;
   email: string | null;
@@ -26,6 +24,25 @@ export interface PrivateProAccessDiff {
 
 function normalizeEmail(email: string): string {
   return email.trim().toLowerCase();
+}
+
+export function buildPrivateProAccountRecord(input: {
+  uid: string;
+  email: string;
+  current: Record<string, unknown> | undefined;
+  nowMs: number;
+}) {
+  const accessEpoch = input.current?.active === true
+    ? Math.max(1, Number(input.current.accessEpoch) || 1)
+    : Math.max(1, (Number(input.current?.accessEpoch) || 0) + 1);
+  return {
+    uid: input.uid,
+    email: normalizeEmail(input.email),
+    active: true,
+    accessEpoch,
+    createdAtMs: Number(input.current?.createdAtMs) || input.nowMs,
+    updatedAtMs: input.nowMs,
+  };
 }
 
 export function diffPrivateProAccess(users: PrivateProAccessUser[], allowedEmails: ReadonlySet<string>): PrivateProAccessDiff {
@@ -100,20 +117,9 @@ async function grant(uid: string, nowMs: number) {
   const reference = firestore.doc(`users/${uid}`);
   const snapshot = await reference.get();
   const current = snapshot.data();
-  const accessEpoch = current?.active === true
-    ? Math.max(1, Number(current.accessEpoch) || 1)
-    : Math.max(1, (Number(current?.accessEpoch) || 0) + 1);
-  await reference.set({
-    uid,
-    email: normalizeEmail(user.email),
-    active: true,
-    accessEpoch,
-    quotaBytes: Number(process.env.PRIVATE_PRO_ATTACHMENT_QUOTA_BYTES) || Number(current?.quotaBytes) || DEFAULT_QUOTA_BYTES,
-    usedBytes: Number(current?.usedBytes) || 0,
-    reservedBytes: Number(current?.reservedBytes) || 0,
-    createdAtMs: Number(current?.createdAtMs) || nowMs,
-    updatedAtMs: nowMs,
-  });
+  const account = buildPrivateProAccountRecord({ uid, email: user.email, current, nowMs });
+  await reference.set(account);
+  const { accessEpoch } = account;
   await auth.setCustomUserClaims(uid, { ...user.customClaims, privatePro: true, privateProEpoch: accessEpoch });
 }
 

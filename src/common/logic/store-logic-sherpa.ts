@@ -115,6 +115,10 @@ export const setComposerStartupText = (text: string | null) => {
   useLogicSherpaStore.getState().setChatComposerPrefill(text);
 };
 
+export function logicSherpaResetPrivateProRuntime(): void {
+  useLogicSherpaStore.setState({ usageCount: 0, lastSeenNewsVersion: 0, chatComposerPrefill: null });
+}
+
 export const useComposerStartupText = (): [string | null, (text: string | null) => void] => {
   return useLogicSherpaStore(useShallow(state => [state.chatComposerPrefill, state.setChatComposerPrefill]));
 };

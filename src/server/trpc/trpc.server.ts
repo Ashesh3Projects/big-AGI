@@ -53,7 +53,6 @@ export const createTRPCFetchContext = async ({ req }: FetchCreateContextFnOption
     privateProIdentity,
     privateProAuthError,
     privateProAppCheckToken: req.headers.get('x-firebase-appcheck'),
-    privateProDeviceId: req.headers.get('x-private-pro-device-id'),
   };
 };
 

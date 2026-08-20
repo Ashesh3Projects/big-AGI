@@ -14,7 +14,6 @@ describe('private Pro App Check verification', () => {
       firebaseProjectId: 'project',
       firebaseClientEmail: 'service@example.iam.gserviceaccount.com',
       firebasePrivateKey: 'key',
-      firebaseStorageBucket: 'bucket',
       appCheckSiteKey: 'site-key',
     });
 

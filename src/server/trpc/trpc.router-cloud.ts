@@ -3,8 +3,6 @@ import { createTRPCRouter } from './trpc.server';
 import { browseRouter } from '~/modules/browse/browse.router';
 import { tradeRouter } from '~/modules/trade/server/trade.router';
 import { privateProAuthRouter } from '~/modules/private-pro/auth/privatePro.auth.router';
-import { privateProVaultAssetsRouter } from '~/modules/private-pro/assets/privatePro.assets.router';
-import { privateProVaultRouter } from '~/modules/private-pro/vault/privatePro.vault.router';
 
 /**
  * Cloud rooter, which is geolocated in 1 location and separate from the other routers.
@@ -13,8 +11,6 @@ import { privateProVaultRouter } from '~/modules/private-pro/vault/privatePro.va
 export const appRouterCloud = createTRPCRouter({
   browse: browseRouter,
   privateProAuth: privateProAuthRouter,
-  privateProVaultAssets: privateProVaultAssetsRouter,
-  privateProVault: privateProVaultRouter,
   trade: tradeRouter,
 });
 

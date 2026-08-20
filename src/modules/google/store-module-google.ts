@@ -41,27 +41,27 @@ export const useGoogleSearchStore = create<ModuleGoogleSearchStore>()(
 );
 
 
-/// Private vault adapters
+/// Private sync adapters
 
-export interface GoogleVaultState {
+export interface GoogleSyncState {
   googleCloudApiKey: string;
   googleCSEId: string;
   restrictToDomain: string;
 }
 
-export function googleVaultSnapshot(): GoogleVaultState {
+export function googleSyncSnapshot(): GoogleSyncState {
   const { googleCloudApiKey, googleCSEId, restrictToDomain } = useGoogleSearchStore.getState();
   return { googleCloudApiKey, googleCSEId, restrictToDomain };
 }
 
-export function googleVaultApply(value: GoogleVaultState): void {
+export function googleSyncApply(value: GoogleSyncState): void {
   useGoogleSearchStore.setState(structuredClone(value));
 }
 
-export function googleVaultReset(): void {
+export function googleSyncReset(): void {
   useGoogleSearchStore.setState({ googleCloudApiKey: '', googleCSEId: '', restrictToDomain: '' });
 }
 
-export function googleVaultSubscribe(listener: () => void): () => void {
+export function googleSyncSubscribe(listener: () => void): () => void {
   return useGoogleSearchStore.subscribe(listener);
 }

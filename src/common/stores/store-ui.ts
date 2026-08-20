@@ -291,26 +291,26 @@ export function resetUICounter(key: KnownKeys) {
 }
 
 
-/// Private vault theme adapter
+/// Private sync theme adapter
 
-export type ThemeVaultMode = 'light' | 'dark' | 'system';
+export type ThemeSyncMode = 'light' | 'dark' | 'system';
 
-export function themeVaultSnapshot(): ThemeVaultMode {
+export function themeSyncSnapshot(): ThemeSyncMode {
   const value = privateProPortableLocalStorage.getItem('joy-mode');
   return value === 'light' || value === 'dark' || value === 'system' ? value : 'light';
 }
 
-export function themeVaultApply(mode: ThemeVaultMode): void {
+export function themeSyncApply(mode: ThemeSyncMode): void {
   privateProPortableLocalStorage.setItem('joy-mode', mode);
   if (typeof window !== 'undefined')
     window.dispatchEvent(new StorageEvent('storage', { key: 'joy-mode', newValue: mode }));
 }
 
-export function themeVaultReset(): void {
-  themeVaultApply('light');
+export function themeSyncReset(): void {
+  themeSyncApply('light');
 }
 
-export function themeVaultSubscribe(listener: () => void): () => void {
+export function themeSyncSubscribe(listener: () => void): () => void {
   if (typeof window === 'undefined') return () => undefined;
   const handleStorage = (event: StorageEvent) => {
     if (event.key === 'joy-mode') listener();

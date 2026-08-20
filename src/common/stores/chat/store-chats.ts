@@ -20,6 +20,8 @@ import { V3StoreDataToHead, V4ToHeadConverters } from './chats.converters';
 import { conversationTitle, createDConversation, DConversation, DConversationId, duplicateDConversation } from './chat.conversation';
 import { estimateTokensForFragments } from './chat.tokens';
 import { gcChatImageAssets } from '~/common/stores/chat/chat.gc';
+import { parseSyncChatConversation } from '~/modules/private-pro/sync/privatePro.sync.serialize';
+import type { SyncChatMessage, SyncChatMeta } from '~/modules/private-pro/sync/privatePro.sync.schemas';
 
 
 /// Conversations Store
@@ -543,6 +545,9 @@ export const useChatStore = create<ConversationsStore>()(/*devtools(*/
 
 /// Private sync adapters
 
+const chatSyncMetas = new Map<DConversationId, SyncChatMeta>();
+const chatSyncMessages = new Map<DConversationId, Map<string, SyncChatMessage>>();
+
 function _chatSyncEligible(conversation: DConversation): boolean {
   return !conversation._isIncognito && !conversation.messages.some(message => message.pendingIncomplete);
 }
@@ -565,7 +570,41 @@ export function chatSyncUpsert(conversation: DConversation): void {
   }));
 }
 
+export function chatSyncMaterialize(meta: SyncChatMeta, messages: readonly SyncChatMessage[]): DConversation {
+  const conversation = parseSyncChatConversation(meta, messages);
+  conversation.tokenCount = conversation.messages.reduce((sum, message) => sum + message.tokenCount, 0);
+  return conversation;
+}
+
+function _chatSyncRematerialize(conversationId: DConversationId): void {
+  const meta = chatSyncMetas.get(conversationId);
+  if (!meta) return;
+  chatSyncUpsert(chatSyncMaterialize(meta, [...(chatSyncMessages.get(conversationId)?.values() ?? [])]));
+}
+
+export function chatSyncApplyMeta(meta: SyncChatMeta): void {
+  chatSyncMetas.set(meta.conversationId, structuredClone(meta));
+  _chatSyncRematerialize(meta.conversationId);
+}
+
+export function chatSyncApplyMessage(value: SyncChatMessage): void {
+  const messages = chatSyncMessages.get(value.conversationId) ?? new Map<string, SyncChatMessage>();
+  messages.set(value.message.id, structuredClone(value));
+  chatSyncMessages.set(value.conversationId, messages);
+  _chatSyncRematerialize(value.conversationId);
+}
+
+export function chatSyncRemoveMessage(conversationId: DConversationId, messageId: string): void {
+  const messages = chatSyncMessages.get(conversationId);
+  if (!messages) return;
+  messages.delete(messageId);
+  if (!messages.size) chatSyncMessages.delete(conversationId);
+  _chatSyncRematerialize(conversationId);
+}
+
 export function chatSyncDelete(conversationId: DConversationId): void {
+  chatSyncMetas.delete(conversationId);
+  chatSyncMessages.delete(conversationId);
   useChatStore.setState(state => ({
     conversations: state.conversations.filter(conversation => conversation.id !== conversationId),
   }));
@@ -576,6 +615,8 @@ export function chatSyncExists(conversationId: DConversationId): boolean {
 }
 
 export function chatSyncResetAll(): void {
+  chatSyncMetas.clear();
+  chatSyncMessages.clear();
   useChatStore.setState({ conversations: [createDConversation(undefined)] });
 }
 

@@ -298,6 +298,10 @@ export function liveFileGetAllValidIDs(): LiveFileId[] {
     .map(([id, _]) => id);
 }
 
+export function liveFileResetPrivateProRuntime(): void {
+  useLiveFileStore.setState({ liveFiles: {} });
+}
+
 export function checkPairingValid(file: LiveFile): boolean {
   return typeof (file.fsHandle?.getFile) === 'function';
 }

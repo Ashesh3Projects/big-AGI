@@ -112,3 +112,7 @@ function _generateLocalDeviceIdentifier(): string {
   // Combine for a total of 10 characters
   return random + timestamp;
 }
+
+export function deviceResetPrivateProRuntime(): void {
+  useDeviceStore.setState({ localDeviceId: '' });
+}

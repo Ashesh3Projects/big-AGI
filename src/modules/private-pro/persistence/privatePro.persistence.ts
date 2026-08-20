@@ -38,11 +38,14 @@ export const PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS = new Set([
   'app-state',
 ] as const);
 
-const encryptedBuild = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
-let encryptedPersistenceActive = encryptedBuild;
+const managedBuild = process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED === 'true';
+const PENDING_AUTH_UID = '__pending-auth__';
+const RETAINED_UID_OWNER = Symbol('private-pro-retained-uid');
+export type PrivateProPersistenceOwner = object | symbol;
+let managedPersistenceUid: string | null = managedBuild ? PENDING_AUTH_UID : null;
+let managedPersistenceOwner: PrivateProPersistenceOwner | null = null;
 const volatileLocalStorage = new Map<string, string>();
 const volatilePersistStorage = new Map<string, StorageValue<unknown>>();
-const pendingPortableAssets = new Set<string>();
 const patchedStorage = Symbol.for('big-agi.private-pro-portable-storage');
 let rawLocalStorageRemoveItem: ((storage: Storage, key: string) => void) | null = null;
 
@@ -71,43 +74,67 @@ function browserLocalStorage(): Storage | null {
   return typeof window === 'undefined' ? null : window.localStorage;
 }
 
+export function removePrivateProDurableLocalStorageItem(storage: Storage, key: string): void {
+  if (rawLocalStorageRemoveItem) rawLocalStorageRemoveItem(storage, key);
+  else storage.removeItem(key);
+}
+
 function cloneStorageValue<S>(value: StorageValue<S>): StorageValue<S> {
   return JSON.parse(JSON.stringify(value)) as StorageValue<S>;
 }
 
-export function isPrivateProEncryptedPersistenceActive(): boolean {
-  return encryptedPersistenceActive;
+export function isPrivateProManagedPersistenceActive(): boolean {
+  return managedPersistenceUid !== null;
 }
 
-export function setPrivateProEncryptedPersistenceActive(active: boolean): void {
-  encryptedPersistenceActive = active;
-  if (!encryptedPersistenceActive) clearPrivateProVolatilePortableState();
+export function privateProManagedPersistenceUid(): string | null {
+  return managedPersistenceUid?.startsWith('__') ? null : managedPersistenceUid;
+}
+
+export function privateProManagedPersistenceOwnership(): { uid: string; owner: PrivateProPersistenceOwner } | null {
+  const uid = privateProManagedPersistenceUid();
+  return uid && managedPersistenceOwner ? { uid, owner: managedPersistenceOwner } : null;
+}
+
+export function isPrivateProRetainedPersistenceOwner(owner: PrivateProPersistenceOwner): boolean {
+  return owner === RETAINED_UID_OWNER;
 }
 
 export function clearPrivateProVolatilePortableState(): void {
   volatileLocalStorage.clear();
   volatilePersistStorage.clear();
-  pendingPortableAssets.clear();
 }
 
-export function markPrivateProPortableAssetPending(assetId: string): void {
-  if (encryptedPersistenceActive) pendingPortableAssets.add(assetId);
+export async function activatePrivateProManagedPersistence(uid: string | null, owner: PrivateProPersistenceOwner | null): Promise<void> {
+  if (managedBuild && uid === null) uid = PENDING_AUTH_UID;
+  if (uid !== null && uid !== PENDING_AUTH_UID && !owner) throw new TypeError('Private Pro managed persistence owner is required.');
+  if (managedPersistenceUid !== uid && managedPersistenceUid !== PENDING_AUTH_UID) clearPrivateProVolatilePortableState();
+  managedPersistenceUid = uid;
+  managedPersistenceOwner = uid === null || uid === PENDING_AUTH_UID ? null : owner;
 }
 
-export function markPrivateProPortableAssetEncrypted(assetId: string): void {
-  pendingPortableAssets.delete(assetId);
+export async function deactivatePrivateProManagedPersistence(
+  uid: string,
+  owner: PrivateProPersistenceOwner,
+  clearRuntime?: () => void,
+): Promise<boolean> {
+  if (managedPersistenceUid !== uid || managedPersistenceOwner !== owner) return false;
+  clearRuntime?.();
+  clearPrivateProVolatilePortableState();
+  if (managedPersistenceUid === uid && managedPersistenceOwner === owner) {
+    managedPersistenceUid = PENDING_AUTH_UID;
+    managedPersistenceOwner = null;
+  }
+  return true;
 }
 
-export function hasPrivateProPendingPortableAssets(): boolean {
-  return encryptedPersistenceActive && pendingPortableAssets.size > 0;
-}
-
-export function privateProPortableAssetBeforeUnload(event: Pick<BeforeUnloadEvent, 'preventDefault' | 'returnValue'>): string | undefined {
-  if (!hasPrivateProPendingPortableAssets()) return undefined;
-  const message = 'Encrypted attachments are still being saved.';
-  event.preventDefault();
-  event.returnValue = message;
-  return message;
+export async function releasePrivateProManagedPersistence(
+  uid: string,
+  owner: PrivateProPersistenceOwner,
+): Promise<boolean> {
+  if (managedPersistenceUid !== uid || managedPersistenceOwner !== owner) return false;
+  managedPersistenceOwner = RETAINED_UID_OWNER;
+  return true;
 }
 
 export function createPrivateProPortableLocalStorage(
@@ -115,28 +142,28 @@ export function createPrivateProPortableLocalStorage(
 ): Storage {
   return {
     get length() {
-      return encryptedPersistenceActive ? volatileLocalStorage.size : getDurableStorage()?.length ?? 0;
+      return isPrivateProManagedPersistenceActive() ? volatileLocalStorage.size : getDurableStorage()?.length ?? 0;
     },
     clear() {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         volatileLocalStorage.clear();
         return;
       }
       getDurableStorage()?.clear();
     },
     getItem(key) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertPortableLocalStorageKey(key);
         return volatileLocalStorage.get(key) ?? null;
       }
       return getDurableStorage()?.getItem(key) ?? null;
     },
     key(index) {
-      if (encryptedPersistenceActive) return [...volatileLocalStorage.keys()][index] ?? null;
+      if (isPrivateProManagedPersistenceActive()) return [...volatileLocalStorage.keys()][index] ?? null;
       return getDurableStorage()?.key(index) ?? null;
     },
     removeItem(key) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertPortableLocalStorageKey(key);
         volatileLocalStorage.delete(key);
         return;
@@ -144,7 +171,7 @@ export function createPrivateProPortableLocalStorage(
       getDurableStorage()?.removeItem(key);
     },
     setItem(key, value) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertPortableLocalStorageKey(key);
         volatileLocalStorage.set(key, value);
         return;
@@ -159,7 +186,7 @@ export const privateProPortableLocalStorage = createPrivateProPortableLocalStora
 function createPrivateProVolatileZustandStorage<S>(assertKey: (key: string) => void): PersistStorage<S> {
   return {
     getItem(name) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertKey(name);
         const value = volatilePersistStorage.get(name) as StorageValue<S> | undefined;
         return value === undefined ? null : cloneStorageValue(value);
@@ -168,7 +195,7 @@ function createPrivateProVolatileZustandStorage<S>(assertKey: (key: string) => v
       return raw === null || raw === undefined ? null : JSON.parse(raw) as StorageValue<S>;
     },
     setItem(name, value) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertKey(name);
         volatilePersistStorage.set(name, cloneStorageValue(value) as StorageValue<unknown>);
         return;
@@ -176,7 +203,7 @@ function createPrivateProVolatileZustandStorage<S>(assertKey: (key: string) => v
       browserLocalStorage()?.setItem(name, JSON.stringify(value));
     },
     removeItem(name) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertKey(name);
         volatilePersistStorage.delete(name);
         return;
@@ -198,12 +225,13 @@ export function createPrivateProSensitiveLocalStorageOptions<S>(): { storage: Pe
   return { storage: createPrivateProVolatileZustandStorage<S>(assertSensitiveLocalStorageKey) };
 }
 
-export function createPrivateProPortableIDBStorage<S>(): PersistStorage<S> | undefined {
-  const durable = createIDBPersistStorage<S>();
+export function createPrivateProPortableIDBStorage<S>(
+  durable: PersistStorage<S> | undefined = createIDBPersistStorage<S>(),
+): PersistStorage<S> | undefined {
   if (!durable) return undefined;
   return {
     getItem(name) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertPortableIDBKey(name);
         const value = volatilePersistStorage.get(name) as StorageValue<S> | undefined;
         return value === undefined ? null : cloneStorageValue(value);
@@ -211,7 +239,7 @@ export function createPrivateProPortableIDBStorage<S>(): PersistStorage<S> | und
       return durable.getItem(name);
     },
     setItem(name, value) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertPortableIDBKey(name);
         volatilePersistStorage.set(name, cloneStorageValue(value) as StorageValue<unknown>);
         return;
@@ -219,7 +247,7 @@ export function createPrivateProPortableIDBStorage<S>(): PersistStorage<S> | und
       return durable.setItem(name, value);
     },
     removeItem(name) {
-      if (encryptedPersistenceActive) {
+      if (isPrivateProManagedPersistenceActive()) {
         assertPortableIDBKey(name);
         volatilePersistStorage.delete(name);
         return;
@@ -229,23 +257,37 @@ export function createPrivateProPortableIDBStorage<S>(): PersistStorage<S> | und
   };
 }
 
-export async function clearPrivateProPlaintextPortablePersistence(): Promise<void> {
-  clearPrivateProVolatilePortableState();
-  if (typeof window === 'undefined') return;
-  for (const key of [...PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS, ...PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS]) {
-    if (rawLocalStorageRemoveItem) rawLocalStorageRemoveItem(window.localStorage, key);
-    else window.localStorage.removeItem(key);
+interface PrivateProManagedPersistencePort {
+  clearUid(uid: string): Promise<void>;
+}
+
+export async function clearPrivateProManagedPersistence(
+  uid: string,
+  syncDB?: PrivateProManagedPersistencePort,
+  clearRuntime?: () => void,
+): Promise<void> {
+  if (!uid) throw new TypeError('Private Pro managed persistence UID is required.');
+  if (managedPersistenceUid === uid || managedPersistenceUid === PENDING_AUTH_UID) {
+    clearRuntime?.();
+    clearPrivateProVolatilePortableState();
+    managedPersistenceUid = managedBuild ? PENDING_AUTH_UID : null;
+    managedPersistenceOwner = null;
   }
-  const { del } = await import('idb-keyval');
-  const { clearPrivateProPlaintextDBlobPersistence } = await import('~/modules/dblobs/dblobs.db');
-  await Promise.all([
-    ...[...PRIVATE_PRO_PORTABLE_IDB_KEYS].map(key => del(key)),
-    clearPrivateProPlaintextDBlobPersistence(),
-  ]);
+  const database = syncDB ?? (await import('../sync/privatePro.sync.db')).privateProSyncDB;
+  const tasks: Promise<unknown>[] = [database.clearUid(uid)];
+  if (typeof window !== 'undefined') {
+    for (const key of [...PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS, ...PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS]) {
+      removePrivateProDurableLocalStorageItem(window.localStorage, key);
+    }
+    const { del } = await import('idb-keyval');
+    const { clearPrivateProLegacyPlaintextDBlobPersistence } = await import('~/modules/dblobs/dblobs.db');
+    tasks.push(...[...PRIVATE_PRO_PORTABLE_IDB_KEYS].map(key => del(key)), clearPrivateProLegacyPlaintextDBlobPersistence());
+  }
+  await Promise.all(tasks);
 }
 
 function installPrivateProStoragePrototypeGate(): void {
-  if (!encryptedBuild || typeof window === 'undefined' || typeof Storage === 'undefined') return;
+  if (!managedBuild || typeof window === 'undefined' || typeof Storage === 'undefined') return;
   const prototype = Storage.prototype as Storage & { [patchedStorage]?: true };
   if (prototype[patchedStorage]) return;
   const descriptor = (name: 'getItem' | 'setItem' | 'removeItem') => {
@@ -259,19 +301,19 @@ function installPrivateProStoragePrototypeGate(): void {
   rawLocalStorageRemoveItem = (storage, key) => { Reflect.apply(removeItem, storage, [key]); };
   Object.defineProperty(prototype, patchedStorage, { value: true });
   prototype.getItem = function(key: string) {
-    if (encryptedPersistenceActive && isPrivateProVolatileLocalStorageKey(key))
+    if (isPrivateProManagedPersistenceActive() && isPrivateProVolatileLocalStorageKey(key))
       return volatileLocalStorage.get(key) ?? null;
     return Reflect.apply(getItem, this, [key]) as string | null;
   };
   prototype.setItem = function(key: string, value: string) {
-    if (encryptedPersistenceActive && isPrivateProVolatileLocalStorageKey(key)) {
+    if (isPrivateProManagedPersistenceActive() && isPrivateProVolatileLocalStorageKey(key)) {
       volatileLocalStorage.set(key, value);
       return;
     }
     Reflect.apply(setItem, this, [key, value]);
   };
   prototype.removeItem = function(key: string) {
-    if (encryptedPersistenceActive && isPrivateProVolatileLocalStorageKey(key)) {
+    if (isPrivateProManagedPersistenceActive() && isPrivateProVolatileLocalStorageKey(key)) {
       volatileLocalStorage.delete(key);
       return;
     }

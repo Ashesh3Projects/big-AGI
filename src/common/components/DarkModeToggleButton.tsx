@@ -5,7 +5,7 @@ import BrightnessAutoIcon from '@mui/icons-material/BrightnessAuto';
 import DarkModeIcon from '@mui/icons-material/DarkMode';
 import LightModeIcon from '@mui/icons-material/LightMode';
 import { GoodTooltip } from './GoodTooltip';
-import { themeVaultApply } from '~/common/stores/store-ui';
+import { themeSyncApply } from '~/common/stores/store-ui';
 
 
 const _inPageSx = {
@@ -56,7 +56,7 @@ export function DarkModeToggleButton(props: { hasText?: boolean, inPage?: boolea
 
   const handleToggleDarkMode = (event: React.MouseEvent) => {
     event.stopPropagation();
-    themeVaultApply(_nextThemeMode[mode]);
+    themeSyncApply(_nextThemeMode[mode]);
   };
 
   const title = `Theme: ${_themeModeLabel[mode]}`;

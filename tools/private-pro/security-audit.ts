@@ -1,11 +1,14 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createPublicKey, verify } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { access, readFile } from 'node:fs/promises';
 import { delimiter, dirname, join } from 'node:path';
 import { promisify, TextDecoder } from 'node:util';
 import { pathToFileURL } from 'node:url';
 
 import { GoogleAuth } from 'google-auth-library';
+
+import { privateProRecordKey } from '../../src/modules/private-pro/sync/privatePro.sync.codec';
 
 
 const execFile = promisify(execFileCallback);
@@ -39,12 +42,34 @@ const REQUIRED_BROWSER_API_SERVICES = new Set([
   'firebaseappcheck.googleapis.com',
   'identitytoolkit.googleapis.com',
   'securetoken.googleapis.com',
+  'firestore.googleapis.com',
+  'firebasestorage.googleapis.com',
 ]);
 const REQUIRED_APP_CHECK_SERVICES = new Set(['firebaseauth.googleapis.com', 'firestore.googleapis.com', 'storage.googleapis.com']);
 const ALLOWED_AUTH_DOMAINS = new Set(['chatgpt.ashesh.dev', 'big-agi-243b6.firebaseapp.com']);
-const ALLOWED_BUCKET_CORS_ORIGINS = new Set(['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com']);
-const ALLOWED_BUCKET_CORS_METHODS = new Set(['GET', 'PUT']);
-const ALLOWED_BUCKET_CORS_HEADERS = new Set(['content-type', 'x-goog-meta-sha256']);
+export const EXPECTED_PRIVATE_PRO_BUCKET_CORS = [{
+  origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
+  method: ['DELETE', 'GET', 'POST'],
+  responseHeader: [
+    'Authorization',
+    'Content-Type',
+    'X-Firebase-AppCheck',
+    'X-Firebase-GMPID',
+    'X-Firebase-Storage-Version',
+    'X-Goog-Upload-Command',
+    'X-Goog-Upload-Header-Content-Length',
+    'X-Goog-Upload-Header-Content-Type',
+    'X-Goog-Upload-Offset',
+    'X-Goog-Upload-Protocol',
+    'X-Goog-Upload-Size-Received',
+    'X-Goog-Upload-Status',
+    'X-Goog-Upload-URL',
+  ],
+  maxAgeSeconds: 3600,
+}] as const;
+const ALLOWED_BUCKET_CORS_ORIGINS: ReadonlySet<string> = new Set(EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].origin);
+const ALLOWED_BUCKET_CORS_METHODS: ReadonlySet<string> = new Set(EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].method);
+const ALLOWED_BUCKET_CORS_HEADERS = new Set(EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader.map(header => header.toLowerCase()));
 const BROAD_ADMIN_ROLES = new Set([
   'roles/owner',
   'roles/editor',
@@ -63,15 +88,10 @@ const RUNTIME_ROLE_MANIFEST_PATH = 'infra/private-pro/gcp-runtime-role.yaml';
 const PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS = new Set([
   'datastore.databases.get',
   'datastore.entities.create',
-  'datastore.entities.delete',
   'datastore.entities.get',
-  'datastore.entities.list',
   'datastore.entities.update',
   'firebaseauth.users.get',
   'firebaseauth.users.update',
-  'storage.objects.create',
-  'storage.objects.delete',
-  'storage.objects.get',
 ]);
 const FORBIDDEN_RUNTIME_PERMISSIONS = new Set([
   'apikeys.keys.create',
@@ -117,6 +137,10 @@ export interface AuditReport {
 export interface FirestoreRestoreEvidenceEnvironmentInput {
   readonly evidenceBase64?: string;
   readonly additionalExpectedCommitSha?: string;
+}
+
+export interface SecurityAuditEnvironmentInput extends FirestoreRestoreEvidenceEnvironmentInput {
+  readonly appCheckToken?: string;
 }
 
 interface HeaderFacts {
@@ -171,6 +195,7 @@ interface BucketCorsFacts {
   duplicateOrigins: number;
   duplicateMethods: number;
   duplicateHeaders: number;
+  maxAgeMatches: boolean;
 }
 
 interface AppCheckFacts {
@@ -227,7 +252,6 @@ export interface RuntimeRoleManifestFacts {
   unexpectedRuntimePermissions: number;
   forbiddenRuntimePermissions: number;
   signBlobInRuntimeRole: number;
-  signingBindingValid: boolean;
   projectSpecificPrincipals: number;
 }
 
@@ -251,8 +275,6 @@ export interface RuntimeServiceAccountPolicyFacts {
   readable: boolean;
   missingWifPrincipals: number;
   unexpectedWifPrincipals: number;
-  selfTokenCreatorBindings: number;
-  externalTokenCreators: number;
   unexpectedBindings: number;
 }
 
@@ -273,13 +295,6 @@ interface RuntimeRoleManifest {
     role: 'roles/iam.workloadIdentityUser';
     serviceAccount: '${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
     members: ['${WIF_RUNTIME_PRINCIPAL}'];
-    scope: 'runtime-service-account-only';
-  };
-  signingBinding: {
-    permission: 'iam.serviceAccounts.signBlob';
-    role: 'roles/iam.serviceAccountTokenCreator';
-    serviceAccount: '${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
-    member: 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
     scope: 'runtime-service-account-only';
   };
   validation: {
@@ -432,6 +447,7 @@ export function classifyBucketCors(facts: BucketCorsFacts): AuditFinding[] {
     finding('bucketCors', 'duplicateOrigins', facts.duplicateOrigins === 0 ? 'pass' : 'block', facts.duplicateOrigins),
     finding('bucketCors', 'duplicateMethods', facts.duplicateMethods === 0 ? 'pass' : 'block', facts.duplicateMethods),
     finding('bucketCors', 'duplicateHeaders', facts.duplicateHeaders === 0 ? 'pass' : 'block', facts.duplicateHeaders),
+    booleanFinding('bucketCors', 'maxAgeMatches', facts.maxAgeMatches),
   ];
 }
 
@@ -481,8 +497,7 @@ export function classifyRuntimeRoleManifest(facts: RuntimeRoleManifestFacts): Au
     finding('runtimeRoleManifest', 'missingRuntimePermissions', facts.missingRuntimePermissions === 0 ? 'pass' : 'block', facts.missingRuntimePermissions),
     finding('runtimeRoleManifest', 'unexpectedRuntimePermissions', facts.unexpectedRuntimePermissions === 0 ? 'pass' : 'block', facts.unexpectedRuntimePermissions),
     finding('runtimeRoleManifest', 'forbiddenRuntimePermissions', facts.forbiddenRuntimePermissions === 0 ? 'pass' : 'block', facts.forbiddenRuntimePermissions),
-    finding('runtimeRoleManifest', 'signBlobSeparated', facts.signBlobInRuntimeRole === 0 ? 'pass' : 'block', facts.signBlobInRuntimeRole),
-    booleanFinding('runtimeRoleManifest', 'signingBindingValid', facts.signingBindingValid),
+    finding('runtimeRoleManifest', 'signBlobAbsent', facts.signBlobInRuntimeRole === 0 ? 'pass' : 'block', facts.signBlobInRuntimeRole),
     finding('runtimeRoleManifest', 'projectSpecificPrincipals', facts.projectSpecificPrincipals === 0 ? 'pass' : 'block', facts.projectSpecificPrincipals),
   ];
 }
@@ -512,8 +527,6 @@ export function classifyRuntimeServiceAccountPolicy(facts: RuntimeServiceAccount
     booleanFinding('runtimeServiceAccountPolicy', 'readable', facts.readable),
     finding('runtimeServiceAccountPolicy', 'missingWifPrincipals', facts.missingWifPrincipals === 0 ? 'pass' : 'block', facts.missingWifPrincipals),
     finding('runtimeServiceAccountPolicy', 'unexpectedWifPrincipals', facts.unexpectedWifPrincipals === 0 ? 'pass' : 'block', facts.unexpectedWifPrincipals),
-    finding('runtimeServiceAccountPolicy', 'selfTokenCreatorBindings', facts.selfTokenCreatorBindings === 1 ? 'pass' : 'block', facts.selfTokenCreatorBindings),
-    finding('runtimeServiceAccountPolicy', 'externalTokenCreators', facts.externalTokenCreators === 0 ? 'pass' : 'block', facts.externalTokenCreators),
     finding('runtimeServiceAccountPolicy', 'unexpectedBindings', facts.unexpectedBindings === 0 ? 'pass' : 'block', facts.unexpectedBindings),
   ];
 }
@@ -543,8 +556,8 @@ export function classifyDependencyAudit(facts: DependencyAuditFacts): AuditFindi
 
 export function classifyFirebaseRuleProbes(facts: FirebaseRuleProbeFacts): AuditFinding[] {
   const probeFinding = (resource: string, state: ProbeState) => finding(
-    'firebaseRules',
-    `${resource}${state === 'denied' ? 'Denied' : state === 'allowed' ? 'Allowed' : 'Unknown'}`,
+    'anonymousFirebaseRules',
+    `${resource}Anonymous${state === 'denied' ? 'Denied' : state === 'allowed' ? 'Allowed' : 'Unknown'}`,
     state === 'denied' ? 'pass' : 'block',
     state === 'denied' ? 0 : 1,
   );
@@ -1179,7 +1192,8 @@ function childProcessEnvironment(): NodeJS.ProcessEnv {
   for (const name of Object.keys(environment)) {
     const upper = name.toUpperCase();
     const privateProAuditSecret = upper.startsWith('PRIVATE_PRO_')
-      && (upper.includes('RESTORE_EVIDENCE')
+      && (upper === 'PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN'
+        || upper.includes('RESTORE_EVIDENCE')
         || upper.includes('ATTEST')
         || (upper.includes('SIGN') && /(?:_PRIVATE_KEY|_SECRET|_TOKEN|_CREDENTIAL|_SIGNING_KEY)$/.test(upper))
         || (upper.includes('RESTORE') && /(?:_PRIVATE_KEY|_SECRET|_TOKEN|_CREDENTIAL)$/.test(upper))
@@ -1304,6 +1318,7 @@ export function inspectBucketCors(
     duplicateOrigins: 0,
     duplicateMethods: 0,
     duplicateHeaders: 0,
+    maxAgeMatches: false,
   };
 
   const rules = asRecords(rawCors);
@@ -1325,6 +1340,7 @@ export function inspectBucketCors(
     duplicateOrigins: origins.length - new Set(origins).size,
     duplicateMethods: methods.length - new Set(methods).size,
     duplicateHeaders: headers.length - new Set(headers).size,
+    maxAgeMatches: rules.length === 1 && rules[0].maxAgeSeconds === EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].maxAgeSeconds,
   };
 }
 
@@ -1374,7 +1390,7 @@ function exactStringArray(value: unknown): string[] | undefined {
 function parseRuntimeRoleManifest(value: unknown): { manifest?: RuntimeRoleManifest; schemaErrors: number } {
   let schemaErrors = 0;
   if (!isPlainRecord(value)) return { schemaErrors: 1 };
-  if (!hasExactKeys(value, ['schemaVersion', 'runtimeRole', 'localVerification', 'workloadIdentityBinding', 'signingBinding', 'validation'])) schemaErrors++;
+  if (!hasExactKeys(value, ['schemaVersion', 'runtimeRole', 'localVerification', 'workloadIdentityBinding', 'validation'])) schemaErrors++;
   if (value.schemaVersion !== 1) schemaErrors++;
 
   const role = value.runtimeRole;
@@ -1415,16 +1431,6 @@ function parseRuntimeRoleManifest(value: unknown): { manifest?: RuntimeRoleManif
     || !Array.isArray(workload.members)
     || workload.members.length !== 1
     || workload.members[0] !== '${WIF_RUNTIME_PRINCIPAL}'
-  ) schemaErrors++;
-
-  const signing = value.signingBinding;
-  if (!isPlainRecord(signing) || !hasExactKeys(signing, ['permission', 'role', 'serviceAccount', 'member', 'scope'])) schemaErrors++;
-  else if (
-    signing.permission !== 'iam.serviceAccounts.signBlob'
-    || signing.role !== 'roles/iam.serviceAccountTokenCreator'
-    || signing.serviceAccount !== '${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
-    || signing.member !== 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
-    || signing.scope !== 'runtime-service-account-only'
   ) schemaErrors++;
 
   const validation = value.validation;
@@ -1614,7 +1620,6 @@ export function inspectRuntimeRoleManifest(value: unknown): RuntimeRoleManifestF
     unexpectedRuntimePermissions: permissions.filter(permission => !PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS.has(permission)).length,
     forbiddenRuntimePermissions: permissions.filter(permission => FORBIDDEN_RUNTIME_PERMISSIONS.has(permission)).length,
     signBlobInRuntimeRole: permissions.filter(permission => permission === 'iam.serviceAccounts.signBlob').length,
-    signingBindingValid: !!parsed.manifest,
     projectSpecificPrincipals: countProjectSpecificPrincipals(value),
   };
 }
@@ -1683,23 +1688,15 @@ export function inspectRuntimeServiceAccountPolicy(
   wifPrincipals: ReadonlySet<string>,
 ): RuntimeServiceAccountPolicyFacts {
   const policy = inspectPolicyBindings(value);
-  const selfMember = `serviceAccount:${runtimeEmail}`;
   const workloadBindings = policy.bindings.filter(binding => binding.role === 'roles/iam.workloadIdentityUser');
-  const tokenCreatorBindings = policy.bindings.filter(binding => binding.role === 'roles/iam.serviceAccountTokenCreator');
   const actualWifPrincipals = new Set(workloadBindings.flatMap(binding => binding.members));
-  const tokenCreatorMembers = tokenCreatorBindings.flatMap(binding => binding.members);
-  const unexpectedBindingRoles = policy.bindings.filter(binding => ![
-    'roles/iam.workloadIdentityUser',
-    'roles/iam.serviceAccountTokenCreator',
-  ].includes(binding.role)).length;
-  const malformedExpectedBindings = [...workloadBindings, ...tokenCreatorBindings].filter(binding => !binding.exact).length;
-  const duplicateExpectedBindings = Math.max(0, workloadBindings.length - 1) + Math.max(0, tokenCreatorBindings.length - 1);
+  const unexpectedBindingRoles = policy.bindings.filter(binding => binding.role !== 'roles/iam.workloadIdentityUser').length;
+  const malformedExpectedBindings = workloadBindings.filter(binding => !binding.exact).length;
+  const duplicateExpectedBindings = Math.max(0, workloadBindings.length - 1);
   return {
     readable: policy.readable,
     missingWifPrincipals: [...wifPrincipals].filter(member => !actualWifPrincipals.has(member)).length,
     unexpectedWifPrincipals: [...actualWifPrincipals].filter(member => !wifPrincipals.has(member)).length,
-    selfTokenCreatorBindings: tokenCreatorBindings.filter(binding => binding.exact && binding.members.length === 1 && binding.members[0] === selfMember).length,
-    externalTokenCreators: tokenCreatorMembers.filter(member => member !== selfMember).length,
     unexpectedBindings: unexpectedBindingRoles + malformedExpectedBindings + duplicateExpectedBindings,
   };
 }
@@ -2084,25 +2081,176 @@ async function collectDependencyAudit(): Promise<DependencyAuditFacts> {
   return inspectDependencyAudit(await runJson('npm', ['audit', '--omit=dev', '--json'], true));
 }
 
-async function probeRead(url: string): Promise<ProbeState> {
-  const response = await fetch(url, {
-    method: 'GET',
-  });
-  if (response.status === 401 || response.status === 403) return 'denied';
+function endpointProbeState(response: Response, deniedStatuses: ReadonlySet<number>): ProbeState {
+  if (deniedStatuses.has(response.status)) return 'denied';
   if (response.ok) return 'allowed';
   return 'unknown';
 }
 
-async function collectFirebaseRuleProbes(projectId: string, storageBucket: string): Promise<FirebaseRuleProbeFacts> {
-  const marker = 'security-audit-public-probe';
-  const firestoreDocument = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/${marker}/probe`;
-  const storageObject = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(storageBucket)}/o/${encodeURIComponent(`${marker}/probe`)}`;
-  return {
-    firestoreRead: await probeRead(firestoreDocument),
-    firestoreWrite: 'unknown',
-    storageRead: await probeRead(storageObject),
-    storageWrite: 'unknown',
+async function endpointProbe(request: () => Promise<Response>, deniedStatuses = new Set([403])): Promise<ProbeState> {
+  try {
+    return endpointProbeState(await request(), deniedStatuses);
+  } catch {
+    return 'unknown';
+  }
+}
+
+export async function collectFirebaseEndpointProbes(input: {
+  projectId: string;
+  storageBucket: string;
+  apiKey: string;
+  auditUid: string;
+  operationId: string;
+  origin: string;
+  appCheckToken: string;
+  fetch: typeof fetch;
+  cleanupFirestore?(paths: readonly string[]): Promise<boolean>;
+  cleanupStorage?(paths: readonly string[]): Promise<boolean>;
+}): Promise<FirebaseRuleProbeFacts> {
+  const appCheckToken = input.appCheckToken.trim();
+  if (!appCheckToken || !ALLOWED_BUCKET_CORS_ORIGINS.has(input.origin))
+    return { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' };
+  const uid = input.auditUid;
+  const recordKey = privateProRecordKey('settings', 'security-audit');
+  const firestorePath = `users/${uid}/workspaces/v1/records/${recordKey}`;
+  const firestoreReceiptPath = `users/${uid}/workspaces/v1/mutationReceipts/${input.operationId}`;
+  const operationSuffix = input.operationId.replaceAll('-', '').toLowerCase();
+  const assetId = `audit-${operationSuffix}`;
+  const storagePath = `users/${uid}/workspace-v1/assets/${assetId}/original`;
+  const storagePrefix = `users/${uid}/workspace-v1/assets/`;
+  const firestoreCollection = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents/users/${encodeURIComponent(input.auditUid)}/workspaces/v1/records?pageSize=1&key=${encodeURIComponent(input.apiKey)}`;
+  const firestoreCommit = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents:commit?key=${encodeURIComponent(input.apiKey)}`;
+  const storageList = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?prefix=${encodeURIComponent(storagePrefix)}&delimiter=${encodeURIComponent('/')}&maxResults=1&key=${encodeURIComponent(input.apiKey)}`;
+  const storageUpload = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?name=${encodeURIComponent(storagePath)}&key=${encodeURIComponent(input.apiKey)}`;
+  const documentName = `projects/${input.projectId}/databases/(default)/documents/${firestorePath}`;
+  const receiptName = `projects/${input.projectId}/databases/(default)/documents/${firestoreReceiptPath}`;
+  const browserHeaders = {
+    Origin: input.origin,
+    Referer: `${input.origin.replace(/\/$/, '')}/`,
+    'X-Firebase-AppCheck': appCheckToken,
   };
+  const firestoreRead = await endpointProbe(() => input.fetch(firestoreCollection, { method: 'GET', headers: browserHeaders }));
+  const storageRead = await endpointProbe(() => input.fetch(storageList, { method: 'GET', headers: browserHeaders }));
+  const firestoreWrite = await endpointProbe(() => input.fetch(firestoreCommit, {
+    method: 'POST',
+    headers: { ...browserHeaders, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ writes: [
+      { update: { name: documentName, fields: {
+        recordType: { stringValue: 'settings' }, logicalId: { stringValue: 'security-audit' }, schemaVersion: { integerValue: '1' }, payload: { stringValue: '{}' }, contentHash: { stringValue: '0'.repeat(64) }, revision: { integerValue: '1' }, mutationId: { stringValue: input.operationId }, writerId: { stringValue: input.operationId }, deleted: { booleanValue: false }, updatedAt: { timestampValue: '1970-01-01T00:00:00Z' },
+      } }, updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }] },
+      { update: { name: receiptName, fields: {
+        schemaVersion: { integerValue: '1' }, mutationId: { stringValue: input.operationId }, recordKey: { stringValue: recordKey }, recordType: { stringValue: 'settings' }, logicalId: { stringValue: 'security-audit' }, kind: { stringValue: 'put' }, contentHash: { stringValue: '0'.repeat(64) }, revision: { integerValue: '1' }, writerId: { stringValue: input.operationId }, committedAt: { timestampValue: '1970-01-01T00:00:00Z' },
+      } }, updateTransforms: [{ fieldPath: 'committedAt', setToServerValue: 'REQUEST_TIME' }] },
+    ] }),
+  }));
+  const boundary = `private-pro-security-audit-${operationSuffix}`;
+  const storageMetadata = JSON.stringify({
+    name: storagePath,
+    size: 1,
+    contentType: 'image/png',
+    metadata: { uid, assetId, kind: 'original', sha256: '0'.repeat(64) },
+  });
+  const storageBody = `--${boundary}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n${storageMetadata}\r\n--${boundary}\r\nContent-Type: image/png\r\n\r\n0\r\n--${boundary}--`;
+  const storageWrite = await endpointProbe(() => input.fetch(storageUpload, {
+    method: 'POST',
+    headers: {
+      ...browserHeaders,
+      'Content-Type': `multipart/related; boundary=${boundary}`,
+      'X-Goog-Upload-Protocol': 'multipart',
+    },
+    body: storageBody,
+  }));
+  let cleanedFirestoreWrite = firestoreWrite;
+  let cleanedStorageWrite = storageWrite;
+  if (firestoreWrite === 'allowed'
+    && (!input.cleanupFirestore || !await input.cleanupFirestore([firestorePath, firestoreReceiptPath]))) cleanedFirestoreWrite = 'unknown';
+  if (storageWrite === 'allowed'
+    && (!input.cleanupStorage || !await input.cleanupStorage([storagePath]))) cleanedStorageWrite = 'unknown';
+  return {
+    firestoreRead,
+    firestoreWrite: cleanedFirestoreWrite,
+    storageRead,
+    storageWrite: cleanedStorageWrite,
+  };
+}
+
+export function assertPrivateProSecurityAuditIdentity(input: {
+  auditUid: string;
+  account: { uid: unknown; active: unknown; accessEpoch: unknown };
+  auth: { uid: unknown; email: unknown; emailVerified: unknown; claims: Readonly<Record<string, unknown>> };
+  allowedEmails: ReadonlySet<string>;
+}): void {
+  const email = typeof input.auth.email === 'string' ? input.auth.email.trim().toLowerCase() : '';
+  const epoch = input.account.accessEpoch;
+  if (input.account.uid !== input.auditUid
+    || input.account.active !== true
+    || typeof epoch !== 'number'
+    || !Number.isSafeInteger(epoch)
+    || epoch <= 0
+    || input.auth.uid !== input.auditUid
+    || input.auth.emailVerified !== true
+    || !input.allowedEmails.has(email)
+    || input.auth.claims.privatePro !== true
+    || input.auth.claims.privateProEpoch !== epoch) throw new Error('Private Pro security audit identity is invalid.');
+}
+
+async function collectFirebaseRuleProbes(
+  projectId: string,
+  storageBucket: string,
+  origin: string,
+  appCheckToken: string | undefined,
+): Promise<FirebaseRuleProbeFacts> {
+  const apiKey = process.env.NEXT_PUBLIC_FIREBASE_API_KEY?.trim();
+  if (!apiKey) throw new Error('Firebase browser API key is missing.');
+  if (!appCheckToken?.trim()) return { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' };
+  const auditUid = process.env.PRIVATE_PRO_SECURITY_AUDIT_UID?.trim();
+  if (!auditUid || !/^[A-Za-z0-9_-]{1,128}$/.test(auditUid)) throw new Error('Private Pro security audit UID is missing.');
+  const auth = new GoogleAuth({ scopes: ['https://www.googleapis.com/auth/cloud-platform'] });
+  const accessToken = await auth.getAccessToken();
+  if (!accessToken) throw new Error('Private Pro security audit cleanup identity is unavailable.');
+  const operatorHeaders = { Authorization: `Bearer ${accessToken}` };
+  const accountResponse = await fetch(`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/users/${encodeURIComponent(auditUid)}`, { headers: operatorHeaders });
+  if (!accountResponse.ok) throw new Error('Private Pro security audit account is unavailable.');
+  const account = asRecord(await accountResponse.json());
+  const accountFields = asRecord(account.fields);
+  const accountUid = asRecord(accountFields.uid).stringValue;
+  const accountEpochValue = asRecord(accountFields.accessEpoch).integerValue;
+  const accountEpoch = typeof accountEpochValue === 'string' && /^\d+$/.test(accountEpochValue) ? Number(accountEpochValue) : Number.NaN;
+  const app = await import('firebase-admin/app');
+  const authModule = await import('firebase-admin/auth');
+  const adminApp = app.getApps().find(candidate => candidate.name === 'private-pro-security-audit') ?? app.initializeApp({ projectId }, 'private-pro-security-audit');
+  const user = await authModule.getAuth(adminApp).getUser(auditUid);
+  const allowedEmails = new Set((process.env.PRIVATE_PRO_ALLOWED_EMAILS ?? '').split(',').map(email => email.trim().toLowerCase()).filter(Boolean));
+  assertPrivateProSecurityAuditIdentity({
+    auditUid,
+    account: { uid: accountUid, active: asRecord(accountFields.active).booleanValue, accessEpoch: accountEpoch },
+    auth: { uid: user.uid, email: user.email, emailVerified: user.emailVerified, claims: { ...user.customClaims } },
+    allowedEmails,
+  });
+  return collectFirebaseEndpointProbes({
+    projectId,
+    storageBucket,
+    apiKey,
+    auditUid,
+    operationId: randomUUID(),
+    origin,
+    appCheckToken,
+    fetch,
+    cleanupFirestore: async paths => {
+      for (const path of paths) {
+        const response = await fetch(`https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/${path}`, { method: 'DELETE', headers: operatorHeaders });
+        if (!response.ok && response.status !== 404) return false;
+      }
+      return true;
+    },
+    cleanupStorage: async paths => {
+      for (const path of paths) {
+        const response = await fetch(`https://storage.googleapis.com/storage/v1/b/${encodeURIComponent(storageBucket)}/o/${encodeURIComponent(path)}`, { method: 'DELETE', headers: operatorHeaders });
+        if (!response.ok && response.status !== 404) return false;
+      }
+      return true;
+    },
+  });
 }
 
 function validateProjectId(value: string): string {
@@ -2121,27 +2269,29 @@ function isAuditOnlyRestoreEvidenceEnvironmentName(name: string): boolean {
     && (upper.includes('RESTORE_EVIDENCE') || (upper.includes('RESTORE') && upper.includes('HMAC')));
 }
 
-function captureFirestoreRestoreEvidenceEnvironment(): Readonly<FirestoreRestoreEvidenceEnvironmentInput> {
+function captureSecurityAuditEnvironment(): Readonly<SecurityAuditEnvironmentInput> {
   const evidenceBase64 = process.env.PRIVATE_PRO_FIRESTORE_RESTORE_EVIDENCE_BASE64;
   const expectedCommit = process.env.PRIVATE_PRO_RESTORE_EVIDENCE_EXPECTED_COMMIT_SHA?.trim();
+  const appCheckToken = process.env.PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN?.trim();
   const input = Object.freeze({
     ...(evidenceBase64 !== undefined ? { evidenceBase64 } : {}),
     ...(expectedCommit ? { additionalExpectedCommitSha: expectedCommit } : {}),
+    ...(appCheckToken ? { appCheckToken } : {}),
   });
   for (const name of Object.keys(process.env)) {
-    if (isAuditOnlyRestoreEvidenceEnvironmentName(name)) delete process.env[name];
+    if (isAuditOnlyRestoreEvidenceEnvironmentName(name) || name.toUpperCase() === 'PRIVATE_PRO_SECURITY_AUDIT_APP_CHECK_TOKEN') delete process.env[name];
   }
   return input;
 }
 
 export async function runSecurityAuditWithCollector<T>(
-  collector: (input: Readonly<FirestoreRestoreEvidenceEnvironmentInput>) => Promise<T>,
+  collector: (input: Readonly<SecurityAuditEnvironmentInput>) => Promise<T>,
 ): Promise<T> {
-  const restoreEvidenceInput = captureFirestoreRestoreEvidenceEnvironment();
-  return collector(restoreEvidenceInput);
+  const auditEnvironmentInput = captureSecurityAuditEnvironment();
+  return collector(auditEnvironmentInput);
 }
 
-async function collectReport(restoreEvidenceInput: Readonly<FirestoreRestoreEvidenceEnvironmentInput>): Promise<AuditReport> {
+async function collectReport(auditEnvironmentInput: Readonly<SecurityAuditEnvironmentInput>): Promise<AuditReport> {
   const projectId = validateProjectId(process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID?.trim() || DEFAULT_PROJECT_ID);
   const deploymentOrigin = process.env.PRIVATE_PRO_AUDIT_ORIGIN?.trim() || DEFAULT_DEPLOYMENT_ORIGIN;
   const storageBucket = validateBucket(process.env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET?.trim() || `${projectId}.firebasestorage.app`);
@@ -2153,7 +2303,7 @@ async function collectReport(restoreEvidenceInput: Readonly<FirestoreRestoreEvid
     collectBucketCors(storageBucket).then(classifyBucketCors),
     collectAppCheck(projectId).then(classifyAppCheck),
     collectFirestoreRecoveryState(projectId).then(classifyFirestoreRecoveryState),
-    collectFirestoreRestoreEvidence(restoreEvidenceInput).then(classifyFirestoreRestoreEvidence),
+    collectFirestoreRestoreEvidence(auditEnvironmentInput).then(classifyFirestoreRestoreEvidence),
     collectIamRoles(projectId).then(classifyIamRoles),
     collectRuntimeIdentity(projectId).then(classifyRuntimeIdentity),
     collectRuntimeRoleManifest().then(classifyRuntimeRoleManifest),
@@ -2162,7 +2312,7 @@ async function collectReport(restoreEvidenceInput: Readonly<FirestoreRestoreEvid
     collectRuntimeServiceAccountPolicy(projectId).then(classifyRuntimeServiceAccountPolicy),
     collectServiceAccountKeys(projectId).then(classifyServiceAccountKeys),
     collectDependencyAudit().then(classifyDependencyAudit),
-    collectFirebaseRuleProbes(projectId, storageBucket).then(classifyFirebaseRuleProbes),
+    collectFirebaseRuleProbes(projectId, storageBucket, deploymentOrigin, auditEnvironmentInput.appCheckToken).then(classifyFirebaseRuleProbes),
   ];
   const areas = ['headers', 'deployment', 'authorizedDomains', 'browserApiKeys', 'bucketCors', 'appCheck', 'firestoreRecovery', 'firestoreRestoreEvidence', 'iam', 'runtimeIdentity', 'runtimeRoleManifest', 'deployedRuntimeRole', 'projectRuntimePolicy', 'runtimeServiceAccountPolicy', 'serviceAccountKeys', 'dependencies', 'firebaseRules'];
   const results = await Promise.allSettled(tasks);

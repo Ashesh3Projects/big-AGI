@@ -3,8 +3,6 @@ import * as React from 'react';
 import { BaseProduct, Release } from '~/common/app.release';
 import { isPwa } from '~/common/util/pwaUtils';
 
-import '../../logic/sherpa.css';
-
 import { instanceLockRequestTransfer, useInstanceLock } from './instanceLock';
 
 
@@ -29,7 +27,13 @@ export function SherpaLoading(props: { stage: string }) {
 const useRevealEffect = typeof window !== 'undefined' ? React.useLayoutEffect : React.useEffect;
 
 
-export const ProviderSingleTab = (props: { children: React.ReactNode }) => {
+export const ProviderSingleTab = (props: { enabled: boolean; children?: React.ReactNode }) => {
+  if (!props.enabled) return props.children;
+  return <ProviderSingleTabEnabled>{props.children}</ProviderSingleTabEnabled>;
+};
+
+
+const ProviderSingleTabEnabled = (props: { children: React.ReactNode }) => {
 
   // state
   const { role, peer, wiping } = useInstanceLock();

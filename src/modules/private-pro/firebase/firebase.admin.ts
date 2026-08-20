@@ -9,7 +9,6 @@ import {
 import { getAppCheck } from 'firebase-admin/app-check';
 import { getAuth } from 'firebase-admin/auth';
 import { getFirestore } from 'firebase-admin/firestore';
-import { getStorage } from 'firebase-admin/storage';
 
 import {
   classifyPrivateProFirebaseCredentialSource,
@@ -26,9 +25,7 @@ export interface PrivateProFirebaseCredentialConfig {
   privateKey?: string;
 }
 
-export interface PrivateProFirebaseAdminConfig extends PrivateProFirebaseCredentialConfig {
-  storageBucket: string;
-}
+export interface PrivateProFirebaseAdminConfig extends PrivateProFirebaseCredentialConfig {}
 
 export interface PrivateProFirebaseCredentialFactories<TCredential> {
   applicationDefault(): TCredential;
@@ -72,11 +69,10 @@ export function createPrivateProAdminAppOptions<TCredential>(
   factories: PrivateProFirebaseCredentialFactories<TCredential>,
 ): {
   credentialSource: PrivateProFirebaseCredentialSource;
-  options: { credential: TCredential; projectId: string; storageBucket: string };
+  options: { credential: TCredential; projectId: string };
 } {
   const missing = [
     !config.projectId && 'NEXT_PUBLIC_FIREBASE_PROJECT_ID',
-    !config.storageBucket && 'NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET',
   ].filter((value): value is string => !!value);
   if (missing.length)
     throw new Error(`Private Pro Firebase Admin is missing: ${missing.join(', ')}`);
@@ -87,7 +83,6 @@ export function createPrivateProAdminAppOptions<TCredential>(
     options: {
       credential: selection.credential,
       projectId: config.projectId,
-      storageBucket: config.storageBucket,
     },
   };
 }
@@ -111,8 +106,4 @@ export function getPrivateProAdminAppCheck() {
 
 export function getPrivateProFirestore() {
   return getFirestore(getPrivateProAdminApp());
-}
-
-export function getPrivateProStorageBucket() {
-  return getStorage(getPrivateProAdminApp()).bucket();
 }

@@ -308,26 +308,26 @@ export function asrxAreCredentialsValid(credentials: DASRxCredentialsAny): boole
 }
 
 
-/// Private vault adapters
+/// Private sync adapters
 
-export interface ASRxVaultState {
+export interface ASRxSyncState {
   engines: Record<DASRxEngineId, DASRxEngineAny>;
   activeEngineId: DASRxEngineId | null;
 }
 
-export function asrxVaultSnapshot(): ASRxVaultState {
+export function asrxSyncSnapshot(): ASRxSyncState {
   const { engines, activeEngineId } = useASRxStore.getState();
   return structuredClone({ engines, activeEngineId });
 }
 
-export function asrxVaultApply(value: ASRxVaultState): void {
+export function asrxSyncApply(value: ASRxSyncState): void {
   useASRxStore.setState({ ...structuredClone(value), hasInitializedLlms: true });
 }
 
-export function asrxVaultReset(): void {
+export function asrxSyncReset(): void {
   useASRxStore.setState({ engines: {}, activeEngineId: null, hasInitializedLlms: true });
 }
 
-export function asrxVaultSubscribe(listener: () => void): () => void {
+export function asrxSyncSubscribe(listener: () => void): () => void {
   return useASRxStore.subscribe(listener);
 }

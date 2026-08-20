@@ -11,14 +11,14 @@ import { get, set } from 'idb-keyval';
 import {
   PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS,
   PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS,
-  clearPrivateProPlaintextPortablePersistence,
+  activatePrivateProManagedPersistence as activatePrivateProManagedPersistenceOwned,
+  clearPrivateProManagedPersistence,
   createPrivateProPortableLocalStorage,
-  isPrivateProEncryptedPersistenceActive,
-  hasPrivateProPendingPortableAssets,
-  markPrivateProPortableAssetEncrypted,
-  markPrivateProPortableAssetPending,
-  privateProPortableAssetBeforeUnload,
-  setPrivateProEncryptedPersistenceActive,
+  deactivatePrivateProManagedPersistence as deactivatePrivateProManagedPersistenceOwned,
+  isPrivateProManagedPersistenceActive,
+  privateProManagedPersistenceOwnership,
+  privateProManagedPersistenceUid,
+  releasePrivateProManagedPersistence,
 } from './privatePro.persistence';
 
 
@@ -33,38 +33,52 @@ class MemoryStorage implements Storage {
   setItem(key: string, value: string) { this.values.set(key, value); }
 }
 
+const managedOwners = new Map<string, object>();
+const managedOwner = (uid: string) => {
+  let owner = managedOwners.get(uid);
+  if (!owner) {
+    owner = {};
+    managedOwners.set(uid, owner);
+  }
+  return owner;
+};
+const activatePrivateProManagedPersistence = (uid: string | null) =>
+  activatePrivateProManagedPersistenceOwned(uid, uid ? managedOwner(uid) : null);
+const deactivatePrivateProManagedPersistence = (uid: string, clearRuntime?: () => void) =>
+  deactivatePrivateProManagedPersistenceOwned(uid, managedOwner(uid), clearRuntime);
 
-afterEach(() => setPrivateProEncryptedPersistenceActive(false));
 
-describe('private Pro portable persistence gate', () => {
-  test('uses volatile storage for an explicit portable key while encrypted persistence is active', () => {
+afterEach(() => activatePrivateProManagedPersistence(null));
+
+describe('private Pro managed persistence gate', () => {
+  test('uses volatile storage for an explicit portable key while managed persistence is active', async () => {
     const durable = new MemoryStorage();
     const storage = createPrivateProPortableLocalStorage(() => durable);
     const key = 'app-models';
     const sentinel = 'sentinel-provider-api-key';
 
-    setPrivateProEncryptedPersistenceActive(true);
+    await activatePrivateProManagedPersistence('uid-a');
     storage.setItem(key, sentinel);
 
-    assert.equal(isPrivateProEncryptedPersistenceActive(), true);
+    assert.equal(isPrivateProManagedPersistenceActive(), true);
     assert.equal(storage.getItem(key), sentinel);
     assert.equal(durable.getItem(key), null);
   });
 
-  test('keeps Open storage behavior unchanged', () => {
+  test('keeps Open storage behavior unchanged', async () => {
     const durable = new MemoryStorage();
     const storage = createPrivateProPortableLocalStorage(() => durable);
 
-    setPrivateProEncryptedPersistenceActive(false);
+    await activatePrivateProManagedPersistence(null);
     storage.setItem('app-models', 'open-model-state');
 
     assert.equal(durable.getItem('app-models'), 'open-model-state');
     assert.equal(storage.getItem('app-models'), 'open-model-state');
   });
 
-  test('fails closed for portable stores outside the inclusion list', () => {
+  test('fails closed for portable stores outside the inclusion list', async () => {
     const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
-    setPrivateProEncryptedPersistenceActive(true);
+    await activatePrivateProManagedPersistence('uid-a');
 
     assert.throws(() => storage.setItem('unregistered-portable-store', 'secret'), /allowlist/i);
   });
@@ -167,9 +181,8 @@ describe('private Pro portable persistence gate', () => {
       ['common/components/3rdparty/PostHogAnalytics.tsx', 'excluded'],
       ['common/util/idbUtils.ts', 'portable-idb-infrastructure'],
       ['modules/dblobs/dblobs.db.ts', 'portable-asset-legacy'],
-      ['modules/private-pro/vault/privatePro.vault.db.ts', 'encrypted-vault'],
-      ['modules/private-pro/vault/privatePro.vault.device.ts', 'device-only'],
-      ['modules/private-pro/persistence/privatePro.persistence.ts', 'portable-gate'],
+      ['modules/private-pro/sync/privatePro.sync.cutover.ts', 'workspace-cutover'],
+      ['modules/private-pro/sync/privatePro.sync.db.ts', 'managed-workspace'],
       ['modules/trade/BackupRestore.tsx', 'manual-export-only'],
     ] as const;
     const sourceRoot = join(process.cwd(), 'src');
@@ -202,7 +215,7 @@ describe('private Pro portable persistence gate', () => {
         const nativeSetItem = Storage.prototype.setItem;
         Reflect.apply(nativeSetItem, localStorage, ['app-models', 'plaintext-secret']);
         Reflect.apply(nativeSetItem, localStorage, ['unrelated-feature', 'keep-me']);
-        await module.clearPrivateProPlaintextPortablePersistence();
+        await module.clearPrivateProManagedPersistence('uid-a', { clearUid: async () => {} });
         const nativeGetItem = Storage.prototype.getItem;
         if (Reflect.apply(nativeGetItem, localStorage, ['app-models']) !== null) throw new Error('allowlisted plaintext survived');
         if (Reflect.apply(nativeGetItem, localStorage, ['unrelated-feature']) !== 'keep-me') throw new Error('unrelated key was removed');
@@ -228,7 +241,8 @@ describe('private Pro portable persistence gate', () => {
     await set('app-chats', 'sentinel-chat');
     await set('unrelated-cell', 'keep-me');
 
-    await clearPrivateProPlaintextPortablePersistence();
+    await activatePrivateProManagedPersistence('uid-a');
+    await clearPrivateProManagedPersistence('uid-a', { clearUid: async () => {} });
 
     assert.equal(durable.getItem('app-models'), null);
     assert.equal(durable.getItem('app-state'), null);
@@ -240,17 +254,128 @@ describe('private Pro portable persistence gate', () => {
     assert.equal(await get('unrelated-cell'), 'keep-me');
   });
 
-  test('blocks reload while a volatile attachment has not reached encrypted storage', () => {
-    const event = { preventDefaultCalled: false, preventDefault() { this.preventDefaultCalled = true; }, returnValue: '' };
-    setPrivateProEncryptedPersistenceActive(true);
-    markPrivateProPortableAssetPending('asset-sentinel');
+  test('atomically clears volatile values and only the requested UID sync state', async () => {
+    const durable = new MemoryStorage();
+    const storage = createPrivateProPortableLocalStorage(() => durable);
+    const cleared: string[] = [];
+    await activatePrivateProManagedPersistence('uid-a');
+    storage.setItem('app-models', 'uid-a-models');
 
-    assert.equal(hasPrivateProPendingPortableAssets(), true);
-    assert.equal(privateProPortableAssetBeforeUnload(event), 'Encrypted attachments are still being saved.');
-    assert.equal(event.preventDefaultCalled, true);
+    await clearPrivateProManagedPersistence('uid-a', { clearUid: async uid => { cleared.push(uid); } });
 
-    markPrivateProPortableAssetEncrypted('asset-sentinel');
-    assert.equal(hasPrivateProPendingPortableAssets(), false);
-    assert.equal(privateProPortableAssetBeforeUnload(event), undefined);
+    await activatePrivateProManagedPersistence('uid-a');
+    assert.equal(storage.getItem('app-models'), null);
+    assert.deepEqual(cleared, ['uid-a']);
+  });
+
+  test('stale UID cleanup cannot clear or deactivate the current account runtime', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    let runtimeClears = 0;
+    await activatePrivateProManagedPersistence('uid-b');
+    storage.setItem('app-models', 'uid-b-models');
+
+    assert.equal(await deactivatePrivateProManagedPersistence('uid-a', () => { runtimeClears++; }), false);
+    assert.equal(storage.getItem('app-models'), 'uid-b-models');
+    assert.equal(runtimeClears, 0);
+    assert.equal(privateProManagedPersistenceUid(), 'uid-b');
+  });
+
+  test('stale same-UID owner cleanup cannot deactivate a replacement runtime', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    const oldOwner = Symbol('old-owner');
+    const replacementOwner = Symbol('replacement-owner');
+    let runtimeClears = 0;
+    await activatePrivateProManagedPersistenceOwned('uid-a', oldOwner);
+    storage.setItem('app-models', 'uid-a-models');
+    await activatePrivateProManagedPersistenceOwned('uid-a', replacementOwner);
+
+    assert.equal(await deactivatePrivateProManagedPersistenceOwned('uid-a', oldOwner, () => { runtimeClears++; }), false);
+    assert.equal(storage.getItem('app-models'), 'uid-a-models');
+    assert.equal(runtimeClears, 0);
+    assert.equal(privateProManagedPersistenceUid(), 'uid-a');
+  });
+
+  test('ordinary same-UID owner release preserves volatile workspace state for remount', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    const oldOwner = Symbol('old-owner');
+    const replacementOwner = Symbol('replacement-owner');
+    await activatePrivateProManagedPersistenceOwned('uid-a', oldOwner);
+    storage.setItem('app-models', 'uid-a-models');
+
+    assert.equal(await releasePrivateProManagedPersistence('uid-a', oldOwner), true);
+    await activatePrivateProManagedPersistenceOwned('uid-a', replacementOwner);
+
+    assert.equal(storage.getItem('app-models'), 'uid-a-models');
+    assert.equal(privateProManagedPersistenceUid(), 'uid-a');
+  });
+
+  test('first UID activation preserves values edited while authentication and cutover are pending', async () => {
+    const script = `
+      process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED = 'true';
+      import('./src/modules/private-pro/persistence/privatePro.persistence.ts').then(async imported => {
+        const module = imported.default ?? imported;
+        const storage = module.createPrivateProPortableLocalStorage(() => null);
+        storage.setItem('app-models', 'edited-before-uid-activation');
+        await module.activatePrivateProManagedPersistence('uid-a', Symbol('uid-a-owner'));
+        if (storage.getItem('app-models') !== 'edited-before-uid-activation') throw new Error('pending edit was cleared');
+        if (module.privateProManagedPersistenceUid() !== 'uid-a') throw new Error('UID activation failed');
+      }).catch(error => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ['--import', 'tsx', '--eval', script], {
+      cwd: process.cwd(), encoding: 'utf8', env: { ...process.env, NODE_ENV: 'development' },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+  });
+
+  test('switching a real UID still clears the previous account volatile values', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    await activatePrivateProManagedPersistenceOwned('uid-a', Symbol('uid-a-owner'));
+    storage.setItem('app-models', 'uid-a-models');
+
+    await activatePrivateProManagedPersistenceOwned('uid-b', Symbol('uid-b-owner'));
+
+    assert.equal(storage.getItem('app-models'), null);
+    assert.equal(privateProManagedPersistenceUid(), 'uid-b');
+  });
+
+  test('released same-UID state remains discoverable for a later cross-account clear', async () => {
+    const oldOwner = Symbol('old-owner');
+    await activatePrivateProManagedPersistenceOwned('uid-a', oldOwner);
+    await releasePrivateProManagedPersistence('uid-a', oldOwner);
+
+    assert.equal(privateProManagedPersistenceOwnership()?.uid, 'uid-a');
+  });
+
+  test('Private Pro deactivation returns to pending-auth volatile storage instead of Open durability', async () => {
+    const durable = new MemoryStorage();
+    const storage = createPrivateProPortableLocalStorage(() => durable);
+    await activatePrivateProManagedPersistence('uid-a');
+
+    assert.equal(await deactivatePrivateProManagedPersistence('uid-a'), true);
+    storage.setItem('app-models', 'after-deactivation');
+
+    assert.equal(isPrivateProManagedPersistenceActive(), true);
+    assert.equal(privateProManagedPersistenceUid(), null);
+    assert.equal(storage.getItem('app-models'), 'after-deactivation');
+    assert.equal(durable.getItem('app-models'), null);
+  });
+
+  test('Private Pro IDB adapter stays volatile while pending authentication', async () => {
+    const { createPrivateProPortableIDBStorage } = await import('./privatePro.persistence');
+    const durableValues = new Map<string, unknown>();
+    await activatePrivateProManagedPersistence('uid-a');
+    await deactivatePrivateProManagedPersistence('uid-a');
+    const storage = createPrivateProPortableIDBStorage<{ value: string }>({
+      getItem: async name => durableValues.get(name) as never ?? null,
+      setItem: async (name, value) => { durableValues.set(name, value); },
+      removeItem: async name => { durableValues.delete(name); },
+    });
+    if (!storage) assert.fail('Expected IndexedDB storage.');
+
+    await storage.setItem('app-chats', { state: { value: 'pending-auth' }, version: 1 });
+
+    assert.deepEqual(await storage.getItem('app-chats'), { state: { value: 'pending-auth' }, version: 1 });
+    assert.equal(durableValues.has('app-chats'), false);
   });
 });
