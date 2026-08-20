@@ -8,7 +8,7 @@ import { createPrivateProAssetClient } from '../assets/privatePro.assets.client'
 import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { privateProClientConfig } from '../config/privatePro.config';
 import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, isPrivateProRetainedPersistenceOwner, privateProManagedPersistenceOwnership, releasePrivateProManagedPersistence, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
-import { createPrivateProSyncCoordinator, type PrivateProSyncCoordinator } from './privatePro.sync.coordinator';
+import { createPrivateProSyncCoordinator, type PrivateProSyncCoordinator, type PrivateProSyncCoordinatorOptions } from './privatePro.sync.coordinator';
 import { privateProRecordKey } from './privatePro.sync.codec';
 import { privateProSyncDB } from './privatePro.sync.db';
 import { createPrivateProSyncEngine, type PrivateProSyncEngine, type PrivateProSyncStartupMutation } from './privatePro.sync.engine';
@@ -184,6 +184,7 @@ export function createPrivateProBufferedSyncLifecycle(
     },
     retry: lifecycle.retry,
     signOut: lifecycle.signOut,
+    handleSignedOut: lifecycle.handleSignedOut,
     async stop() {
       startupBuffer.stop();
       await lifecycle.stop();
@@ -192,6 +193,27 @@ export function createPrivateProBufferedSyncLifecycle(
 }
 
 export interface PrivateProSyncLifecycleEngine extends Pick<PrivateProSyncEngine, 'start' | 'retryNow' | 'flushNow' | 'pendingCount' | 'stop'> {}
+
+export function createProductionPrivateProSyncCoordinator(
+  options: Omit<PrivateProSyncCoordinatorOptions, 'onWake' | 'onSignedOut'>,
+): {
+  coordinator: PrivateProSyncCoordinator;
+  bindEngine(engine: Pick<PrivateProSyncEngine, 'wake'>): void;
+  bindLifecycle(lifecycle: Pick<PrivateProSyncLifecycle, 'handleSignedOut'>): void;
+} {
+  let activeEngine: Pick<PrivateProSyncEngine, 'wake'> | null = null;
+  let activeLifecycle: Pick<PrivateProSyncLifecycle, 'handleSignedOut'> | null = null;
+  const coordinator = createPrivateProSyncCoordinator({
+    ...options,
+    onWake: () => activeEngine?.wake(),
+    onSignedOut: () => { void activeLifecycle?.handleSignedOut().catch(() => {}); },
+  });
+  return {
+    coordinator,
+    bindEngine: engine => { activeEngine = engine; },
+    bindLifecycle: lifecycle => { activeLifecycle = lifecycle; },
+  };
+}
 
 interface PreparedPrivateProSync {
   engine: PrivateProSyncLifecycleEngine;
@@ -218,6 +240,7 @@ export interface PrivateProSyncLifecycle {
   start: () => Promise<void>;
   retry: () => Promise<void>;
   signOut: (options?: { discardPending?: boolean }) => Promise<void>;
+  handleSignedOut: () => Promise<void>;
   stop: () => Promise<void>;
 }
 
@@ -366,6 +389,8 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
   const ownerCleanups = new Map<PrivateProPersistenceOwner, Promise<void>>();
   let latestAttempt: StartAttempt | null = null;
   let signOutPromise: Promise<void> | null = null;
+  let cleanupPromise: Promise<void> | null = null;
+  let destructiveSignOutStarted = false;
   let closing = false;
   let decisionInProgress = false;
   let decisionGate: { promise: Promise<void>; resolve: () => void } | null = null;
@@ -522,6 +547,90 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
     decisionGate = null;
   }
 
+  function beginDestructiveSignOut(
+    received: boolean,
+    decisionPrepared: { attempt: StartAttempt; value: PreparedPrivateProSync } | null,
+    decisionAttempt: StartAttempt | null,
+  ): Promise<void> {
+    if (cleanupPromise) return cleanupPromise;
+    if (destructiveSignOutStarted) return Promise.resolve();
+    destructiveSignOutStarted = true;
+    const cleanup = (async () => {
+      destructiveSignOutStarted = true;
+      closing = true;
+      finishDecision();
+      generation++;
+      const currentAttempt = attempt ?? decisionAttempt;
+      if (currentAttempt) currentAttempt.cancelled = true;
+      attempt = null;
+      const currentPrepared = prepared ?? decisionPrepared ?? latestPrepared;
+      const current = currentPrepared?.value ?? currentAttempt?.engine ?? null;
+      const newestPreparingOwner = latestAttempt?.prepareStarted
+        && (!currentPrepared || latestAttempt.id > currentPrepared.attempt.id)
+        ? latestAttempt
+        : null;
+      const currentOwner = newestPreparingOwner ?? currentPrepared?.attempt ?? currentAttempt ?? latestAttempt;
+      prepared = null;
+      latestPrepared = null;
+      let failure: unknown = null;
+      if (!received) {
+        try { current?.coordinator?.broadcastSignedOut?.(); } catch (error) { failure = rememberFailure(failure, error); }
+      }
+      const cleanups = new Set<Promise<void>>();
+      if (currentPrepared) cleanups.add(beginRelease(currentPrepared.attempt, currentPrepared.value));
+      if (currentAttempt) cleanups.add(beginRelease(currentAttempt, currentAttempt.engine));
+      if (currentOwner) cleanups.add(beginRelease(currentOwner, currentOwner.engine));
+      for (const cleanup of cleanups) {
+        try { await cleanup; } catch (error) { failure = rememberFailure(failure, error); }
+      }
+      let destroyedRecovery = false;
+      try { destroyedRecovery = currentOwner ? destroyPrivateProLifecycleOwnerRecovery(currentOwner.owner) : false; } catch (error) { failure = rememberFailure(failure, error); }
+      if (!destroyedRecovery) {
+        try { await dependencies.beforeClear?.(); } catch (error) { failure = rememberFailure(failure, error); }
+      }
+      try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
+      try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
+      try { dependencies.reload(); } catch (error) { failure = rememberFailure(failure, error); }
+      if (failure) throw new PrivateProLifecycleError();
+    })();
+    const settled = cleanup.finally(() => { if (cleanupPromise === settled) cleanupPromise = null; });
+    cleanupPromise = settled;
+    return cleanupPromise;
+  }
+
+  function signOut(options: { discardPending?: boolean } = {}): Promise<void> {
+    if (cleanupPromise) return cleanupPromise;
+    if (destructiveSignOutStarted) return Promise.resolve();
+    if (signOutPromise) return signOutPromise;
+    signOutPromise = (async () => {
+      decisionInProgress = true;
+      decisionGate = createGate();
+      const decisionPrepared = prepared;
+      const decisionAttempt = attempt;
+      const decisionOwner = decisionPrepared?.value ?? null;
+      let pending: number | null = null;
+      try {
+        pending = decisionOwner
+          ? (await decisionOwner.engine.flushNow(5_000)).pending
+          : await dependencies.pendingCount();
+      } catch {
+        try { pending = await dependencies.pendingCount(); } catch {}
+      }
+      if (destructiveSignOutStarted) return cleanupPromise ?? Promise.resolve();
+      if (cleanupPromise) return cleanupPromise;
+      if (pending === null && !options.discardPending) {
+        finishDecision();
+        throw new PrivateProLifecycleError();
+      }
+      if (pending !== null && pending > 0 && !options.discardPending) {
+        finishDecision();
+        throw new PrivateProUnsyncedChangesError(pending);
+      }
+      return beginDestructiveSignOut(false, decisionPrepared, decisionAttempt);
+    })().finally(() => { signOutPromise = null; });
+    return signOutPromise;
+  }
+
   return {
     start,
 
@@ -536,66 +645,11 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
       })();
     },
 
-    async signOut(options = {}): Promise<void> {
-      if (signOutPromise) return signOutPromise;
-      signOutPromise = (async () => {
-        decisionInProgress = true;
-        decisionGate = createGate();
-        const decisionPrepared = prepared;
-        const decisionAttempt = attempt;
-        const decisionOwner = decisionPrepared?.value ?? null;
-        let pending: number | null = null;
-        try {
-          pending = decisionOwner
-            ? (await decisionOwner.engine.flushNow(5_000)).pending
-            : await dependencies.pendingCount();
-        } catch {
-          try { pending = await dependencies.pendingCount(); } catch {}
-        }
-        if (pending === null && !options.discardPending) {
-          finishDecision();
-          throw new PrivateProLifecycleError();
-        }
-        if (pending !== null && pending > 0 && !options.discardPending) {
-          finishDecision();
-          throw new PrivateProUnsyncedChangesError(pending);
-        }
+    signOut: options => signOut(options),
 
-        closing = true;
-        generation++;
-        const currentAttempt = attempt ?? decisionAttempt;
-        if (currentAttempt) currentAttempt.cancelled = true;
-        attempt = null;
-        const currentPrepared = prepared ?? decisionPrepared ?? latestPrepared;
-        const current = currentPrepared?.value ?? currentAttempt?.engine ?? null;
-        const newestPreparingOwner = latestAttempt?.prepareStarted
-          && (!currentPrepared || latestAttempt.id > currentPrepared.attempt.id)
-          ? latestAttempt
-          : null;
-        const currentOwner = newestPreparingOwner ?? currentPrepared?.attempt ?? currentAttempt ?? latestAttempt;
-        prepared = null;
-        latestPrepared = null;
-        finishDecision();
-        let failure: unknown = null;
-        try { current?.coordinator?.broadcastSignedOut?.(); } catch (error) { failure = rememberFailure(failure, error); }
-        const cleanups = new Set<Promise<void>>();
-        if (currentPrepared) cleanups.add(beginRelease(currentPrepared.attempt, currentPrepared.value));
-        if (currentAttempt) cleanups.add(beginRelease(currentAttempt, currentAttempt.engine));
-        if (currentOwner) cleanups.add(beginRelease(currentOwner, currentOwner.engine));
-        for (const cleanup of cleanups) {
-          try { await cleanup; } catch (error) { failure = rememberFailure(failure, error); }
-        }
-        let destroyedRecovery = false;
-        try { destroyedRecovery = currentOwner ? destroyPrivateProLifecycleOwnerRecovery(currentOwner.owner) : false; } catch (error) { failure = rememberFailure(failure, error); }
-        if (!destroyedRecovery) {
-          try { await dependencies.beforeClear?.(); } catch (error) { failure = rememberFailure(failure, error); }
-        }
-        try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
-        try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
-        try { dependencies.reload(); } catch (error) { failure = rememberFailure(failure, error); }
-        if (failure) throw new PrivateProLifecycleError();
-      })().finally(() => { signOutPromise = null; });
-      return signOutPromise;
+    handleSignedOut: () => {
+      finishDecision();
+      return beginDestructiveSignOut(true, prepared, attempt);
     },
 
     stop,
@@ -839,12 +893,13 @@ function createProductionLifecycle(
         deactivateAssets: deactivatePrivateProAssetPersistence,
         async prepareAssets() {
           const local = createPrivateProAssetLocalPort(uid, privateProSyncDB);
-          const coordinator = createPrivateProSyncCoordinator({ uid, leases: privateProSyncDB });
+          const coordinatorBinding = createProductionPrivateProSyncCoordinator({ uid, leases: privateProSyncDB });
+          const coordinator = coordinatorBinding.coordinator;
           const transport = createPrivateProFirebaseSyncTransport(uid);
           const assets = createPrivateProAssetClient(uid, undefined, { wake: () => coordinator.wake() }, local, undefined, {
             port: privateProSyncDB,
             ...ASSET_UPLOAD_LEASE_TIMING,
-          });
+          }, { port: privateProSyncDB });
           assertPrivateProPrepareCurrent(isCurrent);
           await activatePrivateProAssetPersistence(uid, owner, local, (assetId, guard) => assets.delete(assetId, guard));
           assertPrivateProPrepareCurrent(isCurrent);
@@ -864,6 +919,8 @@ function createProductionLifecycle(
             runSuppressed: callback => callback(),
             statusStore,
           });
+          coordinatorBinding.bindEngine(engine);
+          coordinatorBinding.bindLifecycle(lifecycle);
           return { engine, coordinator, resumeStartupCapture: () => startupBuffer.start() };
         },
       });

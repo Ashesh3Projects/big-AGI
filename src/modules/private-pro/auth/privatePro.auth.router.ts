@@ -25,19 +25,29 @@ function createPrivateProAuthAdminPort(): PrivateProAuthAdminPort {
       if (!snapshot.exists) return 'absent';
       return snapshot.data()?.state === 'complete' ? 'complete' : 'running';
     },
-    async activateAccount(input) {
-      const reference = firestore.doc(`users/${input.uid}`);
+    async activateAccountIfResetIdle(input) {
+      const resetReference = firestore.doc('privateProOperations/workspaceV1Reset-v1');
+      const accountReference = firestore.doc(`users/${input.uid}`);
       return firestore.runTransaction(async transaction => {
-        const snapshot = await transaction.get(reference);
-        const existing = snapshot.exists ? snapshot.data() as PrivateProAccountRecord : null;
+        const resetSnapshot = await transaction.get(resetReference);
+        const accountSnapshot = await transaction.get(accountReference);
+        if (resetSnapshot.exists && resetSnapshot.data()?.state !== 'complete') throw new PrivateProResetInProgressError();
+        const existing = accountSnapshot.exists ? accountSnapshot.data() as PrivateProAccountRecord : null;
         const account = activatePrivateProAccountRecord(existing, input);
-        transaction.set(reference, account);
+        transaction.set(accountReference, account);
         return account;
       });
     },
     async setClaims(uid, claims) {
       const user = await auth.getUser(uid);
       await auth.setCustomUserClaims(uid, { ...user.customClaims, ...claims });
+    },
+    async clearClaims(uid) {
+      const user = await auth.getUser(uid);
+      const claims = { ...user.customClaims };
+      delete claims.privatePro;
+      delete claims.privateProEpoch;
+      await auth.setCustomUserClaims(uid, claims);
     },
     async revokeRefreshTokens(uid) {
       await auth.revokeRefreshTokens(uid);

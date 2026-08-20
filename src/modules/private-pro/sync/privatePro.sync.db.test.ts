@@ -309,10 +309,14 @@ describe('Private Pro seamless sync database', () => {
 
     await seedUid(db, UID_A);
     await seedUid(db, UID_B);
+    await db.putAssetCleanupDebt(UID_A, 'asset-a', ['original'], 1, 1_000, 'offline');
+    await db.putAssetCleanupDebt(UID_B, 'asset-b', ['thumb256'], 1, 1_000, 'offline');
     await db.clearUid(UID_A);
 
     assert.equal((await db.listLocalRecords(UID_A)).length, 0);
     assert.notEqual((await db.listLocalRecords(UID_B)).length, 0);
+    assert.equal(await db.assetCleanupDebt.get([UID_A, 'asset-a']), undefined);
+    assert.notEqual(await db.assetCleanupDebt.get([UID_B, 'asset-b']), undefined);
   });
 
   test('leases due work once until the lease expires', async (t) => {
@@ -366,6 +370,27 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(otherUid.fence, 1);
     assert.equal(renewed?.ownerToken, current.ownerToken);
     assert.equal(renewed?.expiresAtMs, 12_000);
+  });
+
+  test('keeps cleanup debt lease fences monotonic across durable retries', async (t) => {
+    const db = createDB(t);
+    await db.putAssetCleanupDebt(UID_A, 'asset-cleanup-fence', ['original'], 1, 1_000, 'offline');
+    const first = await db.leaseAssetCleanupDebt(UID_A, 1_000, 100);
+    if (!first?.leaseToken || first.leaseFence === null) assert.fail('Expected first cleanup debt lease.');
+    await db.settleAssetCleanupDebt(
+      UID_A,
+      first.assetId,
+      first.leaseToken,
+      first.leaseFence,
+      ['original'],
+      1_200,
+      'offline',
+    );
+
+    const second = await db.leaseAssetCleanupDebt(UID_A, 1_200, 100);
+
+    if (!second || second.leaseFence === null) assert.fail('Expected second cleanup debt lease.');
+    assert.ok(second.leaseFence > first.leaseFence);
   });
 
   test('does not let a delayed asset renewal resurrect an owner after release', async (t) => {

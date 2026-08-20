@@ -24,6 +24,12 @@ const IDENTITY: PrivateProIdentity = {
   expiresAt: 200,
 };
 
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>(resolve_ => { resolve = resolve_; });
+  return { promise, resolve };
+}
+
 class FakeAdminPort implements PrivateProAuthAdminPort {
   account: PrivateProAccountRecord | null = null;
   claims: { privatePro: true; privateProEpoch: number } | null = null;
@@ -41,12 +47,21 @@ class FakeAdminPort implements PrivateProAuthAdminPort {
     return structuredClone(this.account);
   }
 
+  async activateAccountIfResetIdle(input: { uid: string; email: string; nowMs: number }) {
+    if (await this.getWorkspaceResetState() === 'running') throw new PrivateProResetInProgressError();
+    return this.activateAccount(input);
+  }
+
   async setClaims(_uid: string, claims: { privatePro: true; privateProEpoch: number }) {
     this.claims = claims;
   }
 
   async revokeRefreshTokens() {
     // Not used by bootstrap.
+  }
+
+  async clearClaims() {
+    this.claims = null;
   }
 }
 
@@ -146,13 +161,74 @@ describe('private Pro account bootstrap', () => {
 
   test('rechecks reset journal after account activation and before claims', async () => {
     const admin = new FakeAdminPort();
-    admin.resetStates = ['absent', 'running'];
+    admin.resetStates = ['absent', 'absent', 'running'];
     await assert.rejects(
       bootstrapPrivateProAccount(IDENTITY, admin, { allowedEmails: new Set(['friend@example.com']), nowMs: 5000 }),
       error => error instanceof PrivateProResetInProgressError,
     );
     assert.equal(admin.saved, 1);
     assert.equal(admin.claims, null);
+  });
+
+  test('does not commit activation when reset begins before the atomic activation transaction commits', async () => {
+    const admin = new FakeAdminPort();
+    const transactionEntered = deferred<void>();
+    const releaseTransaction = deferred<void>();
+    admin.activateAccount = async input => {
+      transactionEntered.resolve();
+      await releaseTransaction.promise;
+      admin.account = activatePrivateProAccountRecord(admin.account, input);
+      admin.saved++;
+      return structuredClone(admin.account);
+    };
+    admin.activateAccountIfResetIdle = async input => {
+      transactionEntered.resolve();
+      await releaseTransaction.promise;
+      if (admin.resetState === 'running') throw new PrivateProResetInProgressError();
+      admin.account = activatePrivateProAccountRecord(admin.account, input);
+      admin.saved++;
+      return structuredClone(admin.account);
+    };
+
+    const bootstrap = bootstrapPrivateProAccount(IDENTITY, admin, {
+      allowedEmails: new Set(['friend@example.com']),
+      nowMs: 5000,
+    });
+    await transactionEntered.promise;
+    admin.resetState = 'running';
+    releaseTransaction.resolve();
+
+    await assert.rejects(bootstrap, error => error instanceof PrivateProResetInProgressError);
+    assert.equal(admin.saved, 0);
+    assert.equal(admin.account, null);
+    assert.equal(admin.claims, null);
+  });
+
+  test('clears newly issued claims and revokes tokens when reset starts after claim issuance', async () => {
+    const admin = new FakeAdminPort();
+    let revoked = 0;
+    admin.resetStates = ['absent', 'absent', 'absent', 'running'];
+    admin.revokeRefreshTokens = async () => { revoked++; };
+
+    await assert.rejects(
+      bootstrapPrivateProAccount(IDENTITY, admin, { allowedEmails: new Set(['friend@example.com']), nowMs: 5000 }),
+      error => error instanceof PrivateProResetInProgressError,
+    );
+
+    assert.equal(admin.claims, null);
+    assert.equal(revoked, 1);
+  });
+
+  test('maps claim cleanup failures to reset unavailability without exposing raw errors', async () => {
+    const admin = new FakeAdminPort();
+    admin.resetStates = ['absent', 'absent', 'absent', 'running'];
+    admin.clearClaims = async () => { throw new Error('secret claims failure'); };
+    admin.revokeRefreshTokens = async () => { throw new Error('secret revoke failure'); };
+
+    await assert.rejects(
+      bootstrapPrivateProAccount(IDENTITY, admin, { allowedEmails: new Set(['friend@example.com']), nowMs: 5000 }),
+      error => error instanceof PrivateProResetInProgressError && !error.message.includes('secret'),
+    );
   });
 
   test('maps reset lock to sanitized temporary unavailability', () => {

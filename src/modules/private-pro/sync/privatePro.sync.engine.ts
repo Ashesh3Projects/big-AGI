@@ -32,6 +32,7 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
 export interface PrivateProSyncEngine {
   start(): Promise<void>;
   capture(mutation: PrivateProSyncLocalMutation): Promise<void>;
+  wake(): void;
   retryNow(): Promise<void>;
   flushNow(timeoutMs: number): Promise<{ pending: number }>;
   pendingCount(): Promise<number>;
@@ -112,6 +113,8 @@ export interface PrivateProSyncEngineDependencies {
   assets?: {
     ensureUploaded(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
     hydrate(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
+    nextCleanupDueAt?(): Promise<number | null>;
+    processCleanupDebt?(signal?: AbortSignal): Promise<boolean>;
   };
   runSuppressed<T>(callback: () => Promise<T> | T): Promise<T> | T;
   createOutbound?: (hooks: OutboundHooks) => PrivateProSyncEngineOutbound;
@@ -339,6 +342,9 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       onCommitted,
       onStatus: status => outboundHooks.onStatus(status),
       lifecycleSignal: () => lifecycleAbort.signal,
+      now,
+      setTimeout: scheduleTimeout,
+      clearTimeout: cancelTimeout,
     });
     return implementation;
   })();
@@ -518,6 +524,10 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     capture: async mutation => {
       if (!outbound.capture) throw new TypeError('Private Pro sync outbound capture is unavailable.');
       await outbound.capture(mutation);
+    },
+
+    wake(): void {
+      outbound.wake();
     },
 
     retryNow,

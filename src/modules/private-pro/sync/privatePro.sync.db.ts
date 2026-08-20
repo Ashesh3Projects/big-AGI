@@ -8,7 +8,7 @@ import type { DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import type { PrivateProAssetManifest } from '../assets/privatePro.assets.schemas';
 
 
-export const PRIVATE_PRO_SYNC_DB_VERSION = 2;
+export const PRIVATE_PRO_SYNC_DB_VERSION = 3;
 
 function throwIfCaptureAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw captureAbortError();
@@ -87,6 +87,21 @@ export interface PrivateProAssetUploadLease {
   ownerToken: string;
 }
 
+export type PrivateProAssetCleanupObjectKind = 'original' | 'thumb256';
+export type PrivateProAssetCleanupErrorCategory = 'permission' | 'offline' | 'quota' | 'unknown';
+
+export interface PrivateProAssetCleanupDebt {
+  uid: string;
+  assetId: string;
+  objectKinds: readonly PrivateProAssetCleanupObjectKind[];
+  attemptCount: number;
+  nextAttemptAtMs: number;
+  leaseUntilMs: number | null;
+  leaseToken: string | null;
+  leaseFence: number | null;
+  errorCategory: PrivateProAssetCleanupErrorCategory | null;
+}
+
 export interface PrivateProSyncQuarantineState {
   id?: number;
   uid: string;
@@ -149,6 +164,7 @@ export class PrivateProSyncDB extends Dexie {
   assets!: Table<PrivateProSyncAssetState, [string, string]>;
   leases!: Table<PrivateProCoordinatorLease, [string, string]>;
   assetUploadLeases!: Table<PrivateProAssetUploadLease, [string, string]>;
+  assetCleanupDebt!: Table<PrivateProAssetCleanupDebt, [string, string]>;
   meta!: Table<PrivateProSyncMetaState, [string, string]>;
 
   constructor(name = 'private-pro-workspace-v1') {
@@ -166,6 +182,7 @@ export class PrivateProSyncDB extends Dexie {
     this.version(PRIVATE_PRO_SYNC_DB_VERSION).stores({
       ...storesV1,
       assetUploadLeases: '[uid+assetId], uid, expiresAtMs, fence',
+      assetCleanupDebt: '[uid+assetId], uid, nextAttemptAtMs, leaseUntilMs',
     });
   }
 
@@ -786,14 +803,90 @@ export class PrivateProSyncDB extends Dexie {
     });
   }
 
+  async putAssetCleanupDebt(
+    uid: string,
+    assetId: string,
+    objectKinds: readonly PrivateProAssetCleanupObjectKind[],
+    attemptCount: number,
+    nextAttemptAtMs: number,
+    errorCategory: PrivateProAssetCleanupErrorCategory,
+  ): Promise<void> {
+    await this.transaction('rw', this.assetCleanupDebt, async () => {
+      const current = await this.assetCleanupDebt.get([uid, assetId]);
+      await this.assetCleanupDebt.put({
+        uid,
+        assetId,
+        objectKinds: [...new Set([...(current?.objectKinds ?? []), ...objectKinds])],
+        attemptCount: Math.max(attemptCount, current?.attemptCount ?? 0),
+        nextAttemptAtMs: Math.min(nextAttemptAtMs, current?.nextAttemptAtMs ?? nextAttemptAtMs),
+        leaseUntilMs: null,
+        leaseToken: null,
+        leaseFence: null,
+        errorCategory,
+      });
+    });
+  }
+
+  async nextAssetCleanupDueAt(uid: string): Promise<number | null> {
+    return (await this.assetCleanupDebt.where('uid').equals(uid).toArray()).reduce<number | null>((earliest, entry) => {
+      const schedulableAt = entry.leaseUntilMs === null ? entry.nextAttemptAtMs : Math.max(entry.nextAttemptAtMs, entry.leaseUntilMs);
+      return earliest === null ? schedulableAt : Math.min(earliest, schedulableAt);
+    }, null);
+  }
+
+  async leaseAssetCleanupDebt(uid: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetCleanupDebt | null> {
+    return this.transaction('rw', this.assetCleanupDebt, async () => {
+      const due = (await this.assetCleanupDebt.where('uid').equals(uid).toArray())
+        .filter(entry => entry.nextAttemptAtMs <= nowMs && (entry.leaseUntilMs === null || entry.leaseUntilMs <= nowMs))
+        .sort((left, right) => left.nextAttemptAtMs - right.nextAttemptAtMs || left.assetId.localeCompare(right.assetId))[0];
+      if (!due) return null;
+      due.leaseUntilMs = nowMs + leaseMs;
+      due.leaseToken = crypto.randomUUID();
+      due.leaseFence = (due.leaseFence ?? 0) + 1;
+      await this.assetCleanupDebt.put(due);
+      return { ...due, objectKinds: [...due.objectKinds] };
+    });
+  }
+
+  async settleAssetCleanupDebt(
+    uid: string,
+    assetId: string,
+    leaseToken: string,
+    leaseFence: number,
+    remainingKinds: readonly PrivateProAssetCleanupObjectKind[],
+    nextAttemptAtMs: number,
+    errorCategory: PrivateProAssetCleanupErrorCategory | null,
+  ): Promise<boolean> {
+    return this.transaction('rw', this.assetCleanupDebt, async () => {
+      const current = await this.assetCleanupDebt.get([uid, assetId]);
+      if (!current || current.leaseToken !== leaseToken || current.leaseFence !== leaseFence) return false;
+      if (!remainingKinds.length) {
+        await this.assetCleanupDebt.delete([uid, assetId]);
+        return true;
+      }
+      await this.assetCleanupDebt.put({
+        ...current,
+        objectKinds: [...new Set(remainingKinds)],
+        attemptCount: current.attemptCount + 1,
+        nextAttemptAtMs,
+        leaseUntilMs: null,
+        leaseToken: null,
+        leaseFence: current.leaseFence,
+        errorCategory,
+      });
+      return true;
+    });
+  }
+
   async clearUid(uid: string): Promise<void> {
-    await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.quarantine, this.assets, this.leases, this.assetUploadLeases, this.meta], async () => {
+    await this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.quarantine, this.assets, this.leases, this.assetUploadLeases, this.assetCleanupDebt, this.meta], async () => {
       await Promise.all([
         this.localRecords.where('uid').equals(uid).delete(),
         this.outbox.where('uid').equals(uid).delete(),
         this.remoteBases.where('uid').equals(uid).delete(),
         this.quarantine.where('uid').equals(uid).delete(),
         this.assets.where('uid').equals(uid).delete(),
+        this.assetCleanupDebt.where('uid').equals(uid).delete(),
         this.meta.where('uid').equals(uid).delete(),
       ]);
       const leases = await this.leases.where('uid').equals(uid).toArray();

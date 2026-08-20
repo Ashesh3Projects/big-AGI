@@ -677,6 +677,54 @@ describe('Private Pro seamless sync outbound', () => {
     await second.stop();
   });
 
+  test('leader scheduler resumes due cleanup debt after restart without a hot loop', async (t) => {
+    const name = `private-pro-sync-cleanup-restart-${crypto.randomUUID()}`;
+    const db = new PrivateProSyncDB(name);
+    const clock = new ManualClock();
+    let processed = 0;
+    const cleanupAssets = {
+      ensureUploaded: async () => {},
+      nextCleanupDueAt: () => db.nextAssetCleanupDueAt(UID),
+      processCleanupDebt: async () => {
+        const debt = await db.leaseAssetCleanupDebt(UID, clock.now(), 15_000);
+        if (!debt?.leaseToken || debt.leaseFence === null) return false;
+        processed++;
+        await db.settleAssetCleanupDebt(UID, debt.assetId, debt.leaseToken, debt.leaseFence, [], clock.now(), null);
+        return true;
+      },
+    };
+    const createOutbound = () => createPrivateProSyncOutbound({
+      uid: UID,
+      writerId: WRITER_ID,
+      serializers: [],
+      db,
+      coordinator: new FakeCoordinator(),
+      transport: new FakeTransport(),
+      assets: cleanupAssets,
+      now: clock.now,
+      setTimeout: clock.setTimeout,
+      clearTimeout: clock.clearTimeout,
+    });
+    t.after(async () => {
+      db.close();
+      await Dexie.delete(name);
+    });
+    await db.putAssetCleanupDebt(UID, 'asset-cleanup', ['thumb256'], 1, 1_000, 'offline');
+    const first = createOutbound();
+    await first.start();
+    await first.stop();
+    const restarted = createOutbound();
+    await restarted.start();
+
+    await clock.advance(999);
+    assert.equal(processed, 0);
+    await clock.advance(1);
+    assert.equal(processed, 1);
+    await clock.advance(10_000);
+    assert.equal(processed, 1);
+    await restarted.stop();
+  });
+
   test('durably blocks a permission failure and reports only its sanitized category', async (t) => {
     const { outbound, transport, clock, db, statuses } = createHarness(t);
     transport.results.push(new PrivateProSyncTransportError('permission'));

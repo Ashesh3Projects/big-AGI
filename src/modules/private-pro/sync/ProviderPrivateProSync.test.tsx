@@ -1,7 +1,11 @@
+import 'fake-indexeddb/auto';
+
 import assert from 'node:assert/strict';
-import { describe, test } from 'node:test';
+import { describe, test, type TestContext } from 'node:test';
 import * as React from 'react';
 import { renderToStaticMarkup } from 'react-dom/server';
+
+import Dexie from 'dexie';
 
 import { privateProClientConfig } from '../config/privatePro.config';
 import {
@@ -9,6 +13,7 @@ import {
   createPrivateProSyncLifecycle,
   createPrivateProBufferedSyncLifecycle,
   createPrivateProStartupMutationBuffer,
+  createProductionPrivateProSyncCoordinator,
   preparePrivateProPersistenceOwner,
   PrivateProUnsyncedChangesError,
   PrivateProWorkspaceTransitionScreen,
@@ -18,6 +23,8 @@ import {
   type PrivateProSyncLifecycleEngine,
   waitForPrivateProSyncLifecycleOwner,
 } from './ProviderPrivateProSync';
+import { createPrivateProSyncEngine } from './privatePro.sync.engine';
+import { PrivateProSyncDB } from './privatePro.sync.db';
 import { createPrivateProSyncStore } from './store-private-pro-sync';
 import { PrivateProAccountControlContent } from '../ui/PrivateProAccountControl';
 import { PrivateProAccountControl } from '../ui/PrivateProAccountControl';
@@ -29,6 +36,131 @@ function deferred<T>() {
   let reject!: (reason?: unknown) => void;
   const promise = new Promise<T>((resolve_, reject_) => { resolve = resolve_; reject = reject_; });
   return { promise, resolve, reject };
+}
+
+async function settle(): Promise<void> {
+  for (let index = 0; index < 20; index++) {
+    await Promise.resolve();
+    await new Promise<void>(resolve => setImmediate(resolve));
+  }
+}
+
+class ProductionCompositionClock {
+  nowMs = 0;
+  private nextId = 1;
+  private readonly timers = new Map<number, { at: number; callback: () => void }>();
+
+  now = (): number => this.nowMs;
+  setTimeout = (callback: () => void, ms: number): ReturnType<typeof globalThis.setTimeout> => {
+    const id = this.nextId++;
+    this.timers.set(id, { at: this.nowMs + Math.max(0, ms), callback });
+    return id as unknown as ReturnType<typeof globalThis.setTimeout>;
+  };
+  clearTimeout = (id: ReturnType<typeof globalThis.setTimeout>): void => { this.timers.delete(id as unknown as number); };
+
+  async advance(ms: number): Promise<void> {
+    const target = this.nowMs + ms;
+    while (true) {
+      await settle();
+      const next = [...this.timers.entries()]
+        .filter(([, timer]) => timer.at <= target)
+        .sort((left, right) => left[1].at - right[1].at || left[0] - right[0])[0];
+      if (!next) break;
+      this.nowMs = next[1].at;
+      this.timers.delete(next[0]);
+      next[1].callback();
+    }
+    this.nowMs = target;
+    await settle();
+  }
+}
+
+class ProductionCompositionLocks {
+  private readonly queues = new Map<string, Array<{
+    callback: () => Promise<void>;
+    resolve: () => void;
+    reject: (error: unknown) => void;
+    signal?: AbortSignal;
+  }>>();
+  private readonly held = new Set<string>();
+
+  request(name: string, options: LockOptions, callback: () => Promise<void>): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      const queue = this.queues.get(name) ?? [];
+      const entry = { callback, resolve, reject, signal: options.signal };
+      queue.push(entry);
+      this.queues.set(name, queue);
+      options.signal?.addEventListener('abort', () => {
+        const index = queue.indexOf(entry);
+        if (index < 0) return;
+        queue.splice(index, 1);
+        reject(new DOMException('aborted', 'AbortError'));
+      }, { once: true });
+      this.pump(name);
+    });
+  }
+
+  private pump(name: string): void {
+    if (this.held.has(name)) return;
+    const entry = this.queues.get(name)?.shift();
+    if (!entry) return;
+    if (entry.signal?.aborted) {
+      entry.reject(new DOMException('aborted', 'AbortError'));
+      this.pump(name);
+      return;
+    }
+    this.held.add(name);
+    void entry.callback().then(entry.resolve, entry.reject).finally(() => {
+      this.held.delete(name);
+      this.pump(name);
+    });
+  }
+}
+
+class ProductionCompositionBroadcastChannel {
+  static readonly channels = new Map<string, Set<ProductionCompositionBroadcastChannel>>();
+  onmessage: ((event: MessageEvent<unknown>) => void) | null = null;
+
+  constructor(readonly name: string) {
+    const peers = ProductionCompositionBroadcastChannel.channels.get(name) ?? new Set();
+    peers.add(this);
+    ProductionCompositionBroadcastChannel.channels.set(name, peers);
+  }
+
+  postMessage(message: unknown): void {
+    for (const peer of ProductionCompositionBroadcastChannel.channels.get(this.name) ?? []) {
+      if (peer !== this) peer.onmessage?.({ data: message } as MessageEvent<unknown>);
+    }
+  }
+
+  close(): void {
+    const peers = ProductionCompositionBroadcastChannel.channels.get(this.name);
+    peers?.delete(this);
+    if (!peers?.size) ProductionCompositionBroadcastChannel.channels.delete(this.name);
+  }
+}
+
+function productionCompositionSerializer(): PrivateProSyncSerializer<unknown> {
+  return {
+    recordType: 'settings',
+    schemaVersion: 1,
+    conflictPolicy: 'replace',
+    snapshot: async () => [],
+    validate: async (_logicalId, value) => structuredClone(value),
+    project: logicalId => ({ projectionKey: logicalId, referencedAssetIds: [] }),
+    projection: { apply: async () => {}, remove: async () => {} },
+    subscribe: () => () => {},
+  };
+}
+
+function productionCompositionDB(t: TestContext): PrivateProSyncDB {
+  const name = `private-pro-provider-composition-${crypto.randomUUID()}`;
+  const db = new PrivateProSyncDB(name);
+  t.after(async () => {
+    db.close();
+    await Dexie.delete(name);
+  });
+  return db;
 }
 
 function fakeEngine(options: { pending?: number } = {}) {
@@ -45,6 +177,142 @@ function fakeEngine(options: { pending?: number } = {}) {
 }
 
 describe('ProviderPrivateProSync', () => {
+  test('production coordinator composition wakes the leader for follower-only capture without expediting its minute deadline', async (t) => {
+    const uid = 'uid-production-wake';
+    const db = productionCompositionDB(t);
+    const locks = new ProductionCompositionLocks();
+    const clock = new ProductionCompositionClock();
+    const writes: number[] = [];
+    const transport = {
+      async write(input: { baseRevision: number }) {
+        writes.push(clock.nowMs);
+        return { status: 'accepted' as const, revision: input.baseRevision + 1 };
+      },
+      listen: () => () => {},
+    };
+    const createAccount = (writerId: string) => {
+      const binding = createProductionPrivateProSyncCoordinator({
+        uid,
+        leases: db,
+        locks,
+        broadcastChannel: ProductionCompositionBroadcastChannel,
+      });
+      const engine = createPrivateProSyncEngine({
+        uid,
+        writerId,
+        serializers: [productionCompositionSerializer()],
+        db,
+        coordinator: binding.coordinator,
+        transport,
+        runSuppressed: callback => callback(),
+        now: clock.now,
+        setTimeout: clock.setTimeout,
+        clearTimeout: clock.clearTimeout,
+      });
+      binding.bindEngine(engine);
+      return { binding, engine };
+    };
+    const leader = createAccount('123e4567-e89b-42d3-a456-426614174101');
+    const follower = createAccount('123e4567-e89b-42d3-a456-426614174102');
+    t.after(async () => {
+      await Promise.allSettled([leader.engine.stop(), follower.engine.stop()]);
+    });
+    await leader.engine.start();
+    await follower.engine.start();
+    await settle();
+    assert.equal(leader.binding.coordinator.isLeader(), true);
+    assert.equal(follower.binding.coordinator.isLeader(), false);
+
+    await follower.engine.capture({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { theme: 'dark' }, referencedAssetIds: [],
+    } });
+    await settle();
+
+    await clock.advance(59_999);
+    assert.deepEqual(writes, []);
+    await clock.advance(1);
+    assert.deepEqual(writes, [60_000]);
+  });
+
+  test('a peer signed-out signal quiesces and clears the sibling lifecycle without a broadcast loop', async (t) => {
+    const uid = 'uid-production-sign-out';
+    const order: string[] = [];
+    const locks = new ProductionCompositionLocks();
+    const sender = createProductionPrivateProSyncCoordinator({ uid, locks, broadcastChannel: ProductionCompositionBroadcastChannel });
+    const sibling = createProductionPrivateProSyncCoordinator({ uid, locks, broadcastChannel: ProductionCompositionBroadcastChannel });
+    let loopSignals = 0;
+    sender.bindLifecycle({ handleSignedOut: async () => { loopSignals++; } });
+    const engine: PrivateProSyncLifecycleEngine = {
+      async start() {
+        order.push('start');
+        await sibling.coordinator.start(context => new Promise(resolve => context.signal.addEventListener('abort', () => resolve(), { once: true })));
+      },
+      async retryNow() {},
+      async flushNow() { order.push('flush'); return { pending: 0 }; },
+      async pendingCount() { return 0; },
+      async stop() { order.push('stop'); await sibling.coordinator.stop(); },
+    };
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid,
+      statusStore: createPrivateProSyncStore(),
+      prepare: async () => ({ engine, coordinator: sibling.coordinator }),
+      release: async () => { order.push('release'); },
+      clear: async value => { order.push(`clear:${value}`); },
+      firebaseSignOut: async () => { order.push('auth'); },
+      reload: () => { order.push('reload'); },
+      pendingCount: async () => 0,
+    });
+    sibling.bindLifecycle(lifecycle);
+    await sender.coordinator.start(context => new Promise(resolve => context.signal.addEventListener('abort', () => resolve(), { once: true })));
+    await lifecycle.start();
+    t.after(async () => { await sender.coordinator.stop(); });
+
+    sender.coordinator.broadcastSignedOut?.();
+    await settle();
+
+    assert.deepEqual(order, ['start', 'stop', 'release', `clear:${uid}`, 'auth', 'reload']);
+    assert.equal(loopSignals, 0);
+  });
+
+  test('a peer signed-out signal preempts an unresolved local sign-out decision and shares cleanup', async () => {
+    const pending = deferred<{ pending: number }>();
+    const order: string[] = [];
+    let broadcasts = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-peer-race',
+      statusStore: createPrivateProSyncStore(),
+      prepare: async () => ({
+        engine: {
+          async start() {},
+          async retryNow() {},
+          flushNow: () => pending.promise,
+          async pendingCount() { return 0; },
+          async stop() { order.push('stop'); },
+        },
+        coordinator: { broadcastSignedOut: () => { broadcasts++; } },
+      }),
+      release: async () => { order.push('release'); },
+      clear: async () => { order.push('clear'); },
+      firebaseSignOut: async () => { order.push('auth'); },
+      reload: () => { order.push('reload'); },
+      pendingCount: async () => 0,
+    });
+    await lifecycle.start();
+    const localSignOut = lifecycle.signOut();
+    await Promise.resolve();
+
+    await Promise.race([
+      lifecycle.handleSignedOut(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('peer sign-out waited for local decision')))),
+    ]);
+    pending.resolve({ pending: 1 });
+    await localSignOut;
+
+    assert.deepEqual(order, ['stop', 'release', 'clear', 'auth', 'reload']);
+    assert.equal(broadcasts, 0);
+  });
+
   test('buffers only edits emitted while prepare is pending and reuses them after a failed attempt', async () => {
     let emit: (mutation: PrivateProSyncLocalMutation) => void = () => assert.fail('Startup buffer listener was not installed.');
     const serializer = {
@@ -445,6 +713,7 @@ describe('ProviderPrivateProSync', () => {
           start: () => startup.promise,
           retry: async () => {},
           signOut: async () => {},
+          handleSignedOut: async () => {},
           stop: async () => {},
         },
       },

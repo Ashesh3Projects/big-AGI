@@ -25,6 +25,7 @@ const OUTBOX_LEASE_MS = 15_000;
 const RETRY_BASE_MS = 1_000;
 const RETRY_CAP_MS = PRIVATE_PRO_SYNC_WINDOW_MS;
 const ASSET_READINESS_RECHECK_MS = 1_000;
+const ASSET_CLEANUP_MIN_INTERVAL_MS = 250;
 
 type TimeoutHandle = ReturnType<typeof globalThis.setTimeout>;
 export type PrivateProOutboundErrorCategory = PrivateProSyncErrorCategory | 'schema';
@@ -61,6 +62,8 @@ export interface PrivateProSyncOutboundStatus {
 
 export interface PrivateProSyncAssetPort {
   ensureUploaded(referencedAssetIds: readonly string[], signal?: AbortSignal): Promise<void>;
+  nextCleanupDueAt?(): Promise<number | null>;
+  processCleanupDebt?(signal?: AbortSignal): Promise<boolean>;
 }
 
 export interface PrivateProSyncOutboundDependencies {
@@ -161,6 +164,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   let captureOwner: CaptureOwner = { epoch: captureEpoch, controller: new AbortController() };
   let captureQueue: Promise<void> = Promise.resolve();
   let drainPromise: Promise<void> | null = null;
+  let cleanupNotBeforeMs = 0;
 
   function report(category: PrivateProOutboundErrorCategory): void {
     dependencies.onStatus?.({ category });
@@ -187,7 +191,14 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       clearTimer();
       return;
     }
-    const dueAt = await dependencies.db.nextDueAt(dependencies.uid);
+    const [outboxDueAt, cleanupDueAt] = await Promise.all([
+      dependencies.db.nextDueAt(dependencies.uid),
+      assets.nextCleanupDueAt?.() ?? Promise.resolve(null),
+    ]);
+    const scheduledCleanupDueAt = cleanupDueAt === null ? null : Math.max(cleanupDueAt, cleanupNotBeforeMs);
+    const dueAt = outboxDueAt === null
+      ? scheduledCleanupDueAt
+      : scheduledCleanupDueAt === null ? outboxDueAt : Math.min(outboxDueAt, scheduledCleanupDueAt);
     if (version !== scheduleVersion || !leaderContext || leaderContext.signal.aborted || stopped) return;
     if (dueAt === null) {
       clearTimer();
@@ -509,6 +520,12 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
   async function drain(context: PrivateProSyncLeaderContext): Promise<void> {
     const captureOutcome = await raceAbortable(captureQueue, context.signal);
     if (captureOutcome.type !== 'result') return;
+    if (assets.processCleanupDebt) {
+      const cleanupOutcome = await raceAbortable(assets.processCleanupDebt(context.signal), context.signal);
+      if (cleanupOutcome.type === 'aborted') return;
+      if (cleanupOutcome.type === 'error') report(privateProClassifySyncError(cleanupOutcome.error));
+      else if (cleanupOutcome.result) cleanupNotBeforeMs = now() + ASSET_CLEANUP_MIN_INTERVAL_MS;
+    }
     while (!context.signal.aborted && !stopped) {
       const row = await dependencies.db.leaseDue(dependencies.uid, now(), OUTBOX_LEASE_MS, context.coordinatorFence);
       if (!row) return;

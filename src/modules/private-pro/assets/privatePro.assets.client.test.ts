@@ -115,12 +115,16 @@ function harness(t: TestContext) {
   const storage = new FakeStorage();
   let wakes = 0;
   const locks = new FakeLocks();
-  const client = createPrivateProAssetClient(UID, storage, { wake: () => { wakes++; } }, local, locks, leaseFallback(db));
+  let nowMs = 0;
+  const client = createPrivateProAssetClient(UID, storage, { wake: () => { wakes++; } }, local, locks, leaseFallback(db), {
+    port: db,
+    now: () => nowMs,
+  });
   t.after(async () => {
     db.close();
     await Dexie.delete(name);
   });
-  return { client, db, local, storage, locks, wakes: () => wakes };
+  return { client, db, local, storage, locks, wakes: () => wakes, setNow: (value: number) => { nowMs = value; } };
 }
 
 function leaseFallback(db: PrivateProSyncDB) {
@@ -780,6 +784,45 @@ describe('Private Pro direct assets', () => {
       `users/${UID}/workspace-v1/assets/${asset.id}/thumb256`,
     ].sort());
     assert.ok(wakes() >= 2);
+  });
+
+  test('persists partial cleanup debt and a restarted client retries only the remaining fixed object', async (t) => {
+    const { client, db, local, storage } = harness(t);
+    const asset = fixture('asset-cleanup-restart');
+    await local.putAsset(asset);
+    await client.ensureUploaded([asset.id]);
+    const originalPath = `users/${UID}/workspace-v1/assets/${asset.id}/original`;
+    const thumbPath = `users/${UID}/workspace-v1/assets/${asset.id}/thumb256`;
+    storage.failDeletePaths.add(thumbPath);
+
+    await assert.rejects(client.delete(asset.id), /cleanup failed/i);
+
+    assert.equal(storage.objects.has(originalPath), false);
+    assert.equal(storage.objects.has(thumbPath), true);
+    const debt = await db.assetCleanupDebt.get([UID, asset.id]);
+    assert.deepEqual(debt, {
+      uid: UID,
+      assetId: asset.id,
+      objectKinds: ['thumb256'],
+      attemptCount: 1,
+      nextAttemptAtMs: 1_000,
+      leaseUntilMs: null,
+      leaseToken: null,
+      leaseFence: null,
+      errorCategory: 'unknown',
+    });
+    assert.equal(JSON.stringify(debt).includes('users/'), false);
+    assert.equal(JSON.stringify(debt).includes('original bytes'), false);
+
+    storage.failDeletePaths.clear();
+    const restarted = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, leaseFallback(db), {
+      port: db,
+      now: () => 1_000,
+    });
+    await restarted.processCleanupDebt();
+
+    assert.equal(storage.objects.has(thumbPath), false);
+    assert.equal(await db.assetCleanupDebt.get([UID, asset.id]), undefined);
   });
 
   test('treats already missing fixed objects as an idempotent delete success', async (t) => {

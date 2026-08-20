@@ -3,7 +3,12 @@ import { deleteObject, getBytes, getMetadata, ref, uploadBytesResumable, type Fu
 import type { DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import { getPrivateProClientStorage } from '../firebase/firebase.client';
 import { assertPrivateProPayloadSize, privateProCanonicalJson, privateProContentHash } from '../sync/privatePro.sync.codec';
-import type { PrivateProAssetUploadLease } from '../sync/privatePro.sync.db';
+import type {
+  PrivateProAssetCleanupDebt,
+  PrivateProAssetCleanupErrorCategory,
+  PrivateProAssetCleanupObjectKind,
+  PrivateProAssetUploadLease,
+} from '../sync/privatePro.sync.db';
 import { PrivateProSyncTransportError } from '../sync/privatePro.sync.transport';
 import type { PrivateProAssetActivationGuard, PrivateProAssetLocalPort } from './privatePro.assets.local';
 import {
@@ -49,10 +54,41 @@ export interface PrivateProAssetUploadLeaseOptions {
   now?: () => number;
 }
 
+export interface PrivateProAssetCleanupDebtPort {
+  putAssetCleanupDebt(
+    uid: string,
+    assetId: string,
+    objectKinds: readonly PrivateProAssetCleanupObjectKind[],
+    attemptCount: number,
+    nextAttemptAtMs: number,
+    errorCategory: PrivateProAssetCleanupErrorCategory,
+  ): Promise<void>;
+  nextAssetCleanupDueAt(uid: string): Promise<number | null>;
+  leaseAssetCleanupDebt(uid: string, nowMs: number, leaseMs: number): Promise<PrivateProAssetCleanupDebt | null>;
+  settleAssetCleanupDebt(
+    uid: string,
+    assetId: string,
+    leaseToken: string,
+    leaseFence: number,
+    remainingKinds: readonly PrivateProAssetCleanupObjectKind[],
+    nextAttemptAtMs: number,
+    errorCategory: PrivateProAssetCleanupErrorCategory | null,
+  ): Promise<boolean>;
+}
+
+export interface PrivateProAssetCleanupOptions {
+  port: PrivateProAssetCleanupDebtPort;
+  now?: () => number;
+  leaseMs?: number;
+  retryBaseMs?: number;
+}
+
 export interface PrivateProAssetClient {
   ensureUploaded(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
   hydrate(assetIds: readonly string[], signal?: AbortSignal): Promise<void>;
   delete(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
+  nextCleanupDueAt(): Promise<number | null>;
+  processCleanupDebt(signal?: AbortSignal): Promise<boolean>;
   clearLocal(): Promise<void>;
 }
 
@@ -175,11 +211,65 @@ export function createPrivateProAssetClient(
   local: PrivateProAssetLocalPort,
   locks?: PrivateProAssetLockPort | null,
   leaseOptions?: PrivateProAssetUploadLeaseOptions,
+  cleanupOptions?: PrivateProAssetCleanupOptions,
 ): PrivateProAssetClient {
   if (!uid) throw new TypeError('Private Pro asset UID is required.');
   const uploadQueues = new Map<string, Promise<void>>();
   const selectedLocks = locks === undefined ? browserLockPort() : locks;
   const durableLease = leaseOptions ? durableLeaseLockPort(uid, leaseOptions) : unavailableLeasePort();
+  const cleanupPort = cleanupOptions?.port;
+  const cleanupNow = cleanupOptions?.now ?? Date.now;
+  const cleanupLeaseMs = cleanupOptions?.leaseMs ?? 15_000;
+  const cleanupRetryBaseMs = cleanupOptions?.retryBaseMs ?? 1_000;
+
+  function cleanupDelay(attemptCount: number): number {
+    return Math.min(60_000, cleanupRetryBaseMs * (2 ** Math.min(6, Math.max(0, attemptCount - 1))));
+  }
+
+  function cleanupCategory(error: unknown): PrivateProAssetCleanupErrorCategory {
+    try {
+      storageError(error);
+    } catch (classified) {
+      return classified instanceof PrivateProSyncTransportError ? classified.category : 'unknown';
+    }
+  }
+
+  async function deleteKinds(assetId: string, kinds: readonly PrivateProAssetCleanupObjectKind[]): Promise<{
+    remaining: PrivateProAssetCleanupObjectKind[];
+    category: PrivateProAssetCleanupErrorCategory | null;
+  }> {
+    const remaining: PrivateProAssetCleanupObjectKind[] = [];
+    let category: PrivateProAssetCleanupErrorCategory | null = null;
+    for (const kind of kinds) {
+      try {
+        await storage.deleteObject(objectPath(uid, assetId, kind));
+      } catch (error) {
+        if (isObjectNotFound(error)) continue;
+        remaining.push(kind);
+        category ??= cleanupCategory(error);
+      }
+    }
+    return { remaining, category };
+  }
+
+  async function processCleanupDebt(signal?: AbortSignal): Promise<boolean> {
+    if (!cleanupPort) return false;
+    abortIfNeeded(signal);
+    const debt = await cleanupPort.leaseAssetCleanupDebt(uid, cleanupNow(), cleanupLeaseMs);
+    if (!debt || !debt.leaseToken || debt.leaseFence === null) return false;
+    const outcome = await deleteKinds(debt.assetId, debt.objectKinds);
+    abortIfNeeded(signal);
+    await cleanupPort.settleAssetCleanupDebt(
+      uid,
+      debt.assetId,
+      debt.leaseToken,
+      debt.leaseFence,
+      outcome.remaining,
+      cleanupNow() + cleanupDelay(debt.attemptCount + 1),
+      outcome.category,
+    );
+    return true;
+  }
 
   function requestUploadLease<T>(assetId: string, signal: AbortSignal | undefined, callback: (guard: PrivateProAssetUploadLeaseGuard) => Promise<T>): Promise<T> {
     const name = `private-pro-asset-upload:${uid}:${assetId}`;
@@ -287,15 +377,20 @@ export function createPrivateProAssetClient(
       await local.deleteAsset(assetId, guard);
       guard?.assertActive();
       transport.wake();
-      const outcomes = await Promise.allSettled([
-        storage.deleteObject(objectPath(uid, assetId, 'original')),
-        storage.deleteObject(objectPath(uid, assetId, 'thumb256')),
-      ]);
-      const failed = outcomes.find(outcome => outcome.status === 'rejected' && !isObjectNotFound(outcome.reason));
-      if (failed?.status === 'rejected') {
-        try { storageError(failed.reason); } catch (error) { throw new Error('Private Pro attachment cleanup failed.', { cause: error }); }
+      const outcome = await deleteKinds(assetId, ['original', 'thumb256']);
+      if (outcome.remaining.length) {
+        if (cleanupPort) {
+          await cleanupPort.putAssetCleanupDebt(uid, assetId, outcome.remaining, 1, cleanupNow() + cleanupDelay(1), outcome.category ?? 'unknown');
+        }
+        throw new Error('Private Pro attachment cleanup failed.', {
+          cause: new PrivateProSyncTransportError(outcome.category ?? 'unknown'),
+        });
       }
     },
+
+    processCleanupDebt,
+
+    nextCleanupDueAt: () => cleanupPort?.nextAssetCleanupDueAt(uid) ?? Promise.resolve(null),
 
     clearLocal: () => local.clear(),
   };

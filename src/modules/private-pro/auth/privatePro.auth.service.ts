@@ -33,12 +33,13 @@ export class PrivateProResetInProgressError extends Error {
 
 export interface PrivateProAuthAdminPort {
   getWorkspaceResetState(): Promise<'absent' | 'running' | 'complete'>;
-  activateAccount(input: {
+  activateAccountIfResetIdle(input: {
     uid: string;
     email: string;
     nowMs: number;
   }): Promise<PrivateProAccountRecord>;
   setClaims(uid: string, claims: { privatePro: true; privateProEpoch: number }): Promise<void>;
+  clearClaims(uid: string): Promise<void>;
   revokeRefreshTokens(uid: string): Promise<void>;
 }
 
@@ -80,13 +81,20 @@ export async function bootstrapPrivateProAccount(
   if (!identity.emailVerified || !isPrivateProEmailAllowed(identity.email, options.allowedEmails))
     throw new PrivateProAccessDeniedError();
 
-  const account = await admin.activateAccount({
+  const account = await admin.activateAccountIfResetIdle({
     uid: identity.uid,
     email: identity.email,
     nowMs: options.nowMs,
   });
   if (await admin.getWorkspaceResetState() === 'running') throw new PrivateProResetInProgressError();
   await admin.setClaims(identity.uid, { privatePro: true, privateProEpoch: account.accessEpoch });
+  if (await admin.getWorkspaceResetState() === 'running') {
+    await Promise.allSettled([
+      admin.clearClaims(identity.uid),
+      admin.revokeRefreshTokens(identity.uid),
+    ]);
+    throw new PrivateProResetInProgressError();
+  }
 
   return {
     uid: account.uid,
