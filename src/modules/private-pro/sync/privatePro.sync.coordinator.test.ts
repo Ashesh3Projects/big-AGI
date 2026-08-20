@@ -349,6 +349,24 @@ describe('Private Pro sync coordinator', () => {
     await starting;
   });
 
+  for (const [label, cancellation] of [
+    ['Error named AbortError', Object.assign(new Error('cancelled'), { name: 'AbortError' })],
+    ['nested abort cause', new Error('wrapped cancellation', { cause: { error: new DOMException('cancelled', 'AbortError') } })],
+  ] as const) {
+    test(`filters ${label} during the stop microtask checkpoint`, async () => {
+      const scheduler = new ManualScheduler();
+      const leases = new FakeLeasePort();
+      const leader = deferred<void>();
+      const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+      await coordinator.start(() => leader.promise);
+
+      leader.reject(cancellation);
+
+      await coordinator.stop();
+      assert.equal(coordinator.isLeader(), false);
+    });
+  }
+
   test('ignores a leader rejection after the stop checkpoint and preserves restart', async () => {
     const scheduler = new ManualScheduler();
     const leases = new FakeLeasePort();

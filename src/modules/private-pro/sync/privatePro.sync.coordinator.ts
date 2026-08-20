@@ -1,4 +1,5 @@
 import type { PrivateProCoordinatorLease } from './privatePro.sync.db';
+import { isAbortErrorLike } from '~/common/util/errorUtils';
 
 
 const COORDINATOR_NAME = 'sync';
@@ -68,11 +69,6 @@ function sameLeaseIdentity(left: LeaseIdentity | null, right: LeaseIdentity | nu
   return !!left && !!right && left.fence === right.fence && left.ownerToken === right.ownerToken;
 }
 
-function isAbortError(error: unknown): boolean {
-  return error instanceof DOMException && error.name === 'AbortError';
-}
-
-
 export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinatorOptions): PrivateProSyncCoordinator {
   const locks = options.locks ?? (typeof window !== 'undefined' ? globalThis.navigator?.locks : undefined);
   const broadcastChannel = options.broadcastChannel ?? (typeof window !== 'undefined' ? globalThis.BroadcastChannel : undefined);
@@ -109,7 +105,7 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
   }
 
   function rememberFailure(generation: number, error: unknown, signal?: AbortSignal): void {
-    if (!canRememberFailure(generation) || coordinatorFailure || (signal?.aborted && isAbortError(error))) return;
+    if (!canRememberFailure(generation) || coordinatorFailure || (signal?.aborted && isAbortErrorLike(error))) return;
     coordinatorFailure = error;
   }
 

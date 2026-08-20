@@ -169,3 +169,30 @@ GREEN:
 - The stopping generation is failure-reportable for one microtask only and is never leadership-active during that window.
 - Snapshotting happens before generation invalidation; all later callbacks see a stale generation.
 - Exact regexes match the provided verified codec boundaries without claiming logical-ID digest verification.
+
+## Fix round 3
+
+### Findings addressed
+
+- Coordinator cancellation filtering now uses the shared `isAbortErrorLike` classifier from `errorUtils` instead of a local DOMException-only check.
+- Expected stop-checkpoint cancellation includes DOMException AbortError, ordinary `Error` values named `AbortError`, and recursively nested `cause` or `error` abort values.
+- Genuine non-abort leader and acquire rejections settled before stop remain reportable and are returned by stop.
+
+### TDD evidence
+
+RED:
+
+- An `Error` named `AbortError` and an error containing a nested abort cause were both incorrectly returned by stop under the DOMException-only classifier.
+
+GREEN:
+
+- Coordinator focused suite: 25 passed, 0 failed.
+- Focused coordinator, provider lifecycle, engine, reconciler, Firebase transport, and direct asset matrix: 160 passed, 0 failed.
+- Root TypeScript: exit 0.
+- Scoped ESLint: exit 0.
+- Diff check: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- The shared classifier is already the application-wide cancellation definition and recursively handles `cause` and `error` wrappers.
+- Existing immediate genuine failure tests prevent cancellation filtering from swallowing unrelated pre-stop failures.
