@@ -1,5 +1,6 @@
 import { execFile as execFileCallback } from 'node:child_process';
 import { createPublicKey, verify } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { access, readFile } from 'node:fs/promises';
 import { delimiter, dirname, join } from 'node:path';
 import { promisify, TextDecoder } from 'node:util';
@@ -46,7 +47,7 @@ const REQUIRED_APP_CHECK_SERVICES = new Set(['firebaseauth.googleapis.com', 'fir
 const ALLOWED_AUTH_DOMAINS = new Set(['chatgpt.ashesh.dev', 'big-agi-243b6.firebaseapp.com']);
 export const EXPECTED_PRIVATE_PRO_BUCKET_CORS = [{
   origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-  method: ['DELETE', 'GET', 'POST', 'PUT'],
+  method: ['DELETE', 'GET', 'POST'],
   responseHeader: [
     'Authorization',
     'Content-Type',
@@ -188,6 +189,7 @@ interface BucketCorsFacts {
   duplicateOrigins: number;
   duplicateMethods: number;
   duplicateHeaders: number;
+  maxAgeMatches: boolean;
 }
 
 interface AppCheckFacts {
@@ -439,6 +441,7 @@ export function classifyBucketCors(facts: BucketCorsFacts): AuditFinding[] {
     finding('bucketCors', 'duplicateOrigins', facts.duplicateOrigins === 0 ? 'pass' : 'block', facts.duplicateOrigins),
     finding('bucketCors', 'duplicateMethods', facts.duplicateMethods === 0 ? 'pass' : 'block', facts.duplicateMethods),
     finding('bucketCors', 'duplicateHeaders', facts.duplicateHeaders === 0 ? 'pass' : 'block', facts.duplicateHeaders),
+    booleanFinding('bucketCors', 'maxAgeMatches', facts.maxAgeMatches),
   ];
 }
 
@@ -1308,6 +1311,7 @@ export function inspectBucketCors(
     duplicateOrigins: 0,
     duplicateMethods: 0,
     duplicateHeaders: 0,
+    maxAgeMatches: false,
   };
 
   const rules = asRecords(rawCors);
@@ -1329,6 +1333,7 @@ export function inspectBucketCors(
     duplicateOrigins: origins.length - new Set(origins).size,
     duplicateMethods: methods.length - new Set(methods).size,
     duplicateHeaders: headers.length - new Set(headers).size,
+    maxAgeMatches: rules.length === 1 && rules[0].maxAgeSeconds === EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].maxAgeSeconds,
   };
 }
 
@@ -2069,25 +2074,86 @@ async function collectDependencyAudit(): Promise<DependencyAuditFacts> {
   return inspectDependencyAudit(await runJson('npm', ['audit', '--omit=dev', '--json'], true));
 }
 
-async function probeRead(url: string): Promise<ProbeState> {
-  const response = await fetch(url, {
-    method: 'GET',
-  });
-  if (response.status === 401 || response.status === 403) return 'denied';
+function endpointProbeState(response: Response): ProbeState {
+  if ([401, 403, 404].includes(response.status)) return 'denied';
   if (response.ok) return 'allowed';
   return 'unknown';
 }
 
-async function collectFirebaseRuleProbes(projectId: string, storageBucket: string): Promise<FirebaseRuleProbeFacts> {
-  const marker = 'security-audit-public-probe';
-  const firestoreDocument = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/databases/(default)/documents/${marker}/probe`;
-  const storageObject = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(storageBucket)}/o/${encodeURIComponent(`${marker}/probe`)}`;
+async function endpointProbe(request: () => Promise<Response>): Promise<ProbeState> {
+  try {
+    return endpointProbeState(await request());
+  } catch {
+    return 'unknown';
+  }
+}
+
+export async function collectFirebaseEndpointProbes(input: {
+  projectId: string;
+  storageBucket: string;
+  apiKey: string;
+  marker: string;
+  fetch: typeof fetch;
+}): Promise<FirebaseRuleProbeFacts> {
+  const uid = `anonymous-audit-${input.marker}`;
+  const firestorePath = `users/${uid}/workspaces/v1/records/settings_audit`;
+  const firestoreReceiptPath = `users/${uid}/workspaces/v1/mutationReceipts/${input.marker}`;
+  const storagePath = `users/${uid}/workspace-v1/assets/audit/original`;
+  const firestoreDocument = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents/${firestorePath}?key=${encodeURIComponent(input.apiKey)}`;
+  const firestoreReceipt = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents/${firestoreReceiptPath}?key=${encodeURIComponent(input.apiKey)}`;
+  const firestoreCommit = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents:commit?key=${encodeURIComponent(input.apiKey)}`;
+  const storageObject = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o/${encodeURIComponent(storagePath)}?key=${encodeURIComponent(input.apiKey)}`;
+  const storageUpload = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?uploadType=media&name=${encodeURIComponent(storagePath)}&key=${encodeURIComponent(input.apiKey)}`;
+  const documentName = `projects/${input.projectId}/databases/(default)/documents/${firestorePath}`;
+  const receiptName = `projects/${input.projectId}/databases/(default)/documents/${firestoreReceiptPath}`;
+  const firestoreRead = await endpointProbe(() => input.fetch(firestoreDocument, { method: 'GET' }));
+  const storageRead = await endpointProbe(() => input.fetch(`${storageObject}&alt=media`, { method: 'GET' }));
+  const firestoreWrite = await endpointProbe(() => input.fetch(firestoreCommit, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ writes: [
+      { update: { name: documentName, fields: {
+        recordType: { stringValue: 'settings' }, logicalId: { stringValue: 'audit' }, schemaVersion: { integerValue: '1' }, payload: { stringValue: '{}' }, contentHash: { stringValue: '0'.repeat(64) }, revision: { integerValue: '1' }, mutationId: { stringValue: input.marker }, writerId: { stringValue: input.marker }, deleted: { booleanValue: false }, updatedAt: { timestampValue: '1970-01-01T00:00:00Z' },
+      } }, updateTransforms: [{ fieldPath: 'updatedAt', setToServerValue: 'REQUEST_TIME' }] },
+      { update: { name: receiptName, fields: {
+        schemaVersion: { integerValue: '1' }, mutationId: { stringValue: input.marker }, recordKey: { stringValue: 'settings_audit' }, recordType: { stringValue: 'settings' }, logicalId: { stringValue: 'audit' }, kind: { stringValue: 'put' }, contentHash: { stringValue: '0'.repeat(64) }, revision: { integerValue: '1' }, writerId: { stringValue: input.marker }, committedAt: { timestampValue: '1970-01-01T00:00:00Z' },
+      } }, updateTransforms: [{ fieldPath: 'committedAt', setToServerValue: 'REQUEST_TIME' }] },
+    ] }),
+  }));
+  const storageWrite = await endpointProbe(() => input.fetch(storageUpload, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/octet-stream',
+      'x-goog-meta-uid': uid,
+      'x-goog-meta-assetid': 'audit',
+      'x-goog-meta-kind': 'original',
+      'x-goog-meta-sha256': '0'.repeat(64),
+    },
+    body: new Uint8Array([0]),
+  }));
+  if (firestoreWrite === 'allowed') {
+    await endpointProbe(() => input.fetch(firestoreDocument, { method: 'DELETE' }));
+    await endpointProbe(() => input.fetch(firestoreReceipt, { method: 'DELETE' }));
+  }
+  if (storageWrite === 'allowed') await endpointProbe(() => input.fetch(storageObject, { method: 'DELETE' }));
   return {
-    firestoreRead: await probeRead(firestoreDocument),
-    firestoreWrite: 'unknown',
-    storageRead: await probeRead(storageObject),
-    storageWrite: 'unknown',
+    firestoreRead,
+    firestoreWrite,
+    storageRead,
+    storageWrite,
   };
+}
+
+async function collectFirebaseRuleProbes(projectId: string, storageBucket: string): Promise<FirebaseRuleProbeFacts> {
+  const apiKey = process.env.NEXT_PUBLIC_FIREBASE_API_KEY?.trim();
+  if (!apiKey) throw new Error('Firebase browser API key is missing.');
+  return collectFirebaseEndpointProbes({
+    projectId,
+    storageBucket,
+    apiKey,
+    marker: randomUUID(),
+    fetch,
+  });
 }
 
 function validateProjectId(value: string): string {

@@ -58,8 +58,9 @@ Required server configuration:
 
 ```dotenv
 PRIVATE_PRO_ALLOWED_EMAILS=you@example.com,friend@example.com
-PRIVATE_PRO_MAX_FILE_BYTES=67108864
 ```
+
+The v1 attachment size limit is a fixed 64 MiB rule and schema constant. It is not deployment configuration.
 
 Runtime identity configuration:
 
@@ -109,7 +110,7 @@ The reset command defaults to a count-only dry run:
 npm run private-pro:reset-workspaces
 ```
 
-It reads Auth users, account documents, exact legacy Firestore subtrees, and exact Storage prefixes. It prints only the project ID, UIDs, counts, and approved epoch transitions. It does not print emails, claims, document payloads, object names, or object bytes.
+Before listing or deleting any object, it proves the configured bucket name and numeric project ownership against the configured Firebase project. It reads Auth users, account documents, exact legacy Firestore subtrees, and exact Storage prefixes. It prints only the project ID, UIDs, counts, epoch transitions, fixed stages, and fixed error codes. It does not print emails, claims, upstream error messages, document or object paths, payloads, credentials, or object bytes.
 
 Execution requires both flags and an exact match with `NEXT_PUBLIC_FIREBASE_PROJECT_ID`:
 
@@ -117,7 +118,7 @@ Execution requires both flags and an exact match with `NEXT_PUBLIC_FIREBASE_PROJ
 npm run private-pro:reset-workspaces -- --execute --confirm <project-id>
 ```
 
-Execution refuses an empty allowlist. It never deletes Auth identities. Approved verified identities receive a clean current account record and rotated claims. Other account documents and all orphan account documents are deleted after their exact Firestore subtrees and Storage prefixes are cleared. Refresh tokens are revoked for every Auth identity whose claims are rotated or cleared.
+Execution refuses an empty allowlist. It never deletes Auth identities. Each Auth UID is fenced with an inactive fixed target epoch, cleared claims, and revoked tokens before cleanup. Approved verified identities receive a clean active account and matching claims at that same epoch after cleanup. Other account documents and all orphan account documents are deleted after cleanup. Refresh tokens are revoked again after final convergence. Reruns reuse an in-progress or completed target epoch instead of rotating endlessly.
 
 Do not run reset execution against production without separate approval of the reviewed dry-run counts.
 
@@ -170,6 +171,6 @@ No command in this document records a production change as completed.
 
 ## Recovery and spending
 
-Follow `infra/private-pro/firestore-recovery-controls.md` for deletion protection, recovery policy, and approval-gated restore rehearsals. Recovery copies contain server-readable plaintext.
+Configure Firestore deletion protection. Select PITR or managed backup controls only after an approved RPO, RTO, retention, location, and cost decision. Any restore rehearsal must use a new empty non-default database, deploy the current v1 rules and indexes, compare per-collection document counts and content hashes, exercise application reconstruction in an isolated environment, and delete the rehearsal resources only with separate approval. Recovery copies contain server-readable plaintext.
 
 Configure Google Cloud budgets and alerts. Monitor Firestore operations and stored bytes, Storage operations and egress, App Check rejection metrics, and Vercel runtime usage. Budget alerts do not impose a hard spending cap.

@@ -44,3 +44,14 @@
 - Reset execution is intentionally destructive and remains approval-gated.
 - The runtime IAM manifest is locally validated but still requires separately approved cloud provisioning and live validation.
 - CORS is derived from the installed SDK source and mounted calls. A production browser trace should remain part of the approval evidence before mutation.
+
+## Fix round 1
+
+- Bound the configured Storage bucket to its metadata name and the confirmed numeric Firebase project before any object count or deletion.
+- Made reset epochs resumable and idempotent across account-only, claims-only, fenced, and completed partial states. Unsafe epoch overflow now fails closed.
+- Added the execution fence: inactive target-epoch account, cleared claims, and token revocation before cleanup, followed by final convergence at the same epoch and a second revocation.
+- Execution now stops on the first UID failure and emits only sanitized UIDs, counts, fixed stages, and fixed error codes. Top-level failures and invalid arguments do not echo upstream content.
+- Added unauthenticated valid-shaped v1 Firestore and Storage read/write endpoint probes with best-effort cleanup after unexpected allowed writes.
+- Added the redacted installed-SDK CORS trace fixture, removed unused PUT, and audited exact methods, headers, rule count, and max age.
+- Removed `PRIVATE_PRO_MAX_FILE_BYTES` from current environment docs. The v1 attachment limit is documented as a fixed 64 MiB rule constant.
+- Replaced the stale recovery runbook link with concise current plaintext v1 recovery requirements.

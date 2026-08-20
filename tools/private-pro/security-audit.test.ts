@@ -20,6 +20,7 @@ import {
   classifyRuntimeRoleManifest,
   classifyServiceAccountKeys,
   collectProjectNumber,
+  collectFirebaseEndpointProbes,
   runCommand,
   selectRuntimeIdentity,
   buildAuditReport,
@@ -1110,14 +1111,19 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(wrong.unrelatedApiTargets, 0);
   });
 
-  test('passes only the observed Firebase Web Storage SDK bucket CORS', () => {
+  test('passes only the checked-in Firebase Web Storage trace CORS', async () => {
+    const trace = JSON.parse(await readFile('infra/private-pro/firebase-storage-cors-trace.json', 'utf8')) as {
+      expectedCors: unknown;
+    };
+    assert.deepEqual(trace.expectedCors, EXPECTED_PRIVATE_PRO_BUCKET_CORS);
     const exact = inspectBucketCors({ cors: EXPECTED_PRIVATE_PRO_BUCKET_CORS });
 
     assert.equal(classifyBucketCors(exact).every(finding => finding.severity === 'pass'), true);
     assert.equal(classifyBucketCors(inspectBucketCors({ cors_config: [{
       origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-      method: ['DELETE', 'GET', 'POST', 'PUT'],
+      method: ['DELETE', 'GET', 'POST'],
       responseHeader: [...EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader],
+      maxAgeSeconds: 3600,
     }] })).every(finding => finding.severity === 'pass'), true);
   });
 
@@ -1131,13 +1137,19 @@ describe('private Pro security audit classifiers', () => {
     }] });
     const missingUploadHeader = inspectBucketCors({ cors: [{
       origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-      method: ['DELETE', 'GET', 'POST', 'PUT'],
+      method: ['DELETE', 'GET', 'POST'],
       responseHeader: EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader.filter(header => header !== 'X-Goog-Upload-URL'),
+      maxAgeSeconds: 3600,
     }] });
     const duplicates = inspectBucketCors({ cors: [{
       origin: ['https://chatgpt.ashesh.dev', 'https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-      method: ['DELETE', 'GET', 'GET', 'POST', 'PUT'],
+      method: ['DELETE', 'GET', 'GET', 'POST'],
       responseHeader: [...EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader, 'Content-Type'],
+      maxAgeSeconds: 3600,
+    }] });
+    const wrongMaxAge = inspectBucketCors({ cors: [{
+      ...EXPECTED_PRIVATE_PRO_BUCKET_CORS[0],
+      maxAgeSeconds: 60,
     }] });
 
     assert.equal(classifyBucketCors(unreadable)[0].severity, 'block');
@@ -1148,6 +1160,7 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(broad.wildcardHeaders, 1);
     assert.equal(classifyBucketCors(missingUploadHeader).some(finding => finding.severity === 'block'), true);
     assert.equal(classifyBucketCors(duplicates).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyBucketCors(wrongMaxAge).some(finding => finding.severity === 'block'), true);
   });
 
   test('blocks disabled App Check enforcement', () => {
@@ -1568,6 +1581,45 @@ describe('private Pro security audit classifiers', () => {
     });
 
     assert.deepEqual(severities(findings), ['pass', 'block', 'block', 'pass']);
+  });
+
+  test('collects anonymous endpoint write denial, allowed cleanup, and unknown outcomes', async () => {
+    const requests: Array<{ url: string; method: string }> = [];
+    const denied = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      marker: '123e4567-e89b-42d3-a456-426614174000',
+      fetch: async (url, init) => {
+        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET' });
+        return new Response('', { status: 403 });
+      },
+    });
+    assert.deepEqual(denied, { firestoreRead: 'denied', firestoreWrite: 'denied', storageRead: 'denied', storageWrite: 'denied' });
+
+    requests.length = 0;
+    const allowed = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      marker: '123e4567-e89b-42d3-a456-426614174000',
+      fetch: async (url, init) => {
+        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET' });
+        return new Response('', { status: 200 });
+      },
+    });
+    assert.deepEqual(allowed, { firestoreRead: 'allowed', firestoreWrite: 'allowed', storageRead: 'allowed', storageWrite: 'allowed' });
+    assert.equal(requests.filter(request => request.method === 'DELETE').length, 3);
+    assert.doesNotMatch(JSON.stringify(requests), /secret-api-key/);
+
+    const unknown = await collectFirebaseEndpointProbes({
+      projectId: 'sample-project',
+      storageBucket: 'sample-project.firebasestorage.app',
+      apiKey: 'secret-api-key',
+      marker: '123e4567-e89b-42d3-a456-426614174000',
+      fetch: async () => { throw new Error('network secret'); },
+    });
+    assert.deepEqual(unknown, { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' });
   });
 
   test('reduces live collector payloads to booleans and counts', () => {

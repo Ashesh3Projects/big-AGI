@@ -26,7 +26,7 @@ It has these exact API targets:
 
 Private Pro uses Firebase Auth, App Check, Firestore, and Storage directly in approved browsers. Anonymous Firestore and Storage probes remain denied by rules. The browser referrer policy is `strict-origin-when-cross-origin`.
 
-The bucket has exactly this CORS policy. It matches the installed `@firebase/storage` 0.14.4 requests used by `uploadBytesResumable`, `getBytes`, `getMetadata`, and `deleteObject`. The SDK sends Firebase Auth, App Check, app ID, version, content type, and `X-Goog-Upload-*` request headers. Resumable upload reads the listed `X-Goog-Upload-*` response headers.
+The bucket has exactly this CORS policy. `infra/private-pro/firebase-storage-cors-trace.json` records the installed `@firebase/storage` 0.14.4 evidence for `uploadBytesResumable`, `getBytes`, `getMetadata`, and `deleteObject`. The SDK uses POST, GET, and DELETE. The trace separates request headers from response headers read by the SDK. Cloud Storage `responseHeader` must contain the exact combined preflight and exposed-header set below.
 
 ```json
 [
@@ -35,7 +35,7 @@ The bucket has exactly this CORS policy. It matches the installed `@firebase/sto
       "https://chatgpt.ashesh.dev",
       "https://big-agi-243b6.firebaseapp.com"
     ],
-    "method": ["DELETE", "GET", "POST", "PUT"],
+    "method": ["DELETE", "GET", "POST"],
     "responseHeader": [
       "Authorization",
       "Content-Type",
@@ -108,7 +108,7 @@ Keep separate local rollback files for the previous authorized domains, API key 
 - Run `npm run private-pro:security-audit` and require zero origin, key, CORS, IAM, or anonymous-rule blockers.
 - In a clean approved browser, complete Google sign-in and obtain App Check tokens.
 - Confirm authenticated direct Firestore sync and Storage upload, download, metadata, and delete.
-- Confirm anonymous Firestore and Storage reads remain denied.
+- Confirm anonymous Firestore and Storage read and write endpoints remain denied. A 401, 403, or 404 proves endpoint denial but may not distinguish Rules from browser API-key restrictions.
 - Confirm an unapproved origin cannot sign in or use bucket CORS.
 - Confirm App Check metrics for Firestore and Storage before enforcing both products.
 

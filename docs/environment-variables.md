@@ -67,7 +67,6 @@ HTTP_BASIC_AUTH_PASSWORD=
 
 # Private Pro Firebase deployment (see deploy-private-pro-firebase.md)
 PRIVATE_PRO_ALLOWED_EMAILS=
-PRIVATE_PRO_MAX_FILE_BYTES=67108864
 # Optional audit identity hint for ADC/WIF. Not a credential.
 PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL=
 PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS=
@@ -169,7 +168,6 @@ See [Private Pro Firebase deployment](deploy-private-pro-firebase.md) for the co
 | Variable                             | Description                                                                                         |
 |:-------------------------------------|:----------------------------------------------------------------------------------------------------|
 | `PRIVATE_PRO_ALLOWED_EMAILS`         | Comma-separated exact Google email allowlist.                                                       |
-| `PRIVATE_PRO_MAX_FILE_BYTES`         | Maximum size of one synchronized attachment. Defaults to 67108864 bytes.                            |
 | `PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL` | Expected dedicated runtime service-account email for live ADC and IAM-policy audit. Not proof of active identity and not a credential. |
 | `PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS` | Comma-separated exact WIF subject, attribute, or group principals from one numeric project and workload identity pool. Wildcards and other IAM member types are rejected. |
 | `FIREBASE_CLIENT_EMAIL`              | Optional static-key fallback service-account email. Server-only. Must be paired with `FIREBASE_PRIVATE_KEY`. |

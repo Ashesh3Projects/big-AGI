@@ -2,8 +2,11 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
+  assertPrivateProResetBucketBinding,
   buildPrivateProResetPlan,
+  executePrivateProResetActions,
   parsePrivateProResetArguments,
+  verifyPrivateProResetBucketBeforeInspection,
 } from './reset-workspaces';
 
 
@@ -132,13 +135,159 @@ test('normalizes allowlist matching and uses only valid epochs and creation time
   assert.equal(action.account.record.createdAtMs, NOW_MS);
 });
 
+test('reuses an in-progress or completed safe epoch without endless rotation', () => {
+  const currentAccount = (accessEpoch: number) => ({
+    uid: 'uid-a',
+    email: 'user@example.com',
+    active: true,
+    accessEpoch,
+    createdAtMs: 123,
+    updatedAtMs: 456,
+  });
+  const planFor = (accountEpoch: number, claims: Record<string, unknown>, active = true) => buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: false,
+    authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims }],
+    accountDocuments: [{ uid: 'uid-a', exists: true, data: { ...currentAccount(accountEpoch), active } }],
+    allowedEmails: new Set(['user@example.com']),
+    nowMs: NOW_MS,
+  }).actions[0];
+
+  assert.deepEqual(planFor(7, { privatePro: true, privateProEpoch: 6 }).epochTransition, { from: 7, to: 7 });
+  assert.deepEqual(planFor(7, {}, false).epochTransition, { from: 7, to: 7 });
+  assert.deepEqual(planFor(6, { privatePro: true, privateProEpoch: 7 }).epochTransition, { from: 7, to: 7 });
+  assert.deepEqual(planFor(7, { privatePro: true, privateProEpoch: 7 }).epochTransition, { from: 7, to: 7 });
+});
+
+test('increments legacy state once and rejects unsafe epoch overflow', () => {
+  const base = {
+    projectId: PROJECT_ID,
+    execute: false,
+    authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims: { privatePro: true, privateProEpoch: 8 } }],
+    allowedEmails: new Set(['user@example.com']),
+    nowMs: NOW_MS,
+  };
+  const legacy = buildPrivateProResetPlan({
+    ...base,
+    accountDocuments: [{ uid: 'uid-a', exists: true, data: { active: true, accessEpoch: 9, createdAtMs: 123 } }],
+  }).actions[0];
+  assert.deepEqual(legacy.epochTransition, { from: 9, to: 10 });
+
+  assert.throws(() => buildPrivateProResetPlan({
+    ...base,
+    authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims: { privateProEpoch: Number.MAX_SAFE_INTEGER } }],
+    accountDocuments: [],
+  }), /safe epoch/i);
+});
+
+test('binds the configured bucket to the confirmed numeric project before inspection', async () => {
+  assert.doesNotThrow(() => assertPrivateProResetBucketBinding({
+    configuredBucket: 'sample-project.firebasestorage.app',
+    actualBucketName: 'sample-project.firebasestorage.app',
+    bucketProjectNumber: '123456789012',
+    confirmedProjectNumber: '123456789012',
+  }));
+  assert.throws(() => assertPrivateProResetBucketBinding({
+    configuredBucket: 'sample-project.firebasestorage.app',
+    actualBucketName: 'other-project.firebasestorage.app',
+    bucketProjectNumber: '123456789012',
+    confirmedProjectNumber: '123456789012',
+  }), /bucket name/i);
+  assert.throws(() => assertPrivateProResetBucketBinding({
+    configuredBucket: 'sample-project.firebasestorage.app',
+    actualBucketName: 'sample-project.firebasestorage.app',
+    bucketProjectNumber: '999999999999',
+    confirmedProjectNumber: '123456789012',
+  }), /project number/i);
+
+  const calls: string[] = [];
+  await verifyPrivateProResetBucketBeforeInspection({
+    projectId: PROJECT_ID,
+    configuredBucket: 'sample-project.firebasestorage.app',
+    readConfirmedProjectNumber: async () => { calls.push('project'); return '123456789012'; },
+    readBucketMetadata: async () => { calls.push('bucket'); return { name: 'sample-project.firebasestorage.app', projectNumber: '123456789012' }; },
+    inspect: async () => { calls.push('inspect'); },
+  });
+  assert.deepEqual(calls, ['project', 'bucket', 'inspect']);
+});
+
+test('stops execution after one sanitized per-UID failure result', async () => {
+  const plan = buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: true,
+    confirm: PROJECT_ID,
+    authIdentities: [
+      { uid: 'uid-a', email: 'a@example.com', emailVerified: true, claims: {} },
+      { uid: 'uid-b', email: 'b@example.com', emailVerified: true, claims: {} },
+    ],
+    accountDocuments: [],
+    allowedEmails: new Set(['a@example.com', 'b@example.com']),
+    nowMs: NOW_MS,
+  });
+  const calls: string[] = [];
+  const results: unknown[] = [];
+  await assert.rejects(() => executePrivateProResetActions(plan.actions, {
+    inspect: async action => ({ uid: action.uid, documentCount: 3, objectCount: 4, epochTransition: action.epochTransition }),
+    fenceAccount: async () => undefined,
+    fenceClaims: async () => undefined,
+    revokeFenceTokens: async () => undefined,
+    cleanupFirestore: async action => { calls.push(action.uid); throw new Error('secret payload'); },
+    cleanupStorage: async () => assert.fail('Storage must not run after Firestore failure.'),
+    applyFinalAccount: async () => assert.fail('Account must not run after cleanup failure.'),
+    applyFinalClaims: async () => assert.fail('Claims must not run after cleanup failure.'),
+    revokeFinalTokens: async () => assert.fail('Revoke must not run after cleanup failure.'),
+    emit: result => { results.push(result); },
+  }), /reset failed/i);
+  assert.deepEqual(calls, ['uid-a']);
+  assert.deepEqual(results, [{
+    uid: 'uid-a',
+    documentCount: 3,
+    objectCount: 4,
+    epochTransition: { from: 0, to: 1 },
+    stage: 'firestore-cleanup',
+    success: false,
+    errorCode: 'FIRESTORE_CLEANUP_FAILED',
+  }]);
+  assert.doesNotMatch(JSON.stringify(results), /secret payload/);
+});
+
+test('fences access before cleanup and restores the same fixed epoch', async () => {
+  const action = buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: true,
+    confirm: PROJECT_ID,
+    authIdentities: [{ uid: 'uid-a', email: 'a@example.com', emailVerified: true, claims: { privatePro: true, privateProEpoch: 4 } }],
+    accountDocuments: [{ uid: 'uid-a', exists: true, data: { active: true, accessEpoch: 4, createdAtMs: 123 } }],
+    allowedEmails: new Set(['a@example.com']),
+    nowMs: NOW_MS,
+  }).actions[0];
+  const order: string[] = [];
+  await executePrivateProResetActions([action], {
+    inspect: async input => ({ uid: input.uid, documentCount: 0, objectCount: 0, epochTransition: input.epochTransition }),
+    fenceAccount: async input => { order.push(`fence-account:${input.epochTransition?.to}`); },
+    fenceClaims: async () => { order.push('fence-claims'); },
+    revokeFenceTokens: async () => { order.push('fence-tokens'); },
+    cleanupFirestore: async () => { order.push('firestore'); assert.deepEqual(order.slice(0, 3), [`fence-account:${action.epochTransition?.to}`, 'fence-claims', 'fence-tokens']); },
+    cleanupStorage: async () => { order.push('storage'); },
+    applyFinalAccount: async input => { order.push(`final-account:${input.epochTransition?.to}`); },
+    applyFinalClaims: async input => { order.push(`final-claims:${input.epochTransition?.to}`); },
+    revokeFinalTokens: async () => { order.push('final-tokens'); },
+    emit: () => undefined,
+  });
+  assert.deepEqual(order, [`fence-account:${action.epochTransition?.to}`, 'fence-claims', 'fence-tokens', 'firestore', 'storage', `final-account:${action.epochTransition?.to}`, `final-claims:${action.epochTransition?.to}`, 'final-tokens']);
+});
+
 test('defaults to dry run and enforces the exact destructive execution gate', () => {
   assert.deepEqual(parsePrivateProResetArguments([], PROJECT_ID), { execute: false, confirm: undefined });
   assert.deepEqual(parsePrivateProResetArguments(['--execute', '--confirm', PROJECT_ID], PROJECT_ID), { execute: true, confirm: PROJECT_ID });
   assert.throws(() => parsePrivateProResetArguments(['--execute'], PROJECT_ID), /--confirm/);
   assert.throws(() => parsePrivateProResetArguments(['--confirm', PROJECT_ID], PROJECT_ID), /--execute/);
   assert.throws(() => parsePrivateProResetArguments(['--execute', '--confirm', 'other-project'], PROJECT_ID), /exact project ID/);
-  assert.throws(() => parsePrivateProResetArguments(['--execute', '--confirm', PROJECT_ID, '--unknown'], PROJECT_ID), /Unknown argument/);
+  assert.throws(() => parsePrivateProResetArguments(['--execute', '--confirm', PROJECT_ID, '--secret-token'], PROJECT_ID), error => {
+    assert.match(String(error), /invalid reset arguments/i);
+    assert.doesNotMatch(String(error), /secret-token/);
+    return true;
+  });
 
   const base = {
     projectId: PROJECT_ID,
