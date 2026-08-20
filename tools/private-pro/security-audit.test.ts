@@ -1584,14 +1584,17 @@ describe('private Pro security audit classifiers', () => {
   });
 
   test('collects anonymous endpoint write denial, allowed cleanup, and unknown outcomes', async () => {
-    const requests: Array<{ url: string; method: string }> = [];
+    const requests: Array<{ url: string; method: string; body?: BodyInit | null; headers?: HeadersInit }> = [];
     const denied = await collectFirebaseEndpointProbes({
       projectId: 'sample-project',
       storageBucket: 'sample-project.firebasestorage.app',
       apiKey: 'secret-api-key',
-      marker: '123e4567-e89b-42d3-a456-426614174000',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      cleanupFirestore: async () => true,
+      cleanupStorage: async () => true,
       fetch: async (url, init) => {
-        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET' });
+        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET', body: init?.body, headers: init?.headers });
         return new Response('', { status: 403 });
       },
     });
@@ -1602,21 +1605,33 @@ describe('private Pro security audit classifiers', () => {
       projectId: 'sample-project',
       storageBucket: 'sample-project.firebasestorage.app',
       apiKey: 'secret-api-key',
-      marker: '123e4567-e89b-42d3-a456-426614174000',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      cleanupFirestore: async paths => { requests.push({ url: paths.join(','), method: 'ADMIN_DELETE' }); return true; },
+      cleanupStorage: async paths => { requests.push({ url: paths.join(','), method: 'ADMIN_DELETE' }); return true; },
       fetch: async (url, init) => {
-        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET' });
+        requests.push({ url: String(url).replace('secret-api-key', '<key>'), method: init?.method ?? 'GET', body: init?.body, headers: init?.headers });
         return new Response('', { status: 200 });
       },
     });
     assert.deepEqual(allowed, { firestoreRead: 'allowed', firestoreWrite: 'allowed', storageRead: 'allowed', storageWrite: 'allowed' });
-    assert.equal(requests.filter(request => request.method === 'DELETE').length, 3);
+    assert.equal(requests.filter(request => request.method === 'ADMIN_DELETE').length, 2);
+    const commit = requests.find(request => request.url.includes('documents:commit'));
+    assert.match(String(commit?.body), /security-audit/);
+    assert.match(String(commit?.body), /updateTransforms/);
+    const upload = requests.find(request => request.url.includes('uploadType=media'));
+    assert.equal((upload?.headers as Record<string, string>)['content-type'], 'image/png');
+    assert.match(String(upload?.url), /workspace-v1%2Fassets%2Faudit%2Foriginal/);
     assert.doesNotMatch(JSON.stringify(requests), /secret-api-key/);
 
     const unknown = await collectFirebaseEndpointProbes({
       projectId: 'sample-project',
       storageBucket: 'sample-project.firebasestorage.app',
       apiKey: 'secret-api-key',
-      marker: '123e4567-e89b-42d3-a456-426614174000',
+      auditUid: 'firebase-uid-a',
+      operationId: '123e4567-e89b-42d3-a456-426614174000',
+      cleanupFirestore: async () => true,
+      cleanupStorage: async () => true,
       fetch: async () => { throw new Error('network secret'); },
     });
     assert.deepEqual(unknown, { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' });

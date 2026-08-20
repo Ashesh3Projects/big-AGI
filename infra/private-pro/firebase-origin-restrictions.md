@@ -58,9 +58,9 @@ The bucket has exactly this CORS policy. `infra/private-pro/firebase-storage-cor
 
 Do not use wildcard origins, methods, headers, or referrers.
 
-## Read-only collection
+## Audit collection
 
-Do not save raw API key, IAM, Auth, or bucket output. Reduce it to counts and booleans.
+Most audit collectors are read-only. Anonymous Firestore and Storage probes perform bounded active writes against the existing approved UID in `PRIVATE_PRO_SECURITY_AUDIT_UID`. Unexpected allowed writes require operator cleanup and remain blockers if cleanup cannot be confirmed. Do not save raw API key, IAM, Auth, or bucket output. Reduce it to counts and booleans.
 
 ```powershell
 $ProjectId=$env:NEXT_PUBLIC_FIREBASE_PROJECT_ID

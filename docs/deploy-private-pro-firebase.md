@@ -58,6 +58,7 @@ Required server configuration:
 
 ```dotenv
 PRIVATE_PRO_ALLOWED_EMAILS=you@example.com,friend@example.com
+PRIVATE_PRO_SECURITY_AUDIT_UID=existing-approved-firebase-uid
 ```
 
 The v1 attachment size limit is a fixed 64 MiB rule and schema constant. It is not deployment configuration.

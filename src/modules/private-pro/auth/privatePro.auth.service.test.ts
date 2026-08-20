@@ -5,7 +5,9 @@ import {
   bootstrapPrivateProAccount,
   activatePrivateProAccountRecord,
   PrivateProAccessDeniedError,
+  PrivateProResetInProgressError,
   privateProAccountIsCurrent,
+  privateProBootstrapErrorCode,
   type PrivateProAccountRecord,
   type PrivateProAuthAdminPort,
 } from './privatePro.auth.service';
@@ -26,6 +28,11 @@ class FakeAdminPort implements PrivateProAuthAdminPort {
   account: PrivateProAccountRecord | null = null;
   claims: { privatePro: true; privateProEpoch: number } | null = null;
   saved = 0;
+  resetState: 'absent' | 'running' | 'complete' = 'absent';
+
+  async getWorkspaceResetState() {
+    return this.resetState;
+  }
 
   async activateAccount(input: { uid: string; email: string; nowMs: number }) {
     this.account = activatePrivateProAccountRecord(this.account, input);
@@ -117,6 +124,29 @@ describe('private Pro account bootstrap', () => {
       },
     );
     assert.equal(admin.saved, 0);
+  });
+
+  test('blocks bootstrap while the workspace reset journal is running', async () => {
+    const admin = new FakeAdminPort();
+    admin.resetState = 'running';
+    await assert.rejects(
+      bootstrapPrivateProAccount(IDENTITY, admin, { allowedEmails: new Set(['friend@example.com']), nowMs: 5000 }),
+      error => error instanceof PrivateProResetInProgressError,
+    );
+    assert.equal(admin.saved, 0);
+  });
+
+  test('allows bootstrap after the workspace reset journal is complete', async () => {
+    const admin = new FakeAdminPort();
+    admin.resetState = 'complete';
+    await bootstrapPrivateProAccount(IDENTITY, admin, { allowedEmails: new Set(['friend@example.com']), nowMs: 5000 });
+    assert.equal(admin.saved, 1);
+  });
+
+  test('maps reset lock to sanitized temporary unavailability', () => {
+    assert.equal(privateProBootstrapErrorCode(new PrivateProResetInProgressError()), 'SERVICE_UNAVAILABLE');
+    assert.equal(privateProBootstrapErrorCode(new PrivateProAccessDeniedError()), 'UNAUTHORIZED');
+    assert.equal(privateProBootstrapErrorCode(new Error('secret')), null);
   });
 });
 

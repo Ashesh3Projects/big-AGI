@@ -24,7 +24,15 @@ export interface PrivateProBootstrap {
   accessEpoch: number;
 }
 
+export class PrivateProResetInProgressError extends Error {
+  constructor() {
+    super('Private Pro is temporarily unavailable.');
+    this.name = 'PrivateProResetInProgressError';
+  }
+}
+
 export interface PrivateProAuthAdminPort {
+  getWorkspaceResetState(): Promise<'absent' | 'running' | 'complete'>;
   activateAccount(input: {
     uid: string;
     email: string;
@@ -37,6 +45,12 @@ export interface PrivateProAuthAdminPort {
 export interface PrivateProBootstrapOptions {
   allowedEmails: ReadonlySet<string>;
   nowMs: number;
+}
+
+export function privateProBootstrapErrorCode(error: unknown): 'UNAUTHORIZED' | 'SERVICE_UNAVAILABLE' | null {
+  if (error instanceof PrivateProAccessDeniedError) return 'UNAUTHORIZED';
+  if (error instanceof PrivateProResetInProgressError) return 'SERVICE_UNAVAILABLE';
+  return null;
 }
 
 export function activatePrivateProAccountRecord(
@@ -62,6 +76,7 @@ export async function bootstrapPrivateProAccount(
   admin: PrivateProAuthAdminPort,
   options: PrivateProBootstrapOptions,
 ): Promise<PrivateProBootstrap> {
+  if (await admin.getWorkspaceResetState() === 'running') throw new PrivateProResetInProgressError();
   if (!identity.emailVerified || !isPrivateProEmailAllowed(identity.email, options.allowedEmails))
     throw new PrivateProAccessDeniedError();
 

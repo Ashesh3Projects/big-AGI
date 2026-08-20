@@ -55,3 +55,13 @@
 - Added the redacted installed-SDK CORS trace fixture, removed unused PUT, and audited exact methods, headers, rule count, and max age.
 - Removed `PRIVATE_PRO_MAX_FILE_BYTES` from current environment docs. The v1 attachment limit is documented as a fixed 64 MiB rule constant.
 - Replaced the stale recovery runbook link with concise current plaintext v1 recovery requirements.
+
+## Fix round 2
+
+- Added a strict global reset operation journal and per-UID target journal. The journal freezes target epochs and phases across retries and is the only completion authority.
+- A complete operation makes reset reruns no-op. A failed operation stays running until resumed, and the operation is marked complete only after every target reaches complete.
+- Bootstrap now reads the server-only operation marker before account activation and returns temporary unavailability while reset is running.
+- Every account UID, including orphans, receives an inactive target-epoch fence before cleanup. Auth identities also have claims cleared and tokens revoked before cleanup.
+- Tightened epoch parsing so unsafe, fractional, negative, and non-finite numeric epochs fail closed.
+- Security audit probes now require `PRIVATE_PRO_SECURITY_AUDIT_UID`, target actual v1 paths, use a codec-derived record key and valid Storage metadata, and require operator cleanup for any unexpectedly allowed write.
+- Documented that `--report-only` still performs bounded active anonymous endpoint probes.

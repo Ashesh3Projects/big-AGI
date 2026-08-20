@@ -6,6 +6,8 @@ import {
   buildPrivateProResetPlan,
   executePrivateProResetActions,
   parsePrivateProResetArguments,
+  parsePrivateProResetOperation,
+  parsePrivateProResetTarget,
   verifyPrivateProResetBucketBeforeInspection,
 } from './reset-workspaces';
 
@@ -109,8 +111,8 @@ test('plans exact cleanup, approved account replacement, claim rotation, and Aut
   }
 });
 
-test('normalizes allowlist matching and uses only valid epochs and creation times', () => {
-  const plan = buildPrivateProResetPlan({
+test('normalizes allowlist matching and rejects invalid epochs', () => {
+  assert.throws(() => buildPrivateProResetPlan({
     projectId: PROJECT_ID,
     execute: false,
     authIdentities: [{
@@ -126,16 +128,10 @@ test('normalizes allowlist matching and uses only valid epochs and creation time
     }],
     allowedEmails: new Set([' user@example.com ']),
     nowMs: NOW_MS,
-  });
-
-  const action = plan.actions[0];
-  assert.equal(action.account.type, 'replace');
-  if (action.account.type !== 'replace') assert.fail('Expected account replacement.');
-  assert.equal(action.account.record.accessEpoch, 1);
-  assert.equal(action.account.record.createdAtMs, NOW_MS);
+  }), /epoch/i);
 });
 
-test('reuses an in-progress or completed safe epoch without endless rotation', () => {
+test('uses journal targets as the only authority for resumable epochs and phases', () => {
   const currentAccount = (accessEpoch: number) => ({
     uid: 'uid-a',
     email: 'user@example.com',
@@ -144,19 +140,45 @@ test('reuses an in-progress or completed safe epoch without endless rotation', (
     createdAtMs: 123,
     updatedAtMs: 456,
   });
-  const planFor = (accountEpoch: number, claims: Record<string, unknown>, active = true) => buildPrivateProResetPlan({
+  const planFor = (accountEpoch: number, claims: Record<string, unknown>, phase?: 'planned' | 'fenced' | 'cleaned' | 'complete') => buildPrivateProResetPlan({
     projectId: PROJECT_ID,
     execute: false,
     authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims }],
-    accountDocuments: [{ uid: 'uid-a', exists: true, data: { ...currentAccount(accountEpoch), active } }],
+    accountDocuments: [{ uid: 'uid-a', exists: true, data: currentAccount(accountEpoch) }],
     allowedEmails: new Set(['user@example.com']),
     nowMs: NOW_MS,
+    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 },
+    resetTargets: phase ? [{ uid: 'uid-a', approved: true, targetEpoch: 7, phase, updatedAtMs: 200 }] : [],
   }).actions[0];
 
-  assert.deepEqual(planFor(7, { privatePro: true, privateProEpoch: 6 }).epochTransition, { from: 7, to: 7 });
-  assert.deepEqual(planFor(7, {}, false).epochTransition, { from: 7, to: 7 });
-  assert.deepEqual(planFor(6, { privatePro: true, privateProEpoch: 7 }).epochTransition, { from: 7, to: 7 });
-  assert.deepEqual(planFor(7, { privatePro: true, privateProEpoch: 7 }).epochTransition, { from: 7, to: 7 });
+  assert.deepEqual(planFor(6, { privatePro: true, privateProEpoch: 6 }, 'fenced').epochTransition, { from: 6, to: 7 });
+  assert.equal(planFor(6, {}, 'fenced').journalPhase, 'fenced');
+  assert.equal(planFor(6, {}, 'cleaned').journalPhase, 'cleaned');
+  assert.equal(planFor(6, {}, 'complete').journalPhase, 'complete');
+  assert.deepEqual(planFor(7, { privatePro: true, privateProEpoch: 7 }).epochTransition, { from: 7, to: 8 });
+});
+
+test('completed operation makes execute and dry-run plans no-op', () => {
+  const plan = buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: true,
+    confirm: PROJECT_ID,
+    authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims: {} }],
+    accountDocuments: [],
+    allowedEmails: new Set(['user@example.com']),
+    nowMs: NOW_MS,
+    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'complete', startedAtMs: 100 },
+    resetTargets: [],
+  });
+  assert.equal(plan.alreadyComplete, true);
+  assert.deepEqual(plan.actions, []);
+});
+
+test('rejects malformed reset operation and target journal schemas', () => {
+  assert.deepEqual(parsePrivateProResetOperation({ operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 }), { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 });
+  assert.deepEqual(parsePrivateProResetTarget({ uid: 'uid-a', approved: true, targetEpoch: 2, phase: 'planned', updatedAtMs: 100 }), { uid: 'uid-a', approved: true, targetEpoch: 2, phase: 'planned', updatedAtMs: 100 });
+  assert.throws(() => parsePrivateProResetOperation({ operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, extra: 'secret' }), /journal/i);
+  assert.throws(() => parsePrivateProResetTarget({ uid: 'uid-a', approved: true, targetEpoch: 1.5, phase: 'planned', updatedAtMs: 100 }), /journal/i);
 });
 
 test('increments legacy state once and rejects unsafe epoch overflow', () => {
@@ -178,6 +200,50 @@ test('increments legacy state once and rejects unsafe epoch overflow', () => {
     authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims: { privateProEpoch: Number.MAX_SAFE_INTEGER } }],
     accountDocuments: [],
   }), /safe epoch/i);
+  assert.throws(() => buildPrivateProResetPlan({
+    ...base,
+    authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims: { privateProEpoch: 1.5 } }],
+    accountDocuments: [],
+  }), /epoch/i);
+  const resumedMaximum = buildPrivateProResetPlan({
+    ...base,
+    authIdentities: [{ uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims: { privateProEpoch: Number.MAX_SAFE_INTEGER } }],
+    accountDocuments: [],
+    resetTargets: [{ uid: 'uid-a', approved: true, targetEpoch: Number.MAX_SAFE_INTEGER, phase: 'fenced', updatedAtMs: 100 }],
+  }).actions[0];
+  assert.equal(resumedMaximum.epochTransition?.to, Number.MAX_SAFE_INTEGER);
+});
+
+test('fences orphan accounts with a journaled target epoch', () => {
+  const action = buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: true,
+    confirm: PROJECT_ID,
+    authIdentities: [],
+    accountDocuments: [{ uid: 'orphan', exists: true, data: { email: 'old@example.com', accessEpoch: 4, createdAtMs: 123 } }],
+    allowedEmails: new Set(['allowed@example.com']),
+    nowMs: NOW_MS,
+    resetTargets: [{ uid: 'orphan', approved: false, targetEpoch: 5, phase: 'planned', updatedAtMs: 100 }],
+  }).actions[0];
+  assert.deepEqual(action.fenceAccount, { uid: 'orphan', email: 'old@example.com', active: false, accessEpoch: 5, createdAtMs: 123, updatedAtMs: NOW_MS });
+  assert.deepEqual(action.claims, { type: 'none' });
+});
+
+test('keeps a cleaned orphan journal target in the resume plan after its account is gone', () => {
+  const plan = buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: true,
+    confirm: PROJECT_ID,
+    authIdentities: [],
+    accountDocuments: [],
+    allowedEmails: new Set(['allowed@example.com']),
+    nowMs: NOW_MS,
+    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 },
+    resetTargets: [{ uid: 'orphan', approved: false, targetEpoch: 5, phase: 'cleaned', updatedAtMs: 100 }],
+  });
+  assert.equal(plan.actions[0].uid, 'orphan');
+  assert.equal(plan.actions[0].journalPhase, 'cleaned');
+  assert.deepEqual(plan.actions[0].account, { type: 'delete' });
 });
 
 test('binds the configured bucket to the confirmed numeric project before inspection', async () => {
@@ -236,6 +302,7 @@ test('stops execution after one sanitized per-UID failure result', async () => {
     applyFinalAccount: async () => assert.fail('Account must not run after cleanup failure.'),
     applyFinalClaims: async () => assert.fail('Claims must not run after cleanup failure.'),
     revokeFinalTokens: async () => assert.fail('Revoke must not run after cleanup failure.'),
+    persistPhase: async () => undefined,
     emit: result => { results.push(result); },
   }), /reset failed/i);
   assert.deepEqual(calls, ['uid-a']);
@@ -272,9 +339,38 @@ test('fences access before cleanup and restores the same fixed epoch', async () 
     applyFinalAccount: async input => { order.push(`final-account:${input.epochTransition?.to}`); },
     applyFinalClaims: async input => { order.push(`final-claims:${input.epochTransition?.to}`); },
     revokeFinalTokens: async () => { order.push('final-tokens'); },
+    persistPhase: async (_input, phase) => { order.push(`phase:${phase}`); },
     emit: () => undefined,
   });
-  assert.deepEqual(order, [`fence-account:${action.epochTransition?.to}`, 'fence-claims', 'fence-tokens', 'firestore', 'storage', `final-account:${action.epochTransition?.to}`, `final-claims:${action.epochTransition?.to}`, 'final-tokens']);
+  assert.deepEqual(order, [`fence-account:${action.epochTransition?.to}`, 'fence-claims', 'fence-tokens', 'phase:fenced', 'firestore', 'storage', 'phase:cleaned', `final-account:${action.epochTransition?.to}`, `final-claims:${action.epochTransition?.to}`, 'final-tokens', 'phase:complete']);
+});
+
+test('persists journal phases and resumes without repeating completed phases', async () => {
+  const action = buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: true,
+    confirm: PROJECT_ID,
+    authIdentities: [{ uid: 'uid-a', email: 'a@example.com', emailVerified: true, claims: {} }],
+    accountDocuments: [],
+    allowedEmails: new Set(['a@example.com']),
+    nowMs: NOW_MS,
+    resetTargets: [{ uid: 'uid-a', approved: true, targetEpoch: 7, phase: 'cleaned', updatedAtMs: 100 }],
+  }).actions[0];
+  const calls: string[] = [];
+  await executePrivateProResetActions([action], {
+    inspect: async input => ({ uid: input.uid, documentCount: 0, objectCount: 0, epochTransition: input.epochTransition }),
+    fenceAccount: async () => { calls.push('fence'); },
+    fenceClaims: async () => { calls.push('fence-claims'); },
+    revokeFenceTokens: async () => { calls.push('fence-tokens'); },
+    cleanupFirestore: async () => { calls.push('firestore'); },
+    cleanupStorage: async () => { calls.push('storage'); },
+    applyFinalAccount: async () => { calls.push('final-account'); },
+    applyFinalClaims: async () => { calls.push('final-claims'); },
+    revokeFinalTokens: async () => { calls.push('final-tokens'); },
+    persistPhase: async (_input, phase) => { calls.push(`phase:${phase}`); },
+    emit: () => undefined,
+  });
+  assert.deepEqual(calls, ['final-account', 'final-claims', 'final-tokens', 'phase:complete']);
 });
 
 test('defaults to dry run and enforces the exact destructive execution gate', () => {

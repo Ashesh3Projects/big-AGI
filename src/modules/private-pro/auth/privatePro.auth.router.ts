@@ -9,6 +9,8 @@ import {
   bootstrapPrivateProAccount,
   activatePrivateProAccountRecord,
   PrivateProAccessDeniedError,
+  PrivateProResetInProgressError,
+  privateProBootstrapErrorCode,
   type PrivateProAccountRecord,
   type PrivateProAuthAdminPort,
 } from './privatePro.auth.service';
@@ -18,6 +20,11 @@ function createPrivateProAuthAdminPort(): PrivateProAuthAdminPort {
   const auth = getPrivateProAdminAuth();
   const firestore = getPrivateProFirestore();
   return {
+    async getWorkspaceResetState() {
+      const snapshot = await firestore.doc('privateProOperations/workspaceV1Reset').get();
+      if (!snapshot.exists) return 'absent';
+      return snapshot.data()?.state === 'complete' ? 'complete' : 'running';
+    },
     async activateAccount(input) {
       const reference = firestore.doc(`users/${input.uid}`);
       return firestore.runTransaction(async transaction => {
@@ -47,8 +54,10 @@ export const privateProAuthRouter = createTRPCRouter({
         nowMs: Date.now(),
       });
     } catch (error) {
-      if (error instanceof PrivateProAccessDeniedError)
+      if (privateProBootstrapErrorCode(error) === 'UNAUTHORIZED' && error instanceof PrivateProAccessDeniedError)
         throw new TRPCError({ code: 'UNAUTHORIZED', message: error.message });
+      if (privateProBootstrapErrorCode(error) === 'SERVICE_UNAVAILABLE' && error instanceof PrivateProResetInProgressError)
+        throw new TRPCError({ code: 'SERVICE_UNAVAILABLE', message: 'Private Pro is temporarily unavailable.' });
       throw error;
     }
   }),

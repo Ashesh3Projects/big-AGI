@@ -20,6 +20,7 @@ const FIRESTORE_TARGETS = [
 const STORAGE_PREFIXES = ['vault/', 'assets/', 'chatUploads/', 'workspace-v1/'] as const;
 const PAGE_SIZE = 500;
 const DELETE_CONCURRENCY = 10;
+const RESET_OPERATION_PATH = 'privateProOperations/workspaceV1Reset';
 
 export interface PrivateProResetAuthIdentity {
   uid: string;
@@ -42,6 +43,8 @@ export interface PrivateProResetPlanInput {
   accountDocuments: readonly PrivateProResetAccountDocument[];
   allowedEmails: ReadonlySet<string>;
   nowMs: number;
+  resetOperation?: PrivateProResetOperation;
+  resetTargets?: readonly PrivateProResetJournalTarget[];
 }
 
 export interface PrivateProAccountRecord {
@@ -72,6 +75,7 @@ export interface PrivateProResetAction {
   claims: { type: 'replace'; claims: Record<string, unknown> } | { type: 'none' };
   revokeRefreshTokens: boolean;
   epochTransition?: { from: number; to: number };
+  journalPhase: PrivateProResetTargetPhase;
 }
 
 export interface PrivateProResetPlan {
@@ -80,6 +84,25 @@ export interface PrivateProResetPlan {
   authIdentityUids: string[];
   authDeleteCount: 0;
   actions: PrivateProResetAction[];
+  alreadyComplete: boolean;
+}
+
+export type PrivateProResetTargetPhase = 'planned' | 'fenced' | 'cleaned' | 'complete';
+
+export interface PrivateProResetOperation {
+  operationId: 'workspace-v1';
+  schemaVersion: 1;
+  projectId: string;
+  state: 'running' | 'complete';
+  startedAtMs: number;
+}
+
+export interface PrivateProResetJournalTarget {
+  uid: string;
+  approved: boolean;
+  targetEpoch: number;
+  phase: PrivateProResetTargetPhase;
+  updatedAtMs: number;
 }
 
 export interface PrivateProResetArguments {
@@ -110,6 +133,7 @@ export interface PrivateProResetExecutionPort {
   applyFinalAccount(action: PrivateProResetAction): Promise<void>;
   applyFinalClaims(action: PrivateProResetAction): Promise<void>;
   revokeFinalTokens(action: PrivateProResetAction): Promise<void>;
+  persistPhase(action: PrivateProResetAction, phase: PrivateProResetTargetPhase): Promise<void>;
   emit(result: PrivateProResetActionResult): void;
 }
 
@@ -124,22 +148,15 @@ function normalizeEmail(value: string): string {
   return value.trim().toLowerCase();
 }
 
-function validNonnegativeInteger(value: unknown): number {
-  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 0 ? value : 0;
+function strictEpoch(value: unknown): number {
+  if (value === undefined || value === null) return 0;
+  if (typeof value !== 'number') return 0;
+  if (!Number.isFinite(value) || value < 0 || !Number.isSafeInteger(value)) throw new Error('Private Pro epoch is invalid.');
+  return value;
 }
 
 function validPositiveTimestamp(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isSafeInteger(value) && value > 0 ? value : fallback;
-}
-
-function isCurrentPrivateProAccount(value: Readonly<Record<string, unknown>> | undefined, uid: string, email: string): boolean {
-  if (!value || Object.keys(value).sort().join(',') !== 'accessEpoch,active,createdAtMs,email,uid,updatedAtMs') return false;
-  return value.uid === uid
-    && value.email === email
-    && typeof value.active === 'boolean'
-    && validNonnegativeInteger(value.accessEpoch) > 0
-    && validPositiveTimestamp(value.createdAtMs, 0) > 0
-    && validPositiveTimestamp(value.updatedAtMs, 0) > 0;
 }
 
 function resetTargetEpoch(input: {
@@ -148,16 +165,10 @@ function resetTargetEpoch(input: {
   uid: string;
   email: string;
 }): { maximumEpoch: number; targetEpoch: number } {
-  const accountEpoch = validNonnegativeInteger(input.account?.data?.accessEpoch);
-  const claimEpoch = validNonnegativeInteger(input.identity.claims.privateProEpoch);
+  const accountEpoch = strictEpoch(input.account?.data?.accessEpoch);
+  const claimEpoch = strictEpoch(input.identity.claims.privateProEpoch);
   const maximumEpoch = Math.max(accountEpoch, claimEpoch, 0);
-  if (maximumEpoch >= Number.MAX_SAFE_INTEGER) throw new Error('Private Pro reset cannot advance beyond the maximum safe epoch.');
-  const accountIsResetState = isCurrentPrivateProAccount(input.account?.data, input.uid, input.email);
-  const claimsAreResetState = input.identity.claims.privatePro === true && claimEpoch > 0;
-  return {
-    maximumEpoch,
-    targetEpoch: accountIsResetState || (!input.account && claimsAreResetState) ? Math.max(maximumEpoch, 1) : maximumEpoch + 1,
-  };
+  return { maximumEpoch, targetEpoch: maximumEpoch >= Number.MAX_SAFE_INTEGER ? maximumEpoch : maximumEpoch + 1 };
 }
 
 function clearedPrivateProClaims(claims: Readonly<Record<string, unknown>>): Record<string, unknown> {
@@ -202,18 +213,31 @@ export function buildPrivateProResetPlan(input: PrivateProResetPlanInput): Priva
   if (!Number.isSafeInteger(input.nowMs) || input.nowMs <= 0) throw new Error('nowMs must be a positive integer.');
   if (input.execute && input.confirm !== input.projectId)
     throw new Error('Execution requires confirmation with the exact project ID.');
+  if (input.resetOperation?.projectId !== undefined && input.resetOperation.projectId !== input.projectId)
+    throw new Error('Reset operation project mismatch.');
+  if (input.resetOperation?.state === 'complete') return {
+    projectId: input.projectId,
+    mode: input.execute ? 'execute' : 'dry-run',
+    authIdentityUids: input.authIdentities.map(identity => identity.uid).sort(),
+    authDeleteCount: 0,
+    actions: [],
+    alreadyComplete: true,
+  };
 
   const allowedEmails = new Set([...input.allowedEmails].map(normalizeEmail).filter(Boolean));
   if (input.execute && allowedEmails.size === 0) throw new Error('PRIVATE_PRO_ALLOWED_EMAILS allowlist is empty.');
 
   const authByUid = new Map(input.authIdentities.map(identity => [identity.uid, identity]));
   const accountByUid = new Map(input.accountDocuments.filter(account => account.exists).map(account => [account.uid, account]));
-  const uids = [...new Set([...authByUid.keys(), ...accountByUid.keys()])].sort();
+  const resetTargetByUid = new Map((input.resetTargets ?? []).map(target => [target.uid, target]));
+  const uids = [...new Set([...authByUid.keys(), ...accountByUid.keys(), ...resetTargetByUid.keys()])].sort();
   const actions = uids.map(uid => {
     const identity = authByUid.get(uid);
     const account = accountByUid.get(uid);
     const normalizedEmail = identity?.email ? normalizeEmail(identity.email) : '';
     const approved = !!identity && identity.emailVerified && normalizedEmail !== '' && allowedEmails.has(normalizedEmail);
+    const journalTarget = resetTargetByUid.get(uid);
+    if (journalTarget && journalTarget.approved !== approved) throw new Error('Reset target approval mismatch.');
     const targets = cleanupTargets(uid);
 
     if (!approved) return {
@@ -221,21 +245,32 @@ export function buildPrivateProResetPlan(input: PrivateProResetPlanInput): Priva
       approved: false,
       ...targets,
       account: { type: 'delete' } as const,
-      ...(identity ? (() => {
-        const { maximumEpoch, targetEpoch } = resetTargetEpoch({ account, identity, uid, email: normalizedEmail });
+      ...(() => {
+        const maximumEpoch = Math.max(strictEpoch(account?.data?.accessEpoch), identity ? strictEpoch(identity.claims.privateProEpoch) : 0);
+        const targetEpoch = journalTarget?.targetEpoch ?? (() => {
+          if (maximumEpoch >= Number.MAX_SAFE_INTEGER) throw new Error('Private Pro reset cannot advance beyond the maximum safe epoch.');
+          return maximumEpoch + 1;
+        })();
+        if (!Number.isSafeInteger(targetEpoch) || targetEpoch <= 0) throw new Error('Private Pro reset target epoch is invalid.');
         const createdAtMs = validPositiveTimestamp(account?.data?.createdAtMs, input.nowMs);
+        const accountEmail = normalizedEmail || (typeof account?.data?.email === 'string' ? normalizeEmail(account.data.email) : '');
         return {
-          fenceAccount: { uid, email: normalizedEmail, active: false as const, accessEpoch: targetEpoch, createdAtMs, updatedAtMs: input.nowMs },
+          fenceAccount: { uid, email: accountEmail, active: false as const, accessEpoch: targetEpoch, createdAtMs, updatedAtMs: input.nowMs },
           epochTransition: { from: maximumEpoch, to: targetEpoch },
+          journalPhase: journalTarget?.phase ?? 'planned' as const,
         };
-      })() : {}),
+      })(),
       claims: identity
         ? { type: 'replace' as const, claims: clearedPrivateProClaims(identity.claims) }
         : { type: 'none' as const },
       revokeRefreshTokens: !!identity,
     };
 
-    const { maximumEpoch, targetEpoch: accessEpoch } = resetTargetEpoch({ account, identity, uid, email: normalizedEmail });
+    const computedEpoch = resetTargetEpoch({ account, identity, uid, email: normalizedEmail });
+    const maximumEpoch = computedEpoch.maximumEpoch;
+    if (!journalTarget && maximumEpoch >= Number.MAX_SAFE_INTEGER) throw new Error('Private Pro reset cannot advance beyond the maximum safe epoch.');
+    const accessEpoch = journalTarget?.targetEpoch ?? computedEpoch.targetEpoch;
+    if (!Number.isSafeInteger(accessEpoch) || accessEpoch <= 0) throw new Error('Private Pro reset target epoch is invalid.');
     return {
       uid,
       approved: true,
@@ -258,6 +293,7 @@ export function buildPrivateProResetPlan(input: PrivateProResetPlanInput): Priva
       },
       revokeRefreshTokens: true,
       epochTransition: { from: maximumEpoch, to: accessEpoch },
+      journalPhase: journalTarget?.phase ?? 'planned',
     };
   });
 
@@ -267,6 +303,7 @@ export function buildPrivateProResetPlan(input: PrivateProResetPlanInput): Priva
     authIdentityUids: [...authByUid.keys()].sort(),
     authDeleteCount: 0,
     actions,
+    alreadyComplete: false,
   };
 }
 
@@ -307,6 +344,7 @@ const STAGE_ERRORS: Record<Exclude<PrivateProResetExecutionStage, 'complete'>, P
 };
 
 export async function executePrivateProResetActions(actions: readonly PrivateProResetAction[], port: PrivateProResetExecutionPort): Promise<void> {
+  const phaseRank: Record<PrivateProResetTargetPhase, number> = { planned: 0, fenced: 1, cleaned: 2, complete: 3 };
   for (const action of actions) {
     let stage: Exclude<PrivateProResetExecutionStage, 'complete'> = 'inspect';
     let counts: Pick<PrivateProResetActionResult, 'uid' | 'documentCount' | 'objectCount' | 'epochTransition'> = {
@@ -317,22 +355,31 @@ export async function executePrivateProResetActions(actions: readonly PrivatePro
     };
     try {
       counts = await port.inspect(action);
-      stage = 'fence-account';
-      await port.fenceAccount(action);
-      stage = 'fence-claims';
-      await port.fenceClaims(action);
-      stage = 'fence-tokens';
-      await port.revokeFenceTokens(action);
-      stage = 'firestore-cleanup';
-      await port.cleanupFirestore(action);
-      stage = 'storage-cleanup';
-      await port.cleanupStorage(action);
-      stage = 'final-account';
-      await port.applyFinalAccount(action);
-      stage = 'final-claims';
-      await port.applyFinalClaims(action);
-      stage = 'final-tokens';
-      await port.revokeFinalTokens(action);
+      if (phaseRank[action.journalPhase] < phaseRank.fenced) {
+        stage = 'fence-account';
+        await port.fenceAccount(action);
+        stage = 'fence-claims';
+        await port.fenceClaims(action);
+        stage = 'fence-tokens';
+        await port.revokeFenceTokens(action);
+        await port.persistPhase(action, 'fenced');
+      }
+      if (phaseRank[action.journalPhase] < phaseRank.cleaned) {
+        stage = 'firestore-cleanup';
+        await port.cleanupFirestore(action);
+        stage = 'storage-cleanup';
+        await port.cleanupStorage(action);
+        await port.persistPhase(action, 'cleaned');
+      }
+      if (phaseRank[action.journalPhase] < phaseRank.complete) {
+        stage = 'final-account';
+        await port.applyFinalAccount(action);
+        stage = 'final-claims';
+        await port.applyFinalClaims(action);
+        stage = 'final-tokens';
+        await port.revokeFinalTokens(action);
+        await port.persistPhase(action, 'complete');
+      }
       port.emit({ ...counts, stage: 'complete', success: true });
     } catch {
       port.emit({ ...counts, stage, success: false, errorCode: STAGE_ERRORS[stage] });
@@ -386,7 +433,7 @@ function initializeResetApp(admin: AdminModules, projectId: string, storageBucke
   }, 'private-pro-reset');
 }
 
-async function collectInputs(admin: AdminModules, projectId: string, storageBucket: string) {
+async function collectInputs(admin: AdminModules, projectId: string, storageBucket: string, execute: boolean, nowMs: number) {
   const app = initializeResetApp(admin, projectId, storageBucket);
   const auth = admin.getAuth(app);
   const firestore = admin.getFirestore(app);
@@ -398,6 +445,12 @@ async function collectInputs(admin: AdminModules, projectId: string, storageBuck
     readBucketMetadata: () => readBucketBindingMetadata(bucket),
     inspect: async () => undefined,
   });
+  if (execute) await ensureResetOperation(firestore, projectId, nowMs);
+  const operationSnapshot = await firestore.doc(RESET_OPERATION_PATH).get();
+  const resetOperation = operationSnapshot.exists ? parsePrivateProResetOperation(operationSnapshot.data()) : undefined;
+  const resetTargets = resetOperation
+    ? (await firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()))
+    : [];
   const authIdentities: PrivateProResetAuthIdentity[] = [];
   let authPageToken: string | undefined;
   do {
@@ -422,7 +475,79 @@ async function collectInputs(admin: AdminModules, projectId: string, storageBuck
     if (page.size < PAGE_SIZE) break;
   } while (afterUid);
 
-  return { auth, firestore, bucket, authIdentities, accountDocuments };
+  return { auth, firestore, bucket, authIdentities, accountDocuments, resetOperation, resetTargets };
+}
+
+function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boolean {
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  return actual.length === expected.length && actual.every((key, index) => key === expected[index]);
+}
+
+export function parsePrivateProResetOperation(value: unknown): PrivateProResetOperation {
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
+  if (!exactKeys(record, ['operationId', 'schemaVersion', 'projectId', 'state', 'startedAtMs'])
+    || record.operationId !== 'workspace-v1'
+    || record.schemaVersion !== 1
+    || typeof record.projectId !== 'string'
+    || !['running', 'complete'].includes(String(record.state))
+    || typeof record.startedAtMs !== 'number'
+    || !Number.isSafeInteger(record.startedAtMs)
+    || record.startedAtMs <= 0) throw new Error('Reset operation journal is invalid.');
+  return record as unknown as PrivateProResetOperation;
+}
+
+export function parsePrivateProResetTarget(value: unknown): PrivateProResetJournalTarget {
+  const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
+  if (!exactKeys(record, ['uid', 'approved', 'targetEpoch', 'phase', 'updatedAtMs'])
+    || typeof record.uid !== 'string'
+    || typeof record.approved !== 'boolean'
+    || !Number.isSafeInteger(record.targetEpoch)
+    || Number(record.targetEpoch) <= 0
+    || !['planned', 'fenced', 'cleaned', 'complete'].includes(String(record.phase))
+    || typeof record.updatedAtMs !== 'number'
+    || !Number.isSafeInteger(record.updatedAtMs)
+    || record.updatedAtMs <= 0) throw new Error('Reset target journal is invalid.');
+  return record as unknown as PrivateProResetJournalTarget;
+}
+
+async function ensureResetOperation(firestore: FirebaseFirestore.Firestore, projectId: string, nowMs: number): Promise<PrivateProResetOperation> {
+  const reference = firestore.doc(RESET_OPERATION_PATH);
+  return firestore.runTransaction(async transaction => {
+    const snapshot = await transaction.get(reference);
+    if (snapshot.exists) {
+      const operation = parsePrivateProResetOperation(snapshot.data());
+      if (operation.projectId !== projectId) throw new Error('Reset operation project mismatch.');
+      return operation;
+    }
+    const operation: PrivateProResetOperation = { operationId: 'workspace-v1', schemaVersion: 1, projectId, state: 'running', startedAtMs: nowMs };
+    transaction.create(reference, operation);
+    return operation;
+  });
+}
+
+async function ensureResetTargets(firestore: FirebaseFirestore.Firestore, actions: readonly PrivateProResetAction[], nowMs: number): Promise<void> {
+  for (const action of actions) {
+    await firestore.runTransaction(async transaction => {
+      const reference = firestore.doc(`${RESET_OPERATION_PATH}/targets/${action.uid}`);
+      const snapshot = await transaction.get(reference);
+      if (snapshot.exists) {
+        parsePrivateProResetTarget(snapshot.data());
+        return;
+      }
+      transaction.create(reference, {
+        uid: action.uid,
+        approved: action.approved,
+        targetEpoch: action.epochTransition?.to ?? (() => { throw new Error('Reset target epoch is missing.'); })(),
+        phase: 'planned',
+        updatedAtMs: nowMs,
+      } satisfies PrivateProResetJournalTarget);
+    });
+  }
+}
+
+async function persistResetPhase(firestore: FirebaseFirestore.Firestore, action: PrivateProResetAction, phase: PrivateProResetTargetPhase, nowMs: number): Promise<void> {
+  await firestore.doc(`${RESET_OPERATION_PATH}/targets/${action.uid}`).update({ phase, updatedAtMs: nowMs });
 }
 
 function numericProjectNumber(value: unknown): string {
@@ -540,18 +665,48 @@ async function main() {
   const args = parsePrivateProResetArguments(process.argv.slice(2), projectId);
   const allowedEmails = new Set((process.env.PRIVATE_PRO_ALLOWED_EMAILS ?? '').split(',').map(normalizeEmail).filter(Boolean));
   const admin = await loadAdminModules();
-  const inputs = await collectInputs(admin, projectId, storageBucket);
+  const nowMs = Date.now();
+  const inputs = await collectInputs(admin, projectId, storageBucket, args.execute, nowMs);
   const plan = buildPrivateProResetPlan({
     projectId,
     ...args,
     authIdentities: inputs.authIdentities,
     accountDocuments: inputs.accountDocuments,
     allowedEmails,
-    nowMs: Date.now(),
+    nowMs,
+    resetOperation: inputs.resetOperation,
+    resetTargets: inputs.resetTargets,
   });
 
   if (plan.mode === 'execute') {
-    await executePrivateProResetActions(plan.actions, {
+    const operation = await ensureResetOperation(inputs.firestore, projectId, nowMs);
+    if (operation.state === 'complete') {
+      console.log(JSON.stringify({ projectId, mode: 'execute', alreadyComplete: true }));
+      return;
+    }
+    const journalPlan = buildPrivateProResetPlan({
+      projectId,
+      ...args,
+      authIdentities: inputs.authIdentities,
+      accountDocuments: inputs.accountDocuments,
+      allowedEmails,
+      nowMs,
+      resetOperation: operation,
+      resetTargets: inputs.resetTargets,
+    });
+    await ensureResetTargets(inputs.firestore, journalPlan.actions, nowMs);
+    const refreshedTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
+    const executablePlan = buildPrivateProResetPlan({
+      projectId,
+      ...args,
+      authIdentities: inputs.authIdentities,
+      accountDocuments: inputs.accountDocuments,
+      allowedEmails,
+      nowMs,
+      resetOperation: operation,
+      resetTargets: refreshedTargets,
+    });
+    await executePrivateProResetActions(executablePlan.actions, {
       inspect: action => inspectAction(action, inputs.firestore, inputs.bucket, admin.FieldPath.documentId()),
       fenceAccount: action => fenceAccountAction(action, inputs.firestore),
       fenceClaims: action => fenceClaimsAction(action, inputs.auth),
@@ -561,13 +716,15 @@ async function main() {
       applyFinalAccount: action => applyAccountAction(action, inputs.firestore),
       applyFinalClaims: action => applyClaimsAction(action, inputs.auth),
       revokeFinalTokens: action => revokeTokensAction(action, inputs.auth),
+      persistPhase: (action, phase) => persistResetPhase(inputs.firestore, action, phase, Date.now()),
       emit: result => console.log(JSON.stringify(result)),
     });
+    await inputs.firestore.doc(RESET_OPERATION_PATH).update({ state: 'complete' });
     return;
   }
   const accounts = [];
   for (const action of plan.actions) accounts.push(await inspectAction(action, inputs.firestore, inputs.bucket, admin.FieldPath.documentId()));
-  console.log(JSON.stringify({ projectId: plan.projectId, mode: plan.mode, authIdentityCount: plan.authIdentityUids.length, authDeleteCount: plan.authDeleteCount, accountCount: plan.actions.length, accounts }, null, 2));
+  console.log(JSON.stringify({ projectId: plan.projectId, mode: plan.mode, alreadyComplete: plan.alreadyComplete, authIdentityCount: plan.authIdentityUids.length, authDeleteCount: plan.authDeleteCount, accountCount: plan.actions.length, accounts }, null, 2));
 }
 
 const isEntrypoint = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
