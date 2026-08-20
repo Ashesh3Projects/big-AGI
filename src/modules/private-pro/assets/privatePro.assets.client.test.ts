@@ -353,8 +353,21 @@ describe('Private Pro direct assets', () => {
     const { db, local, storage } = harness(t);
     const asset = fixture('asset-db-lease-serialized', false);
     await local.putAsset(asset);
-    const firstClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, leaseFallback(db));
-    const secondClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, leaseFallback(db));
+    const renewalObserved = deferred();
+    let renewals = 0;
+    const observingLeasePort: PrivateProAssetUploadLeasePort = {
+      acquireAssetUploadLease: (...args) => db.acquireAssetUploadLease(...args),
+      async renewAssetUploadLease(...args) {
+        renewals++;
+        renewalObserved.resolve();
+        return db.renewAssetUploadLease(...args);
+      },
+      releaseAssetUploadLease: (...args) => db.releaseAssetUploadLease(...args),
+      ownsAssetUploadLease: (...args) => db.ownsAssetUploadLease(...args),
+    };
+    const leaseOptions = { port: observingLeasePort, leaseMs: 60_000, renewEveryMs: 10, retryEveryMs: 2 };
+    const firstClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, leaseOptions);
+    const secondClient = createPrivateProAssetClient(UID, storage, { wake: () => {} }, local, null, leaseOptions);
     const upload = storage.uploadBytesResumable.bind(storage);
     let release!: () => void;
     let started!: () => void;
@@ -378,11 +391,12 @@ describe('Private Pro direct assets', () => {
     const first = firstClient.ensureUploaded([asset.id]);
     await startedPromise;
     const second = secondClient.ensureUploaded([asset.id]);
-    await delay(160);
+    await renewalObserved.promise;
     const observedMax = maxConcurrent;
     release();
     await Promise.all([first, second]);
 
+    assert.ok(renewals >= 1);
     assert.equal(observedMax, 1);
     assert.equal(maxConcurrent, 1);
   });

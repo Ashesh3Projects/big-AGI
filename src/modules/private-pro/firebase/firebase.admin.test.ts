@@ -115,7 +115,7 @@ describe('Private Pro Firebase Admin credentials', () => {
     const deployment = await readFile('docs/deploy-private-pro-firebase.md', 'utf8');
     const dotenvBlocks = [...deployment.matchAll(/```dotenv\r?\n([\s\S]*?)```/g)].map(match => match[1]);
     const primary = dotenvBlocks.find(block => block.includes('NEXT_PUBLIC_PRIVATE_PRO_ENABLED=true')) ?? '';
-    const fallback = dotenvBlocks.find(block => block.includes('BEGIN PRIVATE KEY')) ?? '';
+    const fallback = dotenvBlocks.find(block => block.includes('FIREBASE_CLIENT_EMAIL=') && block.includes('FIREBASE_PRIVATE_KEY=')) ?? '';
 
     assert.doesNotMatch(primary, /FIREBASE_(?:CLIENT_EMAIL|PRIVATE_KEY)=/);
     assert.match(fallback, /FIREBASE_CLIENT_EMAIL=/);
