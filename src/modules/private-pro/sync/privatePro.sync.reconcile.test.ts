@@ -633,9 +633,19 @@ describe('Private Pro sync reconciler', () => {
   test('quarantines non-canonical or hash-mismatched remote payloads', async (t) => {
     const { db, reconciler } = createHarness(t);
     const canonical = await remoteRecord();
+    const noncanonicalPayload = '{"value":"remote","id":"settings-1"}';
 
-    await reconciler.handle({ type: 'record', canonical: { ...canonical, payload: '{"value":"remote","id":"settings-1"}' } });
+    await reconciler.handle({ type: 'record', canonical: { ...canonical, contentHash: 'f'.repeat(64) } });
+    await reconciler.handle({ type: 'record', canonical: {
+      ...canonical,
+      payload: noncanonicalPayload,
+      contentHash: await privateProContentHash(noncanonicalPayload),
+      mutationId: crypto.randomUUID(),
+    } });
 
-    assert.deepEqual((await db.quarantine.where('uid').equals(UID).toArray()).map(item => item.reasonCode), ['invalid-payload']);
+    assert.deepEqual(
+      (await db.quarantine.where('uid').equals(UID).toArray()).map(item => item.reasonCode),
+      ['invalid-payload', 'invalid-payload'],
+    );
   });
 });

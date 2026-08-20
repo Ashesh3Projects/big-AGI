@@ -2,6 +2,9 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    // Rules enforce account isolation, atomic transition shape, timestamps, and
+    // structural bounds. They cannot recompute SHA-256 or the logical-ID digest.
+    // The client reconciler treats all remote payloads as untrusted and verifies both.
     function account(uid) {
       return get(/databases/$(database)/documents/users/$(uid));
     }
@@ -28,11 +31,22 @@ service cloud.firestore {
         && account(uid).data.accessEpoch == epoch;
     }
 
-    function validRecordKey(recordKey) {
+    // This checks the codec's encoded type prefix and total length only. The client
+    // reconciler still recomputes the full key digest and payload SHA-256.
+    function validRecordKey(recordKey, recordType) {
       return recordKey is string
-        && recordKey.size() >= 1
-        && recordKey.size() <= 1024
-        && recordKey.matches('^[A-Za-z0-9_-]+$');
+        && recordKey.matches('^[A-Za-z0-9_-]+$')
+        && (
+          (recordType == 'credential-service' && recordKey.size() == 68 && recordKey.matches('^Y3JlZGVudGlhbC1zZXJ2aWNl.*$'))
+          || (recordType == 'model-service' && recordKey.size() == 62 && recordKey.matches('^bW9kZWwtc2Vydmlj.*$'))
+          || (recordType == 'settings' && recordKey.size() == 55 && recordKey.matches('^c2V0dGluZ3MA.*$'))
+          || (recordType == 'persona' && recordKey.size() == 54 && recordKey.matches('^cGVyc29u.*$'))
+          || (recordType == 'folder' && recordKey.size() == 52 && recordKey.matches('^Zm9sZGVy.*$'))
+          || (recordType == 'scratch' && recordKey.size() == 54 && recordKey.matches('^c2NyYXRj.*$'))
+          || (recordType == 'chat-meta' && recordKey.size() == 56 && recordKey.matches('^Y2hhdC1tZXRh.*$'))
+          || (recordType == 'chat-message' && recordKey.size() == 60 && recordKey.matches('^Y2hhdC1tZXNzYWdl.*$'))
+          || (recordType == 'asset' && recordKey.size() == 51 && recordKey.matches('^YXNzZXQA.*$'))
+        );
     }
 
     function validRecordType(recordType) {
@@ -67,7 +81,7 @@ service cloud.firestore {
       return data.keys().hasAll(['payload', 'contentHash', 'deleted'])
         && data.payload is string
         && data.payload.size() <= 786432
-        && data.payload.matches('^[\\x00-\\x7F]*$')
+        && data.payload.matches('^[\\x20-\\x7E]*$')
         && validHash(data.contentHash)
         && (
           (!data.deleted && data.payload.size() > 0)
@@ -125,6 +139,7 @@ service cloud.firestore {
           'schemaVersion', 'mutationId', 'recordKey', 'recordType', 'logicalId',
           'kind', 'contentHash', 'revision', 'writerId', 'committedAt'
         ])
+        && getAfter(path).data.schemaVersion is int
         && getAfter(path).data.schemaVersion == 1
         && getAfter(path).data.mutationId == data.mutationId
         && getAfter(path).data.recordKey == recordKey
@@ -160,7 +175,7 @@ service cloud.firestore {
     function canCreateCanonical(uid, recordKey, assetCollection) {
       let data = request.resource.data;
       return currentAccount(uid)
-        && validRecordKey(recordKey)
+        && validRecordKey(recordKey, data.recordType)
         && validCanonical(data)
         && data.revision == 1
         && !data.deleted
@@ -173,7 +188,7 @@ service cloud.firestore {
     function canUpdateCanonical(uid, recordKey, assetCollection) {
       let data = request.resource.data;
       return currentAccount(uid)
-        && validRecordKey(recordKey)
+        && validRecordKey(recordKey, data.recordType)
         && validCanonical(data)
         && (assetCollection == (data.recordType == 'asset'))
         && sameCanonicalIdentity(resource.data, data)
@@ -187,11 +202,12 @@ service cloud.firestore {
 
     function validReceiptCreate(uid, mutationId) {
       let data = request.resource.data;
+      let path = canonicalPath(uid, data.recordType, data.recordKey);
       return currentAccount(uid)
         && data.keys().hasAll(['recordType', 'recordKey'])
         && mutationId == data.mutationId
         && validUuid(mutationId)
-        && validRecordKey(data.recordKey)
+        && validRecordKey(data.recordKey, data.recordType)
         && validRecordType(data.recordType)
         && data.keys().hasAll([
           'schemaVersion', 'mutationId', 'recordKey', 'recordType', 'logicalId',
@@ -201,6 +217,7 @@ service cloud.firestore {
           'schemaVersion', 'mutationId', 'recordKey', 'recordType', 'logicalId',
           'kind', 'contentHash', 'revision', 'writerId', 'committedAt'
         ])
+        && data.schemaVersion is int
         && data.schemaVersion == 1
         && data.logicalId is string
         && data.logicalId.size() >= 1
@@ -211,24 +228,36 @@ service cloud.firestore {
         && data.revision > 0
         && validUuid(data.writerId)
         && data.committedAt == request.time
-        && existsAfter(canonicalPath(uid, data.recordType, data.recordKey))
-        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.recordType == data.recordType
-        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.logicalId == data.logicalId
-        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.mutationId == data.mutationId
-        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.writerId == data.writerId
-        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.revision == data.revision
-        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.deleted == (data.kind == 'delete')
-        && data.contentHash == (getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.deleted
-          ? null
-          : getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.contentHash);
+        && existsAfter(path)
+        && getAfter(path).data.updatedAt == request.time
+        && getAfter(path).data.recordType == data.recordType
+        && getAfter(path).data.logicalId == data.logicalId
+        && getAfter(path).data.mutationId == data.mutationId
+        && getAfter(path).data.writerId == data.writerId
+        && getAfter(path).data.revision == data.revision
+        && getAfter(path).data.deleted == (data.kind == 'delete')
+        && data.contentHash == (getAfter(path).data.deleted ? null : getAfter(path).data.contentHash)
+        && (
+          (!exists(path)
+            && data.kind == 'put'
+            && data.revision == 1
+            && getAfter(path).data.deleted == false)
+          || (exists(path)
+            && get(path).data.deleted == false
+            && sameCanonicalIdentity(get(path).data, getAfter(path).data)
+            && getAfter(path).data.revision == get(path).data.revision + 1)
+        )
+        && (data.kind != 'delete'
+          || validTombstoneLink(uid, data.recordKey, getAfter(path).data));
     }
 
     function validTombstoneCreate(uid, recordKey) {
       let data = request.resource.data;
+      let path = canonicalPath(uid, data.recordType, recordKey);
       return currentAccount(uid)
         && data.keys().hasAll(['recordType'])
         && recordKey == data.recordKey
-        && validRecordKey(recordKey)
+        && validRecordKey(recordKey, data.recordType)
         && data.keys().hasAll([
           'recordKey', 'recordType', 'logicalId', 'deletedRevision',
           'mutationId', 'writerId', 'deletedAt'
@@ -246,13 +275,19 @@ service cloud.firestore {
         && validUuid(data.mutationId)
         && validUuid(data.writerId)
         && data.deletedAt == request.time
-        && existsAfter(canonicalPath(uid, data.recordType, recordKey))
-        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.recordType == data.recordType
-        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.logicalId == data.logicalId
-        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.deleted == true
-        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.revision == data.deletedRevision
-        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.mutationId == data.mutationId
-        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.writerId == data.writerId;
+        && exists(path)
+        && get(path).data.deleted == false
+        && existsAfter(path)
+        && getAfter(path).data.updatedAt == request.time
+        && sameCanonicalIdentity(get(path).data, getAfter(path).data)
+        && getAfter(path).data.recordType == data.recordType
+        && getAfter(path).data.logicalId == data.logicalId
+        && getAfter(path).data.deleted == true
+        && getAfter(path).data.revision == get(path).data.revision + 1
+        && getAfter(path).data.revision == data.deletedRevision
+        && getAfter(path).data.mutationId == data.mutationId
+        && getAfter(path).data.writerId == data.writerId
+        && validReceiptLink(uid, recordKey, getAfter(path).data);
     }
 
     match /users/{uid}/workspaces/v1/records/{recordKey} {

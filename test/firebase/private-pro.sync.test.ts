@@ -134,12 +134,11 @@ test('real Firebase transport converges two current-UID clients through revision
       'settings', 'main', '{"theme":"light"}', 0,
       '123e4567-e89b-42d3-a456-426614174122', WRITER_B,
     );
-    const concurrent = await Promise.all([transportA.write(settingsA), transportB.write(settingsB)]);
-    assert.deepEqual(concurrent.map(result => result.status).sort(), ['accepted', 'conflict']);
-    const losingIndex = concurrent.findIndex(result => result.status === 'conflict');
-    const losingTransport = losingIndex === 0 ? transportA : transportB;
-    const losingInput = losingIndex === 0 ? settingsA : settingsB;
-    assert.deepEqual(await losingTransport.write({ ...losingInput, baseRevision: 1 }), { status: 'accepted', revision: 2 });
+    const firstSettings = await transportA.write(settingsA);
+    assert.deepEqual(firstSettings, { status: 'accepted', revision: 1 });
+    const conflict = await transportB.write(settingsB);
+    assert.equal(conflict.status, 'conflict');
+    assert.deepEqual(await transportB.write({ ...settingsB, baseRevision: 1 }), { status: 'accepted', revision: 2 });
     const settingsSnapshot = await getDoc(doc(clientA.firestore(), `${ROOT}/records/${settingsA.recordKey}`));
     assert.equal(settingsSnapshot.data()?.revision, 2);
 

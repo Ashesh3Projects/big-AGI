@@ -88,3 +88,51 @@ Complete on `codex/private-pro-seamless-sync`.
 
 - Firestore Rules `string.size()` counts characters, not bytes. The rules require ASCII first, so character count equals byte count for accepted payloads, satisfying the 786432-byte bound.
 - Expected negative Firestore emulator assertions emit verbose permission-denied and evaluation-error diagnostics when malformed documents omit fields. The assertions pass and no invalid operation is authorized.
+
+## Fix round 1
+
+### Findings addressed
+
+- Coordinator lifecycle work is now fenced by a monotonically increasing generation captured by start, fallback acquire, renewal, leader execution, timers, and Web Lock callbacks.
+- Stop increments the generation synchronously, marks the coordinator stopped, clears timers, channel, leader state, lease identity, and task references, aborts owned controllers, and detaches all remaining work with same-turn rejection handlers.
+- Stop does not wait for leader callbacks, fenced release, fallback acquire, renewal, Web Lock requests, or leadership promises. Late acquire releases its stale lease best-effort and late callbacks cannot alter the restarted generation, owner, leader state, timers, or failure state.
+- Receipt creation now proves a real canonical transition from pre-state to post-state: absent to revision 1 live put, or existing live canonical to exact next revision with stable identity. Resulting canonical identity, mutation, revision, writer, timestamp, and content link must match.
+- Delete receipts additionally require the exact tombstone in the same atomic write. Tombstone creation requires an existing live canonical, an exact next deleted revision with stable identity and request timestamp, plus the exact receipt after the write.
+- Receipt-only creation against an unchanged orphan canonical and tombstone-only recreation against an unchanged deleted canonical are denied.
+- Receipt `schemaVersion` must be an integer exactly equal to 1.
+- Record keys now require the exact codec family prefix and encoded length for all nine record types. This is structural validation only and is not represented as logical-ID digest verification.
+- Firestore payloads allow only printable ASCII (`0x20` through `0x7e`). Canonical JSON backslash escapes remain printable while raw C0 controls, newlines, tabs, carriage returns, and NUL are denied.
+- The deployment guide and rules comments state the actual trust boundary: Rules do not recompute SHA-256 or the record-key digest. The transport validates schemas/collection identity, and the reconciler recomputes the full key and content hash, enforces canonical JSON, and quarantines invalid remote records without payload retention.
+- Storage tests explicitly preserve zero-byte originals and valid strict-shape metadata replacement on object update as protocol decisions.
+- The real emulator transport settings-conflict case is deterministic: client A creates revision 1, client B observes a conflict and retries revision 2. This avoids offline transaction contention masking the rules result.
+
+### TDD evidence
+
+RED:
+
+- Coordinator tests hung before the redesign because stop awaited never-settling leader, release, acquire, renewal, and Web Lock work.
+- Emulator rules initially failed 3 cases: tombstone-only creation succeeded, a settings document with a persona-family record key succeeded, and raw-control payloads succeeded.
+- The receipt-only test was corrected to use a rules-disabled orphan canonical, separating the companion-transition finding from existing receipt immutability.
+
+GREEN:
+
+- Coordinator focused suite: 20 passed, 0 failed.
+- Firebase emulator suite: 23 passed, 0 failed.
+- Focused coordinator, provider lifecycle, engine, reconciler, Firebase transport, and direct asset matrix: 155 passed, 0 failed.
+- Root TypeScript: exit 0.
+- Scoped ESLint for modified TypeScript and Firebase tests: exit 0.
+- Diff check: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- Every asynchronous coordinator continuation checks its captured generation before changing shared state or reporting a failure.
+- A delayed Web Lock callback from a stopped generation cannot lead after restart; the current generation callback still leads normally.
+- Stop clears the current generation before initiating exact fenced release, and neither release failure nor non-settlement can block remount or sign-out.
+- All nine valid record families pass the exact prefix/length matrix. Wrong family prefixes and wrong lengths fail.
+- Companion documents can no longer be manufactured beside unchanged canonical state.
+- Wrong-hash and independently noncanonical remote payloads each quarantine as `invalid-payload`.
+
+### Concerns
+
+- Detached coordinator release/acquire/leader failures after stop are intentionally not returned to the stopped generation. Finite cleanup and stale-generation isolation take priority; same-turn rejection handlers prevent unhandled rejections.
+- Firebase emulator negative assertions continue to print expected permission/evaluation diagnostics for malformed documents.

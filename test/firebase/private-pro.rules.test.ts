@@ -16,7 +16,6 @@ import {
   doc,
   getDoc,
   getDocs,
-  runTransaction,
   serverTimestamp,
   setDoc,
   writeBatch,
@@ -25,6 +24,7 @@ import {
 import { deleteObject, getBytes, listAll, ref, uploadBytes } from 'firebase/storage';
 
 import { privateProRecordKey } from '../../src/modules/private-pro/sync/privatePro.sync.codec';
+import type { PrivateProSyncRecordType } from '../../src/modules/private-pro/sync/privatePro.sync.schemas';
 
 
 const PROJECT_ID = 'demo-private-pro';
@@ -134,7 +134,7 @@ function tombstone(input: {
 }
 
 async function validCreate(firestore: Firestore, options: {
-  recordType?: 'settings' | 'chat-message' | 'asset';
+  recordType?: PrivateProSyncRecordType;
   logicalId?: string;
   mutationId?: string;
   writerId?: string;
@@ -255,6 +255,23 @@ describe('Private Pro Firestore current account access', () => {
 });
 
 describe('Private Pro Firestore transaction invariants', () => {
+  test('accepts the exact codec prefix and length for every record family', async () => {
+    const firestore = approvedContext().firestore();
+    const recordTypes: readonly PrivateProSyncRecordType[] = [
+      'credential-service', 'model-service', 'settings', 'persona', 'folder',
+      'scratch', 'chat-meta', 'chat-message', 'asset',
+    ];
+
+    for (let index = 0; index < recordTypes.length; index++) {
+      const recordType = recordTypes[index];
+      await assertSucceeds(validCreate(firestore, {
+        recordType,
+        logicalId: `${recordType}-${index}`,
+        mutationId: `123e4567-e89b-42d3-a456-426614174${String(50 + index).padStart(3, '0')}`,
+      }));
+    }
+  });
+
   test('accepts revision one create and exact plus-one update only with matching immutable receipts', async () => {
     const firestore = approvedContext().firestore();
     const recordKey = await assertSucceeds(validCreate(firestore));
@@ -272,6 +289,41 @@ describe('Private Pro Firestore transaction invariants', () => {
     batch.set(doc(firestore, `${ROOT_A}/records/${recordKey}`), canonical({ revision: 3, mutationId: MUTATION_2, writerId: WRITER_2 }));
     batch.set(doc(firestore, `${ROOT_A}/mutationReceipts/${MUTATION_2}`), receipt({ recordKey, revision: 3, mutationId: MUTATION_2, writerId: WRITER_2 }));
     await assertFails(batch.commit());
+  });
+
+  test('denies receipt-only creation against an unchanged canonical record', async () => {
+    const firestore = approvedContext().firestore();
+    const recordKey = privateProRecordKey('settings', 'receipt-only');
+    const mutationId = '123e4567-e89b-42d3-a456-426614174021';
+    await testEnv.withSecurityRulesDisabled(context => setDoc(doc(context.firestore(), `${ROOT_A}/records/${recordKey}`), {
+      recordType: 'settings', logicalId: 'receipt-only', schemaVersion: 1, payload: '{"theme":"dark"}',
+      contentHash: HASH_A, revision: 1, mutationId, writerId: WRITER_1, deleted: false, updatedAt: new Date(),
+    }));
+
+    await assertFails(setDoc(doc(firestore, `${ROOT_A}/mutationReceipts/${mutationId}`), receipt({
+      recordKey,
+      logicalId: 'receipt-only',
+      revision: 1,
+      mutationId,
+      writerId: WRITER_1,
+    })));
+  });
+
+  test('denies tombstone-only creation against an unchanged deleted canonical record', async () => {
+    const firestore = approvedContext().firestore();
+    const recordKey = await validCreate(firestore);
+    const deleteBatch = writeBatch(firestore);
+    deleteBatch.set(doc(firestore, `${ROOT_A}/records/${recordKey}`), canonical({
+      payload: '', contentHash: EMPTY_HASH, revision: 2, mutationId: MUTATION_2, writerId: WRITER_2, deleted: true,
+    }));
+    deleteBatch.set(doc(firestore, `${ROOT_A}/mutationReceipts/${MUTATION_2}`), receipt({
+      recordKey, kind: 'delete', contentHash: null, revision: 2, mutationId: MUTATION_2, writerId: WRITER_2,
+    }));
+    deleteBatch.set(doc(firestore, `${ROOT_A}/tombstones/${recordKey}`), tombstone({ recordKey }));
+    await deleteBatch.commit();
+    await testEnv.withSecurityRulesDisabled(context => deleteDoc(doc(context.firestore(), `${ROOT_A}/tombstones/${recordKey}`)));
+
+    await assertFails(setDoc(doc(firestore, `${ROOT_A}/tombstones/${recordKey}`), tombstone({ recordKey })));
   });
 
   test('denies reusing an immutable mutation receipt ID for another canonical revision', async () => {
@@ -313,6 +365,26 @@ describe('Private Pro Firestore transaction invariants', () => {
       recordKey: assetKey, recordType: 'asset', logicalId: 'asset-wrong-collection', mutationId: MUTATION_2,
     }));
     await assertFails(wrongCollection.commit());
+
+    const wrongPrefixKey = privateProRecordKey('persona', 'main');
+    const wrongPrefix = writeBatch(firestore);
+    wrongPrefix.set(doc(firestore, `${ROOT_A}/records/${wrongPrefixKey}`), canonical({
+      logicalId: 'wrong-prefix', mutationId: '123e4567-e89b-42d3-a456-426614174031',
+    }));
+    wrongPrefix.set(doc(firestore, `${ROOT_A}/mutationReceipts/123e4567-e89b-42d3-a456-426614174031`), receipt({
+      recordKey: wrongPrefixKey, logicalId: 'wrong-prefix', mutationId: '123e4567-e89b-42d3-a456-426614174031',
+    }));
+    await assertFails(wrongPrefix.commit());
+
+    const wrongLengthKey = `${privateProRecordKey('settings', 'wrong-length')}A`;
+    const wrongLength = writeBatch(firestore);
+    wrongLength.set(doc(firestore, `${ROOT_A}/records/${wrongLengthKey}`), canonical({
+      logicalId: 'wrong-length', mutationId: '123e4567-e89b-42d3-a456-426614174032',
+    }));
+    wrongLength.set(doc(firestore, `${ROOT_A}/mutationReceipts/123e4567-e89b-42d3-a456-426614174032`), receipt({
+      recordKey: wrongLengthKey, logicalId: 'wrong-length', mutationId: '123e4567-e89b-42d3-a456-426614174032',
+    }));
+    await assertFails(wrongLength.commit());
   });
 
   test('denies non-ASCII, oversized, empty live payloads, wrong hashes, and arbitrary timestamps', async () => {
@@ -322,6 +394,9 @@ describe('Private Pro Firestore transaction invariants', () => {
       { logicalId: 'oversized', payload: 'x'.repeat(786_433), contentHash: HASH_A },
       { logicalId: 'empty', payload: '', contentHash: HASH_A },
       { logicalId: 'bad-hash', payload: '{}', contentHash: 'A'.repeat(64) },
+      { logicalId: 'raw-newline', payload: '{"value":1}\n', contentHash: HASH_A },
+      { logicalId: 'raw-tab', payload: '{"value":1}\t', contentHash: HASH_A },
+      { logicalId: 'raw-null', payload: '{"value":"\u0000"}', contentHash: HASH_A },
     ];
     for (let index = 0; index < cases.length; index++) {
       const value = cases[index];
@@ -408,6 +483,32 @@ describe('Private Pro Firestore transaction invariants', () => {
       recordKey, extra: { unexpected: true },
     }));
     await assertFails(extraTombstone.commit());
+
+    const receiptSchema = writeBatch(firestore);
+    const schemaKey = privateProRecordKey('settings', 'receipt-schema');
+    receiptSchema.set(doc(firestore, `${ROOT_A}/records/${schemaKey}`), canonical({
+      logicalId: 'receipt-schema', mutationId: '123e4567-e89b-42d3-a456-426614174041',
+    }));
+    receiptSchema.set(doc(firestore, `${ROOT_A}/mutationReceipts/123e4567-e89b-42d3-a456-426614174041`), receipt({
+      recordKey: schemaKey,
+      logicalId: 'receipt-schema',
+      mutationId: '123e4567-e89b-42d3-a456-426614174041',
+      extra: { schemaVersion: 1 },
+    }));
+    await assertSucceeds(receiptSchema.commit());
+
+    const invalidReceiptSchema = writeBatch(firestore);
+    const invalidSchemaKey = privateProRecordKey('settings', 'receipt-schema-invalid');
+    invalidReceiptSchema.set(doc(firestore, `${ROOT_A}/records/${invalidSchemaKey}`), canonical({
+      logicalId: 'receipt-schema-invalid', mutationId: '123e4567-e89b-42d3-a456-426614174042',
+    }));
+    invalidReceiptSchema.set(doc(firestore, `${ROOT_A}/mutationReceipts/123e4567-e89b-42d3-a456-426614174042`), receipt({
+      recordKey: invalidSchemaKey,
+      logicalId: 'receipt-schema-invalid',
+      mutationId: '123e4567-e89b-42d3-a456-426614174042',
+      extra: { schemaVersion: 1.5 },
+    }));
+    await assertFails(invalidReceiptSchema.commit());
   });
 });
 
@@ -439,6 +540,33 @@ describe('Private Pro Storage v1 rules', () => {
     await assertSucceeds(getBytes(thumb));
     await assertSucceeds(deleteObject(original));
     await assertSucceeds(deleteObject(thumb));
+  });
+
+  test('allows zero-byte original objects as an explicit protocol decision', async () => {
+    const storage = approvedContext().storage();
+    const original = ref(storage, `users/${UID_A}/workspace-v1/assets/asset-empty/original`);
+
+    await assertSucceeds(uploadBytes(original, new Uint8Array(), storageMetadata(UID_A, 'asset-empty', 'original')));
+    assert.equal((await getBytes(original)).byteLength, 0);
+  });
+
+  test('allows metadata replacement on update only when the strict shape remains valid', async () => {
+    const storage = approvedContext().storage();
+    const original = ref(storage, `users/${UID_A}/workspace-v1/assets/asset-metadata-update/original`);
+    await uploadBytes(original, new Uint8Array([1]), storageMetadata(UID_A, 'asset-metadata-update', 'original'));
+
+    await assertSucceeds(uploadBytes(
+      original,
+      new Uint8Array([2]),
+      storageMetadata(UID_A, 'asset-metadata-update', 'original', HASH_B, 'image/webp'),
+    ));
+    await assertFails(uploadBytes(original, new Uint8Array([3]), {
+      ...storageMetadata(UID_A, 'asset-metadata-update', 'original'),
+      customMetadata: {
+        ...storageMetadata(UID_A, 'asset-metadata-update', 'original').customMetadata,
+        extra: 'invalid',
+      },
+    }));
   });
 
   test('denies wrong UID, missing claim, stale epoch, inactive account, arbitrary names, and listing', async () => {

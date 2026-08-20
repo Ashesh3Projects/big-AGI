@@ -15,12 +15,14 @@ import { createPrivateProSyncStore } from './store-private-pro-sync';
 interface Deferred<T> {
   promise: Promise<T>;
   resolve(value: T | PromiseLike<T>): void;
+  reject(error: unknown): void;
 }
 
 function deferred<T = void>(): Deferred<T> {
   let resolve!: (value: T | PromiseLike<T>) => void;
-  const promise = new Promise<T>(resolve_ => { resolve = resolve_; });
-  return { promise, resolve };
+  let reject!: (error: unknown) => void;
+  const promise = new Promise<T>((resolve_, reject_) => { resolve = resolve_; reject = reject_; });
+  return { promise, resolve, reject };
 }
 
 function abortError(): DOMException {
@@ -79,6 +81,27 @@ class FakeLocks {
       this.held.delete(name);
       this.pump(name);
     });
+  }
+}
+
+class DelayedLocks {
+  readonly requests: Array<{ callback: () => Promise<void>; done: Deferred<void> }> = [];
+
+  request(_name: string, _options: LockOptions, callback: () => Promise<void>): Promise<void> {
+    const done = deferred<void>();
+    this.requests.push({ callback, done });
+    return done.promise;
+  }
+
+  async invoke(index: number): Promise<void> {
+    const request = this.requests[index];
+    if (!request) assert.fail(`Missing delayed Web Lock request ${index}.`);
+    try {
+      await request.callback();
+      request.done.resolve();
+    } catch (error) {
+      request.done.reject(error);
+    }
   }
 }
 
@@ -142,6 +165,8 @@ class FakeLeasePort implements PrivateProCoordinatorLeasePort {
   private renewal: Deferred<ReturnType<FakeLeasePort['snapshot']> | null> | null = null;
   private renewalIdentity: LeaseIdentity | null = null;
   private releaseFailure: Error | null = null;
+  private nextAcquireGate: { entered: Deferred<void>; release: Deferred<void> } | null = null;
+  private nextReleaseGate: { entered: Deferred<void>; release: Deferred<void> } | null = null;
   readonly releases: LeaseIdentity[] = [];
   renewCalls = 0;
 
@@ -152,7 +177,14 @@ class FakeLeasePort implements PrivateProCoordinatorLeasePort {
       fence: (this.current?.fence ?? 0) + 1,
       ownerToken: `owner-${++this.ownerNumber}`,
     };
-    return this.snapshot();
+    const acquired = this.snapshot();
+    const gate = this.nextAcquireGate;
+    this.nextAcquireGate = null;
+    if (gate) {
+      gate.entered.resolve();
+      await gate.release.promise;
+    }
+    return acquired;
   }
 
   async renewCoordinatorLease(_uid: string, _name: string, fence: number, ownerToken: string, nowMs: number, leaseMs: number) {
@@ -172,6 +204,12 @@ class FakeLeasePort implements PrivateProCoordinatorLeasePort {
       this.current.expiresAtMs = 0;
       this.current.ownerToken = `released-${ownerToken}`;
     }
+    const gate = this.nextReleaseGate;
+    this.nextReleaseGate = null;
+    if (gate) {
+      gate.entered.resolve();
+      await gate.release.promise;
+    }
     const failure = this.releaseFailure;
     this.releaseFailure = null;
     if (failure) throw failure;
@@ -180,6 +218,20 @@ class FakeLeasePort implements PrivateProCoordinatorLeasePort {
   deferRenewal(): void {
     this.renewal = deferred();
     this.renewalIdentity = this.current ? { fence: this.current.fence, ownerToken: this.current.ownerToken } : null;
+  }
+
+  deferNextAcquire(): { entered: Promise<void>; resolve(): void } {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    this.nextAcquireGate = { entered, release };
+    return { entered: entered.promise, resolve: () => release.resolve() };
+  }
+
+  deferNextRelease(): { entered: Promise<void>; resolve(): void } {
+    const entered = deferred<void>();
+    const release = deferred<void>();
+    this.nextReleaseGate = { entered, release };
+    return { entered: entered.promise, resolve: () => release.resolve() };
   }
 
   failNextRelease(error: Error): void {
@@ -334,7 +386,7 @@ describe('Private Pro sync coordinator', () => {
     completion.resolve();
     await settle();
 
-    assert.deepEqual(leases.releases, [{ fence: 1, ownerToken: 'owner-1' }]);
+    assert.deepEqual(leases.releases[0], { fence: 1, ownerToken: 'owner-1' });
     assert.equal(leases.isAvailable(scheduler.nowMs), true);
     assert.equal(scheduler.activeTimerCount(), 0);
     await coordinator.stop();
@@ -377,9 +429,148 @@ describe('Private Pro sync coordinator', () => {
     await scheduler.advance(5_000);
 
     assert.deepEqual(started, ['first:1', 'second:2']);
-    assert.deepEqual(leases.releases, [{ fence: 1, ownerToken: 'owner-1' }]);
+    assert.deepEqual(leases.releases[0], { fence: 1, ownerToken: 'owner-1' });
     assert.equal(second.isLeader(), true);
     await second.stop();
+  });
+
+  test('stop does not wait for a leader callback that ignores abort and late completion cannot clear a restarted leader', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const firstLeader = deferred<void>();
+    const started: string[] = [];
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+
+    await coordinator.start(async context => {
+      started.push(`first:${context.coordinatorFence}`);
+      await firstLeader.promise;
+    });
+    await Promise.race([
+      coordinator.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop waited for leader callback')))),
+    ]);
+    await coordinator.start(leaderRunner(started, 'second'));
+    firstLeader.resolve();
+    await settle();
+
+    assert.deepEqual(started, ['first:1', 'second:2']);
+    assert.equal(coordinator.isLeader(), true);
+    assert.equal(scheduler.activeTimerCount(), 2);
+    await coordinator.stop();
+  });
+
+  test('stop does not wait for a fenced release that never settles', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const started: string[] = [];
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    await coordinator.start(leaderRunner(started, 'first'));
+    const release = leases.deferNextRelease();
+
+    await Promise.race([
+      coordinator.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop waited for fenced release')))),
+    ]);
+    await release.entered;
+    await coordinator.start(leaderRunner(started, 'second'));
+    assert.deepEqual(started, ['first:1', 'second:2']);
+    assert.equal(coordinator.isLeader(), true);
+    release.resolve();
+    await settle();
+    assert.equal(coordinator.isLeader(), true);
+    await coordinator.stop();
+  });
+
+  test('stop does not wait for a Web Lock request that never settles', async () => {
+    const never = new Promise<void>(() => {});
+    const locks = { request: () => never };
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { locks }));
+    await coordinator.start(async () => {});
+
+    await Promise.race([
+      coordinator.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop waited for Web Lock request')))),
+    ]);
+    assert.equal(coordinator.isLeader(), false);
+  });
+
+  test('a delayed stale Web Lock callback cannot lead after restart', async () => {
+    const locks = new DelayedLocks();
+    const started: string[] = [];
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { locks }));
+    await coordinator.start(leaderRunner(started, 'stale'));
+    await coordinator.stop();
+    await coordinator.start(leaderRunner(started, 'current'));
+
+    await locks.invoke(0);
+    assert.deepEqual(started, []);
+    assert.equal(coordinator.isLeader(), false);
+
+    const current = locks.invoke(1);
+    await settle();
+    assert.deepEqual(started, ['current:0']);
+    assert.equal(coordinator.isLeader(), true);
+    await coordinator.stop();
+    await current;
+  });
+
+  test('stop does not wait for acquire and a late stale lease is released before the restarted generation leads', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const acquire = leases.deferNextAcquire();
+    const started: string[] = [];
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    const staleStart = coordinator.start(leaderRunner(started, 'stale'));
+    await acquire.entered;
+
+    await Promise.race([
+      coordinator.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('stop waited for acquire')))),
+    ]);
+    await coordinator.start(leaderRunner(started, 'current'));
+    acquire.resolve();
+    await staleStart;
+    await scheduler.advance(5_000);
+
+    assert.deepEqual(started, ['current:2']);
+    assert.deepEqual(leases.releases[0], { fence: 1, ownerToken: 'owner-1' });
+    assert.equal(coordinator.isLeader(), true);
+    await coordinator.stop();
+  });
+
+  test('late renewal completion cannot change the restarted generation or its owner', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const started: string[] = [];
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    await coordinator.start(leaderRunner(started, 'first'));
+    leases.deferRenewal();
+    await scheduler.advance(5_000);
+    await coordinator.stop();
+    await coordinator.start(leaderRunner(started, 'second'));
+
+    leases.resolveRenewal(scheduler.nowMs, 15_000);
+    await settle();
+
+    assert.deepEqual(started, ['first:1', 'second:2']);
+    assert.equal(coordinator.isLeader(), true);
+    assert.equal(scheduler.activeTimerCount(), 2);
+    await coordinator.stop();
+  });
+
+  test('late rejected leader work cannot report failure into a restarted generation', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const firstLeader = deferred<void>();
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    await coordinator.start(() => firstLeader.promise);
+    await coordinator.stop();
+    await coordinator.start(leaderRunner([], 'second'));
+
+    firstLeader.reject(new Error('stale leader failed'));
+    await settle();
+
+    await coordinator.stop();
   });
 
   test('a renewal that never settles cannot pin engine stop before a successor acquires', async () => {
@@ -470,11 +661,9 @@ describe('Private Pro sync coordinator', () => {
     const leases = new FakeLeasePort();
     const started: string[] = [];
     const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
-    const failure = new Error('release failed');
-
     await coordinator.start(leaderRunner(started, 'first'));
-    leases.failNextRelease(failure);
-    await assert.rejects(coordinator.stop(), error => error === failure);
+    leases.failNextRelease(new Error('release failed'));
+    await coordinator.stop();
     assert.equal(scheduler.activeTimerCount(), 0);
 
     await coordinator.start(leaderRunner(started, 'second'));

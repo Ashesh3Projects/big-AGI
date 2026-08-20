@@ -162,6 +162,12 @@ Save redacted before and after snapshots using the schema in the restriction pla
 
 ## Rules and indexes
 
+### Direct workspace trust boundary
+
+Firestore and Storage rules isolate the current UID, enforce access epochs, validate exact document and object shapes, and require atomic revision, receipt, and tombstone transitions. Firestore Rules cannot recompute a payload SHA-256 or the record-key logical-ID digest. The type-specific record-key prefix and length checks are structural guards, not digest verification.
+
+Authenticated browser data therefore remains untrusted at the application boundary. The transport re-parses document schemas and collection identity. The reconciler recomputes the complete record key, requires canonical JSON, recomputes the payload SHA-256, and quarantines invalid remote records without retaining payload text. This threat model does not claim protection from a compromised signed-in browser acting within its own UID.
+
 Authenticate Firebase CLI with the intended Google account, then deploy the checked-in rules:
 
 ```powershell
