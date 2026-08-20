@@ -6,7 +6,7 @@ import {
   privateProRecordKey,
 } from './privatePro.sync.codec';
 import type { PrivateProSyncCoordinator, PrivateProSyncLeaderContext } from './privatePro.sync.coordinator';
-import type { PrivateProOutboxState, PrivateProRemoteBaseState, PrivateProSyncDB } from './privatePro.sync.db';
+import type { PrivateProConditionalCaptureResult, PrivateProOutboxState, PrivateProRemoteBaseState, PrivateProSyncDB, PrivateProSyncRecordIdentity } from './privatePro.sync.db';
 import type {
   PrivateProSyncLocalMutation,
   PrivateProSyncPreparedRecord,
@@ -88,12 +88,17 @@ export interface PrivateProSyncOutboundDependencies {
 export interface PrivateProSyncOutbound {
   start(): Promise<void>;
   capture(mutation: PrivateProSyncLocalMutation): Promise<PrivateProOutboxState>;
+  captureIfGeneration(mutation: PrivateProSyncLocalMutation, expectedMaxGeneration: number): Promise<PrivateProSyncConditionalCaptureOutcome>;
   handleCommitted(mutationId: string, revision: number, signal?: AbortSignal): Promise<void>;
   retryNow(): Promise<void>;
   wake(): void;
   flushNow(): Promise<void>;
   stop(): Promise<void>;
 }
+
+export type PrivateProSyncConditionalCaptureOutcome =
+  | { status: 'captured'; row: PrivateProOutboxState; notice: PrivateProSyncDurableCapture }
+  | { status: 'superseded'; notice: PrivateProSyncCaptureNotice };
 
 interface ActiveSend {
   row: PrivateProOutboxState;
@@ -205,14 +210,13 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     if (captureOwner !== owner || captureEpoch !== owner.epoch || owner.controller.signal.aborted) throw captureAbortError();
   }
 
-  async function persistMutation(
+  async function prepareMutation(
     mutation: PrivateProSyncLocalMutation,
     notice: PrivateProSyncCaptureNotice,
     owner: CaptureOwner,
-  ): Promise<PrivateProOutboxState> {
+  ): Promise<PrivateProSyncPreparedRecord | PrivateProSyncRecordIdentity> {
     assertCaptureOwner(owner);
     const serializer = serializerFor(notice.recordType);
-    let pending: PrivateProOutboxState;
     if (mutation.kind === 'put') {
       if (mutation.record.recordType !== serializer.recordType || mutation.record.schemaVersion !== serializer.schemaVersion)
         throw new TypeError('Private Pro sync serializer identity does not match the mutation.');
@@ -222,7 +226,7 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       assertPrivateProPayloadSize(payload);
       const hashed = await contentHash(payload);
       assertCaptureOwner(owner);
-      const record: PrivateProSyncPreparedRecord = {
+      return {
         recordType: mutation.record.recordType,
         logicalId: mutation.record.logicalId,
         recordKey: notice.recordKey,
@@ -232,24 +236,24 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
         contentHash: hashed,
         referencedAssetIds: [...mutation.record.referencedAssetIds],
       };
-      pending = await dependencies.db.recordLocalPut(dependencies.uid, record, now(), owner.controller.signal);
-    } else {
-      if (mutation.recordType !== serializer.recordType || mutation.schemaVersion !== serializer.schemaVersion)
-        throw new TypeError('Private Pro sync serializer identity does not match the mutation.');
-      assertCaptureOwner(owner);
-      pending = await dependencies.db.recordLocalDelete(dependencies.uid, {
-        recordType: mutation.recordType,
-        logicalId: mutation.logicalId,
-        recordKey: notice.recordKey,
-        projectionKey: mutation.projectionKey,
-        schemaVersion: mutation.schemaVersion,
-      }, now(), owner.controller.signal);
     }
+    if (mutation.recordType !== serializer.recordType || mutation.schemaVersion !== serializer.schemaVersion)
+      throw new TypeError('Private Pro sync serializer identity does not match the mutation.');
+    assertCaptureOwner(owner);
+    return {
+      recordType: mutation.recordType,
+      logicalId: mutation.logicalId,
+      recordKey: notice.recordKey,
+      projectionKey: mutation.projectionKey,
+      schemaVersion: mutation.schemaVersion,
+    };
+  }
+
+  function finishCapture(notice: PrivateProSyncCaptureNotice, pending: PrivateProOutboxState, owner: CaptureOwner): void {
     assertCaptureOwner(owner);
     dependencies.onCaptured?.({ ...notice, generation: pending.generation, mutationId: pending.mutationId });
     dependencies.coordinator.wake();
     void reschedule();
-    return pending;
   }
 
   function capture(mutation: PrivateProSyncLocalMutation): Promise<PrivateProOutboxState> {
@@ -264,7 +268,55 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
       projectionKey: identity.projectionKey,
     };
     dependencies.onCapture?.(notice);
-    const result = captureQueue.then(() => persistMutation(mutation, notice, owner));
+    const result = captureQueue.then(async () => {
+      const prepared = await prepareMutation(mutation, notice, owner);
+      const pending = mutation.kind === 'put'
+        ? await dependencies.db.recordLocalPut(dependencies.uid, prepared as PrivateProSyncPreparedRecord, now(), owner.controller.signal)
+        : await dependencies.db.recordLocalDelete(dependencies.uid, prepared, now(), owner.controller.signal);
+      finishCapture(notice, pending, owner);
+      return pending;
+    });
+    captureQueue = result.then(() => undefined, error => {
+      const category = privateProClassifySyncError(error);
+      dependencies.onCaptureFailed?.({ ...notice, category });
+      if (captureOwner === owner && !owner.controller.signal.aborted && !stopped) report(category);
+    });
+    captureQueue.catch(() => {});
+    return result;
+  }
+
+  function captureIfGeneration(
+    mutation: PrivateProSyncLocalMutation,
+    expectedMaxGeneration: number,
+  ): Promise<PrivateProSyncConditionalCaptureOutcome> {
+    const owner = captureOwner;
+    const identity = mutation.kind === 'put' ? mutation.record : mutation;
+    const notice: PrivateProSyncCaptureNotice = {
+      captureId: crypto.randomUUID(),
+      kind: mutation.kind,
+      recordType: identity.recordType,
+      logicalId: identity.logicalId,
+      recordKey: privateProRecordKey(identity.recordType, identity.logicalId),
+      projectionKey: identity.projectionKey,
+    };
+    dependencies.onCapture?.(notice);
+    const result = captureQueue.then(async () => {
+      const prepared = await prepareMutation(mutation, notice, owner);
+      const outcome: PrivateProConditionalCaptureResult = mutation.kind === 'put'
+        ? await dependencies.db.recordLocalPutIfGeneration(
+          dependencies.uid, prepared as PrivateProSyncPreparedRecord, expectedMaxGeneration, now(), owner.controller.signal,
+        )
+        : await dependencies.db.recordLocalDeleteIfGeneration(
+          dependencies.uid, prepared, expectedMaxGeneration, now(), owner.controller.signal,
+        );
+      if (outcome.status === 'superseded') return { status: 'superseded', notice } as const;
+      finishCapture(notice, outcome.row, owner);
+      return {
+        status: 'captured',
+        row: outcome.row,
+        notice: { ...notice, generation: outcome.row.generation, mutationId: outcome.row.mutationId },
+      } as const;
+    });
     captureQueue = result.then(() => undefined, error => {
       const category = privateProClassifySyncError(error);
       dependencies.onCaptureFailed?.({ ...notice, category });
@@ -508,6 +560,8 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
     },
 
     capture,
+
+    captureIfGeneration,
 
     async handleCommitted(mutationId: string, revision: number, signal?: AbortSignal): Promise<void> {
       const active = activeSends.get(mutationId);

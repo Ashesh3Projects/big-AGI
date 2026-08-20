@@ -73,7 +73,7 @@ describe('ProviderPrivateProSync', () => {
     assert.deepEqual(buffer.closeAndTake(), []);
   });
 
-  test('startup buffer versions reject a failed frozen mutation after a newer live edit', () => {
+  test('a newer live edit supersedes a frozen startup version and prunes its metadata', () => {
     let emit: (mutation: PrivateProSyncLocalMutation) => void = () => assert.fail('Startup buffer listener was not installed.');
     const serializer = { subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void) { emit = listener; return () => { emit = () => {}; }; } } as PrivateProSyncSerializer<unknown>;
     const buffer = createPrivateProStartupMutationBuffer([serializer]);
@@ -83,11 +83,52 @@ describe('ProviderPrivateProSync', () => {
     buffer.start();
     emit(mutation('old'));
     const [frozen] = buffer.closeAndTake();
+    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 1 });
+    assert.equal(buffer.isCurrent(frozen), true);
 
     buffer.noteLiveMutation(mutation('new'));
 
-    assert.equal(buffer.restore(frozen), false);
-    assert.deepEqual(buffer.closeAndTake(), []);
+    assert.equal(buffer.isCurrent(frozen), false);
+    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 0 });
+  });
+
+  test('startup baseline rejection is handled in the observation turn', async () => {
+    let emit: (mutation: PrivateProSyncLocalMutation) => void = () => assert.fail('Startup buffer listener was not installed.');
+    const serializer = { subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void) { emit = listener; return () => { emit = () => {}; }; } } as PrivateProSyncSerializer<unknown>;
+    const unhandled: unknown[] = [];
+    const handled: Promise<unknown>[] = [];
+    const onUnhandled = (error: unknown) => { unhandled.push(error); };
+    const onHandled = (promise: Promise<unknown>) => { handled.push(promise); };
+    process.on('unhandledRejection', onUnhandled);
+    process.on('rejectionHandled', onHandled);
+    try {
+      const buffer = createPrivateProStartupMutationBuffer([serializer], async () => { throw new Error('secret baseline failure'); });
+      buffer.start();
+      emit({ kind: 'put', record: {
+        recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1, value: { value: 'old' }, referencedAssetIds: [],
+      } });
+      const [frozen] = buffer.closeAndTake();
+
+      assert.deepEqual(await frozen.baselineGenerationResult, { ok: false });
+      await new Promise(resolve => setImmediate(resolve));
+      assert.deepEqual(unhandled, []);
+      assert.deepEqual(handled, []);
+    } finally {
+      process.off('unhandledRejection', onUnhandled);
+      process.off('rejectionHandled', onHandled);
+    }
+  });
+
+  test('normal post-startup live mutations leave no version metadata', () => {
+    const buffer = createPrivateProStartupMutationBuffer([]);
+    const mutation = (index: number): PrivateProSyncLocalMutation => ({ kind: 'put', record: {
+      recordType: 'settings', logicalId: `setting-${index}`, projectionKey: `setting-${index}`, schemaVersion: 1,
+      value: { value: index }, referencedAssetIds: [],
+    } });
+
+    for (let index = 0; index < 5_000; index++) buffer.noteLiveMutation(mutation(index));
+
+    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 0 });
   });
 
   test('cross-UID cleanup error screen exposes retry and raw account sign-out', () => {
@@ -178,8 +219,9 @@ describe('ProviderPrivateProSync', () => {
       start: () => { active = true; order.push('buffer-start'); },
       closeAndTake: () => [],
       noteLiveMutation: () => 1,
-      currentVersion: () => 1,
-      restore: () => { active = true; return true; },
+      isCurrent: () => true,
+      forget: () => {},
+      testOnlyStateSize: () => ({ versions: 0 }),
       stop: () => { active = false; order.push('buffer-stop'); },
     });
 
@@ -587,6 +629,24 @@ describe('ProviderPrivateProSync', () => {
 
     assert.deepEqual(order, ['start:1', 'resume-buffer:1', 'stop:1', 'deactivate', 'start:2']);
     assert.equal(store.getState().phase, 'local');
+  });
+
+  test('lifecycle preserves an engine-reported startup error after start resolves', async () => {
+    const statusStore = createPrivateProSyncStore();
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore,
+      prepare: async () => ({ engine: {
+        async start() { statusStore.setState({ phase: 'error', lastCategory: 'schema' }); },
+        async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; }, async stop() {},
+      } }),
+      deactivate: async () => {}, clear: async () => {}, firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+
+    await lifecycle.start();
+
+    assert.equal(statusStore.getState().phase, 'error');
+    assert.equal(statusStore.getState().lastCategory, 'schema');
+    await lifecycle.stop();
   });
 
   test('a canceled engine-start failure cannot re-arm the stopped startup buffer', async () => {

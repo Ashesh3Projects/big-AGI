@@ -371,6 +371,73 @@ describe('Private Pro seamless sync outbound', () => {
     assert.equal(captured[0].generation, valid.generation);
   });
 
+  test('conditional capture reports superseded without a durable capture notice', async (t) => {
+    const { outbound, db, notices, captured, failed } = createHarness(t);
+    await outbound.start();
+    const recordKey = privateProRecordKey('settings', 'main');
+    await db.recordLocalPut(UID, {
+      recordType: 'settings', logicalId: 'main', recordKey, projectionKey: 'main', schemaVersion: 1,
+      payload: '{"value":"new"}', contentHash: 'a'.repeat(64), referencedAssetIds: [],
+    }, 1_000);
+
+    const result = await outbound.captureIfGeneration({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'old' }, referencedAssetIds: [],
+    } }, 0);
+
+    assert.deepEqual(result, { status: 'superseded', notice: notices[0] });
+    assert.equal(captured.length, 0);
+    assert.equal(failed.length, 0);
+    assert.equal((await db.getOutbox(UID, recordKey))?.payload, '{"value":"new"}');
+  });
+
+  test('conditional delete uses normal origin and durable capture notices', async (t) => {
+    const { outbound, notices, captured, failed, db } = createHarness(t);
+    await outbound.start();
+
+    const result = await outbound.captureIfGeneration({
+      kind: 'delete', recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+    }, 0);
+
+    assert.equal(result.status, 'captured');
+    if (result.status !== 'captured') assert.fail('Expected the conditional delete to persist.');
+    assert.equal(result.row.kind, 'delete');
+    assert.equal(result.row.generation, 1);
+    assert.equal(notices.length, 1);
+    assert.equal(captured.length, 1);
+    assert.equal(captured[0].captureId, notices[0].captureId);
+    assert.deepEqual(failed, []);
+    assert.equal((await db.getOutbox(UID, result.row.recordKey))?.kind, 'delete');
+  });
+
+  test('conditional capture is superseded when a sibling write commits after validation', async (t) => {
+    const validationStarted = deferred<void>();
+    const releaseValidation = deferred<void>();
+    const serializer = new FakeSerializer('settings', 'replace', async (_logicalId, value) => {
+      validationStarted.resolve();
+      await releaseValidation.promise;
+      return value;
+    });
+    const { outbound, db } = createHarness(t, serializer);
+    await outbound.start();
+    const recordKey = privateProRecordKey('settings', 'main');
+    const retry = outbound.captureIfGeneration({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'old' }, referencedAssetIds: [],
+    } }, 0);
+    await validationStarted.promise;
+    await db.recordLocalPut(UID, {
+      recordType: 'settings', logicalId: 'main', recordKey, projectionKey: 'main', schemaVersion: 1,
+      payload: '{"value":"new"}', contentHash: 'b'.repeat(64), referencedAssetIds: [],
+    }, 1_000);
+    releaseValidation.resolve();
+
+    assert.equal((await retry).status, 'superseded');
+    const pending = await db.getOutbox(UID, recordKey);
+    assert.equal(pending?.generation, 1);
+    assert.equal(pending?.payload, '{"value":"new"}');
+  });
+
   test('stop aborts stalled validation and a replacement capture stays authoritative', async (t) => {
     const validationStarted = deferred<void>();
     const validation = deferred<unknown>();

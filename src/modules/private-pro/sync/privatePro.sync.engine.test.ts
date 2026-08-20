@@ -73,7 +73,7 @@ function deferred<T>() {
 
 function startupEntry(mutation: PrivateProSyncLocalMutation, version = 1) {
   const identity = mutation.kind === 'put' ? mutation.record : mutation;
-  return { key: `${identity.recordType}:${identity.logicalId}`, version, mutation, baselineGeneration: Promise.resolve(0) };
+  return { key: privateProRecordKey(identity.recordType, identity.logicalId), version, mutation, baselineGenerationResult: Promise.resolve({ ok: true, value: 0 } as const) };
 }
 
 function integrationDB(t: TestContext): PrivateProSyncDB {
@@ -265,7 +265,7 @@ describe('Private Pro sync engine', () => {
     let emitPostClose: () => void = () => assert.fail('Post-close edit hook was not installed.');
     const engine = createPrivateProSyncEngine({
       uid: 'uid-order-barrier', serializers: [new FakeSerializer()],
-      startupBuffer: { active: () => active, closeAndTake: () => { active = false; return [startupEntry(first), startupEntry(oldSecond)]; }, restore: () => false },
+      startupBuffer: { active: () => active, closeAndTake: () => { active = false; return [startupEntry(first), startupEntry(oldSecond)]; } },
       transport: new FakeTransport(), db: { pendingCount: async () => 2 }, runSuppressed: callback => callback(),
       createOutbound: hooks => ({
         start: async () => { emitPostClose = () => { if (hooks.shouldCapture(newSecond)) calls.push('new-second'); }; },
@@ -303,13 +303,10 @@ describe('Private Pro sync engine', () => {
       startupBuffer: {
         active: () => false,
         closeAndTake: () => [startupEntry(mutation('first')), startupEntry(mutation('second'))],
-        currentVersion: () => 1,
-        restore: () => false,
+        isCurrent: () => true,
       },
       transport: new FakeTransport(), db: {
         pendingCount: async () => 0,
-        getLocalRecord: async () => null,
-        getOutbox: async () => null,
       }, runSuppressed: callback => callback(),
       createOutbound: () => ({
         start: async () => {},
@@ -324,9 +321,50 @@ describe('Private Pro sync engine', () => {
       createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
     });
 
-    await assert.rejects(engine.start(), /synchronous capture failure/);
+    await engine.start();
 
     assert.deepEqual(calls, ['first', 'second']);
+    await engine.stop();
+  });
+
+  test('a failed frozen capture is non-fatal and preserves sanitized error status', async () => {
+    const store = createPrivateProSyncStore();
+    const mutation: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'invalid' }, referencedAssetIds: [],
+    } };
+    let hooks!: Parameters<NonNullable<Parameters<typeof createPrivateProSyncEngine>[0]['createOutbound']>>[0];
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-nonfatal-startup', serializers: [new FakeSerializer()], statusStore: store,
+      startupBuffer: { active: () => false, closeAndTake: () => [startupEntry(mutation)], isCurrent: () => true, forget: () => {} },
+      transport: new FakeTransport(), db: { pendingCount: async () => 0 }, runSuppressed: callback => callback(),
+      createOutbound: input => {
+        hooks = input;
+        return {
+          start: async () => {},
+          capture: async failedMutation => {
+            const identity = failedMutation.kind === 'put' ? failedMutation.record : failedMutation;
+            const notice = {
+              captureId: crypto.randomUUID(), kind: failedMutation.kind, recordType: identity.recordType,
+              logicalId: identity.logicalId, recordKey: privateProRecordKey(identity.recordType, identity.logicalId), projectionKey: identity.projectionKey,
+            } as const;
+            hooks.onCapture(notice);
+            hooks.onCaptureFailed({ ...notice, category: 'schema' });
+            hooks.onStatus({ category: 'schema' });
+            throw new TypeError('secret invalid value');
+          },
+          retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+        };
+      },
+      createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
+    });
+
+    await engine.start();
+
+    assert.equal(store.getState().phase, 'error');
+    assert.equal(store.getState().lastCategory, 'schema');
+    assert.equal(hooks.originFor(privateProRecordKey('settings', 'main'))?.dirty, true);
+    assert.equal(engine.testOnlyStartupRecoveryStateSize(), 1);
     await engine.stop();
   });
 
@@ -354,7 +392,7 @@ describe('Private Pro sync engine', () => {
       recordType: 'settings', logicalId: 'second', projectionKey: 'second', schemaVersion: 1,
       value: { value: 'new-second' }, referencedAssetIds: [],
     } };
-    const versions = new Map([['settings:first', 1], ['settings:second', 1]]);
+    const versions = new Map([[privateProRecordKey('settings', 'first'), 1], [privateProRecordKey('settings', 'second'), 1]]);
     let active = true;
     const startupBuffer = {
       active: () => active,
@@ -364,13 +402,13 @@ describe('Private Pro sync engine', () => {
       },
       noteLiveMutation: (mutation: PrivateProSyncLocalMutation) => {
         const identity = mutation.kind === 'put' ? mutation.record : mutation;
-        const key = `${identity.recordType}:${identity.logicalId}`;
+        const key = privateProRecordKey(identity.recordType, identity.logicalId);
         const version = (versions.get(key) ?? 0) + 1;
         versions.set(key, version);
         return version;
       },
-      currentVersion: (key: string) => versions.get(key) ?? 0,
-      restore: () => false,
+      isCurrent: (entry: ReturnType<typeof startupEntry>) => versions.get(entry.key) === entry.version,
+      forget: (key: string, version: number) => { if (versions.get(key) === version) versions.delete(key); },
     };
     const transport = new FakeTransport();
     const engine = createPrivateProSyncEngine({
@@ -429,10 +467,10 @@ describe('Private Pro sync engine', () => {
       recordType: 'settings', logicalId: 'second', projectionKey: 'second', schemaVersion: 1,
       value: { value: 'new-second' }, referencedAssetIds: [],
     } };
-    const versions = new Map([['settings:first', 1], ['settings:second', 1]]);
+    const versions = new Map([[privateProRecordKey('settings', 'first'), 1], [privateProRecordKey('settings', 'second'), 1]]);
     const pending = new Map([
-      ['settings:first', startupEntry(first)],
-      ['settings:second', startupEntry(oldSecond)],
+      [privateProRecordKey('settings', 'first'), startupEntry(first)],
+      [privateProRecordKey('settings', 'second'), startupEntry(oldSecond)],
     ]);
     let active = true;
     const startupBuffer = {
@@ -445,18 +483,13 @@ describe('Private Pro sync engine', () => {
       },
       noteLiveMutation: (mutation: PrivateProSyncLocalMutation) => {
         const identity = mutation.kind === 'put' ? mutation.record : mutation;
-        const key = `${identity.recordType}:${identity.logicalId}`;
+        const key = privateProRecordKey(identity.recordType, identity.logicalId);
         const version = (versions.get(key) ?? 0) + 1;
         versions.set(key, version);
         return version;
       },
-      currentVersion: (key: string) => versions.get(key) ?? 0,
-      restore: (entry: ReturnType<typeof startupEntry>) => {
-        if ((versions.get(entry.key) ?? 0) !== entry.version) return false;
-        pending.set(entry.key, entry);
-        active = true;
-        return true;
-      },
+      isCurrent: (entry: ReturnType<typeof startupEntry>) => versions.get(entry.key) === entry.version,
+      forget: (key: string, version: number) => { if (versions.get(key) === version) versions.delete(key); },
     };
     const createEngine = () => {
       const transport = new FakeTransport();
@@ -477,11 +510,13 @@ describe('Private Pro sync engine', () => {
     await firstValidationStarted.promise;
     serializer.listener?.(newSecond);
     releaseFirstValidation.resolve();
-    await assert.rejects(starting, /forced frozen failure/);
+    await starting;
 
     const secondRecordKey = privateProRecordKey('settings', 'second');
+    for (let attempt = 0; attempt < 20 && (await db.getOutbox(uid, secondRecordKey))?.payload !== '{"value":"new-second"}'; attempt++) await settle();
     assert.equal((await db.getOutbox(uid, secondRecordKey))?.payload, '{"value":"new-second"}');
-    assert.deepEqual([...pending.keys()], ['settings:first']);
+    assert.deepEqual([...pending.keys()], []);
+    assert.equal(firstEngine.testOnlyStartupRecoveryStateSize(), 1);
     await firstEngine.stop();
 
     const retryEngine = createEngine();
@@ -638,7 +673,7 @@ describe('Private Pro sync engine', () => {
     await engine.stop();
   });
 
-  test('startup capture failure restores only the uncaptured frozen suffix for retry', async () => {
+  test('startup capture failure retains only the failed frozen entry for explicit retry', async () => {
     const first: PrivateProSyncLocalMutation = { kind: 'put', record: {
       recordType: 'settings', logicalId: 'first', projectionKey: 'first', schemaVersion: 1, value: { value: 'first' }, referencedAssetIds: [],
     } };
@@ -646,19 +681,18 @@ describe('Private Pro sync engine', () => {
       recordType: 'settings', logicalId: 'second', projectionKey: 'second', schemaVersion: 1, value: { value: 'second' }, referencedAssetIds: [],
     } };
     let active = true;
-    let restored: readonly PrivateProSyncLocalMutation[] = [];
+    const forgotten: string[] = [];
+    let conditionalCaptures = 0;
     const engine = createPrivateProSyncEngine({
       uid: 'uid-restore', serializers: [new FakeSerializer()],
       startupBuffer: {
         active: () => active,
         closeAndTake: () => { active = false; return [startupEntry(first), startupEntry(second)]; },
-        currentVersion: () => 1,
-        restore: entry => { restored = [entry.mutation]; active = true; return true; },
+        isCurrent: () => true,
+        forget: key => { forgotten.push(key); },
       },
       transport: new FakeTransport(), db: {
         pendingCount: async () => 2,
-        getLocalRecord: async () => null,
-        getOutbox: async () => null,
       }, runSuppressed: callback => callback(),
       createOutbound: () => ({
         start: async () => {},
@@ -666,15 +700,145 @@ describe('Private Pro sync engine', () => {
           const identity = mutation.kind === 'put' ? mutation.record : mutation;
           if (identity.logicalId === 'second') throw new Error('capture failed');
         },
+        captureIfGeneration: async mutation => {
+          conditionalCaptures++;
+          const identity = mutation.kind === 'put' ? mutation.record : mutation;
+          return { status: 'captured', row: {} as never, notice: {
+            captureId: crypto.randomUUID(), kind: mutation.kind, recordType: identity.recordType, logicalId: identity.logicalId,
+            recordKey: privateProRecordKey(identity.recordType, identity.logicalId), projectionKey: identity.projectionKey,
+            generation: 1, mutationId: crypto.randomUUID(),
+          } };
+        },
         retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
       }),
       createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
     });
 
-    await assert.rejects(engine.start());
+    await engine.start();
 
-    assert.equal(active, true);
-    assert.deepEqual(restored, [second]);
+    assert.equal(active, false);
+    assert.deepEqual(forgotten, [privateProRecordKey('settings', 'first')]);
+    await engine.retryNow();
+    assert.equal(conditionalCaptures, 1);
+    assert.deepEqual(forgotten, [privateProRecordKey('settings', 'first'), privateProRecordKey('settings', 'second')]);
+    await engine.stop();
+  });
+
+  test('superseded startup retry removes its temporary local origin', async () => {
+    const mutation: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'old' }, referencedAssetIds: [],
+    } };
+    let hooks!: Parameters<NonNullable<Parameters<typeof createPrivateProSyncEngine>[0]['createOutbound']>>[0];
+    let attempts = 0;
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-superseded-origin', serializers: [new FakeSerializer()],
+      startupBuffer: {
+        active: () => false,
+        closeAndTake: () => [startupEntry(mutation)],
+        isCurrent: () => true,
+        forget: () => {},
+      },
+      transport: new FakeTransport(), db: { pendingCount: async () => 0 }, runSuppressed: callback => callback(),
+      createOutbound: input => {
+        hooks = input;
+        return {
+          start: async () => {},
+          capture: async () => { throw new Error('startup capture failed'); },
+          captureIfGeneration: async conditionalMutation => {
+            attempts++;
+            const identity = conditionalMutation.kind === 'put' ? conditionalMutation.record : conditionalMutation;
+            const notice = {
+              captureId: crypto.randomUUID(), kind: conditionalMutation.kind, recordType: identity.recordType,
+              logicalId: identity.logicalId, recordKey: privateProRecordKey(identity.recordType, identity.logicalId), projectionKey: identity.projectionKey,
+            } as const;
+            hooks.onCapture(notice);
+            return { status: 'superseded', notice };
+          },
+          retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+        };
+      },
+      createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
+    });
+
+    await engine.start();
+    await engine.retryNow();
+
+    assert.equal(attempts, 1);
+    assert.equal(hooks.originFor(privateProRecordKey('settings', 'main')), undefined);
+    assert.equal(engine.testOnlyStartupRecoveryStateSize(), 0);
+    await engine.stop();
+  });
+
+  test('a live edit during another failed baseline wait cancels its stale retry and keeps its origin', async () => {
+    const mutation = (logicalId: string, value: string): PrivateProSyncLocalMutation => ({ kind: 'put', record: {
+      recordType: 'settings', logicalId, projectionKey: logicalId, schemaVersion: 1, value: { value }, referencedAssetIds: [],
+    } });
+    const oldFirst = mutation('first', 'old-first');
+    const oldSecond = mutation('second', 'old-second');
+    const newFirst = mutation('first', 'new-first');
+    const secondBaseline = deferred<{ ok: true; value: number } | { ok: false }>();
+    const firstEntry = startupEntry(oldFirst);
+    const secondEntry = { ...startupEntry(oldSecond), baselineGenerationResult: secondBaseline.promise };
+    const conditionalKeys: string[] = [];
+    let liveCaptureId = '';
+    let emitLive: () => void = () => assert.fail('Live capture hook was not installed.');
+    let outboundHooks!: Parameters<NonNullable<Parameters<typeof createPrivateProSyncEngine>[0]['createOutbound']>>[0];
+    const noticeFor = (localMutation: PrivateProSyncLocalMutation) => {
+      const identity = localMutation.kind === 'put' ? localMutation.record : localMutation;
+      return {
+        captureId: crypto.randomUUID(), kind: localMutation.kind, recordType: identity.recordType,
+        logicalId: identity.logicalId, recordKey: privateProRecordKey(identity.recordType, identity.logicalId), projectionKey: identity.projectionKey,
+      } as const;
+    };
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-live-during-retry', serializers: [new FakeSerializer()],
+      startupBuffer: {
+        active: () => false,
+        closeAndTake: () => [firstEntry, secondEntry],
+        isCurrent: () => true,
+        forget: () => {},
+      },
+      transport: new FakeTransport(), db: { pendingCount: async () => 0 }, runSuppressed: callback => callback(),
+      createOutbound: hooks => {
+        outboundHooks = hooks;
+        return {
+          start: async () => {
+            emitLive = () => {
+              if (!hooks.shouldCapture(newFirst)) return;
+              const notice = noticeFor(newFirst);
+              liveCaptureId = notice.captureId;
+              hooks.onCapture(notice);
+              hooks.onCaptured({ ...notice, generation: 1, mutationId: crypto.randomUUID() });
+            };
+          },
+          capture: async localMutation => {
+            const notice = noticeFor(localMutation);
+            hooks.onCapture(notice);
+            hooks.onCaptureFailed({ ...notice, category: 'offline' });
+            throw new Error('startup capture failed');
+          },
+          captureIfGeneration: async localMutation => {
+            const notice = noticeFor(localMutation);
+            conditionalKeys.push(notice.recordKey);
+            hooks.onCapture(notice);
+            return { status: 'superseded', notice };
+          },
+          retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+        };
+      },
+      createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
+    });
+    await engine.start();
+
+    const retrying = engine.retryNow();
+    await settle();
+    emitLive();
+    secondBaseline.resolve({ ok: true, value: 0 });
+    await retrying;
+
+    assert.deepEqual(conditionalKeys, [privateProRecordKey('settings', 'second')]);
+    assert.equal(outboundHooks.originFor(privateProRecordKey('settings', 'first'))?.captureId, liveCaptureId);
     await engine.stop();
   });
 
@@ -683,54 +847,58 @@ describe('Private Pro sync engine', () => {
       recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
       value: { value: 'frozen' }, referencedAssetIds: [],
     } };
-    let restoreCalls = 0;
+    let forgotten = 0;
+    let conditionalAttempts = 0;
+    const store = createPrivateProSyncStore();
     const engine = createPrivateProSyncEngine({
-      uid: 'uid-unknown-baseline', serializers: [new FakeSerializer()],
+      uid: 'uid-unknown-baseline', serializers: [new FakeSerializer()], statusStore: store,
       startupBuffer: {
         active: () => false,
-        closeAndTake: () => [{ ...startupEntry(mutation), baselineGeneration: Promise.reject(new Error('baseline read failed')) }],
-        currentVersion: () => 1,
-        restore: () => { restoreCalls++; return true; },
+        closeAndTake: () => [{ ...startupEntry(mutation), baselineGenerationResult: Promise.resolve({ ok: false } as const) }],
+        isCurrent: () => true,
+        forget: () => { forgotten++; },
       },
       transport: new FakeTransport(),
       db: {
         pendingCount: async () => 0,
-        getLocalRecord: async () => null,
-        getOutbox: async () => null,
       },
       runSuppressed: callback => callback(),
       createOutbound: () => ({
         start: async () => {}, capture: async () => { throw new Error('capture failed'); },
+        captureIfGeneration: async () => { conditionalAttempts++; throw new Error('must not retry unknown baseline'); },
         retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
       }),
       createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
     });
 
-    await assert.rejects(engine.start(), /capture failed/);
+    await engine.start();
+    await engine.retryNow();
 
-    assert.equal(restoreCalls, 0);
+    assert.equal(forgotten, 0);
+    assert.equal(conditionalAttempts, 0);
+    assert.equal(engine.testOnlyStartupRecoveryStateSize(), 1);
+    assert.equal(store.getState().phase, 'error');
+    assert.equal(store.getState().lastCategory, 'unknown');
     await engine.stop();
   });
 
-  test('startup capture failure preserves its error when current durability cannot be verified', async () => {
+  test('startup capture failure retains a dirty retry when baseline state is unknown', async () => {
     const mutation: PrivateProSyncLocalMutation = { kind: 'put', record: {
       recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
       value: { value: 'frozen' }, referencedAssetIds: [],
     } };
-    let restoreCalls = 0;
+    let forgotten = 0;
     const engine = createPrivateProSyncEngine({
       uid: 'uid-unknown-current', serializers: [new FakeSerializer()],
       startupBuffer: {
         active: () => false,
         closeAndTake: () => [startupEntry(mutation)],
-        currentVersion: () => 1,
-        restore: () => { restoreCalls++; return true; },
+        isCurrent: () => true,
+        forget: () => { forgotten++; },
       },
       transport: new FakeTransport(),
       db: {
         pendingCount: async () => 0,
-        getLocalRecord: async () => { throw new Error('generation read failed'); },
-        getOutbox: async () => null,
       },
       runSuppressed: callback => callback(),
       createOutbound: () => ({
@@ -740,9 +908,10 @@ describe('Private Pro sync engine', () => {
       createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
     });
 
-    await assert.rejects(engine.start(), /capture failed/);
+    await engine.start();
 
-    assert.equal(restoreCalls, 0);
+    assert.equal(forgotten, 0);
+    assert.equal(engine.testOnlyStartupRecoveryStateSize(), 1);
     await engine.stop();
   });
 
@@ -754,30 +923,40 @@ describe('Private Pro sync engine', () => {
       recordType: 'settings', logicalId: 'second', projectionKey: 'second', schemaVersion: 1, value: { value: 'new-second' }, referencedAssetIds: [],
     } };
     let version = 1;
-    let restoreCalls = 0;
+    let forgotten = 0;
     let durableGeneration = 0;
+    let latestCaptureId = '';
+    let outboundHooks!: Parameters<NonNullable<Parameters<typeof createPrivateProSyncEngine>[0]['createOutbound']>>[0];
     let emitNew: () => void = () => assert.fail('New capture hook was not installed.');
     const oldCapture = deferred<void>();
     const engine = createPrivateProSyncEngine({
       uid: 'uid-newer-live', serializers: [new FakeSerializer()],
       startupBuffer: {
         active: () => false,
-        closeAndTake: () => [{ ...startupEntry(oldSecond), baselineGeneration: Promise.resolve(0) }],
+        closeAndTake: () => [startupEntry(oldSecond)],
         noteLiveMutation: () => ++version,
-        currentVersion: () => version,
-        restore: () => { restoreCalls++; return true; },
+        isCurrent: entry => entry.version === version,
+        forget: () => { forgotten++; },
       },
       transport: new FakeTransport(),
       db: {
         pendingCount: async () => 1,
-        getLocalRecord: async () => ({ generation: durableGeneration }),
-        getOutbox: async () => ({ generation: durableGeneration }),
       },
       runSuppressed: callback => callback(),
-      createOutbound: hooks => ({
+      createOutbound: hooks => {
+        outboundHooks = hooks;
+        return {
         start: async () => {
           emitNew = () => {
-            if (hooks.shouldCapture(newSecond)) durableGeneration = 2;
+            if (!hooks.shouldCapture(newSecond)) return;
+            const notice = {
+              captureId: crypto.randomUUID(), kind: 'put', recordType: 'settings', logicalId: 'second',
+              recordKey: privateProRecordKey('settings', 'second'), projectionKey: 'second',
+            } as const;
+            latestCaptureId = notice.captureId;
+            hooks.onCapture(notice);
+            durableGeneration = 2;
+            hooks.onCaptured({ ...notice, generation: 2, mutationId: crypto.randomUUID() });
           };
         },
         capture: mutation => {
@@ -789,7 +968,8 @@ describe('Private Pro sync engine', () => {
           return Promise.resolve();
         },
         retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
-      }),
+        };
+      },
       createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
     });
     const starting = engine.start();
@@ -797,8 +977,10 @@ describe('Private Pro sync engine', () => {
     oldCapture.resolve();
     await starting;
 
-    assert.equal(restoreCalls, 0);
+    assert.equal(forgotten, 1);
     assert.equal(durableGeneration, 2);
+    assert.equal(engine.testOnlyStartupRecoveryStateSize(), 0);
+    assert.equal(outboundHooks.originFor(privateProRecordKey('settings', 'second'))?.captureId, latestCaptureId);
     await engine.stop();
   });
 
@@ -814,8 +996,8 @@ describe('Private Pro sync engine', () => {
       startupBuffer: {
         active: () => false,
         closeAndTake: () => [startupEntry(mutation)],
-        currentVersion: () => 1,
-        restore: () => { restoreCalls++; return true; },
+        isCurrent: () => true,
+        forget: () => { restoreCalls++; },
       },
       transport: new FakeTransport(), db: { pendingCount: async () => 1 }, runSuppressed: callback => callback(),
       createOutbound: () => ({

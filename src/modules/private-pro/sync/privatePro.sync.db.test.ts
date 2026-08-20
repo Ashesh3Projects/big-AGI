@@ -199,6 +199,51 @@ describe('Private Pro seamless sync database', () => {
     assert.equal(pending?.dueAtMs, 61_000);
   });
 
+  for (const kind of ['put', 'delete'] as const) {
+    test(`conditionally captures a local ${kind} only at the expected effective generation`, async (t) => {
+      const db = createDB(t);
+      const record = preparedRecord(`conditional-${kind}`, '{"value":"old"}');
+      const captured = kind === 'put'
+        ? await db.recordLocalPutIfGeneration(UID_A, record, 0, 1_000)
+        : await db.recordLocalDeleteIfGeneration(UID_A, record, 0, 1_000);
+
+      assert.equal(captured.status, 'captured');
+      if (captured.status !== 'captured') assert.fail('Expected the initial conditional capture to persist.');
+      assert.equal(captured.row.generation, 1);
+
+      await db.recordLocalPut(UID_A, { ...record, payload: '{"value":"new"}' }, 2_000);
+      const superseded = kind === 'put'
+        ? await db.recordLocalPutIfGeneration(UID_A, { ...record, payload: '{"value":"stale"}' }, 1, 3_000)
+        : await db.recordLocalDeleteIfGeneration(UID_A, record, 1, 3_000);
+
+      assert.deepEqual(superseded, { status: 'superseded' });
+      const pending = await db.getOutbox(UID_A, record.recordKey);
+      assert.equal(pending?.generation, 2);
+      assert.equal(pending?.kind, 'put');
+      assert.equal(pending?.payload, '{"value":"new"}');
+    });
+  }
+
+  test('startup generation baseline includes the retained counter after local rows are removed', async (t) => {
+    const db = createDB(t);
+    const record = preparedRecord('conditional-retained-counter', '{"value":"first"}');
+    const first = await db.recordLocalPut(UID_A, record, 1_000);
+    await db.transaction('rw', [db.localRecords, db.outbox], async () => {
+      await Promise.all([
+        db.localRecords.delete([UID_A, record.recordKey]),
+        db.outbox.delete([UID_A, record.recordKey]),
+      ]);
+    });
+
+    const baseline = await db.getCurrentGeneration(UID_A, record.recordKey);
+    const retry = await db.recordLocalPutIfGeneration(UID_A, { ...record, payload: '{"value":"retry"}' }, baseline, 2_000);
+
+    assert.equal(baseline, first.generation);
+    assert.equal(retry.status, 'captured');
+    if (retry.status !== 'captured') assert.fail('Expected the retained generation baseline to permit the retry.');
+    assert.equal(retry.row.generation, first.generation + 1);
+  });
+
   test('acknowledges only the generation that was sent', async (t) => {
     const db = createDB(t);
     const first = preparedRecord('record-1', '{"value":1}');

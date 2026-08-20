@@ -56,6 +56,10 @@ export interface PrivateProOutboxState extends PrivateProSyncRecordIdentity {
   errorCode: string | null;
 }
 
+export type PrivateProConditionalCaptureResult =
+  | { status: 'captured'; row: PrivateProOutboxState }
+  | { status: 'superseded' };
+
 export interface PrivateProRemoteBaseState {
   revision: number;
   mutationId: string;
@@ -326,6 +330,21 @@ export class PrivateProSyncDB extends Dexie {
     return state ? cloneOutbox(state) : null;
   }
 
+  async getCurrentGeneration(uid: string, recordKey: string): Promise<number> {
+    return this.transaction('r', [this.localRecords, this.outbox, this.meta], async () => {
+      const [local, pending, generationState] = await Promise.all([
+        this.localRecords.get([uid, recordKey]),
+        this.outbox.get([uid, recordKey]),
+        this.meta.get([uid, `generation:${recordKey}`]),
+      ]);
+      return Math.max(
+        local?.generation ?? 0,
+        pending?.generation ?? 0,
+        typeof generationState?.value === 'number' ? generationState.value : 0,
+      );
+    });
+  }
+
   async getRemoteBase(uid: string, recordKey: string): Promise<PrivateProRemoteBaseState | null> {
     const state = await this.remoteBases.get([uid, recordKey]);
     return state ? { revision: state.revision, mutationId: state.mutationId, deleted: state.deleted } : null;
@@ -416,6 +435,16 @@ export class PrivateProSyncDB extends Dexie {
     }
   }
 
+  async recordLocalPutIfGeneration(
+    uid: string,
+    record: PrivateProSyncPreparedRecord,
+    expectedMaxGeneration: number,
+    nowMs: number,
+    signal?: AbortSignal,
+  ): Promise<PrivateProConditionalCaptureResult> {
+    return this.recordLocalMutationIfGeneration(uid, record, 'put', expectedMaxGeneration, nowMs, signal);
+  }
+
   async recordLocalDelete(
     uid: string,
     identity: PrivateProSyncRecordIdentity,
@@ -479,6 +508,16 @@ export class PrivateProSyncDB extends Dexie {
     } finally {
       if (abortTransaction) signal?.removeEventListener('abort', abortTransaction);
     }
+  }
+
+  async recordLocalDeleteIfGeneration(
+    uid: string,
+    identity: PrivateProSyncRecordIdentity,
+    expectedMaxGeneration: number,
+    nowMs: number,
+    signal?: AbortSignal,
+  ): Promise<PrivateProConditionalCaptureResult> {
+    return this.recordLocalMutationIfGeneration(uid, identity, 'delete', expectedMaxGeneration, nowMs, signal);
   }
 
   async leaseDue(uid: string, nowMs: number, leaseMs: number, coordinatorFence: number): Promise<PrivateProOutboxState | null> {
@@ -771,6 +810,88 @@ export class PrivateProSyncDB extends Dexie {
       && pending.leasedGeneration === generation
       && pending.leaseToken === leaseToken
       && pending.leaseFence === leaseFence;
+  }
+
+  private async recordLocalMutationIfGeneration(
+    uid: string,
+    input: PrivateProSyncPreparedRecord | PrivateProSyncRecordIdentity,
+    kind: 'put' | 'delete',
+    expectedMaxGeneration: number,
+    nowMs: number,
+    signal?: AbortSignal,
+  ): Promise<PrivateProConditionalCaptureResult> {
+    let abortTransaction: (() => void) | null = null;
+    const recordKey = input.recordKey;
+    const transaction = this.transaction('rw', [this.localRecords, this.outbox, this.remoteBases, this.meta], async dexieTransaction => {
+      abortTransaction = () => dexieTransaction.abort();
+      signal?.addEventListener('abort', abortTransaction, { once: true });
+      throwIfCaptureAborted(signal);
+      const generationKey = `generation:${recordKey}`;
+      const [previousLocal, previousOutbox, remoteBase, generationState] = await Promise.all([
+        this.localRecords.get([uid, recordKey]),
+        this.outbox.get([uid, recordKey]),
+        this.remoteBases.get([uid, recordKey]),
+        this.meta.get([uid, generationKey]),
+      ]);
+      throwIfCaptureAborted(signal);
+      const effectiveGeneration = Math.max(
+        previousLocal?.generation ?? 0,
+        previousOutbox?.generation ?? 0,
+        typeof generationState?.value === 'number' ? generationState.value : 0,
+      );
+      if (effectiveGeneration !== expectedMaxGeneration) return { status: 'superseded' } as const;
+      const generation = effectiveGeneration + 1;
+      const baseRevision = remoteBase?.revision ?? previousLocal?.baseRevision ?? 0;
+      const startsPostLeaseGeneration = previousOutbox?.leasedGeneration !== null
+        && previousOutbox?.leasedGeneration !== undefined
+        && previousOutbox.generation === previousOutbox.leasedGeneration;
+      const identity = kind === 'put' ? asIdentity(input as PrivateProSyncPreparedRecord) : input as PrivateProSyncRecordIdentity;
+      const localRecord: PrivateProLocalRecordState = {
+        uid,
+        ...identity,
+        payload: kind === 'put' ? (input as PrivateProSyncPreparedRecord).payload : '',
+        contentHash: kind === 'put' ? (input as PrivateProSyncPreparedRecord).contentHash : null,
+        referencedAssetIds: kind === 'put' ? [...(input as PrivateProSyncPreparedRecord).referencedAssetIds] : [],
+        generation,
+        baseRevision,
+        deleted: kind === 'delete',
+        updatedAtMs: nowMs,
+      };
+      const outbox: PrivateProOutboxState = {
+        uid,
+        ...identity,
+        kind,
+        payload: localRecord.payload,
+        contentHash: localRecord.contentHash,
+        referencedAssetIds: [...localRecord.referencedAssetIds],
+        mutationId: crypto.randomUUID(),
+        generation,
+        baseRevision,
+        dueAtMs: startsPostLeaseGeneration ? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS : previousOutbox?.dueAtMs ?? nowMs + PRIVATE_PRO_SYNC_WINDOW_MS,
+        retryAttempt: 0,
+        leaseUntilMs: previousOutbox?.leaseUntilMs ?? null,
+        leaseToken: previousOutbox?.leaseToken ?? null,
+        leaseFence: previousOutbox?.leaseFence ?? null,
+        leasedGeneration: previousOutbox?.leasedGeneration ?? null,
+        blocked: false,
+        errorCode: null,
+      };
+      throwIfCaptureAborted(signal);
+      await Promise.all([
+        this.meta.put({ uid, key: generationKey, value: generation }),
+        this.localRecords.put(localRecord),
+        this.outbox.put(outbox),
+      ]);
+      return { status: 'captured', row: cloneOutbox(outbox) } as const;
+    });
+    try {
+      return await transaction;
+    } catch (error) {
+      if (signal?.aborted) throw captureAbortError();
+      throw error;
+    } finally {
+      if (abortTransaction) signal?.removeEventListener('abort', abortTransaction);
+    }
   }
 
   private async nextGeneration(uid: string, recordKey: string): Promise<number> {

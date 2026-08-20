@@ -25,7 +25,7 @@ const usePrivateProLayoutEffect = typeof window === 'undefined' ? React.useEffec
 
 function privateProStartupMutationKey(mutation: PrivateProSyncLocalMutation): string {
   const identity = mutation.kind === 'put' ? mutation.record : mutation;
-  return `${identity.recordType}:${identity.logicalId}`;
+  return privateProRecordKey(identity.recordType, identity.logicalId);
 }
 
 export function createPrivateProStartupMutationBuffer(
@@ -35,9 +35,10 @@ export function createPrivateProStartupMutationBuffer(
   active(): boolean;
   start(): void;
   closeAndTake(): readonly PrivateProSyncStartupMutation[];
-  noteLiveMutation(mutation: PrivateProSyncLocalMutation): number;
-  currentVersion(key: string): number;
-  restore(entry: PrivateProSyncStartupMutation): boolean;
+  noteLiveMutation(mutation: PrivateProSyncLocalMutation): void;
+  isCurrent(entry: Pick<PrivateProSyncStartupMutation, 'key' | 'version'>): boolean;
+  forget(key: string, version: number): void;
+  testOnlyStateSize(): { versions: number };
   stop(): void;
 } {
   const mutations = new Map<string, PrivateProSyncStartupMutation>();
@@ -49,6 +50,10 @@ export function createPrivateProStartupMutationBuffer(
     versions.set(key, version);
     return version;
   };
+  const baselineResult = (mutation: PrivateProSyncLocalMutation) => durableGeneration(mutation).then(
+    value => ({ ok: true, value }) as const,
+    () => ({ ok: false }) as const,
+  );
   const subscribe = () => {
     if (active) return;
     active = true;
@@ -60,7 +65,7 @@ export function createPrivateProStartupMutationBuffer(
         key,
         version: nextVersion(key),
         mutation: structuredClone(mutation),
-        baselineGeneration: durableGeneration(mutation),
+        baselineGenerationResult: baselineResult(mutation),
       });
     })));
   };
@@ -77,17 +82,24 @@ export function createPrivateProStartupMutationBuffer(
       mutations.clear();
       return frozen;
     },
-    noteLiveMutation: mutation => nextVersion(privateProStartupMutationKey(mutation)),
-    currentVersion: key => versions.get(key) ?? 0,
-    restore: entry => {
-      if ((versions.get(entry.key) ?? 0) !== entry.version) return false;
-      mutations.set(entry.key, { ...entry, mutation: structuredClone(entry.mutation) });
-      subscribe();
-      return true;
+    noteLiveMutation: mutation => {
+      const key = privateProStartupMutationKey(mutation);
+      if (!versions.has(key)) return;
+      versions.delete(key);
+      mutations.delete(key);
     },
+    isCurrent: entry => versions.get(entry.key) === entry.version,
+    forget: (key, version) => {
+      if (versions.get(key) === version) versions.delete(key);
+      const mutation = mutations.get(key);
+      if (mutation?.version === version) mutations.delete(key);
+    },
+    testOnlyStateSize: () => ({ versions: versions.size }),
     stop: () => {
       active = false;
       unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
+      mutations.clear();
+      versions.clear();
     },
   };
 }
@@ -95,11 +107,7 @@ export function createPrivateProStartupMutationBuffer(
 async function privateProStartupDurableGeneration(uid: string, mutation: PrivateProSyncLocalMutation): Promise<number> {
   const identity = mutation.kind === 'put' ? mutation.record : mutation;
   const recordKey = privateProRecordKey(identity.recordType, identity.logicalId);
-  const [local, pending] = await Promise.all([
-    privateProSyncDB.getLocalRecord(uid, recordKey),
-    privateProSyncDB.getOutbox(uid, recordKey),
-  ]);
-  return Math.max(local?.generation ?? 0, pending?.generation ?? 0);
+  return privateProSyncDB.getCurrentGeneration(uid, recordKey);
 }
 
 export async function preparePrivateProCrossUidTransition(dependencies: {
@@ -365,6 +373,7 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
         await stopEngine(next, owner).catch(() => {});
         return;
       }
+      dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
       await next.engine.start();
       if (!await waitForDecision(owner)) {
         await stopEngine(next, owner).catch(() => {});
@@ -372,7 +381,6 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
       }
       prepared = { attempt: owner, value: next };
       if (attempt === owner) attempt = null;
-      dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
     } catch {
       if (canOwnStart(owner)) next?.resumeStartupCapture?.();
       if (canOwnStart(owner)) {

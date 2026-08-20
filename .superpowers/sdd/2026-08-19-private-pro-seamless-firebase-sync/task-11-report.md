@@ -180,6 +180,60 @@ The startup handoff is a single atomic boundary:
 
 None.
 
+## Fix round 4
+
+Round 4 supersedes the round-3 recovery mechanism described below.
+
+### Findings addressed
+
+- A rejected frozen startup capture still rejected engine startup. Lifecycle cleanup then stopped outbound and could abort unrelated post-close edits that were already queued.
+- Failed startup recovery used separate generation reads followed by a later ordinary capture. A sibling or same-UID writer could advance the durable generation between those operations and then be overwritten by the stale retry.
+- Baseline generation promises had no rejection handler in their observation turn. Version entries also accumulated for ordinary post-startup mutations.
+- Round-3 recovery status could be overwritten by the lifecycle wrapper after engine start resolved.
+
+### Design
+
+- The engine invokes every frozen capture synchronously, awaits the complete `Promise.allSettled` barrier, records each unchanged failure in a bounded map keyed by canonical record key, and continues to cache hydration and listeners. Failed origins remain dirty and protected. Startup no longer rejects because one frozen capture failed.
+- Retry processes only failed entries whose settled baseline is known. It uses outbound validation, canonical serialization, hashing, and local-origin hooks, then calls a DB-atomic conditional put or delete.
+- The conditional DB transaction reads the retained generation counter, local row, outbox row, and remote base in the same transaction. It allocates and writes only when the effective current generation exactly equals the startup baseline. Otherwise it returns `superseded` without mutation.
+- A superseded conditional attempt removes only its own temporary local origin. A newer live origin remains authoritative.
+- Startup baseline reads attach fulfillment and rejection handlers immediately and store `{ ok: true, value }` or `{ ok: false }`. Unknown baselines remain retained but are not retried automatically.
+- The startup buffer allocates versions only while observing active startup mutations. Successful entries, conditional completions, live supersession, and stop prune version and failed state. Ordinary post-startup mutations do not allocate version entries.
+- The lifecycle clears stale status before engine start and preserves any fresh sanitized error or offline status reported during startup.
+
+### RED evidence
+
+- Startup-buffer regressions failed because settled baseline results and bounded state probes did not exist; the rejected baseline also emitted an `unhandledRejection` after the test ended.
+- DB regressions failed because conditional put/delete and retained-generation baseline APIs did not exist.
+- Outbound regressions failed because `captureIfGeneration` did not exist.
+- The lifecycle regression showed a fresh engine-reported `error` was overwritten with `local`.
+- The sibling-write regression showed conditional retry needed to reject OLD after NEW committed following validation.
+- The live-during-baseline regression showed the retry still enqueued a stale same-key conditional capture after the live edit had superseded it.
+
+### GREEN evidence
+
+- Final provider, engine, outbound, DB, reconciler, persistence, and cutover suite: 219 passed, 0 failed.
+- `npm run tscheck`: exit 0 for root and tools TypeScript programs.
+- `npm run lint`: exit 0 with no warnings.
+- `git diff --check`: exit 0 with only repository line-ending notices.
+
+### Self-review
+
+- Frozen capture calls remain ordered and synchronous before the all-settled wait.
+- One failed record cannot stop startup or abort unrelated queued live captures.
+- A later live edit removes the failed entry before normal capture and owns the record origin.
+- Conditional retry performs no generation allocation, local write, or outbox write after supersession.
+- Same-tab edits queued after a conditional attempt still finish later and remain the final durable value.
+- Sibling writes that commit after validation but before the conditional transaction win atomically.
+- Baseline rejection has no process-level unhandled or rejection-handled event and never retries with an invented zero.
+- Retained counters remain part of the baseline even when local and outbox rows are absent.
+- Stop, sign-out, and UID cleanup still clear the bounded in-memory recovery state.
+- Cross-UID transition, source deletion, cutover, Open-build behavior, and the 60-second outbound schedule remain unchanged.
+
+### Concerns
+
+None.
+
 ## Fix round 3
 
 ### Findings addressed
