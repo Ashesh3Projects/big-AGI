@@ -37,6 +37,7 @@ import {
   inspectRuntimeRoleManifest,
   inspectServiceAccountKeys,
   inspectServiceAccountIamRoles,
+  EXPECTED_PRIVATE_PRO_BUCKET_CORS,
   type AuditFinding,
 } from './security-audit';
 
@@ -1038,6 +1039,8 @@ describe('private Pro security audit classifiers', () => {
         { service: 'firebaseappcheck.googleapis.com' },
         { service: 'identitytoolkit.googleapis.com' },
         { service: 'securetoken.googleapis.com' },
+        { service: 'firestore.googleapis.com' },
+        { service: 'firebasestorage.googleapis.com' },
       ],
     } }]);
 
@@ -1046,10 +1049,12 @@ describe('private Pro security audit classifiers', () => {
       { restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] }, apiTargets: [
         { service: 'firebaseappcheck.googleapis.com' },
         { service: 'identitytoolkit.googleapis.com' }, { service: 'securetoken.googleapis.com' },
+        { service: 'firestore.googleapis.com' }, { service: 'firebasestorage.googleapis.com' },
       ] } },
       { restrictions: { browserKeyRestrictions: { allowedReferrers: ['https://chatgpt.ashesh.dev/*', 'https://big-agi-243b6.firebaseapp.com/*'] }, apiTargets: [
         { service: 'firebaseappcheck.googleapis.com' },
         { service: 'identitytoolkit.googleapis.com' }, { service: 'securetoken.googleapis.com' },
+        { service: 'firestore.googleapis.com' }, { service: 'firebasestorage.googleapis.com' },
       ] } },
     ])).some(finding => finding.severity === 'block'), true);
     assert.equal(classifyBrowserApiKeys(inspectBrowserApiKeys([{ restrictions: {
@@ -1058,6 +1063,8 @@ describe('private Pro security audit classifiers', () => {
         { service: 'firebaseappcheck.googleapis.com' }, { service: 'firebaseappcheck.googleapis.com' },
         { service: 'identitytoolkit.googleapis.com' },
         { service: 'securetoken.googleapis.com' },
+        { service: 'firestore.googleapis.com' },
+        { service: 'firebasestorage.googleapis.com' },
       ],
     } }])).some(finding => finding.severity === 'block'), true);
   });
@@ -1100,22 +1107,17 @@ describe('private Pro security audit classifiers', () => {
     assert.equal(classifyBrowserApiKeys(empty).some(finding => finding.severity === 'block'), true);
     assert.equal(classifyBrowserApiKeys(wrong).some(finding => finding.severity === 'block'), true);
     assert.equal(wrong.missingRequiredApiTargets, 2);
-    assert.equal(wrong.unrelatedApiTargets, 2);
+    assert.equal(wrong.unrelatedApiTargets, 0);
   });
 
-  test('passes only minimum signed URL bucket CORS', () => {
-    const exact = inspectBucketCors({ cors: [{
-      origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-      method: ['GET', 'PUT'],
-      responseHeader: ['Content-Type', 'x-goog-meta-sha256'],
-      maxAgeSeconds: 3600,
-    }] });
+  test('passes only the observed Firebase Web Storage SDK bucket CORS', () => {
+    const exact = inspectBucketCors({ cors: EXPECTED_PRIVATE_PRO_BUCKET_CORS });
 
     assert.equal(classifyBucketCors(exact).every(finding => finding.severity === 'pass'), true);
     assert.equal(classifyBucketCors(inspectBucketCors({ cors_config: [{
       origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-      method: ['GET', 'PUT'],
-      responseHeader: ['Content-Type', 'x-goog-meta-sha256'],
+      method: ['DELETE', 'GET', 'POST', 'PUT'],
+      responseHeader: [...EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader],
     }] })).every(finding => finding.severity === 'pass'), true);
   });
 
@@ -1129,13 +1131,13 @@ describe('private Pro security audit classifiers', () => {
     }] });
     const missingUploadHeader = inspectBucketCors({ cors: [{
       origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-      method: ['GET', 'PUT'],
-      responseHeader: ['Content-Type'],
+      method: ['DELETE', 'GET', 'POST', 'PUT'],
+      responseHeader: EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader.filter(header => header !== 'X-Goog-Upload-URL'),
     }] });
     const duplicates = inspectBucketCors({ cors: [{
       origin: ['https://chatgpt.ashesh.dev', 'https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
-      method: ['GET', 'GET', 'PUT'],
-      responseHeader: ['Content-Type', 'Content-Type', 'x-goog-meta-sha256'],
+      method: ['DELETE', 'GET', 'GET', 'POST', 'PUT'],
+      responseHeader: [...EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader, 'Content-Type'],
     }] });
 
     assert.equal(classifyBucketCors(unreadable)[0].severity, 'block');
@@ -1265,7 +1267,7 @@ describe('private Pro security audit classifiers', () => {
     })), ['warn', 'warn', 'warn', 'pass', 'pass', 'pass']);
   });
 
-  test('validates the exact runtime permission allowlist and separate signBlob binding', async () => {
+  test('validates the exact runtime permission allowlist without signing access', async () => {
     const manifest = JSON.parse(await readFile('infra/private-pro/gcp-runtime-role.yaml', 'utf8')) as unknown;
     const facts = inspectRuntimeRoleManifest(manifest);
 
@@ -1276,7 +1278,6 @@ describe('private Pro security audit classifiers', () => {
       unexpectedRuntimePermissions: 0,
       forbiddenRuntimePermissions: 0,
       signBlobInRuntimeRole: 0,
-      signingBindingValid: true,
       projectSpecificPrincipals: 0,
     });
     assert.equal(classifyRuntimeRoleManifest(facts).every(finding => finding.severity === 'pass'), true);
@@ -1301,10 +1302,6 @@ describe('private Pro security audit classifiers', () => {
       manifest => { (manifest.workloadIdentityBinding as Record<string, unknown>).extra = true; },
       manifest => { (manifest.workloadIdentityBinding as Record<string, unknown>).serviceAccount = 'runtime@example.iam.gserviceaccount.com'; },
       manifest => { (manifest.workloadIdentityBinding as Record<string, unknown>).members = ['principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/pool/*']; },
-      manifest => { (manifest.signingBinding as Record<string, unknown>).extra = true; },
-      manifest => { (manifest.signingBinding as Record<string, unknown>).member = '${WIF_RUNTIME_PRINCIPAL}'; },
-      manifest => { (manifest.signingBinding as Record<string, unknown>).serviceAccount = '${OTHER_SERVICE_ACCOUNT_EMAIL}'; },
-      manifest => { (manifest.signingBinding as Record<string, unknown>).scope = 'project'; },
       manifest => { delete (manifest.validation as Record<string, unknown>).liveValidationTask; },
       manifest => { (manifest.validation as Record<string, unknown>).extra = true; },
     ];
@@ -1324,7 +1321,8 @@ describe('private Pro security audit classifiers', () => {
 
     const signBlob = structuredClone(valid);
     const permissions = (signBlob.runtimeRole as Record<string, unknown>).includedPermissions as string[];
-    permissions.splice(8, 0, 'iam.serviceAccounts.signBlob');
+    permissions.push('iam.serviceAccounts.signBlob');
+    permissions.sort();
     const signBlobFacts = audit.inspectRuntimeRoleManifest(signBlob);
     assert.equal(signBlobFacts.signBlobInRuntimeRole, 1);
     assert.equal(classifyRuntimeRoleManifest(signBlobFacts).some(finding => finding.severity === 'block'), true);
@@ -1350,15 +1348,10 @@ describe('private Pro security audit classifiers', () => {
       includedPermissions: [
         'datastore.databases.get',
         'datastore.entities.create',
-        'datastore.entities.delete',
         'datastore.entities.get',
-        'datastore.entities.list',
         'datastore.entities.update',
         'firebaseauth.users.get',
         'firebaseauth.users.update',
-        'storage.objects.create',
-        'storage.objects.delete',
-        'storage.objects.get',
       ],
     };
 
@@ -1446,33 +1439,29 @@ describe('private Pro security audit classifiers', () => {
     assert.deepEqual(severities(audit.classifyProjectRuntimePolicy(extra)), ['pass', 'pass', 'block', 'block']);
   });
 
-  test('enforces the exact service-account WIF and self-signing policy matrix', () => {
+  test('enforces the exact service-account WIF policy without signing bindings', () => {
     const audit = securityAuditModule as unknown as {
       inspectRuntimeServiceAccountPolicy(value: unknown, runtimeEmail: string, wifPrincipals: ReadonlySet<string>): {
         readable: boolean;
         missingWifPrincipals: number;
         unexpectedWifPrincipals: number;
-        selfTokenCreatorBindings: number;
-        externalTokenCreators: number;
         unexpectedBindings: number;
       };
       classifyRuntimeServiceAccountPolicy(facts: ReturnType<typeof audit.inspectRuntimeServiceAccountPolicy>): AuditFinding[];
     };
     const runtimeEmail = 'private-pro-runtime@sample-project.iam.gserviceaccount.com';
-    const runtimeMember = `serviceAccount:${runtimeEmail}`;
     const wif = 'principalSet://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel/attribute.repository/org/repo';
     const expected = audit.inspectRuntimeServiceAccountPolicy({ bindings: [
       { role: 'roles/iam.workloadIdentityUser', members: [wif] },
-      { role: 'roles/iam.serviceAccountTokenCreator', members: [runtimeMember] },
     ] }, runtimeEmail, new Set([wif]));
     const extra = audit.inspectRuntimeServiceAccountPolicy({ bindings: [
       { role: 'roles/iam.workloadIdentityUser', members: [wif, 'principal://iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/vercel/subject/other'] },
-      { role: 'roles/iam.serviceAccountTokenCreator', members: [runtimeMember, wif] },
+      { role: 'roles/iam.serviceAccountTokenCreator', members: [`serviceAccount:${runtimeEmail}`, wif] },
       { role: 'roles/iam.serviceAccountUser', members: [wif] },
     ] }, runtimeEmail, new Set([wif]));
 
     assert.equal(audit.classifyRuntimeServiceAccountPolicy(expected).every(finding => finding.severity === 'pass'), true);
-    assert.deepEqual(severities(audit.classifyRuntimeServiceAccountPolicy(extra)), ['pass', 'pass', 'block', 'block', 'block', 'block']);
+    assert.deepEqual(severities(audit.classifyRuntimeServiceAccountPolicy(extra)), ['pass', 'pass', 'block', 'block']);
   });
 
   test('accepts only exact bounded WIF subject, attribute, and group members from one pool', () => {

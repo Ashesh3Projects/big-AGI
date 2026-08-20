@@ -39,12 +39,34 @@ const REQUIRED_BROWSER_API_SERVICES = new Set([
   'firebaseappcheck.googleapis.com',
   'identitytoolkit.googleapis.com',
   'securetoken.googleapis.com',
+  'firestore.googleapis.com',
+  'firebasestorage.googleapis.com',
 ]);
 const REQUIRED_APP_CHECK_SERVICES = new Set(['firebaseauth.googleapis.com', 'firestore.googleapis.com', 'storage.googleapis.com']);
 const ALLOWED_AUTH_DOMAINS = new Set(['chatgpt.ashesh.dev', 'big-agi-243b6.firebaseapp.com']);
-const ALLOWED_BUCKET_CORS_ORIGINS = new Set(['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com']);
-const ALLOWED_BUCKET_CORS_METHODS = new Set(['GET', 'PUT']);
-const ALLOWED_BUCKET_CORS_HEADERS = new Set(['content-type', 'x-goog-meta-sha256']);
+export const EXPECTED_PRIVATE_PRO_BUCKET_CORS = [{
+  origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
+  method: ['DELETE', 'GET', 'POST', 'PUT'],
+  responseHeader: [
+    'Authorization',
+    'Content-Type',
+    'X-Firebase-AppCheck',
+    'X-Firebase-GMPID',
+    'X-Firebase-Storage-Version',
+    'X-Goog-Upload-Command',
+    'X-Goog-Upload-Header-Content-Length',
+    'X-Goog-Upload-Header-Content-Type',
+    'X-Goog-Upload-Offset',
+    'X-Goog-Upload-Protocol',
+    'X-Goog-Upload-Size-Received',
+    'X-Goog-Upload-Status',
+    'X-Goog-Upload-URL',
+  ],
+  maxAgeSeconds: 3600,
+}] as const;
+const ALLOWED_BUCKET_CORS_ORIGINS: ReadonlySet<string> = new Set(EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].origin);
+const ALLOWED_BUCKET_CORS_METHODS: ReadonlySet<string> = new Set(EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].method);
+const ALLOWED_BUCKET_CORS_HEADERS = new Set(EXPECTED_PRIVATE_PRO_BUCKET_CORS[0].responseHeader.map(header => header.toLowerCase()));
 const BROAD_ADMIN_ROLES = new Set([
   'roles/owner',
   'roles/editor',
@@ -63,15 +85,10 @@ const RUNTIME_ROLE_MANIFEST_PATH = 'infra/private-pro/gcp-runtime-role.yaml';
 const PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS = new Set([
   'datastore.databases.get',
   'datastore.entities.create',
-  'datastore.entities.delete',
   'datastore.entities.get',
-  'datastore.entities.list',
   'datastore.entities.update',
   'firebaseauth.users.get',
   'firebaseauth.users.update',
-  'storage.objects.create',
-  'storage.objects.delete',
-  'storage.objects.get',
 ]);
 const FORBIDDEN_RUNTIME_PERMISSIONS = new Set([
   'apikeys.keys.create',
@@ -227,7 +244,6 @@ export interface RuntimeRoleManifestFacts {
   unexpectedRuntimePermissions: number;
   forbiddenRuntimePermissions: number;
   signBlobInRuntimeRole: number;
-  signingBindingValid: boolean;
   projectSpecificPrincipals: number;
 }
 
@@ -251,8 +267,6 @@ export interface RuntimeServiceAccountPolicyFacts {
   readable: boolean;
   missingWifPrincipals: number;
   unexpectedWifPrincipals: number;
-  selfTokenCreatorBindings: number;
-  externalTokenCreators: number;
   unexpectedBindings: number;
 }
 
@@ -273,13 +287,6 @@ interface RuntimeRoleManifest {
     role: 'roles/iam.workloadIdentityUser';
     serviceAccount: '${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
     members: ['${WIF_RUNTIME_PRINCIPAL}'];
-    scope: 'runtime-service-account-only';
-  };
-  signingBinding: {
-    permission: 'iam.serviceAccounts.signBlob';
-    role: 'roles/iam.serviceAccountTokenCreator';
-    serviceAccount: '${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
-    member: 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}';
     scope: 'runtime-service-account-only';
   };
   validation: {
@@ -481,8 +488,7 @@ export function classifyRuntimeRoleManifest(facts: RuntimeRoleManifestFacts): Au
     finding('runtimeRoleManifest', 'missingRuntimePermissions', facts.missingRuntimePermissions === 0 ? 'pass' : 'block', facts.missingRuntimePermissions),
     finding('runtimeRoleManifest', 'unexpectedRuntimePermissions', facts.unexpectedRuntimePermissions === 0 ? 'pass' : 'block', facts.unexpectedRuntimePermissions),
     finding('runtimeRoleManifest', 'forbiddenRuntimePermissions', facts.forbiddenRuntimePermissions === 0 ? 'pass' : 'block', facts.forbiddenRuntimePermissions),
-    finding('runtimeRoleManifest', 'signBlobSeparated', facts.signBlobInRuntimeRole === 0 ? 'pass' : 'block', facts.signBlobInRuntimeRole),
-    booleanFinding('runtimeRoleManifest', 'signingBindingValid', facts.signingBindingValid),
+    finding('runtimeRoleManifest', 'signBlobAbsent', facts.signBlobInRuntimeRole === 0 ? 'pass' : 'block', facts.signBlobInRuntimeRole),
     finding('runtimeRoleManifest', 'projectSpecificPrincipals', facts.projectSpecificPrincipals === 0 ? 'pass' : 'block', facts.projectSpecificPrincipals),
   ];
 }
@@ -512,8 +518,6 @@ export function classifyRuntimeServiceAccountPolicy(facts: RuntimeServiceAccount
     booleanFinding('runtimeServiceAccountPolicy', 'readable', facts.readable),
     finding('runtimeServiceAccountPolicy', 'missingWifPrincipals', facts.missingWifPrincipals === 0 ? 'pass' : 'block', facts.missingWifPrincipals),
     finding('runtimeServiceAccountPolicy', 'unexpectedWifPrincipals', facts.unexpectedWifPrincipals === 0 ? 'pass' : 'block', facts.unexpectedWifPrincipals),
-    finding('runtimeServiceAccountPolicy', 'selfTokenCreatorBindings', facts.selfTokenCreatorBindings === 1 ? 'pass' : 'block', facts.selfTokenCreatorBindings),
-    finding('runtimeServiceAccountPolicy', 'externalTokenCreators', facts.externalTokenCreators === 0 ? 'pass' : 'block', facts.externalTokenCreators),
     finding('runtimeServiceAccountPolicy', 'unexpectedBindings', facts.unexpectedBindings === 0 ? 'pass' : 'block', facts.unexpectedBindings),
   ];
 }
@@ -543,8 +547,8 @@ export function classifyDependencyAudit(facts: DependencyAuditFacts): AuditFindi
 
 export function classifyFirebaseRuleProbes(facts: FirebaseRuleProbeFacts): AuditFinding[] {
   const probeFinding = (resource: string, state: ProbeState) => finding(
-    'firebaseRules',
-    `${resource}${state === 'denied' ? 'Denied' : state === 'allowed' ? 'Allowed' : 'Unknown'}`,
+    'anonymousFirebaseRules',
+    `${resource}Anonymous${state === 'denied' ? 'Denied' : state === 'allowed' ? 'Allowed' : 'Unknown'}`,
     state === 'denied' ? 'pass' : 'block',
     state === 'denied' ? 0 : 1,
   );
@@ -1374,7 +1378,7 @@ function exactStringArray(value: unknown): string[] | undefined {
 function parseRuntimeRoleManifest(value: unknown): { manifest?: RuntimeRoleManifest; schemaErrors: number } {
   let schemaErrors = 0;
   if (!isPlainRecord(value)) return { schemaErrors: 1 };
-  if (!hasExactKeys(value, ['schemaVersion', 'runtimeRole', 'localVerification', 'workloadIdentityBinding', 'signingBinding', 'validation'])) schemaErrors++;
+  if (!hasExactKeys(value, ['schemaVersion', 'runtimeRole', 'localVerification', 'workloadIdentityBinding', 'validation'])) schemaErrors++;
   if (value.schemaVersion !== 1) schemaErrors++;
 
   const role = value.runtimeRole;
@@ -1415,16 +1419,6 @@ function parseRuntimeRoleManifest(value: unknown): { manifest?: RuntimeRoleManif
     || !Array.isArray(workload.members)
     || workload.members.length !== 1
     || workload.members[0] !== '${WIF_RUNTIME_PRINCIPAL}'
-  ) schemaErrors++;
-
-  const signing = value.signingBinding;
-  if (!isPlainRecord(signing) || !hasExactKeys(signing, ['permission', 'role', 'serviceAccount', 'member', 'scope'])) schemaErrors++;
-  else if (
-    signing.permission !== 'iam.serviceAccounts.signBlob'
-    || signing.role !== 'roles/iam.serviceAccountTokenCreator'
-    || signing.serviceAccount !== '${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
-    || signing.member !== 'serviceAccount:${RUNTIME_SERVICE_ACCOUNT_EMAIL}'
-    || signing.scope !== 'runtime-service-account-only'
   ) schemaErrors++;
 
   const validation = value.validation;
@@ -1614,7 +1608,6 @@ export function inspectRuntimeRoleManifest(value: unknown): RuntimeRoleManifestF
     unexpectedRuntimePermissions: permissions.filter(permission => !PRIVATE_PRO_RUNTIME_ROLE_PERMISSIONS.has(permission)).length,
     forbiddenRuntimePermissions: permissions.filter(permission => FORBIDDEN_RUNTIME_PERMISSIONS.has(permission)).length,
     signBlobInRuntimeRole: permissions.filter(permission => permission === 'iam.serviceAccounts.signBlob').length,
-    signingBindingValid: !!parsed.manifest,
     projectSpecificPrincipals: countProjectSpecificPrincipals(value),
   };
 }
@@ -1683,23 +1676,15 @@ export function inspectRuntimeServiceAccountPolicy(
   wifPrincipals: ReadonlySet<string>,
 ): RuntimeServiceAccountPolicyFacts {
   const policy = inspectPolicyBindings(value);
-  const selfMember = `serviceAccount:${runtimeEmail}`;
   const workloadBindings = policy.bindings.filter(binding => binding.role === 'roles/iam.workloadIdentityUser');
-  const tokenCreatorBindings = policy.bindings.filter(binding => binding.role === 'roles/iam.serviceAccountTokenCreator');
   const actualWifPrincipals = new Set(workloadBindings.flatMap(binding => binding.members));
-  const tokenCreatorMembers = tokenCreatorBindings.flatMap(binding => binding.members);
-  const unexpectedBindingRoles = policy.bindings.filter(binding => ![
-    'roles/iam.workloadIdentityUser',
-    'roles/iam.serviceAccountTokenCreator',
-  ].includes(binding.role)).length;
-  const malformedExpectedBindings = [...workloadBindings, ...tokenCreatorBindings].filter(binding => !binding.exact).length;
-  const duplicateExpectedBindings = Math.max(0, workloadBindings.length - 1) + Math.max(0, tokenCreatorBindings.length - 1);
+  const unexpectedBindingRoles = policy.bindings.filter(binding => binding.role !== 'roles/iam.workloadIdentityUser').length;
+  const malformedExpectedBindings = workloadBindings.filter(binding => !binding.exact).length;
+  const duplicateExpectedBindings = Math.max(0, workloadBindings.length - 1);
   return {
     readable: policy.readable,
     missingWifPrincipals: [...wifPrincipals].filter(member => !actualWifPrincipals.has(member)).length,
     unexpectedWifPrincipals: [...actualWifPrincipals].filter(member => !wifPrincipals.has(member)).length,
-    selfTokenCreatorBindings: tokenCreatorBindings.filter(binding => binding.exact && binding.members.length === 1 && binding.members[0] === selfMember).length,
-    externalTokenCreators: tokenCreatorMembers.filter(member => member !== selfMember).length,
     unexpectedBindings: unexpectedBindingRoles + malformedExpectedBindings + duplicateExpectedBindings,
   };
 }
