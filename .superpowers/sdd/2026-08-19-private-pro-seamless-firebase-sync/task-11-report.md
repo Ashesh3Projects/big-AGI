@@ -180,6 +180,57 @@ The startup handoff is a single atomic boundary:
 
 None.
 
+## Fix round 3
+
+### Findings addressed
+
+- Frozen startup mutations were awaited one at a time. A post-close live edit could therefore enter the normal outbound queue before a later frozen mutation, after which the later OLD capture could overwrite NEW.
+- Failed startup replay restored a blind suffix. It did not prove that the buffered version or the durable local/outbox generation was still the one observed before replay.
+- The cross-UID cleanup failure gate exposed only Retry, leaving no direct way to abandon the stuck account transition.
+
+### Design
+
+- `closeAndTake()` still closes and unsubscribes the startup buffer synchronously, but now returns entries carrying a record key, monotonically increasing per-key version, cloned mutation, and a durable-generation baseline started when that mutation was observed.
+- After outbound starts, the engine invokes `outbound.capture()` for every frozen entry synchronously without an intervening await. The outbound capture queue therefore receives the complete frozen batch before any later serializer callback can append a post-close edit. The engine then awaits all capture promises together before cache hydration.
+- Every normal post-close capture increments the same per-key version before entering outbound.
+- A failed frozen entry is eligible for retry only when its version is unchanged, its baseline read succeeded, both current local and outbox generation reads succeeded, and neither durable generation advanced beyond the baseline. Version is checked again after the DB reads. Unknown state is never restored.
+- Failed entries are considered independently. A newer live edit or durable generation for one key cannot be overwritten by an older failed frozen entry on the next retry.
+- The cross-UID error screen now exposes Retry and Sign out. Sign out calls the raw Firebase sign-out dependency and attempts a full reload in `finally`; only generic transition/sign-out errors are rendered.
+
+### RED evidence
+
+- The ordering regression initially recorded only the first frozen capture before a post-close callback ran; the later frozen second record had not yet entered outbound.
+- The versioned-buffer regression initially had no live-version API and accepted restoration of an old frozen value.
+- A rejected durable-baseline read initially fell back to generation zero and restored without proof.
+- A failed current-generation read initially replaced the original capture failure and could not make a conservative restore decision.
+- A synchronous outbound capture throw initially stopped invocation before the later frozen entries reached the barrier.
+- The cross-UID error screen initially rendered no Sign out action and had no raw Firebase sign-out/reload helper.
+
+### GREEN evidence
+
+- A real outbound plus IndexedDB regression delays validation of the first frozen record, emits NEW for the second record after buffer closure, and proves the second durable outbox row is NEW at generation 2.
+- A forced frozen-capture failure regression proves the queued NEW edit becomes durable before startup rejects and a replacement-engine retry never replays OLD for the second record.
+- Engine suite: 33 passed, 0 failed.
+- Final persistence, provider, serializer, outbound, engine, DB, reconciler, cutover, and direct-asset suite: 244 passed, 0 failed.
+- `npm run tscheck`: exit 0 for root and tools TypeScript programs.
+- `npm run lint`: exit 0 with no warnings.
+- `git diff --check`: exit 0 with only repository line-ending notices.
+
+### Self-review
+
+- All frozen capture calls are made in array order in one synchronous turn before `Promise.allSettled` yields; a synchronous throw is converted to a rejected promise so later entries are still invoked.
+- The real outbound remains the single serialization point for validation, hashing, generation assignment, and DB writes.
+- Cache hydration cannot begin until every frozen capture has fulfilled or rejected and conservative recovery has finished.
+- A newer post-close edit invalidates the old entry by version; the later generation check independently protects against sibling-tab or already-durable advancement.
+- Failed or unavailable baseline/current DB reads skip restoration and preserve the original capture failure.
+- Stop/cancellation still prevents late restoration through the lifecycle epoch check.
+- Transition error text contains no Firebase or cleanup exception detail.
+- Reload is attempted even when raw Firebase sign-out rejects.
+
+### Concerns
+
+None.
+
 
 ## Fix round 1
 

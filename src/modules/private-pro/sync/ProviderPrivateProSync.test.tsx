@@ -11,8 +11,10 @@ import {
   createPrivateProStartupMutationBuffer,
   preparePrivateProPersistenceOwner,
   PrivateProUnsyncedChangesError,
+  PrivateProWorkspaceTransitionScreen,
   ProviderPrivateProSync,
   ProviderPrivateProSyncAccount,
+  runPrivateProTransitionSignOut,
   type PrivateProSyncLifecycleEngine,
   waitForPrivateProSyncLifecycleOwner,
 } from './ProviderPrivateProSync';
@@ -65,10 +67,60 @@ describe('ProviderPrivateProSync', () => {
     assert.equal(buffer.active(), true);
     emit(first);
     emit(replacement);
-    assert.deepEqual(buffer.closeAndTake(), [replacement]);
+    assert.deepEqual(buffer.closeAndTake().map(entry => entry.mutation), [replacement]);
     assert.equal(buffer.active(), false);
     emit(first);
     assert.deepEqual(buffer.closeAndTake(), []);
+  });
+
+  test('startup buffer versions reject a failed frozen mutation after a newer live edit', () => {
+    let emit: (mutation: PrivateProSyncLocalMutation) => void = () => assert.fail('Startup buffer listener was not installed.');
+    const serializer = { subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void) { emit = listener; return () => { emit = () => {}; }; } } as PrivateProSyncSerializer<unknown>;
+    const buffer = createPrivateProStartupMutationBuffer([serializer]);
+    const mutation = (value: string): PrivateProSyncLocalMutation => ({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1, value: { value }, referencedAssetIds: [],
+    } });
+    buffer.start();
+    emit(mutation('old'));
+    const [frozen] = buffer.closeAndTake();
+
+    buffer.noteLiveMutation(mutation('new'));
+
+    assert.equal(buffer.restore(frozen), false);
+    assert.deepEqual(buffer.closeAndTake(), []);
+  });
+
+  test('cross-UID cleanup error screen exposes retry and raw account sign-out', () => {
+    const markup = renderToStaticMarkup(React.createElement(PrivateProWorkspaceTransitionScreen, {
+      failed: true, busy: false, actionError: false, onRetry: () => {}, onSignOut: () => {},
+    }));
+
+    assert.match(markup, />Retry</);
+    assert.match(markup, />Sign out</);
+  });
+
+  test('cross-UID cleanup sign-out reloads after a sanitized Firebase failure', async () => {
+    const order: string[] = [];
+
+    const succeeded = await runPrivateProTransitionSignOut(
+      async () => { order.push('firebase-sign-out'); throw new Error('secret Firebase failure'); },
+      () => { order.push('reload'); },
+    );
+
+    assert.equal(succeeded, false);
+    assert.deepEqual(order, ['firebase-sign-out', 'reload']);
+  });
+
+  test('cross-UID cleanup sign-out still reports failure when reload throws', async () => {
+    const order: string[] = [];
+
+    const succeeded = await runPrivateProTransitionSignOut(
+      async () => { order.push('firebase-sign-out'); },
+      () => { order.push('reload'); throw new Error('reload failed'); },
+    );
+
+    assert.equal(succeeded, false);
+    assert.deepEqual(order, ['firebase-sign-out', 'reload']);
   });
 
   test('production persistence prepare runs the global local cutover before managed and asset activation', async () => {
@@ -125,7 +177,9 @@ describe('ProviderPrivateProSync', () => {
       active: () => active,
       start: () => { active = true; order.push('buffer-start'); },
       closeAndTake: () => [],
-      restore: () => { active = true; },
+      noteLiveMutation: () => 1,
+      currentVersion: () => 1,
+      restore: () => { active = true; return true; },
       stop: () => { active = false; order.push('buffer-stop'); },
     });
 
@@ -187,7 +241,7 @@ describe('ProviderPrivateProSync', () => {
     buffer.start();
     emit(mutation('b-edit'));
 
-    assert.deepEqual(buffer.closeAndTake(), [mutation('b-edit')]);
+    assert.deepEqual(buffer.closeAndTake().map(entry => entry.mutation), [mutation('b-edit')]);
   });
 
   test('production persistence prepare rolls back its exact owner after managed activation is cancelled', async () => {

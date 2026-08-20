@@ -16,6 +16,7 @@ import {
   type PrivateProSyncReconciler,
 } from './privatePro.sync.reconcile';
 import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer } from './privatePro.sync.serializers';
+import { privateProRecordKey } from './privatePro.sync.codec';
 import { createPrivateProSyncStore, type PrivateProSyncStore } from './store-private-pro-sync';
 import type { PrivateProSyncCollection, PrivateProSyncRemoteEvent, PrivateProSyncTransport } from './privatePro.sync.transport';
 
@@ -36,6 +37,21 @@ export interface PrivateProSyncEngine {
   stop(): Promise<void>;
 }
 
+export interface PrivateProSyncStartupMutation {
+  key: string;
+  version: number;
+  mutation: PrivateProSyncLocalMutation;
+  baselineGeneration: Promise<number>;
+}
+
+export interface PrivateProSyncStartupBuffer {
+  active(): boolean;
+  closeAndTake(): readonly PrivateProSyncStartupMutation[];
+  noteLiveMutation?(mutation: PrivateProSyncLocalMutation): number;
+  currentVersion?(key: string): number;
+  restore?(entry: PrivateProSyncStartupMutation): boolean;
+}
+
 export interface PrivateProSyncEngineOutbound {
   start(): Promise<void>;
   capture?(mutation: PrivateProSyncLocalMutation): Promise<unknown>;
@@ -48,6 +64,8 @@ export interface PrivateProSyncEngineOutbound {
 
 interface PrivateProSyncEngineDB {
   pendingCount(uid: string): Promise<number>;
+  getLocalRecord?(uid: string, recordKey: string): Promise<{ generation: number } | null>;
+  getOutbox?(uid: string, recordKey: string): Promise<{ generation: number } | null>;
 }
 
 interface WindowEventsPort {
@@ -82,11 +100,7 @@ export interface PrivateProSyncEngineDependencies {
   uid: string;
   writerId?: string;
   serializers: readonly PrivateProSyncSerializer<unknown>[];
-  startupBuffer?: {
-    active(): boolean;
-    closeAndTake(): readonly PrivateProSyncLocalMutation[];
-    restore?(mutations: readonly PrivateProSyncLocalMutation[]): void;
-  };
+  startupBuffer?: PrivateProSyncStartupBuffer;
   db: PrivateProSyncEngineDB;
   coordinator?: PrivateProSyncCoordinator;
   transport: PrivateProSyncTransport;
@@ -245,6 +259,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       const projectionKey = mutation.kind === 'put' ? mutation.record.projectionKey : mutation.projectionKey;
       if (suppressionDepths.has(projectionKey)) return false;
       if (dependencies.startupBuffer?.active()) return false;
+      dependencies.startupBuffer?.noteLiveMutation?.(mutation);
       return true;
     },
     runSuppressed,
@@ -372,19 +387,50 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       await outbound.start();
       if (!isEpochActive(epoch)) return;
       if (dependencies.startupBuffer) {
-        const mutations = dependencies.startupBuffer.closeAndTake();
-        let captured = 0;
-        try {
-          for (const mutation of mutations) {
-            if (!outbound.capture) throw new TypeError('Private Pro sync outbound capture is required during startup.');
-            await outbound.capture(mutation);
-            captured++;
-            if (!isEpochActive(epoch)) return;
+        const frozen = dependencies.startupBuffer.closeAndTake();
+        if (!outbound.capture && frozen.length) throw new TypeError('Private Pro sync outbound capture is required during startup.');
+        const captures = frozen.map(entry => {
+          try {
+            return Promise.resolve(outbound.capture!(entry.mutation));
+          } catch (error) {
+            return Promise.reject(error);
           }
-        } catch (error) {
-          if (isEpochActive(epoch)) dependencies.startupBuffer.restore?.(mutations.slice(captured));
-          throw error;
+        });
+        const results = await Promise.allSettled(captures);
+        let failure: unknown = null;
+        for (let index = 0; index < results.length; index++) {
+          const result = results[index];
+          if (result.status === 'fulfilled') continue;
+          failure ??= result.reason;
+          if (!isEpochActive(epoch)) continue;
+          const entry = frozen[index];
+          if (dependencies.startupBuffer.currentVersion?.(entry.key) !== entry.version) continue;
+          let baselineGeneration: number;
+          try {
+            baselineGeneration = await entry.baselineGeneration;
+          } catch {
+            continue;
+          }
+          const recordKey = privateProRecordKey(
+            entry.mutation.kind === 'put' ? entry.mutation.record.recordType : entry.mutation.recordType,
+            entry.mutation.kind === 'put' ? entry.mutation.record.logicalId : entry.mutation.logicalId,
+          );
+          if (!dependencies.db.getLocalRecord || !dependencies.db.getOutbox) continue;
+          let local: { generation: number } | null;
+          let pending: { generation: number } | null;
+          try {
+            [local, pending] = await Promise.all([
+              dependencies.db.getLocalRecord(dependencies.uid, recordKey),
+              dependencies.db.getOutbox(dependencies.uid, recordKey),
+            ]);
+          } catch {
+            continue;
+          }
+          if (dependencies.startupBuffer.currentVersion?.(entry.key) !== entry.version) continue;
+          if (Math.max(local?.generation ?? 0, pending?.generation ?? 0) > baselineGeneration) continue;
+          dependencies.startupBuffer.restore?.(entry);
         }
+        if (failure) throw failure;
       }
       const cached = reconciler.applyCached(epoch, lifecycleAbort.signal);
       cached.catch(() => {});

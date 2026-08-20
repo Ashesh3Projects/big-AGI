@@ -9,8 +9,9 @@ import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { privateProClientConfig } from '../config/privatePro.config';
 import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, privateProManagedPersistenceOwnership, releasePrivateProManagedPersistence, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
 import { createPrivateProSyncCoordinator, type PrivateProSyncCoordinator } from './privatePro.sync.coordinator';
+import { privateProRecordKey } from './privatePro.sync.codec';
 import { privateProSyncDB } from './privatePro.sync.db';
-import { createPrivateProSyncEngine, type PrivateProSyncEngine } from './privatePro.sync.engine';
+import { createPrivateProSyncEngine, type PrivateProSyncEngine, type PrivateProSyncStartupMutation } from './privatePro.sync.engine';
 import { createPrivateProFirebaseSyncTransport } from './privatePro.sync.firebase';
 import { createPrivateProAssetSerializer, createPrivateProSyncSerializers } from './privatePro.sync.serializers';
 import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer } from './privatePro.sync.serializers';
@@ -29,53 +30,76 @@ function privateProStartupMutationKey(mutation: PrivateProSyncLocalMutation): st
 
 export function createPrivateProStartupMutationBuffer(
   serializers: readonly PrivateProSyncSerializer<unknown>[],
+  durableGeneration: (mutation: PrivateProSyncLocalMutation) => Promise<number> = async () => 0,
 ): {
   active(): boolean;
   start(): void;
-  closeAndTake(): readonly PrivateProSyncLocalMutation[];
-  restore(mutations: readonly PrivateProSyncLocalMutation[]): void;
+  closeAndTake(): readonly PrivateProSyncStartupMutation[];
+  noteLiveMutation(mutation: PrivateProSyncLocalMutation): number;
+  currentVersion(key: string): number;
+  restore(entry: PrivateProSyncStartupMutation): boolean;
   stop(): void;
 } {
-  const mutations = new Map<string, PrivateProSyncLocalMutation>();
+  const mutations = new Map<string, PrivateProSyncStartupMutation>();
+  const versions = new Map<string, number>();
   let active = false;
   const unsubscribers: Array<() => void> = [];
+  const nextVersion = (key: string) => {
+    const version = (versions.get(key) ?? 0) + 1;
+    versions.set(key, version);
+    return version;
+  };
+  const subscribe = () => {
+    if (active) return;
+    active = true;
+    unsubscribers.push(...serializers.map(serializer => serializer.subscribe(mutation => {
+      if (!active) return;
+      const key = privateProStartupMutationKey(mutation);
+      mutations.delete(key);
+      mutations.set(key, {
+        key,
+        version: nextVersion(key),
+        mutation: structuredClone(mutation),
+        baselineGeneration: durableGeneration(mutation),
+      });
+    })));
+  };
   return {
     active: () => active,
-    start: () => {
-      if (active) return;
-      active = true;
-      unsubscribers.push(...serializers.map(serializer => serializer.subscribe(mutation => {
-        if (!active) return;
-        mutations.delete(privateProStartupMutationKey(mutation));
-        mutations.set(privateProStartupMutationKey(mutation), structuredClone(mutation));
-      })));
-    },
+    start: subscribe,
     closeAndTake: () => {
       active = false;
       unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
-      const frozen = [...mutations.values()].map(mutation => structuredClone(mutation));
+      const frozen = [...mutations.values()].map(entry => ({
+        ...entry,
+        mutation: structuredClone(entry.mutation),
+      }));
       mutations.clear();
       return frozen;
     },
-    restore: frozen => {
-      for (const mutation of frozen) {
-        mutations.delete(privateProStartupMutationKey(mutation));
-        mutations.set(privateProStartupMutationKey(mutation), structuredClone(mutation));
-      }
-      if (!active) {
-        active = true;
-        unsubscribers.push(...serializers.map(serializer => serializer.subscribe(mutation => {
-          if (!active) return;
-          mutations.delete(privateProStartupMutationKey(mutation));
-          mutations.set(privateProStartupMutationKey(mutation), structuredClone(mutation));
-        })));
-      }
+    noteLiveMutation: mutation => nextVersion(privateProStartupMutationKey(mutation)),
+    currentVersion: key => versions.get(key) ?? 0,
+    restore: entry => {
+      if ((versions.get(entry.key) ?? 0) !== entry.version) return false;
+      mutations.set(entry.key, { ...entry, mutation: structuredClone(entry.mutation) });
+      subscribe();
+      return true;
     },
     stop: () => {
       active = false;
       unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
     },
   };
+}
+
+async function privateProStartupDurableGeneration(uid: string, mutation: PrivateProSyncLocalMutation): Promise<number> {
+  const identity = mutation.kind === 'put' ? mutation.record : mutation;
+  const recordKey = privateProRecordKey(identity.recordType, identity.logicalId);
+  const [local, pending] = await Promise.all([
+    privateProSyncDB.getLocalRecord(uid, recordKey),
+    privateProSyncDB.getOutbox(uid, recordKey),
+  ]);
+  return Math.max(local?.generation ?? 0, pending?.generation ?? 0);
 }
 
 export async function preparePrivateProCrossUidTransition(dependencies: {
@@ -536,13 +560,38 @@ function ProductionPrivateProSyncAccount(props: {
   return <ReadyPrivateProSyncAccount {...props} />;
 }
 
-function PrivateProWorkspaceTransitionScreen(props: { failed: boolean; onRetry: () => void }) {
+export async function runPrivateProTransitionSignOut(
+  firebaseSignOut: () => Promise<void>,
+  reload: () => void,
+): Promise<boolean> {
+  let succeeded = true;
+  try {
+    await firebaseSignOut();
+  } catch {
+    succeeded = false;
+  } finally {
+    try { reload(); } catch { succeeded = false; }
+  }
+  return succeeded;
+}
+
+export function PrivateProWorkspaceTransitionScreen(props: {
+  failed: boolean;
+  busy: boolean;
+  actionError: boolean;
+  onRetry: () => void;
+  onSignOut: () => void;
+}) {
   return <Sheet sx={{ minHeight: '100vh', display: 'grid', placeItems: 'center', p: 2 }}>
     <Stack spacing={2} alignItems='center' textAlign='center'>
       <Typography level='h2'>Private Pro</Typography>
       {props.failed ? <>
         <Alert color='danger'>Unable to prepare your private workspace.</Alert>
-        <Button onClick={props.onRetry}>Retry</Button>
+        {props.actionError && <Alert color='danger'>Unable to complete sign-out.</Alert>}
+        <Stack direction='row' spacing={1}>
+          <Button disabled={props.busy} onClick={props.onRetry}>Retry</Button>
+          <Button variant='plain' color='neutral' loading={props.busy} onClick={props.onSignOut}>Sign out</Button>
+        </Stack>
       </> : <>
         <CircularProgress />
         <Typography textColor='text.secondary'>Preparing your private workspace...</Typography>
@@ -558,9 +607,14 @@ function CrossUidPrivateProSyncAccount(props: {
   children: React.ReactNode;
 }) {
   const startupSerializers = React.useMemo(() => createPrivateProSyncSerializers(), []);
-  const startupBuffer = React.useMemo(() => createPrivateProStartupMutationBuffer(startupSerializers), [startupSerializers]);
+  const startupBuffer = React.useMemo(
+    () => createPrivateProStartupMutationBuffer(startupSerializers, mutation => privateProStartupDurableGeneration(props.user.uid, mutation)),
+    [props.user.uid, startupSerializers],
+  );
   const [attempt, setAttempt] = React.useState(0);
   const [phase, setPhase] = React.useState<'preparing' | 'ready' | 'error'>('preparing');
+  const [signingOut, setSigningOut] = React.useState(false);
+  const [actionError, setActionError] = React.useState(false);
   usePrivateProLayoutEffect(() => {
     let current = true;
     setPhase('preparing');
@@ -582,7 +636,19 @@ function CrossUidPrivateProSyncAccount(props: {
       startupBuffer.stop();
     };
   }, [attempt, props.previousOwnership.owner, props.previousOwnership.uid, props.user.uid, startupBuffer]);
-  if (phase !== 'ready') return <PrivateProWorkspaceTransitionScreen failed={phase === 'error'} onRetry={() => setAttempt(value => value + 1)} />;
+  if (phase !== 'ready') return <PrivateProWorkspaceTransitionScreen
+    failed={phase === 'error'}
+    busy={signingOut}
+    actionError={actionError}
+    onRetry={() => { setActionError(false); setAttempt(value => value + 1); }}
+    onSignOut={() => {
+      setSigningOut(true);
+      setActionError(false);
+      void runPrivateProTransitionSignOut(props.firebaseSignOut, () => window.location.reload())
+        .then(succeeded => { if (!succeeded) setActionError(true); })
+        .finally(() => setSigningOut(false));
+    }}
+  />;
   return <ReadyPrivateProSyncAccount
     user={props.user}
     firebaseSignOut={props.firebaseSignOut}
@@ -603,7 +669,10 @@ function ReadyPrivateProSyncAccount(props: {
   const statusStore = React.useMemo(createPrivateProSyncStore, [props.user.uid]);
   const defaultStartupSerializers = React.useMemo(() => createPrivateProSyncSerializers(), []);
   const startupSerializers = props.startupSerializers ?? defaultStartupSerializers;
-  const defaultStartupBuffer = React.useMemo(() => createPrivateProStartupMutationBuffer(defaultStartupSerializers), [defaultStartupSerializers]);
+  const defaultStartupBuffer = React.useMemo(
+    () => createPrivateProStartupMutationBuffer(defaultStartupSerializers, mutation => privateProStartupDurableGeneration(props.user.uid, mutation)),
+    [defaultStartupSerializers, props.user.uid],
+  );
   const startupBuffer = props.startupBuffer ?? defaultStartupBuffer;
   const previousOwner = props.previousOwnership?.owner ?? null;
   const previousUid = props.previousOwnership?.uid ?? null;
@@ -650,7 +719,10 @@ function createProductionLifecycle(
   firebaseSignOut: () => Promise<void>,
   statusStore: PrivateProSyncStore,
   startupSerializers: readonly PrivateProSyncSerializer<unknown>[] = createPrivateProSyncSerializers(),
-  startupBuffer: ReturnType<typeof createPrivateProStartupMutationBuffer> = createPrivateProStartupMutationBuffer(startupSerializers),
+  startupBuffer: ReturnType<typeof createPrivateProStartupMutationBuffer> = createPrivateProStartupMutationBuffer(
+    startupSerializers,
+    mutation => privateProStartupDurableGeneration(uid, mutation),
+  ),
 ): PrivateProSyncLifecycle {
   const lifecycle = createPrivateProSyncLifecycle({
     uid,
