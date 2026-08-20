@@ -27,8 +27,19 @@ export function getPrivateProFirebaseApp(): FirebaseApp {
   return privateProFirebaseApp;
 }
 
+export function privateProInitializeAppCheckBeforeAuth<TAppCheck, TAuth>(
+  initializeAppCheck: () => TAppCheck,
+  initializeAuth: () => TAuth,
+): TAuth {
+  initializeAppCheck();
+  return initializeAuth();
+}
+
 export function getPrivateProFirebaseAuth(): Auth {
-  return getAuth(getPrivateProFirebaseApp());
+  return privateProInitializeAppCheckBeforeAuth(
+    getPrivateProClientAppCheck,
+    () => getAuth(getPrivateProFirebaseApp()),
+  );
 }
 
 export function getPrivateProClientFirestore(): Firestore {
