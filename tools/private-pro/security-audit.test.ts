@@ -21,6 +21,7 @@ import {
   classifyServiceAccountKeys,
   collectProjectNumber,
   collectFirebaseEndpointProbes,
+  assertPrivateProSecurityAuditIdentity,
   runCommand,
   selectRuntimeIdentity,
   buildAuditReport,
@@ -1619,8 +1620,10 @@ describe('private Pro security audit classifiers', () => {
     const commit = requests.find(request => request.url.includes('documents:commit'));
     assert.match(String(commit?.body), /security-audit/);
     assert.match(String(commit?.body), /updateTransforms/);
-    const upload = requests.find(request => request.url.includes('uploadType=media'));
-    assert.equal((upload?.headers as Record<string, string>)['content-type'], 'image/png');
+    const upload = requests.find(request => request.url.includes('uploadType=multipart'));
+    assert.match((upload?.headers as Record<string, string>)['content-type'], /^multipart\/related; boundary=/);
+    assert.match(String(upload?.body), /"contentType":"image\/png"/);
+    assert.match(String(upload?.body), /"uid":"firebase-uid-a"/);
     assert.match(String(upload?.url), /workspace-v1%2Fassets%2Faudit%2Foriginal/);
     assert.doesNotMatch(JSON.stringify(requests), /secret-api-key/);
 
@@ -1635,6 +1638,32 @@ describe('private Pro security audit classifiers', () => {
       fetch: async () => { throw new Error('network secret'); },
     });
     assert.deepEqual(unknown, { firestoreRead: 'unknown', firestoreWrite: 'unknown', storageRead: 'unknown', storageWrite: 'unknown' });
+  });
+
+  test('validates the audit UID account, Auth identity, allowlist, and matching epoch', () => {
+    assert.doesNotThrow(() => assertPrivateProSecurityAuditIdentity({
+      auditUid: 'uid-a',
+      account: { uid: 'uid-a', active: true, accessEpoch: 7 },
+      auth: { uid: 'uid-a', email: 'User@Example.com', emailVerified: true, claims: { privatePro: true, privateProEpoch: 7 } },
+      allowedEmails: new Set(['user@example.com']),
+    }));
+    for (const mutate of [
+      (input: any) => { input.account.uid = 'other'; },
+      (input: any) => { input.account.active = false; },
+      (input: any) => { input.account.accessEpoch = 1.5; },
+      (input: any) => { input.auth.emailVerified = false; },
+      (input: any) => { input.auth.claims.privatePro = false; },
+      (input: any) => { input.auth.claims.privateProEpoch = 6; },
+      (input: any) => { input.allowedEmails = new Set(['other@example.com']); },
+    ]) {
+      const input = {
+        auditUid: 'uid-a', account: { uid: 'uid-a', active: true, accessEpoch: 7 },
+        auth: { uid: 'uid-a', email: 'user@example.com', emailVerified: true, claims: { privatePro: true, privateProEpoch: 7 } },
+        allowedEmails: new Set(['user@example.com']),
+      };
+      mutate(input);
+      assert.throws(() => assertPrivateProSecurityAuditIdentity(input), /audit identity/i);
+    }
   });
 
   test('reduces live collector payloads to booleans and counts', () => {

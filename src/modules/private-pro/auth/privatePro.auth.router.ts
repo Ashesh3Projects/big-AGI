@@ -21,7 +21,7 @@ function createPrivateProAuthAdminPort(): PrivateProAuthAdminPort {
   const firestore = getPrivateProFirestore();
   return {
     async getWorkspaceResetState() {
-      const snapshot = await firestore.doc('privateProOperations/workspaceV1Reset').get();
+      const snapshot = await firestore.doc('privateProOperations/workspaceV1Reset-v1').get();
       if (!snapshot.exists) return 'absent';
       return snapshot.data()?.state === 'complete' ? 'complete' : 'running';
     },

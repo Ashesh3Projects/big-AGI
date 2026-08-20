@@ -1,4 +1,5 @@
 import { pathToFileURL } from 'node:url';
+import { randomUUID } from 'node:crypto';
 
 import type { Bucket } from '@google-cloud/storage';
 
@@ -20,7 +21,8 @@ const FIRESTORE_TARGETS = [
 const STORAGE_PREFIXES = ['vault/', 'assets/', 'chatUploads/', 'workspace-v1/'] as const;
 const PAGE_SIZE = 500;
 const DELETE_CONCURRENCY = 10;
-const RESET_OPERATION_PATH = 'privateProOperations/workspaceV1Reset';
+export const PRIVATE_PRO_WORKSPACE_RESET_REVISION = 1;
+const RESET_OPERATION_PATH = `privateProOperations/workspaceV1Reset-v${PRIVATE_PRO_WORKSPACE_RESET_REVISION}`;
 
 export interface PrivateProResetAuthIdentity {
   uid: string;
@@ -92,9 +94,12 @@ export type PrivateProResetTargetPhase = 'planned' | 'fenced' | 'cleaned' | 'com
 export interface PrivateProResetOperation {
   operationId: 'workspace-v1';
   schemaVersion: 1;
+  revision: 1;
   projectId: string;
   state: 'running' | 'complete';
   startedAtMs: number;
+  executorId: string;
+  leaseExpiresAtMs: number;
 }
 
 export interface PrivateProResetJournalTarget {
@@ -230,7 +235,13 @@ export function buildPrivateProResetPlan(input: PrivateProResetPlanInput): Priva
   const authByUid = new Map(input.authIdentities.map(identity => [identity.uid, identity]));
   const accountByUid = new Map(input.accountDocuments.filter(account => account.exists).map(account => [account.uid, account]));
   const resetTargetByUid = new Map((input.resetTargets ?? []).map(target => [target.uid, target]));
-  const uids = [...new Set([...authByUid.keys(), ...accountByUid.keys(), ...resetTargetByUid.keys()])].sort();
+  const relevantAuthUids = [...authByUid.values()].filter(identity => {
+    const email = identity.email ? normalizeEmail(identity.email) : '';
+    return identity.claims.privatePro === true
+      || identity.claims.privateProEpoch !== undefined
+      || (identity.emailVerified && email !== '' && allowedEmails.has(email));
+  }).map(identity => identity.uid);
+  const uids = [...new Set([...relevantAuthUids, ...accountByUid.keys(), ...resetTargetByUid.keys()])].sort();
   const actions = uids.map(uid => {
     const identity = authByUid.get(uid);
     const account = accountByUid.get(uid);
@@ -388,6 +399,35 @@ export async function executePrivateProResetActions(actions: readonly PrivatePro
   }
 }
 
+export async function runPrivateProResetConvergence(port: {
+  runPass(): Promise<{ relevantUids: readonly string[]; targetUids: readonly string[]; incompleteTargets: number }>;
+  refreshLease(): Promise<void>;
+  markComplete(): Promise<void>;
+}, maxPasses = 8): Promise<void> {
+  let previousSignature = '';
+  for (let pass = 0; pass < maxPasses; pass++) {
+    await port.refreshLease();
+    const state = await port.runPass();
+    const relevant = [...state.relevantUids].sort();
+    const targets = [...state.targetUids].sort();
+    const signature = JSON.stringify({ relevant, targets });
+    const completeCoverage = state.incompleteTargets === 0
+      && relevant.length === targets.length
+      && relevant.every((uid, index) => uid === targets[index]);
+    if (completeCoverage && signature === previousSignature) {
+      await port.markComplete();
+      return;
+    }
+    previousSignature = signature;
+  }
+  throw new Error('Private Pro reset did not converge.');
+}
+
+export function assertPrivateProResetExecutorLease(operation: PrivateProResetOperation, executorId: string, nowMs: number): void {
+  if (operation.state === 'running' && operation.executorId !== executorId && operation.leaseExpiresAtMs > nowMs)
+    throw new Error('Reset operation is already running.');
+}
+
 function requiredEnvironment(name: string): string {
   const value = process.env[name]?.trim();
   if (!value) throw new Error(`${name} is required.`);
@@ -433,7 +473,7 @@ function initializeResetApp(admin: AdminModules, projectId: string, storageBucke
   }, 'private-pro-reset');
 }
 
-async function collectInputs(admin: AdminModules, projectId: string, storageBucket: string, execute: boolean, nowMs: number) {
+async function collectInputs(admin: AdminModules, projectId: string, storageBucket: string, execute: boolean, nowMs: number, executorId: string) {
   const app = initializeResetApp(admin, projectId, storageBucket);
   const auth = admin.getAuth(app);
   const firestore = admin.getFirestore(app);
@@ -445,7 +485,7 @@ async function collectInputs(admin: AdminModules, projectId: string, storageBuck
     readBucketMetadata: () => readBucketBindingMetadata(bucket),
     inspect: async () => undefined,
   });
-  if (execute) await ensureResetOperation(firestore, projectId, nowMs);
+  if (execute) await ensureResetOperation(firestore, projectId, nowMs, executorId);
   const operationSnapshot = await firestore.doc(RESET_OPERATION_PATH).get();
   const resetOperation = operationSnapshot.exists ? parsePrivateProResetOperation(operationSnapshot.data()) : undefined;
   const resetTargets = resetOperation
@@ -486,14 +526,19 @@ function exactKeys(value: Record<string, unknown>, keys: readonly string[]): boo
 
 export function parsePrivateProResetOperation(value: unknown): PrivateProResetOperation {
   const record = typeof value === 'object' && value !== null ? value as Record<string, unknown> : {};
-  if (!exactKeys(record, ['operationId', 'schemaVersion', 'projectId', 'state', 'startedAtMs'])
+  if (!exactKeys(record, ['operationId', 'schemaVersion', 'revision', 'projectId', 'state', 'startedAtMs', 'executorId', 'leaseExpiresAtMs'])
     || record.operationId !== 'workspace-v1'
     || record.schemaVersion !== 1
+    || record.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION
     || typeof record.projectId !== 'string'
     || !['running', 'complete'].includes(String(record.state))
     || typeof record.startedAtMs !== 'number'
     || !Number.isSafeInteger(record.startedAtMs)
-    || record.startedAtMs <= 0) throw new Error('Reset operation journal is invalid.');
+    || record.startedAtMs <= 0
+    || typeof record.executorId !== 'string'
+    || record.executorId.length < 1
+    || typeof record.leaseExpiresAtMs !== 'number'
+    || !Number.isSafeInteger(record.leaseExpiresAtMs)) throw new Error('Reset operation journal is invalid.');
   return record as unknown as PrivateProResetOperation;
 }
 
@@ -511,16 +556,21 @@ export function parsePrivateProResetTarget(value: unknown): PrivateProResetJourn
   return record as unknown as PrivateProResetJournalTarget;
 }
 
-async function ensureResetOperation(firestore: FirebaseFirestore.Firestore, projectId: string, nowMs: number): Promise<PrivateProResetOperation> {
+async function ensureResetOperation(firestore: FirebaseFirestore.Firestore, projectId: string, nowMs: number, executorId: string): Promise<PrivateProResetOperation> {
   const reference = firestore.doc(RESET_OPERATION_PATH);
   return firestore.runTransaction(async transaction => {
     const snapshot = await transaction.get(reference);
     if (snapshot.exists) {
       const operation = parsePrivateProResetOperation(snapshot.data());
       if (operation.projectId !== projectId) throw new Error('Reset operation project mismatch.');
+      assertPrivateProResetExecutorLease(operation, executorId, nowMs);
+      if (operation.state === 'running') {
+        transaction.update(reference, { executorId, leaseExpiresAtMs: nowMs + 60_000 });
+        return { ...operation, executorId, leaseExpiresAtMs: nowMs + 60_000 };
+      }
       return operation;
     }
-    const operation: PrivateProResetOperation = { operationId: 'workspace-v1', schemaVersion: 1, projectId, state: 'running', startedAtMs: nowMs };
+    const operation: PrivateProResetOperation = { operationId: 'workspace-v1', schemaVersion: 1, revision: PRIVATE_PRO_WORKSPACE_RESET_REVISION, projectId, state: 'running', startedAtMs: nowMs, executorId, leaseExpiresAtMs: nowMs + 60_000 };
     transaction.create(reference, operation);
     return operation;
   });
@@ -547,7 +597,28 @@ async function ensureResetTargets(firestore: FirebaseFirestore.Firestore, action
 }
 
 async function persistResetPhase(firestore: FirebaseFirestore.Firestore, action: PrivateProResetAction, phase: PrivateProResetTargetPhase, nowMs: number): Promise<void> {
-  await firestore.doc(`${RESET_OPERATION_PATH}/targets/${action.uid}`).update({ phase, updatedAtMs: nowMs });
+  const ranks: Record<PrivateProResetTargetPhase, number> = { planned: 0, fenced: 1, cleaned: 2, complete: 3 };
+  await firestore.runTransaction(async transaction => {
+    const reference = firestore.doc(`${RESET_OPERATION_PATH}/targets/${action.uid}`);
+    const snapshot = await transaction.get(reference);
+    if (!snapshot.exists) throw new Error('Reset target journal is missing.');
+    const current = parsePrivateProResetTarget(snapshot.data());
+    if (ranks[current.phase] > ranks[phase]) return;
+    if (ranks[current.phase] + 1 !== ranks[phase]) throw new Error('Reset target journal phase mismatch.');
+    transaction.update(reference, { phase, updatedAtMs: nowMs });
+  });
+}
+
+async function markResetComplete(firestore: FirebaseFirestore.Firestore, projectId: string, executorId: string): Promise<void> {
+  await firestore.runTransaction(async transaction => {
+    const reference = firestore.doc(RESET_OPERATION_PATH);
+    const snapshot = await transaction.get(reference);
+    if (!snapshot.exists) throw new Error('Reset operation journal is missing.');
+    const operation = parsePrivateProResetOperation(snapshot.data());
+    if (operation.projectId !== projectId || operation.revision !== PRIVATE_PRO_WORKSPACE_RESET_REVISION || operation.state !== 'running' || operation.executorId !== executorId)
+      throw new Error('Reset operation completion mismatch.');
+    transaction.update(reference, { state: 'complete', leaseExpiresAtMs: 0 });
+  });
 }
 
 function numericProjectNumber(value: unknown): string {
@@ -666,7 +737,8 @@ async function main() {
   const allowedEmails = new Set((process.env.PRIVATE_PRO_ALLOWED_EMAILS ?? '').split(',').map(normalizeEmail).filter(Boolean));
   const admin = await loadAdminModules();
   const nowMs = Date.now();
-  const inputs = await collectInputs(admin, projectId, storageBucket, args.execute, nowMs);
+  const executorId = randomUUID();
+  const inputs = await collectInputs(admin, projectId, storageBucket, args.execute, nowMs, executorId);
   const plan = buildPrivateProResetPlan({
     projectId,
     ...args,
@@ -679,47 +751,42 @@ async function main() {
   });
 
   if (plan.mode === 'execute') {
-    const operation = await ensureResetOperation(inputs.firestore, projectId, nowMs);
+    const operation = await ensureResetOperation(inputs.firestore, projectId, nowMs, executorId);
     if (operation.state === 'complete') {
       console.log(JSON.stringify({ projectId, mode: 'execute', alreadyComplete: true }));
       return;
     }
-    const journalPlan = buildPrivateProResetPlan({
-      projectId,
-      ...args,
-      authIdentities: inputs.authIdentities,
-      accountDocuments: inputs.accountDocuments,
-      allowedEmails,
-      nowMs,
-      resetOperation: operation,
-      resetTargets: inputs.resetTargets,
+    await runPrivateProResetConvergence({
+      refreshLease: async () => { await ensureResetOperation(inputs.firestore, projectId, Date.now(), executorId); },
+      runPass: async () => {
+        const fresh = await collectInputs(admin, projectId, storageBucket, false, Date.now(), executorId);
+        const currentOperation = fresh.resetOperation ?? operation;
+        const journalPlan = buildPrivateProResetPlan({ projectId, ...args, authIdentities: fresh.authIdentities, accountDocuments: fresh.accountDocuments, allowedEmails, nowMs: Date.now(), resetOperation: currentOperation, resetTargets: fresh.resetTargets });
+        await ensureResetTargets(inputs.firestore, journalPlan.actions, Date.now());
+        const refreshedTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
+        const executablePlan = buildPrivateProResetPlan({ projectId, ...args, authIdentities: fresh.authIdentities, accountDocuments: fresh.accountDocuments, allowedEmails, nowMs: Date.now(), resetOperation: currentOperation, resetTargets: refreshedTargets });
+        await executePrivateProResetActions(executablePlan.actions, {
+          inspect: action => inspectAction(action, inputs.firestore, inputs.bucket, admin.FieldPath.documentId()),
+          fenceAccount: action => fenceAccountAction(action, inputs.firestore),
+          fenceClaims: action => fenceClaimsAction(action, inputs.auth),
+          revokeFenceTokens: action => revokeTokensAction(action, inputs.auth),
+          cleanupFirestore: action => cleanupFirestoreAction(action, inputs.firestore),
+          cleanupStorage: async action => { for (const prefix of action.storagePrefixes) await deleteStoragePrefix(inputs.bucket, prefix); },
+          applyFinalAccount: action => applyAccountAction(action, inputs.firestore),
+          applyFinalClaims: action => applyClaimsAction(action, inputs.auth),
+          revokeFinalTokens: action => revokeTokensAction(action, inputs.auth),
+          persistPhase: (action, phase) => persistResetPhase(inputs.firestore, action, phase, Date.now()),
+          emit: result => console.log(JSON.stringify(result)),
+        });
+        const finalTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
+        return {
+          relevantUids: executablePlan.actions.map(action => action.uid),
+          targetUids: finalTargets.map(target => target.uid),
+          incompleteTargets: finalTargets.filter(target => target.phase !== 'complete').length,
+        };
+      },
+      markComplete: () => markResetComplete(inputs.firestore, projectId, executorId),
     });
-    await ensureResetTargets(inputs.firestore, journalPlan.actions, nowMs);
-    const refreshedTargets = (await inputs.firestore.collection(`${RESET_OPERATION_PATH}/targets`).get()).docs.map(document => parsePrivateProResetTarget(document.data()));
-    const executablePlan = buildPrivateProResetPlan({
-      projectId,
-      ...args,
-      authIdentities: inputs.authIdentities,
-      accountDocuments: inputs.accountDocuments,
-      allowedEmails,
-      nowMs,
-      resetOperation: operation,
-      resetTargets: refreshedTargets,
-    });
-    await executePrivateProResetActions(executablePlan.actions, {
-      inspect: action => inspectAction(action, inputs.firestore, inputs.bucket, admin.FieldPath.documentId()),
-      fenceAccount: action => fenceAccountAction(action, inputs.firestore),
-      fenceClaims: action => fenceClaimsAction(action, inputs.auth),
-      revokeFenceTokens: action => revokeTokensAction(action, inputs.auth),
-      cleanupFirestore: action => cleanupFirestoreAction(action, inputs.firestore),
-      cleanupStorage: async action => { for (const prefix of action.storagePrefixes) await deleteStoragePrefix(inputs.bucket, prefix); },
-      applyFinalAccount: action => applyAccountAction(action, inputs.firestore),
-      applyFinalClaims: action => applyClaimsAction(action, inputs.auth),
-      revokeFinalTokens: action => revokeTokensAction(action, inputs.auth),
-      persistPhase: (action, phase) => persistResetPhase(inputs.firestore, action, phase, Date.now()),
-      emit: result => console.log(JSON.stringify(result)),
-    });
-    await inputs.firestore.doc(RESET_OPERATION_PATH).update({ state: 'complete' });
     return;
   }
   const accounts = [];

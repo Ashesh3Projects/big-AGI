@@ -85,6 +85,7 @@ export async function bootstrapPrivateProAccount(
     email: identity.email,
     nowMs: options.nowMs,
   });
+  if (await admin.getWorkspaceResetState() === 'running') throw new PrivateProResetInProgressError();
   await admin.setClaims(identity.uid, { privatePro: true, privateProEpoch: account.accessEpoch });
 
   return {

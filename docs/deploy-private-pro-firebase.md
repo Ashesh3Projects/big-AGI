@@ -119,7 +119,7 @@ Execution requires both flags and an exact match with `NEXT_PUBLIC_FIREBASE_PROJ
 npm run private-pro:reset-workspaces -- --execute --confirm <project-id>
 ```
 
-Execution refuses an empty allowlist. It never deletes Auth identities. Each Auth UID is fenced with an inactive fixed target epoch, cleared claims, and revoked tokens before cleanup. Approved verified identities receive a clean active account and matching claims at that same epoch after cleanup. Other account documents and all orphan account documents are deleted after cleanup. Refresh tokens are revoked again after final convergence. Reruns reuse an in-progress or completed target epoch instead of rotating endlessly.
+Execution refuses an empty allowlist. It never deletes Auth identities. Reset revision 1 uses the revisioned `privateProOperations/workspaceV1Reset-v1` journal and an executor lease. Firestore and Storage rules deny v1 browser access while that revision is running. Each Auth UID is fenced with an inactive fixed target epoch, cleared claims, and revoked tokens before cleanup. Approved verified identities receive a clean active account and matching claims at that same epoch after cleanup. Other account documents and all orphan account documents are deleted after cleanup. Refresh tokens are revoked again after final convergence. Reruns reuse journaled target epochs and phases. A future reset requires a new revision.
 
 Do not run reset execution against production without separate approval of the reviewed dry-run counts.
 

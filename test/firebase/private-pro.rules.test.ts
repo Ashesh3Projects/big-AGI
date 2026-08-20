@@ -38,6 +38,7 @@ const MUTATION_2 = '123e4567-e89b-42d3-a456-426614174002';
 const WRITER_1 = '123e4567-e89b-42d3-a456-426614174011';
 const WRITER_2 = '123e4567-e89b-42d3-a456-426614174012';
 const ROOT_A = `users/${UID_A}/workspaces/v1`;
+const RESET_PATH = 'privateProOperations/workspaceV1Reset-v1';
 
 const RECORD_KEY_BOUNDARIES = [
   { recordType: 'credential-service', prefixLength: 25, outside: 'Q' },
@@ -213,6 +214,18 @@ after(async () => testEnv.cleanup());
 
 
 describe('Private Pro Firestore current account access', () => {
+  test('denies current account reads and writes while reset revision one is running', async () => {
+    const recordKey = privateProRecordKey('settings', 'reset-lock');
+    await testEnv.withSecurityRulesDisabled(context => setDoc(doc(context.firestore(), RESET_PATH), {
+      operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID,
+      state: 'running', executorId: 'executor-a', leaseExpiresAtMs: Date.now() + 60_000, startedAtMs: Date.now(),
+    }));
+    const firestore = approvedContext().firestore();
+    await assertFails(getDocs(collection(firestore, `${ROOT_A}/records`)));
+    await assertFails(setDoc(doc(firestore, `${ROOT_A}/records/${recordKey}`), canonical({ logicalId: 'reset-lock' })));
+    await testEnv.withSecurityRulesDisabled(context => setDoc(doc(context.firestore(), RESET_PATH), { state: 'complete' }, { merge: true }));
+    await assertSucceeds(getDocs(collection(firestore, `${ROOT_A}/records`)));
+  });
   test('allows current UID reads and lists for every v1 collection while account documents remain server-only', async () => {
     const firestore = approvedContext().firestore();
     const recordKey = await validCreate(firestore);
@@ -589,6 +602,17 @@ describe('Private Pro legacy path denial', () => {
 });
 
 describe('Private Pro Storage v1 rules', () => {
+  test('denies current account object access while reset revision one is running', async () => {
+    const object = ref(approvedContext().storage(), `users/${UID_A}/workspace-v1/assets/reset-lock/original`);
+    await testEnv.withSecurityRulesDisabled(context => setDoc(doc(context.firestore(), RESET_PATH), {
+      operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID,
+      state: 'running', executorId: 'executor-a', leaseExpiresAtMs: Date.now() + 60_000, startedAtMs: Date.now(),
+    }));
+    await assertFails(uploadBytes(object, new Uint8Array([1]), storageMetadata(UID_A, 'reset-lock', 'original')));
+    await testEnv.withSecurityRulesDisabled(context => setDoc(doc(context.firestore(), RESET_PATH), { state: 'complete' }, { merge: true }));
+    await assertSucceeds(uploadBytes(object, new Uint8Array([1]), storageMetadata(UID_A, 'reset-lock', 'original')));
+    await assertSucceeds(getBytes(object));
+  });
   test('allows current UID create, read, update, and delete at the two fixed object names', async () => {
     const storage = approvedContext().storage();
     const original = ref(storage, `users/${UID_A}/workspace-v1/assets/asset-1/original`);

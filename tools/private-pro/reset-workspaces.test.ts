@@ -8,6 +8,8 @@ import {
   parsePrivateProResetArguments,
   parsePrivateProResetOperation,
   parsePrivateProResetTarget,
+  runPrivateProResetConvergence,
+  assertPrivateProResetExecutorLease,
   verifyPrivateProResetBucketBeforeInspection,
 } from './reset-workspaces';
 
@@ -147,7 +149,7 @@ test('uses journal targets as the only authority for resumable epochs and phases
     accountDocuments: [{ uid: 'uid-a', exists: true, data: currentAccount(accountEpoch) }],
     allowedEmails: new Set(['user@example.com']),
     nowMs: NOW_MS,
-    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 },
+    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, executorId: 'executor-a', leaseExpiresAtMs: 200 },
     resetTargets: phase ? [{ uid: 'uid-a', approved: true, targetEpoch: 7, phase, updatedAtMs: 200 }] : [],
   }).actions[0];
 
@@ -167,17 +169,34 @@ test('completed operation makes execute and dry-run plans no-op', () => {
     accountDocuments: [],
     allowedEmails: new Set(['user@example.com']),
     nowMs: NOW_MS,
-    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'complete', startedAtMs: 100 },
+    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID, state: 'complete', startedAtMs: 100, executorId: 'executor-a', leaseExpiresAtMs: 200 },
     resetTargets: [],
   });
   assert.equal(plan.alreadyComplete, true);
   assert.deepEqual(plan.actions, []);
 });
 
+test('excludes Auth-only identities that have no entitlement claims and are not approved', () => {
+  const plan = buildPrivateProResetPlan({
+    projectId: PROJECT_ID,
+    execute: false,
+    authIdentities: [
+      { uid: 'irrelevant', email: 'other@example.com', emailVerified: true, claims: {} },
+      { uid: 'claimed', email: 'old@example.com', emailVerified: false, claims: { privateProEpoch: 2 } },
+      { uid: 'allowed', email: 'allowed@example.com', emailVerified: true, claims: {} },
+    ],
+    accountDocuments: [],
+    allowedEmails: new Set(['allowed@example.com']),
+    nowMs: NOW_MS,
+  });
+  assert.deepEqual(plan.actions.map(action => action.uid), ['allowed', 'claimed']);
+  assert.deepEqual(plan.authIdentityUids, ['allowed', 'claimed', 'irrelevant']);
+});
+
 test('rejects malformed reset operation and target journal schemas', () => {
-  assert.deepEqual(parsePrivateProResetOperation({ operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 }), { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 });
+  assert.deepEqual(parsePrivateProResetOperation({ operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, executorId: 'executor-a', leaseExpiresAtMs: 200 }), { operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, executorId: 'executor-a', leaseExpiresAtMs: 200 });
   assert.deepEqual(parsePrivateProResetTarget({ uid: 'uid-a', approved: true, targetEpoch: 2, phase: 'planned', updatedAtMs: 100 }), { uid: 'uid-a', approved: true, targetEpoch: 2, phase: 'planned', updatedAtMs: 100 });
-  assert.throws(() => parsePrivateProResetOperation({ operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, extra: 'secret' }), /journal/i);
+  assert.throws(() => parsePrivateProResetOperation({ operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, executorId: 'executor-a', leaseExpiresAtMs: 200, extra: 'secret' }), /journal/i);
   assert.throws(() => parsePrivateProResetTarget({ uid: 'uid-a', approved: true, targetEpoch: 1.5, phase: 'planned', updatedAtMs: 100 }), /journal/i);
 });
 
@@ -238,7 +257,7 @@ test('keeps a cleaned orphan journal target in the resume plan after its account
     accountDocuments: [],
     allowedEmails: new Set(['allowed@example.com']),
     nowMs: NOW_MS,
-    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100 },
+    resetOperation: { operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, executorId: 'executor-a', leaseExpiresAtMs: 200 },
     resetTargets: [{ uid: 'orphan', approved: false, targetEpoch: 5, phase: 'cleaned', updatedAtMs: 100 }],
   });
   assert.equal(plan.actions[0].uid, 'orphan');
@@ -371,6 +390,34 @@ test('persists journal phases and resumes without repeating completed phases', a
     emit: () => undefined,
   });
   assert.deepEqual(calls, ['final-account', 'final-claims', 'final-tokens', 'phase:complete']);
+});
+
+test('convergence processes new relevant UIDs and refuses completion with failed targets', async () => {
+  const passes = [
+    { relevantUids: ['uid-a'], targetUids: ['uid-a'], incompleteTargets: 0 },
+    { relevantUids: ['uid-a', 'uid-b'], targetUids: ['uid-a', 'uid-b'], incompleteTargets: 0 },
+    { relevantUids: ['uid-a', 'uid-b'], targetUids: ['uid-a', 'uid-b'], incompleteTargets: 0 },
+  ];
+  let completed = 0;
+  await runPrivateProResetConvergence({
+    runPass: async () => passes.shift()!,
+    refreshLease: async () => undefined,
+    markComplete: async () => { completed++; },
+  });
+  assert.equal(completed, 1);
+
+  await assert.rejects(() => runPrivateProResetConvergence({
+    runPass: async () => ({ relevantUids: ['uid-a'], targetUids: ['uid-a'], incompleteTargets: 1 }),
+    refreshLease: async () => undefined,
+    markComplete: async () => assert.fail('Incomplete target must prevent completion.'),
+  }, 2), /converge/i);
+});
+
+test('rejects a concurrent unexpired reset executor lease', () => {
+  const operation = { operationId: 'workspace-v1', schemaVersion: 1, revision: 1, projectId: PROJECT_ID, state: 'running', startedAtMs: 100, executorId: 'executor-a', leaseExpiresAtMs: 1_000 } as const;
+  assert.throws(() => assertPrivateProResetExecutorLease(operation, 'executor-b', 500), /already running/i);
+  assert.doesNotThrow(() => assertPrivateProResetExecutorLease(operation, 'executor-a', 500));
+  assert.doesNotThrow(() => assertPrivateProResetExecutorLease(operation, 'executor-b', 1_001));
 });
 
 test('defaults to dry run and enforces the exact destructive execution gate', () => {

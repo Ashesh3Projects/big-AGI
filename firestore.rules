@@ -2,6 +2,12 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
+    function workspaceResetRunning() {
+      let path = /databases/$(database)/documents/privateProOperations/workspaceV1Reset-v1;
+      return exists(path)
+        && get(path).data.revision == 1
+        && get(path).data.state == 'running';
+    }
     // Rules enforce account isolation, atomic transition shape, timestamps, and
     // structural bounds. They cannot recompute SHA-256 or the logical-ID digest.
     // The client reconciler treats all remote payloads as untrusted and verifies both.
@@ -12,6 +18,7 @@ service cloud.firestore {
     function currentAccount(uid) {
       return request.auth != null
         && request.auth.uid == uid
+        && !workspaceResetRunning()
         && currentClaims(uid);
     }
 

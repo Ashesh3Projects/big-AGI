@@ -29,9 +29,10 @@ class FakeAdminPort implements PrivateProAuthAdminPort {
   claims: { privatePro: true; privateProEpoch: number } | null = null;
   saved = 0;
   resetState: 'absent' | 'running' | 'complete' = 'absent';
+  resetStates: Array<'absent' | 'running' | 'complete'> = [];
 
   async getWorkspaceResetState() {
-    return this.resetState;
+    return this.resetStates.shift() ?? this.resetState;
   }
 
   async activateAccount(input: { uid: string; email: string; nowMs: number }) {
@@ -141,6 +142,17 @@ describe('private Pro account bootstrap', () => {
     admin.resetState = 'complete';
     await bootstrapPrivateProAccount(IDENTITY, admin, { allowedEmails: new Set(['friend@example.com']), nowMs: 5000 });
     assert.equal(admin.saved, 1);
+  });
+
+  test('rechecks reset journal after account activation and before claims', async () => {
+    const admin = new FakeAdminPort();
+    admin.resetStates = ['absent', 'running'];
+    await assert.rejects(
+      bootstrapPrivateProAccount(IDENTITY, admin, { allowedEmails: new Set(['friend@example.com']), nowMs: 5000 }),
+      error => error instanceof PrivateProResetInProgressError,
+    );
+    assert.equal(admin.saved, 1);
+    assert.equal(admin.claims, null);
   });
 
   test('maps reset lock to sanitized temporary unavailability', () => {

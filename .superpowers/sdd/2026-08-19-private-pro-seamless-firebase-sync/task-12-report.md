@@ -65,3 +65,12 @@
 - Tightened epoch parsing so unsafe, fractional, negative, and non-finite numeric epochs fail closed.
 - Security audit probes now require `PRIVATE_PRO_SECURITY_AUDIT_UID`, target actual v1 paths, use a codec-derived record key and valid Storage metadata, and require operator cleanup for any unexpectedly allowed write.
 - Documented that `--report-only` still performs bounded active anonymous endpoint probes.
+
+## Fix round 3
+
+- Revisioned the reset as `workspaceV1Reset-v1` with revision constant 1 and an executor lease.
+- Firestore and Storage rules now deny all v1 browser access while reset revision 1 is running. Emulator tests cover running, complete, and absent marker states.
+- Bootstrap checks the revisioned marker before account activation and again before claims, while the rules lock closes the remaining timing window.
+- Resume inventory includes journal-only targets whose account document was already deleted.
+- Execute uses a bounded fresh-inventory convergence loop, requires two stable complete passes, refreshes the single-executor lease, and refuses completion while targets are incomplete or inventory is unstable.
+- Security audit separates the approved audit UID from UUID mutation IDs and keeps codec-derived Firestore shapes plus operator cleanup.

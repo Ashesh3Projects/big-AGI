@@ -2108,7 +2108,7 @@ export async function collectFirebaseEndpointProbes(input: {
   const firestoreCollection = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents/users/${encodeURIComponent(input.auditUid)}/workspaces/v1/records?pageSize=1&key=${encodeURIComponent(input.apiKey)}`;
   const firestoreCommit = `https://firestore.googleapis.com/v1/projects/${encodeURIComponent(input.projectId)}/databases/(default)/documents:commit?key=${encodeURIComponent(input.apiKey)}`;
   const storageObject = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o/${encodeURIComponent(storagePath)}?key=${encodeURIComponent(input.apiKey)}`;
-  const storageUpload = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?uploadType=media&name=${encodeURIComponent(storagePath)}&key=${encodeURIComponent(input.apiKey)}`;
+  const storageUpload = `https://firebasestorage.googleapis.com/v0/b/${encodeURIComponent(input.storageBucket)}/o?uploadType=multipart&name=${encodeURIComponent(storagePath)}&key=${encodeURIComponent(input.apiKey)}`;
   const documentName = `projects/${input.projectId}/databases/(default)/documents/${firestorePath}`;
   const receiptName = `projects/${input.projectId}/databases/(default)/documents/${firestoreReceiptPath}`;
   const firestoreRead = await endpointProbe(() => input.fetch(firestoreCollection, { method: 'GET' }));
@@ -2125,16 +2125,17 @@ export async function collectFirebaseEndpointProbes(input: {
       } }, updateTransforms: [{ fieldPath: 'committedAt', setToServerValue: 'REQUEST_TIME' }] },
     ] }),
   }));
+  const boundary = 'private-pro-security-audit';
+  const storageMetadata = JSON.stringify({
+    name: storagePath,
+    contentType: 'image/png',
+    metadata: { uid, assetId: 'audit', kind: 'original', sha256: '0'.repeat(64) },
+  });
+  const storageBody = `--${boundary}\r\nContent-Type: application/json; charset=utf-8\r\n\r\n${storageMetadata}\r\n--${boundary}\r\nContent-Type: image/png\r\n\r\n0\r\n--${boundary}--`;
   const storageWrite = await endpointProbe(() => input.fetch(storageUpload, {
     method: 'POST',
-    headers: {
-      'content-type': 'image/png',
-      'x-goog-meta-uid': uid,
-      'x-goog-meta-assetid': 'audit',
-      'x-goog-meta-kind': 'original',
-      'x-goog-meta-sha256': '0'.repeat(64),
-    },
-    body: new Uint8Array([0]),
+    headers: { 'content-type': `multipart/related; boundary=${boundary}` },
+    body: storageBody,
   }));
   if (firestoreWrite === 'allowed') {
     if (!input.cleanupFirestore || !await input.cleanupFirestore([firestorePath, firestoreReceiptPath])) return { firestoreRead, firestoreWrite: 'unknown', storageRead, storageWrite };
@@ -2146,6 +2147,26 @@ export async function collectFirebaseEndpointProbes(input: {
     storageRead,
     storageWrite,
   };
+}
+
+export function assertPrivateProSecurityAuditIdentity(input: {
+  auditUid: string;
+  account: { uid: unknown; active: unknown; accessEpoch: unknown };
+  auth: { uid: unknown; email: unknown; emailVerified: unknown; claims: Readonly<Record<string, unknown>> };
+  allowedEmails: ReadonlySet<string>;
+}): void {
+  const email = typeof input.auth.email === 'string' ? input.auth.email.trim().toLowerCase() : '';
+  const epoch = input.account.accessEpoch;
+  if (input.account.uid !== input.auditUid
+    || input.account.active !== true
+    || typeof epoch !== 'number'
+    || !Number.isSafeInteger(epoch)
+    || epoch <= 0
+    || input.auth.uid !== input.auditUid
+    || input.auth.emailVerified !== true
+    || !input.allowedEmails.has(email)
+    || input.auth.claims.privatePro !== true
+    || input.auth.claims.privateProEpoch !== epoch) throw new Error('Private Pro security audit identity is invalid.');
 }
 
 async function collectFirebaseRuleProbes(projectId: string, storageBucket: string): Promise<FirebaseRuleProbeFacts> {
@@ -2161,7 +2182,20 @@ async function collectFirebaseRuleProbes(projectId: string, storageBucket: strin
   if (!accountResponse.ok) throw new Error('Private Pro security audit account is unavailable.');
   const account = asRecord(await accountResponse.json());
   const accountFields = asRecord(account.fields);
-  if (asRecord(accountFields.active).booleanValue !== true) throw new Error('Private Pro security audit account is inactive.');
+  const accountUid = asRecord(accountFields.uid).stringValue;
+  const accountEpochValue = asRecord(accountFields.accessEpoch).integerValue;
+  const accountEpoch = typeof accountEpochValue === 'string' && /^\d+$/.test(accountEpochValue) ? Number(accountEpochValue) : Number.NaN;
+  const app = await import('firebase-admin/app');
+  const authModule = await import('firebase-admin/auth');
+  const adminApp = app.getApps().find(candidate => candidate.name === 'private-pro-security-audit') ?? app.initializeApp({ projectId }, 'private-pro-security-audit');
+  const user = await authModule.getAuth(adminApp).getUser(auditUid);
+  const allowedEmails = new Set((process.env.PRIVATE_PRO_ALLOWED_EMAILS ?? '').split(',').map(email => email.trim().toLowerCase()).filter(Boolean));
+  assertPrivateProSecurityAuditIdentity({
+    auditUid,
+    account: { uid: accountUid, active: asRecord(accountFields.active).booleanValue, accessEpoch: accountEpoch },
+    auth: { uid: user.uid, email: user.email, emailVerified: user.emailVerified, claims: { ...user.customClaims } },
+    allowedEmails,
+  });
   return collectFirebaseEndpointProbes({
     projectId,
     storageBucket,

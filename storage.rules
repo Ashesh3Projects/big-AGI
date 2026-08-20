@@ -2,6 +2,12 @@ rules_version = '2';
 
 service firebase.storage {
   match /b/{bucket}/o {
+    function workspaceResetRunning() {
+      let path = /databases/(default)/documents/privateProOperations/workspaceV1Reset-v1;
+      return firestore.exists(path)
+        && firestore.get(path).data.revision == 1
+        && firestore.get(path).data.state == 'running';
+    }
     function account(uid) {
       return firestore.get(/databases/(default)/documents/users/$(uid));
     }
@@ -9,6 +15,7 @@ service firebase.storage {
     function currentAccount(uid) {
       return request.auth != null
         && request.auth.uid == uid
+        && !workspaceResetRunning()
         && currentClaims(uid);
     }
 
