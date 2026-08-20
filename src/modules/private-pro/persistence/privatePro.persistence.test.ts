@@ -309,6 +309,36 @@ describe('private Pro managed persistence gate', () => {
     assert.equal(privateProManagedPersistenceUid(), 'uid-a');
   });
 
+  test('first UID activation preserves values edited while authentication and cutover are pending', async () => {
+    const script = `
+      process.env.NEXT_PUBLIC_PRIVATE_PRO_ENABLED = 'true';
+      import('./src/modules/private-pro/persistence/privatePro.persistence.ts').then(async imported => {
+        const module = imported.default ?? imported;
+        const storage = module.createPrivateProPortableLocalStorage(() => null);
+        storage.setItem('app-models', 'edited-before-uid-activation');
+        await module.activatePrivateProManagedPersistence('uid-a', Symbol('uid-a-owner'));
+        if (storage.getItem('app-models') !== 'edited-before-uid-activation') throw new Error('pending edit was cleared');
+        if (module.privateProManagedPersistenceUid() !== 'uid-a') throw new Error('UID activation failed');
+      }).catch(error => { console.error(error); process.exitCode = 1; });
+    `;
+    const result = spawnSync(process.execPath, ['--import', 'tsx', '--eval', script], {
+      cwd: process.cwd(), encoding: 'utf8', env: { ...process.env, NODE_ENV: 'development' },
+    });
+
+    assert.equal(result.status, 0, result.stderr);
+  });
+
+  test('switching a real UID still clears the previous account volatile values', async () => {
+    const storage = createPrivateProPortableLocalStorage(() => new MemoryStorage());
+    await activatePrivateProManagedPersistenceOwned('uid-a', Symbol('uid-a-owner'));
+    storage.setItem('app-models', 'uid-a-models');
+
+    await activatePrivateProManagedPersistenceOwned('uid-b', Symbol('uid-b-owner'));
+
+    assert.equal(storage.getItem('app-models'), null);
+    assert.equal(privateProManagedPersistenceUid(), 'uid-b');
+  });
+
   test('released same-UID state remains discoverable for a later cross-account clear', async () => {
     const oldOwner = Symbol('old-owner');
     await activatePrivateProManagedPersistenceOwned('uid-a', oldOwner);

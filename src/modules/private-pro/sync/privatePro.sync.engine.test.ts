@@ -12,6 +12,8 @@ import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer } from './pr
 import { createPrivateProSyncStore } from './store-private-pro-sync';
 import type { PrivateProSyncRemoteEvent, PrivateProSyncTransport } from './privatePro.sync.transport';
 import { privateProCanonicalJson, privateProContentHash, privateProRecordKey } from './privatePro.sync.codec';
+import { createPrivateProSyncCoordinator } from './privatePro.sync.coordinator';
+import { createPrivateProSyncOutbound } from './privatePro.sync.outbound';
 import { PrivateProSyncDB } from './privatePro.sync.db';
 
 
@@ -162,6 +164,175 @@ describe('Private Pro sync engine', () => {
     assert.deepEqual(order.slice(0, 4), ['create-outbound', 'outbound-start', 'cache', 'wake']);
     assert.equal(store.getState().phase, 'local');
     resolveCache();
+    await engine.stop();
+  });
+
+  test('startup replay creates a local origin so cached remote state cannot overwrite the edit', async (t) => {
+    const db = integrationDB(t);
+    const serializer = new FakeSerializer();
+    const recordKey = privateProRecordKey('settings', 'main');
+    const remotePayload = privateProCanonicalJson({ value: 'cached-remote' });
+    await db.commitRemoteRecord('uid-startup', {
+      recordType: 'settings', logicalId: 'main', recordKey, projectionKey: 'main', schemaVersion: 1,
+      payload: remotePayload, contentHash: await privateProContentHash(remotePayload), referencedAssetIds: [],
+    }, { revision: 1, mutationId: crypto.randomUUID(), deleted: false }, 1);
+    const startupMutation: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'edited-during-cutover' }, referencedAssetIds: [],
+    } };
+    const pending = new Map([['settings:main', startupMutation]]);
+    let active = true;
+    const startupBuffer = {
+      active: () => active,
+      mutations: () => [...pending.values()],
+      acknowledge: () => { pending.clear(); },
+      stop: () => { active = false; },
+    };
+    let applied = false;
+    serializer.projection.apply = async () => { applied = true; };
+    const transport = new FakeTransport();
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-startup', writerId: crypto.randomUUID(), serializers: [serializer], startupBuffer,
+      transport, db, runSuppressed: callback => callback(),
+      createOutbound: hooks => createPrivateProSyncOutbound({
+        uid: 'uid-startup', writerId: crypto.randomUUID(), serializers: [serializer], db,
+        coordinator: createPrivateProSyncCoordinator({ uid: 'uid-startup', leases: db }), transport,
+        shouldCapture: hooks.shouldCapture, onCapture: hooks.onCapture, onCaptured: hooks.onCaptured,
+        onCaptureFailed: hooks.onCaptureFailed, onCommitted: hooks.onCommitted, onStatus: hooks.onStatus,
+      }),
+    });
+
+    await engine.start();
+    await settle();
+
+    assert.equal(applied, false);
+    assert.equal((await db.getOutbox('uid-startup', recordKey))?.payload, '{"value":"edited-during-cutover"}');
+    await engine.stop();
+  });
+
+  test('startup buffering and outbound subscription coalesce one edit to one durable generation', async (t) => {
+    const db = integrationDB(t);
+    const serializer = new FakeSerializer();
+    const mutation: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'same-edit' }, referencedAssetIds: [],
+    } };
+    const pending = new Map([['settings:main', mutation]]);
+    let active = true;
+    const startupBuffer = {
+      active: () => active,
+      mutations: () => [...pending.values()],
+      acknowledge: () => { pending.clear(); },
+      stop: () => { active = false; },
+    };
+    const transport = new FakeTransport();
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-duplicate', writerId: crypto.randomUUID(), serializers: [serializer], startupBuffer,
+      transport, db, runSuppressed: callback => callback(),
+      createOutbound: hooks => {
+        const outbound = createPrivateProSyncOutbound({
+          uid: 'uid-duplicate', writerId: crypto.randomUUID(), serializers: [serializer], db,
+          coordinator: createPrivateProSyncCoordinator({ uid: 'uid-duplicate', leases: db }), transport,
+          shouldCapture: hooks.shouldCapture, onCapture: hooks.onCapture, onCaptured: hooks.onCaptured,
+          onCaptureFailed: hooks.onCaptureFailed, onCommitted: hooks.onCommitted, onStatus: hooks.onStatus,
+        });
+        return outbound;
+      },
+    });
+
+    await engine.start();
+    await settle();
+
+    assert.equal((await db.getOutbox('uid-duplicate', privateProRecordKey('settings', 'main')))?.generation, 1);
+    await engine.stop();
+  });
+
+  test('drains an edit emitted during outbound startup before cache hydration', async () => {
+    const first: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'first', projectionKey: 'first', schemaVersion: 1,
+      value: { value: 'before-start' }, referencedAssetIds: [],
+    } };
+    const duringStart: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'second', projectionKey: 'second', schemaVersion: 1,
+      value: { value: 'during-start' }, referencedAssetIds: [],
+    } };
+    const pending = new Map([['settings:first', first]]);
+    let active = true;
+    const order: string[] = [];
+    const startupBuffer = {
+      active: () => active,
+      mutations: () => [...pending.values()],
+      acknowledge(mutation: PrivateProSyncLocalMutation) {
+        const identity = mutation.kind === 'put' ? mutation.record : mutation;
+        pending.delete(`${identity.recordType}:${identity.logicalId}`);
+      },
+      stop() { active = false; },
+    };
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-transition', serializers: [new FakeSerializer()], startupBuffer,
+      transport: new FakeTransport(), db: { pendingCount: async () => 2 }, runSuppressed: callback => callback(),
+      createOutbound: () => ({
+        start: async () => { pending.set('settings:second', duringStart); },
+        capture: async mutation => {
+          const identity = mutation.kind === 'put' ? mutation.record : mutation;
+          order.push(`capture:${identity.logicalId}`);
+        },
+        retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+      }),
+      createReconciler: () => ({ applyCached: async () => { order.push('cache'); }, handle: async () => {} }),
+    });
+
+    await engine.start();
+
+    assert.deepEqual(order, ['capture:first', 'capture:second', 'cache']);
+    assert.equal(startupBuffer.active(), false);
+    await engine.stop();
+  });
+
+  test('drains an edit emitted while startup capture is awaiting durability', async () => {
+    const first: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'first', projectionKey: 'first', schemaVersion: 1,
+      value: { value: 'before-start' }, referencedAssetIds: [],
+    } };
+    const duringCapture: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'settings', logicalId: 'second', projectionKey: 'second', schemaVersion: 1,
+      value: { value: 'during-capture' }, referencedAssetIds: [],
+    } };
+    const pending = new Map([['settings:first', first]]);
+    const firstCapture = deferred<void>();
+    let active = true;
+    const order: string[] = [];
+    const startupBuffer = {
+      active: () => active,
+      mutations: () => [...pending.values()],
+      acknowledge(mutation: PrivateProSyncLocalMutation) {
+        const identity = mutation.kind === 'put' ? mutation.record : mutation;
+        pending.delete(`${identity.recordType}:${identity.logicalId}`);
+      },
+      stop() { active = false; },
+    };
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-capture-transition', serializers: [new FakeSerializer()], startupBuffer,
+      transport: new FakeTransport(), db: { pendingCount: async () => 2 }, runSuppressed: callback => callback(),
+      createOutbound: () => ({
+        start: async () => {},
+        capture: async mutation => {
+          const identity = mutation.kind === 'put' ? mutation.record : mutation;
+          order.push(`capture:${identity.logicalId}`);
+          if (identity.logicalId === 'first') await firstCapture.promise;
+        },
+        retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+      }),
+      createReconciler: () => ({ applyCached: async () => { order.push('cache'); }, handle: async () => {} }),
+    });
+
+    const starting = engine.start();
+    await settle();
+    pending.set('settings:second', duringCapture);
+    firstCapture.resolve();
+    await starting;
+
+    assert.deepEqual(order, ['capture:first', 'capture:second', 'cache']);
     await engine.stop();
   });
 

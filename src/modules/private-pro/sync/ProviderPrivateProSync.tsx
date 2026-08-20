@@ -8,22 +8,85 @@ import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { privateProClientConfig } from '../config/privatePro.config';
 import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, privateProManagedPersistenceOwnership, releasePrivateProManagedPersistence, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
 import { createPrivateProSyncCoordinator, type PrivateProSyncCoordinator } from './privatePro.sync.coordinator';
+import { privateProCanonicalJson } from './privatePro.sync.codec';
 import { privateProSyncDB } from './privatePro.sync.db';
 import { createPrivateProSyncEngine, type PrivateProSyncEngine } from './privatePro.sync.engine';
 import { createPrivateProFirebaseSyncTransport } from './privatePro.sync.firebase';
 import { createPrivateProAssetSerializer, createPrivateProSyncSerializers } from './privatePro.sync.serializers';
+import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer } from './privatePro.sync.serializers';
 import { clearPrivateProManagedRuntimeStores } from './privatePro.sync.runtime';
 import { createPrivateProWorkspaceV1ProductionCutoverPort, runPrivateProWorkspaceV1LocalCutover } from './privatePro.sync.cutover';
 import { createPrivateProSyncStore, type PrivateProSyncStore } from './store-private-pro-sync';
 
 
 const ASSET_UPLOAD_LEASE_TIMING = { leaseMs: 15_000, renewEveryMs: 5_000, retryEveryMs: 250 } as const;
+const usePrivateProLayoutEffect = typeof window === 'undefined' ? React.useEffect : React.useLayoutEffect;
+
+function privateProStartupMutationKey(mutation: PrivateProSyncLocalMutation): string {
+  const identity = mutation.kind === 'put' ? mutation.record : mutation;
+  return `${identity.recordType}:${identity.logicalId}`;
+}
+
+export function createPrivateProStartupMutationBuffer(
+  serializers: readonly PrivateProSyncSerializer<unknown>[],
+): {
+  active(): boolean;
+  start(): void;
+  mutations(): readonly PrivateProSyncLocalMutation[];
+  acknowledge(mutation: PrivateProSyncLocalMutation): void;
+  stop(): void;
+} {
+  const mutations = new Map<string, PrivateProSyncLocalMutation>();
+  let active = false;
+  const unsubscribers: Array<() => void> = [];
+  return {
+    active: () => active,
+    start: () => {
+      if (active) return;
+      active = true;
+      unsubscribers.push(...serializers.map(serializer => serializer.subscribe(mutation => {
+        if (!active) return;
+        mutations.delete(privateProStartupMutationKey(mutation));
+        mutations.set(privateProStartupMutationKey(mutation), structuredClone(mutation));
+      })));
+    },
+    mutations: () => [...mutations.values()].map(mutation => structuredClone(mutation)),
+    acknowledge: mutation => {
+      const key = privateProStartupMutationKey(mutation);
+      const buffered = mutations.get(key);
+      if (buffered && privateProCanonicalJson(buffered) === privateProCanonicalJson(mutation)) mutations.delete(key);
+    },
+    stop: () => {
+      active = false;
+      unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
+    },
+  };
+}
+
+export function createPrivateProBufferedSyncLifecycle(
+  lifecycle: PrivateProSyncLifecycle,
+  startupBuffer: ReturnType<typeof createPrivateProStartupMutationBuffer>,
+): PrivateProSyncLifecycle {
+  return {
+    start() {
+      startupBuffer.start();
+      return lifecycle.start();
+    },
+    retry: lifecycle.retry,
+    signOut: lifecycle.signOut,
+    async stop() {
+      startupBuffer.stop();
+      await lifecycle.stop();
+    },
+  };
+}
 
 export interface PrivateProSyncLifecycleEngine extends Pick<PrivateProSyncEngine, 'start' | 'retryNow' | 'flushNow' | 'pendingCount' | 'stop'> {}
 
 interface PreparedPrivateProSync {
   engine: PrivateProSyncLifecycleEngine;
   coordinator?: Pick<PrivateProSyncCoordinator, 'broadcastSignedOut'>;
+  resumeStartupCapture?(): void;
 }
 
 interface PrivateProSyncLifecycleDependencies {
@@ -244,6 +307,7 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
       if (attempt === owner) attempt = null;
       dependencies.statusStore.setState({ phase: 'local', lastCategory: null });
     } catch {
+      if (canOwnStart(owner)) next?.resumeStartupCapture?.();
       if (canOwnStart(owner)) {
         attempt = null;
         dependencies.statusStore.setState({ phase: 'error', lastCategory: 'unknown' });
@@ -437,7 +501,7 @@ export function ProviderPrivateProSyncAccount(props: {
   const pending = useStore(props.statusStore, state => state.pending);
   const retry = React.useCallback(() => props.lifecycle.retry(), [props.lifecycle]);
   const signOut = React.useCallback((options?: { discardPending?: boolean }) => props.lifecycle.signOut(options), [props.lifecycle]);
-  React.useEffect(() => {
+  usePrivateProLayoutEffect(() => {
     void props.lifecycle.start();
     return () => { void props.lifecycle.stop().catch(() => {}); };
   }, [props.lifecycle, props.uid]);
@@ -456,7 +520,9 @@ function createProductionLifecycle(
   firebaseSignOut: () => Promise<void>,
   statusStore: PrivateProSyncStore,
 ): PrivateProSyncLifecycle {
-  return createPrivateProSyncLifecycle({
+  const startupSerializers = createPrivateProSyncSerializers();
+  const startupBuffer = createPrivateProStartupMutationBuffer(startupSerializers);
+  const lifecycle = createPrivateProSyncLifecycle({
     uid,
     statusStore,
     async prepare(isCurrent, owner) {
@@ -487,10 +553,12 @@ function createProductionLifecycle(
           const assetSerializer = createPrivateProAssetSerializer(uid, local, category => {
             statusStore.setState({ phase: category === 'offline' ? 'offline' : 'error', lastCategory: category });
           });
+          const serializers = [...startupSerializers, assetSerializer];
           const engine = createPrivateProSyncEngine({
             uid,
             writerId: crypto.randomUUID(),
-            serializers: createPrivateProSyncSerializers([assetSerializer]),
+            serializers,
+            startupBuffer,
             db: privateProSyncDB,
             coordinator,
             transport,
@@ -498,7 +566,7 @@ function createProductionLifecycle(
             runSuppressed: callback => callback(),
             statusStore,
           });
-          return { engine, coordinator };
+          return { engine, coordinator, resumeStartupCapture: () => startupBuffer.start() };
         },
       });
     },
@@ -511,6 +579,7 @@ function createProductionLifecycle(
     reload: () => window.location.reload(),
     pendingCount: () => privateProSyncDB.pendingCount(uid),
   });
+  return createPrivateProBufferedSyncLifecycle(lifecycle, startupBuffer);
 }
 
 export function usePrivateProSync(): PrivateProSyncContextValue {

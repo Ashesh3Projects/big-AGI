@@ -129,15 +129,10 @@ export const env = createEnv({
 
     // Private Pro: Firebase Admin and allowlist
     PRIVATE_PRO_ALLOWED_EMAILS: z.string().optional(),
-    PRIVATE_PRO_MAX_FILE_BYTES: z.string().regex(/^\d+$/).optional(),
-    PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS: z.string().regex(/^\d+$/).optional(),
-    PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS: z.string().regex(/^\d+$/).optional(),
-    PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES: z.string().regex(/^\d+$/).optional(),
     PRIVATE_PRO_RUNTIME_SERVICE_ACCOUNT_EMAIL: z.string().optional(),
     PRIVATE_PRO_WIF_RUNTIME_PRINCIPALS: z.string().optional(),
     FIREBASE_CLIENT_EMAIL: z.string().optional(),
     FIREBASE_PRIVATE_KEY: z.string().optional(),
-    CRON_SECRET: z.string().optional(),
 
     // AIX: Strict parsing mode - if omitted: strict in dev (throws on unknown API values), tolerant in prod (warns)
     // Set to 'true' to force strict mode in production (useful for debugging API drift)

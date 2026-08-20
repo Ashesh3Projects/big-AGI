@@ -6,6 +6,8 @@ import { renderToStaticMarkup } from 'react-dom/server';
 import { privateProClientConfig } from '../config/privatePro.config';
 import {
   createPrivateProSyncLifecycle,
+  createPrivateProBufferedSyncLifecycle,
+  createPrivateProStartupMutationBuffer,
   preparePrivateProPersistenceOwner,
   PrivateProUnsyncedChangesError,
   ProviderPrivateProSync,
@@ -16,6 +18,7 @@ import {
 import { createPrivateProSyncStore } from './store-private-pro-sync';
 import { PrivateProAccountControlContent } from '../ui/PrivateProAccountControl';
 import { PrivateProAccountControl } from '../ui/PrivateProAccountControl';
+import type { PrivateProSyncLocalMutation, PrivateProSyncSerializer } from './privatePro.sync.serializers';
 
 
 function deferred<T>() {
@@ -39,6 +42,40 @@ function fakeEngine(options: { pending?: number } = {}) {
 }
 
 describe('ProviderPrivateProSync', () => {
+  test('buffers only edits emitted while prepare is pending and reuses them after a failed attempt', async () => {
+    let emit: (mutation: PrivateProSyncLocalMutation) => void = () => assert.fail('Startup buffer listener was not installed.');
+    const serializer = {
+      subscribe(next: (mutation: PrivateProSyncLocalMutation) => void) {
+        emit = next;
+        return () => { emit = () => {}; };
+      },
+    } as PrivateProSyncSerializer<unknown>;
+    const buffer = createPrivateProStartupMutationBuffer([serializer]);
+    const first: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      recordType: 'scratch', logicalId: 'scratch-clip', projectionKey: 'scratch-clip', schemaVersion: 1,
+      value: { history: [{ id: 'one', text: 'during-cutover', timestamp: 1 }] }, referencedAssetIds: [],
+    } };
+    const replacement: PrivateProSyncLocalMutation = { kind: 'put', record: {
+      ...first.record, value: { history: [{ id: 'two', text: 'after-retry', timestamp: 2 }] },
+    } };
+
+    buffer.start();
+    emit(first);
+    assert.equal(buffer.active(), true);
+    assert.deepEqual(buffer.mutations(), [first]);
+    assert.deepEqual(buffer.mutations(), [first]);
+    buffer.acknowledge(first);
+    assert.deepEqual(buffer.mutations(), []);
+    emit(first);
+    emit(replacement);
+    assert.deepEqual(buffer.mutations(), [replacement]);
+
+    buffer.stop();
+    assert.equal(buffer.active(), false);
+    emit(first);
+    assert.deepEqual(buffer.mutations(), [replacement]);
+  });
+
   test('production persistence prepare runs the global local cutover before managed and asset activation', async () => {
     const order: string[] = [];
 
@@ -73,6 +110,36 @@ describe('ProviderPrivateProSync', () => {
     await preparePrivateProPersistenceOwner(dependencies());
 
     assert.deepEqual(order, ['cutover:1', 'cutover:2', 'activate-managed', 'activate-assets']);
+  });
+
+  test('buffered lifecycle installs its observer before prepare and retains it across retry', async () => {
+    const order: string[] = [];
+    let attempts = 0;
+    const base = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      async prepare() {
+        order.push(`prepare:${++attempts}`);
+        if (attempts === 1) throw new Error('cutover failed');
+        return { engine: fakeEngine().engine };
+      },
+      deactivate: async () => {}, clear: async () => {}, firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    let active = false;
+    const lifecycle = createPrivateProBufferedSyncLifecycle(base, {
+      active: () => active,
+      start: () => { active = true; order.push('buffer-start'); },
+      mutations: () => [], acknowledge: () => {},
+      stop: () => { active = false; order.push('buffer-stop'); },
+    });
+
+    await lifecycle.start();
+    assert.deepEqual(order, ['buffer-start', 'prepare:1']);
+    assert.equal(active, true);
+    await lifecycle.retry();
+    assert.deepEqual(order, ['buffer-start', 'prepare:1', 'prepare:2']);
+    assert.equal(active, true);
+    await lifecycle.stop();
+    assert.equal(active, false);
   });
 
   test('production persistence prepare stops between cross-UID cleanup transitions when ownership is cancelled', async () => {
@@ -426,18 +493,43 @@ describe('ProviderPrivateProSync', () => {
           async start() { order.push(`start:${attempts}`); if (attempts === 1) throw new Error('secret start detail'); },
           async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
           async stop() { order.push(`stop:${attempts}`); },
-        } };
+        }, resumeStartupCapture: () => { order.push(`resume-buffer:${attempts}`); } };
       },
       deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
       firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
     });
 
     await lifecycle.start();
-    assert.deepEqual(order, ['start:1', 'stop:1', 'deactivate']);
+    assert.deepEqual(order, ['start:1', 'resume-buffer:1', 'stop:1', 'deactivate']);
     await lifecycle.retry();
 
-    assert.deepEqual(order, ['start:1', 'stop:1', 'deactivate', 'start:2']);
+    assert.deepEqual(order, ['start:1', 'resume-buffer:1', 'stop:1', 'deactivate', 'start:2']);
     assert.equal(store.getState().phase, 'local');
+  });
+
+  test('a canceled engine-start failure cannot re-arm the stopped startup buffer', async () => {
+    const start = deferred<void>();
+    const order: string[] = [];
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => ({
+        engine: {
+          start: () => start.promise,
+          async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; }, async stop() { order.push('stop'); },
+        },
+        resumeStartupCapture: () => order.push('resume-buffer'),
+      }),
+      deactivate: async () => { order.push('deactivate'); }, clear: async () => {},
+      firebaseSignOut: async () => {}, reload: () => {}, pendingCount: async () => 0,
+    });
+    const starting = lifecycle.start();
+    await new Promise(resolve => setImmediate(resolve));
+
+    const stopping = lifecycle.stop();
+    start.reject(new Error('late start failure'));
+    await Promise.allSettled([starting, stopping]);
+
+    assert.deepEqual(order, ['stop', 'deactivate']);
   });
 
   test('stop failure cannot skip release and replacement waits for stop settlement', async () => {

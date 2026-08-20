@@ -20,7 +20,6 @@ const baseConfigInput = {
   firebaseProjectId: 'sample-project',
   firebaseClientEmail: undefined,
   firebasePrivateKey: undefined,
-  firebaseStorageBucket: 'sample-project.firebasestorage.app',
   appCheckSiteKey: 'site-key',
 } as const;
 
@@ -98,7 +97,6 @@ describe('Private Pro Firebase Admin credentials', () => {
     const adc: TestCredential = { kind: 'adc' };
     const result = createPrivateProAdminAppOptions({
       projectId: 'sample-project',
-      storageBucket: 'sample-project.firebasestorage.app',
     }, {
       applicationDefault: () => adc,
       cert: () => assert.fail('static certificate factory must not run in ADC mode'),
@@ -109,7 +107,6 @@ describe('Private Pro Firebase Admin credentials', () => {
       options: {
         credential: adc,
         projectId: 'sample-project',
-        storageBucket: 'sample-project.firebasestorage.app',
       },
     });
   });
@@ -125,16 +122,4 @@ describe('Private Pro Firebase Admin credentials', () => {
     assert.match(fallback, /FIREBASE_PRIVATE_KEY=/);
   });
 
-  test('uses the dedicated runtime service account as the narrowly scoped signed-URL signer', async () => {
-    const [deployment, manifestText] = await Promise.all([
-      readFile('docs/deploy-private-pro-firebase.md', 'utf8'),
-      readFile('infra/private-pro/gcp-runtime-role.yaml', 'utf8'),
-    ]);
-    const manifest = JSON.parse(manifestText) as { signingBinding: { serviceAccount: string } };
-
-    assert.equal(manifest.signingBinding.serviceAccount, '${RUNTIME_SERVICE_ACCOUNT_EMAIL}');
-    assert.match(deployment, /add-iam-policy-binding \$RuntimeServiceAccount[^\r\n]+member="serviceAccount:\$RuntimeServiceAccount"[^\r\n]+roles\/iam\.serviceAccountTokenCreator/);
-    assert.match(deployment, /add-iam-policy-binding \$RuntimeServiceAccount[^\r\n]+roles\/iam\.workloadIdentityUser/);
-    assert.doesNotMatch(deployment, /SignerServiceAccount/);
-  });
 });

@@ -104,7 +104,7 @@ export function clearPrivateProVolatilePortableState(): void {
 export async function activatePrivateProManagedPersistence(uid: string | null, owner: PrivateProPersistenceOwner | null): Promise<void> {
   if (managedBuild && uid === null) uid = PENDING_AUTH_UID;
   if (uid !== null && uid !== PENDING_AUTH_UID && !owner) throw new TypeError('Private Pro managed persistence owner is required.');
-  if (managedPersistenceUid !== uid) clearPrivateProVolatilePortableState();
+  if (managedPersistenceUid !== uid && managedPersistenceUid !== PENDING_AUTH_UID) clearPrivateProVolatilePortableState();
   managedPersistenceUid = uid;
   managedPersistenceOwner = uid === null || uid === PENDING_AUTH_UID ? null : owner;
 }

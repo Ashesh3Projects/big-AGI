@@ -104,3 +104,22 @@ test('direct Firebase workspace and asset browser modules stay present and Admin
     assert.doesNotMatch(source, removedImport);
   }
 });
+
+test('server source contains no removed upload quota, cron, or Admin Storage infrastructure', async () => {
+  const srcRoot = path.resolve(import.meta.dirname, '../../src');
+  const removedNames = [
+    ['CRON', 'SECRET'].join('_'),
+    ['PRIVATE', 'PRO', 'MAX', 'FILE', 'BYTES'].join('_'),
+    ['PRIVATE', 'PRO', 'UPLOAD', 'RATE'].join('_'),
+    ['getPrivatePro', 'StorageBucket'].join(''),
+  ];
+  const violations: string[] = [];
+
+  for (const file of await sourceFiles(srcRoot)) {
+    const source = await readFile(file, 'utf8');
+    if (removedNames.some(name => source.includes(name)) || /firebase-admin\/storage/.test(source))
+      violations.push(path.relative(srcRoot, file));
+  }
+
+  assert.deepEqual(violations, []);
+});

@@ -29,6 +29,7 @@ function waitForAbort(signal: AbortSignal): Promise<void> {
 
 export interface PrivateProSyncEngine {
   start(): Promise<void>;
+  capture(mutation: PrivateProSyncLocalMutation): Promise<void>;
   retryNow(): Promise<void>;
   flushNow(timeoutMs: number): Promise<{ pending: number }>;
   pendingCount(): Promise<number>;
@@ -37,6 +38,7 @@ export interface PrivateProSyncEngine {
 
 export interface PrivateProSyncEngineOutbound {
   start(): Promise<void>;
+  capture?(mutation: PrivateProSyncLocalMutation): Promise<unknown>;
   retryNow(): Promise<void>;
   flushNow(): Promise<void>;
   wake(): void;
@@ -80,6 +82,12 @@ export interface PrivateProSyncEngineDependencies {
   uid: string;
   writerId?: string;
   serializers: readonly PrivateProSyncSerializer<unknown>[];
+  startupBuffer?: {
+    active(): boolean;
+    mutations(): readonly PrivateProSyncLocalMutation[];
+    acknowledge(mutation: PrivateProSyncLocalMutation): void;
+    stop(): void;
+  };
   db: PrivateProSyncEngineDB;
   coordinator?: PrivateProSyncCoordinator;
   transport: PrivateProSyncTransport;
@@ -236,7 +244,9 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     onStatus: status => report(status.category),
     shouldCapture: mutation => {
       const projectionKey = mutation.kind === 'put' ? mutation.record.projectionKey : mutation.projectionKey;
-      return !suppressionDepths.has(projectionKey);
+      if (suppressionDepths.has(projectionKey)) return false;
+      if (dependencies.startupBuffer?.active()) return false;
+      return true;
     },
     runSuppressed,
     originFor: recordKey => localOrigins.get(recordKey),
@@ -362,6 +372,19 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       statusStore.setState({ phase: 'local', retry: retryNow, lastCategory: null });
       await outbound.start();
       if (!isEpochActive(epoch)) return;
+      if (dependencies.startupBuffer) {
+        for (;;) {
+          const mutations = dependencies.startupBuffer.mutations();
+          if (!mutations.length) break;
+          for (const mutation of mutations) {
+            if (!outbound.capture) throw new TypeError('Private Pro sync outbound capture is required during startup.');
+            await outbound.capture(mutation);
+            dependencies.startupBuffer.acknowledge(mutation);
+            if (!isEpochActive(epoch)) return;
+          }
+        }
+        dependencies.startupBuffer.stop();
+      }
       const cached = reconciler.applyCached(epoch, lifecycleAbort.signal);
       cached.catch(() => {});
       cacheTask = Promise.race([cached, waitForAbort(lifecycleAbort.signal)])
@@ -371,6 +394,11 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       windowEvents?.addEventListener('offline', onOffline);
       outbound.wake();
       await refreshStatus(epoch, false);
+    },
+
+    capture: async mutation => {
+      if (!outbound.capture) throw new TypeError('Private Pro sync outbound capture is unavailable.');
+      await outbound.capture(mutation);
     },
 
     retryNow,

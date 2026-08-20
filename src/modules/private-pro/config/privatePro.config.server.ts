@@ -1,12 +1,5 @@
 import { env } from '~/server/env.server';
 
-import {
-  PRIVATE_PRO_MAX_FILE_BYTES,
-  PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES,
-  PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS,
-  PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS,
-} from './privatePro.config';
-
 
 export function normalizePrivateProEmail(email: string): string {
   return email.trim().toLowerCase();
@@ -24,12 +17,6 @@ export function isPrivateProEmailAllowed(email: string, allowlist: ReadonlySet<s
   return allowlist.has(normalizePrivateProEmail(email));
 }
 
-export function parsePrivateProPositiveInteger(raw: string | undefined, fallback: number, label: string): number {
-  const value = raw === undefined ? fallback : Number(raw);
-  if (!Number.isSafeInteger(value) || value <= 0) throw new Error(`${label} must be a positive integer.`);
-  return value;
-}
-
 export interface PrivateProServerConfig {
   enabled: boolean;
   allowedEmails: ReadonlySet<string>;
@@ -37,14 +24,7 @@ export interface PrivateProServerConfig {
     projectId: string;
     clientEmail?: string;
     privateKey?: string;
-    storageBucket: string;
     credentialSource: PrivateProFirebaseCredentialSource;
-  };
-  maxFileBytes: number;
-  uploadRateLimit: {
-    windowMs: number;
-    maxRequests: number;
-    maxBytes: number;
   };
   appCheckEnforced: boolean;
 }
@@ -58,7 +38,6 @@ export interface PrivateProServerConfigInput {
   firebaseProjectId: string | undefined;
   firebaseClientEmail: string | undefined;
   firebasePrivateKey: string | undefined;
-  firebaseStorageBucket: string | undefined;
   appCheckSiteKey: string | undefined;
 }
 
@@ -94,14 +73,7 @@ export function parsePrivateProServerConfig(input: PrivateProServerConfigInput):
       projectId: input.firebaseProjectId ?? '',
       clientEmail,
       privateKey,
-      storageBucket: input.firebaseStorageBucket ?? '',
       credentialSource,
-    },
-    maxFileBytes: PRIVATE_PRO_MAX_FILE_BYTES,
-    uploadRateLimit: {
-      windowMs: PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS,
-      maxRequests: PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS,
-      maxBytes: PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES,
     },
     appCheckEnforced: input.enabled && !!appCheckSiteKey,
   };
@@ -119,23 +91,10 @@ export function getPrivateProServerConfig(): PrivateProServerConfig {
     firebaseProjectId: env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
     firebaseClientEmail: env.FIREBASE_CLIENT_EMAIL,
     firebasePrivateKey: env.FIREBASE_PRIVATE_KEY,
-    firebaseStorageBucket: env.NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET,
     appCheckSiteKey: env.NEXT_PUBLIC_FIREBASE_APP_CHECK_SITE_KEY,
   });
 
-  cachedConfig = {
-    ...parsedConfig,
-    maxFileBytes: parsePrivateProPositiveInteger(
-      env.PRIVATE_PRO_MAX_FILE_BYTES,
-      PRIVATE_PRO_MAX_FILE_BYTES,
-      'PRIVATE_PRO_MAX_FILE_BYTES',
-    ),
-    uploadRateLimit: {
-      windowMs: parsePrivateProPositiveInteger(env.PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS, PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS, 'PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS'),
-      maxRequests: parsePrivateProPositiveInteger(env.PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS, PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS, 'PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS'),
-      maxBytes: parsePrivateProPositiveInteger(env.PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES, PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES, 'PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES'),
-    },
-  };
+  cachedConfig = parsedConfig;
 
   return cachedConfig;
 }

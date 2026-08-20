@@ -124,3 +124,69 @@ Dependency and import tests now prove:
 ## Concerns
 
 None.
+
+## Fix round 1
+
+### Findings addressed
+
+- Removed the remaining server-only upload, quota, cron, signed-URL, and Admin Storage configuration after proving it had no runtime caller.
+- Removed `CRON_SECRET`, `PRIVATE_PRO_MAX_FILE_BYTES`, and every `PRIVATE_PRO_UPLOAD_RATE_*` server environment entry.
+- Removed obsolete upload constants, positive-integer limit parsing, server config fields, and server-side Firebase bucket input.
+- Firebase Admin initialization now requires only project identity and credentials for Auth, Firestore, and App Check. The Admin Storage import, bucket option, bucket export, and signer-specific Admin test are gone.
+- Browser `NEXT_PUBLIC_FIREBASE_STORAGE_BUCKET` remains required for the direct Firebase Storage client.
+- Pending-auth to first-UID activation now preserves volatile portable and sensitive values. Switching a real UID A to B still clears account A state.
+- A UID-scoped startup mutation buffer subscribes to the non-asset serializers synchronously from the layout-effect lifecycle start before the first cutover await.
+- The buffer records only mutations emitted after its baseline, coalesces by record identity, survives cutover or prepare failure, and is re-armed after a current engine-start failure.
+- Engine startup establishes outbound subscriptions, suppresses their duplicate local capture while the startup buffer is active, durably drains and acknowledges the live buffer, stops the buffer, then starts cache hydration.
+- The drain loops across edits emitted during outbound startup and while an earlier buffered capture is awaiting durability. A stopped or canceled lifecycle cannot re-arm the buffer.
+- Startup capture creates normal local-origin protection before cache hydration, so cached or remote state cannot overwrite an edit made during cutover.
+- No wholesale snapshot seed or default-value upload was added. Asset capture remains owned by the activated asset serializer after the local port exists.
+
+### RED evidence
+
+- Server config regression exposed `maxFileBytes` and `uploadRateLimit`.
+- Admin initialization still rejected a missing Storage bucket.
+- Source boundary regression found obsolete names in server config, shared config, Firebase Admin, and `env.server`.
+- First UID activation cleared a value written while pending authentication.
+- Engine startup reached cache before replaying a startup mutation.
+- Duplicate buffered/live capture initially advanced the durable generation twice.
+- Edits emitted during outbound startup or while capture awaited durability were initially absent from the startup handoff.
+- A late canceled engine-start failure initially re-armed the stopped buffer.
+
+### GREEN evidence
+
+- Final config, Firebase Admin/App Check, persistence, provider, serializer, outbound, engine, reconciler, cutover, direct asset, dependency, and import-boundary suite: 217 passed, 0 failed.
+- `npm run tscheck`: exit 0 for root and tools TypeScript programs.
+- `npm run lint`: exit 0 with no warnings.
+- `git diff --check`: exit 0 with only repository line-ending notices.
+
+### Search classification
+
+```powershell
+rg -n "CRON_SECRET|PRIVATE_PRO_MAX_FILE_BYTES|PRIVATE_PRO_UPLOAD_RATE_WINDOW_MS|PRIVATE_PRO_UPLOAD_RATE_MAX_REQUESTS|PRIVATE_PRO_UPLOAD_RATE_MAX_BYTES|getPrivateProStorageBucket|firebase-admin/storage" src app pages tools package.json
+```
+
+Result: no output, ripgrep status 1.
+
+The remaining `storage.objects`, `signBlob`, and signed-URL matches are confined to:
+
+- `tools/private-pro/security-audit.ts` and its tests, scheduled for Task 12 IAM/CORS/audit rewriting.
+- Direct asset test fakes whose `storage.objects` map represents browser Firebase Storage behavior, not IAM permissions or signed URLs.
+
+Current deployment docs and IAM manifests also retain old claims for Task 12, outside this focused source-code fix.
+
+### Self-review
+
+- Children remain non-blocking.
+- The startup observer is installed before passive effects and before the first async cutover operation.
+- The buffer is UID-local and process-local, stores only emitted allowlisted serializer mutations, and never snapshots wholesale Zustand or localStorage state.
+- Failed cutover and current engine-start failure retain capture coverage for retry.
+- Stop, cancellation, account change, and sign-out stop the buffer.
+- Startup mutations pass through the normal outbound validator, payload limit, content hash, local-origin, outbox, coalescing, and 60-second send path.
+- Cache hydration begins only after all currently buffered mutations are durable.
+- Open builds and direct Firebase browser Storage configuration remain unchanged.
+- Task 12 security-audit and documentation behavior was not rewritten early.
+
+### Concerns
+
+None.

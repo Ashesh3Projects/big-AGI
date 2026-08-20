@@ -5,7 +5,6 @@ import {
   isPrivateProEmailAllowed,
   normalizePrivateProEmail,
   parsePrivateProServerConfig,
-  parsePrivateProPositiveInteger,
   parsePrivateProAllowlist,
 } from './privatePro.config.server';
 
@@ -29,11 +28,6 @@ describe('private Pro allowlist', () => {
     assert.equal(isPrivateProEmailAllowed('other@example.com', allowlist), false);
   });
 
-  test('parses only positive integer limits', () => {
-    assert.equal(parsePrivateProPositiveInteger('30', 10, 'rate'), 30);
-    assert.equal(parsePrivateProPositiveInteger(undefined, 10, 'rate'), 10);
-    assert.throws(() => parsePrivateProPositiveInteger('0', 10, 'rate'), /positive integer/i);
-  });
 });
 
 describe('private Pro App Check configuration', () => {
@@ -44,9 +38,15 @@ describe('private Pro App Check configuration', () => {
     firebaseProjectId: 'project',
     firebaseClientEmail: 'service@example.iam.gserviceaccount.com',
     firebasePrivateKey: 'key',
-    firebaseStorageBucket: 'bucket',
     appCheckSiteKey: 'site-key',
   } as const;
+
+  test('produces only authentication, Firestore, and App Check server configuration', () => {
+    const config = parsePrivateProServerConfig(productionInput);
+
+    assert.deepEqual(Object.keys(config).sort(), ['allowedEmails', 'appCheckEnforced', 'enabled', 'firebase']);
+    assert.deepEqual(Object.keys(config.firebase).sort(), ['clientEmail', 'credentialSource', 'privateKey', 'projectId']);
+  });
 
   test('rejects production private Pro without an App Check site key', () => {
     assert.throws(
