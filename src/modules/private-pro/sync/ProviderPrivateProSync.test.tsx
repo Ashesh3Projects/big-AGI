@@ -5,6 +5,7 @@ import { renderToStaticMarkup } from 'react-dom/server';
 
 import { privateProClientConfig } from '../config/privatePro.config';
 import {
+  preparePrivateProCrossUidTransition,
   createPrivateProSyncLifecycle,
   createPrivateProBufferedSyncLifecycle,
   createPrivateProStartupMutationBuffer,
@@ -62,18 +63,12 @@ describe('ProviderPrivateProSync', () => {
     buffer.start();
     emit(first);
     assert.equal(buffer.active(), true);
-    assert.deepEqual(buffer.mutations(), [first]);
-    assert.deepEqual(buffer.mutations(), [first]);
-    buffer.acknowledge(first);
-    assert.deepEqual(buffer.mutations(), []);
     emit(first);
     emit(replacement);
-    assert.deepEqual(buffer.mutations(), [replacement]);
-
-    buffer.stop();
+    assert.deepEqual(buffer.closeAndTake(), [replacement]);
     assert.equal(buffer.active(), false);
     emit(first);
-    assert.deepEqual(buffer.mutations(), [replacement]);
+    assert.deepEqual(buffer.closeAndTake(), []);
   });
 
   test('production persistence prepare runs the global local cutover before managed and asset activation', async () => {
@@ -81,6 +76,7 @@ describe('ProviderPrivateProSync', () => {
 
     await preparePrivateProPersistenceOwner({
       uid: 'uid-a', owner: Symbol('owner'), previousOwnership: null, isCurrent: () => true,
+      beforeObserve: () => { order.push('observe'); },
       runLocalCutover: async () => { order.push('cutover'); },
       activateManaged: async () => { order.push('activate-managed'); },
       deactivateManaged: async () => {},
@@ -88,7 +84,7 @@ describe('ProviderPrivateProSync', () => {
       prepareAssets: async () => { order.push('activate-assets'); return 'prepared'; },
     });
 
-    assert.deepEqual(order, ['cutover', 'activate-managed', 'activate-assets']);
+    assert.deepEqual(order, ['observe', 'cutover', 'activate-managed', 'activate-assets']);
   });
 
   test('failed local cutover prevents persistence activation and can be retried from the start', async () => {
@@ -128,7 +124,8 @@ describe('ProviderPrivateProSync', () => {
     const lifecycle = createPrivateProBufferedSyncLifecycle(base, {
       active: () => active,
       start: () => { active = true; order.push('buffer-start'); },
-      mutations: () => [], acknowledge: () => {},
+      closeAndTake: () => [],
+      restore: () => { active = true; },
       stop: () => { active = false; order.push('buffer-stop'); },
     });
 
@@ -160,6 +157,37 @@ describe('ProviderPrivateProSync', () => {
     await assert.rejects(preparing);
 
     assert.deepEqual(order, ['deactivate-assets:uid-a']);
+  });
+
+  test('cross-UID transition clears A before B observation and application mount', async () => {
+    const order: string[] = [];
+    const previous = { uid: 'uid-a', owner: Symbol('uid-a-owner') };
+
+    await preparePrivateProCrossUidTransition({
+      uid: 'uid-b', previousOwnership: previous, isCurrent: () => true,
+      waitForPreviousOwner: async () => { order.push('wait-a'); },
+      deactivateAssets: async () => { order.push('deactivate-a-assets'); },
+      clearPrevious: async () => { order.push('clear-a'); },
+      beforeObserve: () => { order.push('observe-b'); },
+    });
+    order.push('render-b-children');
+
+    assert.deepEqual(order, ['wait-a', 'deactivate-a-assets', 'clear-a', 'observe-b', 'render-b-children']);
+  });
+
+  test('A cleanup mutations cannot enter B buffer but B edits after observation survive', async () => {
+    let emit: (mutation: PrivateProSyncLocalMutation) => void = () => {};
+    const serializer = { subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void) { emit = listener; return () => { emit = () => {}; }; } } as PrivateProSyncSerializer<unknown>;
+    const buffer = createPrivateProStartupMutationBuffer([serializer]);
+    const mutation = (value: string): PrivateProSyncLocalMutation => ({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1, value: { value }, referencedAssetIds: [],
+    } });
+
+    emit(mutation('a-reset'));
+    buffer.start();
+    emit(mutation('b-edit'));
+
+    assert.deepEqual(buffer.closeAndTake(), [mutation('b-edit')]);
   });
 
   test('production persistence prepare rolls back its exact owner after managed activation is cancelled', async () => {

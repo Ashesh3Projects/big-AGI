@@ -125,6 +125,62 @@ Dependency and import tests now prove:
 
 None.
 
+## Fix round 2
+
+### Design
+
+The cross-UID case cannot safely distinguish an A cleanup emission from a B user edit while both accounts share the same runtime stores. The existing authentication provider already unmounts the application while a new account bootstraps. The bounded extension is:
+
+- First UID and same-UID remount keep rendering children immediately and install their observer before the first asynchronous startup operation.
+- A real A-to-B switch renders a sanitized workspace-transition screen instead of B application children.
+- The transition waits for A's lifecycle owner, deactivates A assets, clears A managed runtime and UID data, then installs B's observer.
+- Only after that sequence completes does the B application mount and start normal cutover, activation, and engine startup.
+- Failure keeps the transition gate closed and exposes a retry action. No A reset can enter B's mutation buffer.
+
+The startup handoff is a single atomic boundary:
+
+- `closeAndTake()` synchronously marks the buffer inactive, unsubscribes its serializers, clones the coalesced mutations into a finite array, clears the map, and returns that array.
+- Outbound serializers are already subscribed when closure occurs.
+- The engine captures the finite frozen array before cache hydration.
+- Any edit after closure is captured normally by outbound because startup suppression has ended.
+- If a capture fails, only the uncaptured suffix is restored for retry. Already durable mutations remain in the DB.
+- A stopped lifecycle never restores a late failed frozen batch.
+
+### RED evidence
+
+- The cross-UID transition helper did not exist.
+- Existing startup began B observation before waiting for and clearing A.
+- Engine startup expected the previous live `mutations()/acknowledge()` interface instead of atomic `closeAndTake()`.
+- A continuous-edit stress case could keep the live drain conceptually unbounded.
+- An edit after atomic closure initially remained in the old test expectation instead of normal outbound capture.
+- A failed frozen capture initially had no suffix restoration.
+- A late failed capture after stop initially restored the closed buffer.
+
+### GREEN evidence
+
+- Final provider, startup-buffer, engine, outbound, persistence, serializer, reconciler, cutover, and direct-asset suite: 189 passed, 0 failed.
+- `npm run tscheck`: exit 0 for root and tools TypeScript programs.
+- `npm run lint`: exit 0 with no warnings.
+- `git diff --check`: exit 0 with only repository line-ending notices.
+
+### Self-review
+
+- Cross-UID children are gated only during the destructive prior-account cleanup that would otherwise erase or misclassify edits.
+- The transition gate never exposes raw cleanup errors.
+- B observation begins after A clear and before B children mount.
+- First UID and same-UID paths preserve the existing immediate-child behavior.
+- `closeAndTake()` is synchronous and called once.
+- Frozen replay is finite and bounded by the coalesced record identities present at closure.
+- Post-close edits flow through the normal outbound serializer subscriptions.
+- Startup replay still creates local-origin protection before cache hydration.
+- Failed replay restores only the uncaptured suffix and cannot re-arm after stop.
+- No wholesale snapshot seeding or account-shared mutation map was introduced.
+
+### Concerns
+
+None.
+
+
 ## Fix round 1
 
 ### Findings addressed

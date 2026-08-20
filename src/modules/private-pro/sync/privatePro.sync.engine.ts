@@ -84,9 +84,8 @@ export interface PrivateProSyncEngineDependencies {
   serializers: readonly PrivateProSyncSerializer<unknown>[];
   startupBuffer?: {
     active(): boolean;
-    mutations(): readonly PrivateProSyncLocalMutation[];
-    acknowledge(mutation: PrivateProSyncLocalMutation): void;
-    stop(): void;
+    closeAndTake(): readonly PrivateProSyncLocalMutation[];
+    restore?(mutations: readonly PrivateProSyncLocalMutation[]): void;
   };
   db: PrivateProSyncEngineDB;
   coordinator?: PrivateProSyncCoordinator;
@@ -373,17 +372,19 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       await outbound.start();
       if (!isEpochActive(epoch)) return;
       if (dependencies.startupBuffer) {
-        for (;;) {
-          const mutations = dependencies.startupBuffer.mutations();
-          if (!mutations.length) break;
+        const mutations = dependencies.startupBuffer.closeAndTake();
+        let captured = 0;
+        try {
           for (const mutation of mutations) {
             if (!outbound.capture) throw new TypeError('Private Pro sync outbound capture is required during startup.');
             await outbound.capture(mutation);
-            dependencies.startupBuffer.acknowledge(mutation);
+            captured++;
             if (!isEpochActive(epoch)) return;
           }
+        } catch (error) {
+          if (isEpochActive(epoch)) dependencies.startupBuffer.restore?.(mutations.slice(captured));
+          throw error;
         }
-        dependencies.startupBuffer.stop();
       }
       const cached = reconciler.applyCached(epoch, lifecycleAbort.signal);
       cached.catch(() => {});

@@ -1,5 +1,6 @@
 import * as React from 'react';
 import type { User } from 'firebase/auth';
+import { Alert, Button, CircularProgress, Sheet, Stack, Typography } from '@mui/joy';
 import { useStore } from 'zustand';
 
 import { activatePrivateProAssetPersistence, createPrivateProAssetLocalPort, deactivatePrivateProAssetPersistence } from '../assets/privatePro.assets.local';
@@ -8,7 +9,6 @@ import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { privateProClientConfig } from '../config/privatePro.config';
 import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, privateProManagedPersistenceOwnership, releasePrivateProManagedPersistence, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
 import { createPrivateProSyncCoordinator, type PrivateProSyncCoordinator } from './privatePro.sync.coordinator';
-import { privateProCanonicalJson } from './privatePro.sync.codec';
 import { privateProSyncDB } from './privatePro.sync.db';
 import { createPrivateProSyncEngine, type PrivateProSyncEngine } from './privatePro.sync.engine';
 import { createPrivateProFirebaseSyncTransport } from './privatePro.sync.firebase';
@@ -32,8 +32,8 @@ export function createPrivateProStartupMutationBuffer(
 ): {
   active(): boolean;
   start(): void;
-  mutations(): readonly PrivateProSyncLocalMutation[];
-  acknowledge(mutation: PrivateProSyncLocalMutation): void;
+  closeAndTake(): readonly PrivateProSyncLocalMutation[];
+  restore(mutations: readonly PrivateProSyncLocalMutation[]): void;
   stop(): void;
 } {
   const mutations = new Map<string, PrivateProSyncLocalMutation>();
@@ -50,17 +50,54 @@ export function createPrivateProStartupMutationBuffer(
         mutations.set(privateProStartupMutationKey(mutation), structuredClone(mutation));
       })));
     },
-    mutations: () => [...mutations.values()].map(mutation => structuredClone(mutation)),
-    acknowledge: mutation => {
-      const key = privateProStartupMutationKey(mutation);
-      const buffered = mutations.get(key);
-      if (buffered && privateProCanonicalJson(buffered) === privateProCanonicalJson(mutation)) mutations.delete(key);
+    closeAndTake: () => {
+      active = false;
+      unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
+      const frozen = [...mutations.values()].map(mutation => structuredClone(mutation));
+      mutations.clear();
+      return frozen;
+    },
+    restore: frozen => {
+      for (const mutation of frozen) {
+        mutations.delete(privateProStartupMutationKey(mutation));
+        mutations.set(privateProStartupMutationKey(mutation), structuredClone(mutation));
+      }
+      if (!active) {
+        active = true;
+        unsubscribers.push(...serializers.map(serializer => serializer.subscribe(mutation => {
+          if (!active) return;
+          mutations.delete(privateProStartupMutationKey(mutation));
+          mutations.set(privateProStartupMutationKey(mutation), structuredClone(mutation));
+        })));
+      }
     },
     stop: () => {
       active = false;
       unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
     },
   };
+}
+
+export async function preparePrivateProCrossUidTransition(dependencies: {
+  uid: string;
+  previousOwnership: { uid: string; owner: PrivateProPersistenceOwner };
+  isCurrent(): boolean;
+  waitForPreviousOwner?(owner: PrivateProPersistenceOwner): Promise<void>;
+  deactivateAssets(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
+  clearPrevious(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
+  beforeObserve(): void;
+}): Promise<void> {
+  const { uid, previousOwnership } = dependencies;
+  if (previousOwnership.uid === uid) return;
+  const isCurrent = () => dependencies.isCurrent();
+  assertPrivateProPrepareCurrent(isCurrent);
+  await dependencies.waitForPreviousOwner?.(previousOwnership.owner);
+  assertPrivateProPrepareCurrent(isCurrent);
+  await dependencies.deactivateAssets(previousOwnership.uid, previousOwnership.owner);
+  assertPrivateProPrepareCurrent(isCurrent);
+  await dependencies.clearPrevious(previousOwnership.uid, previousOwnership.owner);
+  assertPrivateProPrepareCurrent(isCurrent);
+  dependencies.beforeObserve();
 }
 
 export function createPrivateProBufferedSyncLifecycle(
@@ -132,6 +169,7 @@ interface PrivateProPersistencePrepareDependencies<T> {
   owner: PrivateProPersistenceOwner;
   previousOwnership: { uid: string; owner: PrivateProPersistenceOwner } | null;
   isCurrent(): boolean;
+  beforeObserve?(): void;
   runLocalCutover?(): Promise<void>;
   waitForPreviousOwner?(owner: PrivateProPersistenceOwner): Promise<void>;
   activateManaged(uid: string, owner: PrivateProPersistenceOwner): Promise<void>;
@@ -160,21 +198,26 @@ export async function preparePrivateProPersistenceOwner<T>(
   let managedActivated = false;
   let assetsActivated = false;
   try {
-    if (dependencies.runLocalCutover) {
-      assertPrivateProPrepareCurrent(isCurrent);
-      await dependencies.runLocalCutover();
-      assertPrivateProPrepareCurrent(isCurrent);
-    }
-    if (previousOwnership) {
+    if (!previousOwnership) {
+      dependencies.beforeObserve?.();
+    } else if (previousOwnership.uid === uid) {
+      dependencies.beforeObserve?.();
       assertPrivateProPrepareCurrent(isCurrent);
       await dependencies.waitForPreviousOwner?.(previousOwnership.owner);
       assertPrivateProPrepareCurrent(isCurrent);
-    }
-    if (previousOwnership && previousOwnership.uid !== uid) {
+    } else {
+      assertPrivateProPrepareCurrent(isCurrent);
+      await dependencies.waitForPreviousOwner?.(previousOwnership.owner);
       assertPrivateProPrepareCurrent(isCurrent);
       await dependencies.deactivateAssets(previousOwnership.uid, previousOwnership.owner);
       assertPrivateProPrepareCurrent(isCurrent);
       await (dependencies.clearPrevious ?? dependencies.deactivateManaged)(previousOwnership.uid, previousOwnership.owner);
+      assertPrivateProPrepareCurrent(isCurrent);
+      dependencies.beforeObserve?.();
+    }
+    if (dependencies.runLocalCutover) {
+      assertPrivateProPrepareCurrent(isCurrent);
+      await dependencies.runLocalCutover();
       assertPrivateProPrepareCurrent(isCurrent);
     }
     assertPrivateProPrepareCurrent(isCurrent);
@@ -470,13 +513,98 @@ function ProviderPrivateProSyncEnabled(props: { children: React.ReactNode }) {
   >{props.children}</ProductionPrivateProSyncAccount>;
 }
 
+export function privateProRequiresCrossUidTransition(
+  uid: string,
+  previousOwnership: { uid: string; owner: PrivateProPersistenceOwner } | null,
+): boolean {
+  return !!previousOwnership && previousOwnership.uid !== uid;
+}
+
 function ProductionPrivateProSyncAccount(props: {
   user: User;
   firebaseSignOut: () => Promise<void>;
   previousOwnership: { uid: string; owner: PrivateProPersistenceOwner } | null;
   children: React.ReactNode;
 }) {
+  if (privateProRequiresCrossUidTransition(props.user.uid, props.previousOwnership)) {
+    return <CrossUidPrivateProSyncAccount
+      user={props.user}
+      firebaseSignOut={props.firebaseSignOut}
+      previousOwnership={props.previousOwnership!}
+    >{props.children}</CrossUidPrivateProSyncAccount>;
+  }
+  return <ReadyPrivateProSyncAccount {...props} />;
+}
+
+function PrivateProWorkspaceTransitionScreen(props: { failed: boolean; onRetry: () => void }) {
+  return <Sheet sx={{ minHeight: '100vh', display: 'grid', placeItems: 'center', p: 2 }}>
+    <Stack spacing={2} alignItems='center' textAlign='center'>
+      <Typography level='h2'>Private Pro</Typography>
+      {props.failed ? <>
+        <Alert color='danger'>Unable to prepare your private workspace.</Alert>
+        <Button onClick={props.onRetry}>Retry</Button>
+      </> : <>
+        <CircularProgress />
+        <Typography textColor='text.secondary'>Preparing your private workspace...</Typography>
+      </>}
+    </Stack>
+  </Sheet>;
+}
+
+function CrossUidPrivateProSyncAccount(props: {
+  user: User;
+  firebaseSignOut: () => Promise<void>;
+  previousOwnership: { uid: string; owner: PrivateProPersistenceOwner };
+  children: React.ReactNode;
+}) {
+  const startupSerializers = React.useMemo(() => createPrivateProSyncSerializers(), []);
+  const startupBuffer = React.useMemo(() => createPrivateProStartupMutationBuffer(startupSerializers), [startupSerializers]);
+  const [attempt, setAttempt] = React.useState(0);
+  const [phase, setPhase] = React.useState<'preparing' | 'ready' | 'error'>('preparing');
+  usePrivateProLayoutEffect(() => {
+    let current = true;
+    setPhase('preparing');
+    void preparePrivateProCrossUidTransition({
+      uid: props.user.uid,
+      previousOwnership: props.previousOwnership,
+      isCurrent: () => current,
+      waitForPreviousOwner: waitForPrivateProSyncLifecycleOwner,
+      deactivateAssets: deactivatePrivateProAssetPersistence,
+      clearPrevious: uidToClear => clearPrivateProManagedPersistence(uidToClear, privateProSyncDB, clearPrivateProManagedRuntimeStores),
+      beforeObserve: () => startupBuffer.start(),
+    }).then(() => {
+      if (current) setPhase('ready');
+    }, () => {
+      if (current) setPhase('error');
+    });
+    return () => {
+      current = false;
+      startupBuffer.stop();
+    };
+  }, [attempt, props.previousOwnership.owner, props.previousOwnership.uid, props.user.uid, startupBuffer]);
+  if (phase !== 'ready') return <PrivateProWorkspaceTransitionScreen failed={phase === 'error'} onRetry={() => setAttempt(value => value + 1)} />;
+  return <ReadyPrivateProSyncAccount
+    user={props.user}
+    firebaseSignOut={props.firebaseSignOut}
+    previousOwnership={null}
+    startupSerializers={startupSerializers}
+    startupBuffer={startupBuffer}
+  >{props.children}</ReadyPrivateProSyncAccount>;
+}
+
+function ReadyPrivateProSyncAccount(props: {
+  user: User;
+  firebaseSignOut: () => Promise<void>;
+  previousOwnership: { uid: string; owner: PrivateProPersistenceOwner } | null;
+  startupSerializers?: readonly PrivateProSyncSerializer<unknown>[];
+  startupBuffer?: ReturnType<typeof createPrivateProStartupMutationBuffer>;
+  children: React.ReactNode;
+}) {
   const statusStore = React.useMemo(createPrivateProSyncStore, [props.user.uid]);
+  const defaultStartupSerializers = React.useMemo(() => createPrivateProSyncSerializers(), []);
+  const startupSerializers = props.startupSerializers ?? defaultStartupSerializers;
+  const defaultStartupBuffer = React.useMemo(() => createPrivateProStartupMutationBuffer(defaultStartupSerializers), [defaultStartupSerializers]);
+  const startupBuffer = props.startupBuffer ?? defaultStartupBuffer;
   const previousOwner = props.previousOwnership?.owner ?? null;
   const previousUid = props.previousOwnership?.uid ?? null;
   const lifecycle = React.useMemo(
@@ -485,8 +613,10 @@ function ProductionPrivateProSyncAccount(props: {
       previousOwner && previousUid ? { uid: previousUid, owner: previousOwner } : null,
       props.firebaseSignOut,
       statusStore,
+      startupSerializers,
+      startupBuffer,
     ),
-    [previousOwner, previousUid, props.firebaseSignOut, props.user.uid, statusStore],
+    [previousOwner, previousUid, props.firebaseSignOut, props.user.uid, startupBuffer, startupSerializers, statusStore],
   );
   return <ProviderPrivateProSyncAccount uid={props.user.uid} statusStore={statusStore} lifecycle={lifecycle}>{props.children}</ProviderPrivateProSyncAccount>;
 }
@@ -519,9 +649,9 @@ function createProductionLifecycle(
   previousOwnership: { uid: string; owner: PrivateProPersistenceOwner } | null,
   firebaseSignOut: () => Promise<void>,
   statusStore: PrivateProSyncStore,
+  startupSerializers: readonly PrivateProSyncSerializer<unknown>[] = createPrivateProSyncSerializers(),
+  startupBuffer: ReturnType<typeof createPrivateProStartupMutationBuffer> = createPrivateProStartupMutationBuffer(startupSerializers),
 ): PrivateProSyncLifecycle {
-  const startupSerializers = createPrivateProSyncSerializers();
-  const startupBuffer = createPrivateProStartupMutationBuffer(startupSerializers);
   const lifecycle = createPrivateProSyncLifecycle({
     uid,
     statusStore,
@@ -531,6 +661,7 @@ function createProductionLifecycle(
         owner,
         previousOwnership,
         isCurrent,
+        beforeObserve: () => startupBuffer.start(),
         runLocalCutover: async () => runPrivateProWorkspaceV1LocalCutover(await createPrivateProWorkspaceV1ProductionCutoverPort()),
         waitForPreviousOwner: waitForPrivateProSyncLifecycleOwner,
         activateManaged: activatePrivateProManagedPersistence,
