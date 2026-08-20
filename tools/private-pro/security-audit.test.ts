@@ -1403,6 +1403,9 @@ describe('private Pro security audit classifiers', () => {
 
     const exact = audit.inspectDeployedRuntimeRole(deployed, 'sample-project', manifest);
     assert.equal(audit.classifyDeployedRuntimeRole(exact).every(finding => finding.severity === 'pass'), true);
+    const { deleted: _activeDeleted, ...activeGcloudRole } = deployed;
+    const activeGcloudShape = audit.inspectDeployedRuntimeRole(activeGcloudRole, 'sample-project', manifest);
+    assert.equal(audit.classifyDeployedRuntimeRole(activeGcloudShape).every(finding => finding.severity === 'pass'), true);
     assert.equal(audit.classifyDeployedRuntimeRole(audit.inspectDeployedRuntimeRole({}, 'sample-project', manifest)).every(finding => finding.severity === 'pass'), false);
     const drifted = audit.inspectDeployedRuntimeRole({
       ...deployed,

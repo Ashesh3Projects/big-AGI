@@ -1642,10 +1642,10 @@ export function inspectDeployedRuntimeRole(
   const deployedPermissionSet = new Set(deployedPermissions ?? []);
   const expectedPermissionSet = new Set(expectedPermissions);
   return {
-    readable: !!manifest && !!deployedPermissions && typeof deployed.name === 'string' && typeof deployed.stage === 'string' && typeof deployed.deleted === 'boolean',
+    readable: !!manifest && !!deployedPermissions && typeof deployed.name === 'string' && typeof deployed.stage === 'string' && (deployed.deleted === undefined || typeof deployed.deleted === 'boolean'),
     nameMatches: deployed.name === `projects/${projectId}/roles/${RUNTIME_ROLE_ID}`,
     stageMatches: deployed.stage === manifest?.runtimeRole.stage,
-    active: deployed.deleted === false,
+    active: deployed.deleted !== true,
     missingPermissions: expectedPermissions.filter(permission => !deployedPermissionSet.has(permission)).length,
     unexpectedPermissions: (deployedPermissions ?? []).filter(permission => !expectedPermissionSet.has(permission)).length,
   };
