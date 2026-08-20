@@ -37,15 +37,15 @@ service cloud.firestore {
       return recordKey is string
         && recordKey.matches('^[A-Za-z0-9_-]+$')
         && (
-          (recordType == 'credential-service' && recordKey.size() == 68 && recordKey.matches('^Y3JlZGVudGlhbC1zZXJ2aWNl.*$'))
-          || (recordType == 'model-service' && recordKey.size() == 62 && recordKey.matches('^bW9kZWwtc2Vydmlj.*$'))
-          || (recordType == 'settings' && recordKey.size() == 55 && recordKey.matches('^c2V0dGluZ3MA.*$'))
-          || (recordType == 'persona' && recordKey.size() == 54 && recordKey.matches('^cGVyc29u.*$'))
-          || (recordType == 'folder' && recordKey.size() == 52 && recordKey.matches('^Zm9sZGVy.*$'))
-          || (recordType == 'scratch' && recordKey.size() == 54 && recordKey.matches('^c2NyYXRj.*$'))
-          || (recordType == 'chat-meta' && recordKey.size() == 56 && recordKey.matches('^Y2hhdC1tZXRh.*$'))
-          || (recordType == 'chat-message' && recordKey.size() == 60 && recordKey.matches('^Y2hhdC1tZXNzYWdl.*$'))
-          || (recordType == 'asset' && recordKey.size() == 51 && recordKey.matches('^YXNzZXQA.*$'))
+          (recordType == 'credential-service' && recordKey.size() == 68 && recordKey.matches('^Y3JlZGVudGlhbC1zZXJ2aWNlA[A-P][A-Za-z0-9_-]{42}$'))
+          || (recordType == 'model-service' && recordKey.size() == 62 && recordKey.matches('^bW9kZWwtc2VydmljZQ[A-D][A-Za-z0-9_-]{43}$'))
+          || (recordType == 'settings' && recordKey.size() == 55 && recordKey.matches('^c2V0dGluZ3MA[A-Za-z0-9_-]{43}$'))
+          || (recordType == 'persona' && recordKey.size() == 54 && recordKey.matches('^cGVyc29uYQ[A-D][A-Za-z0-9_-]{43}$'))
+          || (recordType == 'folder' && recordKey.size() == 52 && recordKey.matches('^Zm9sZGVyA[A-P][A-Za-z0-9_-]{42}$'))
+          || (recordType == 'scratch' && recordKey.size() == 54 && recordKey.matches('^c2NyYXRjaA[A-D][A-Za-z0-9_-]{43}$'))
+          || (recordType == 'chat-meta' && recordKey.size() == 56 && recordKey.matches('^Y2hhdC1tZXRhA[A-P][A-Za-z0-9_-]{42}$'))
+          || (recordType == 'chat-message' && recordKey.size() == 60 && recordKey.matches('^Y2hhdC1tZXNzYWdlA[A-P][A-Za-z0-9_-]{42}$'))
+          || (recordType == 'asset' && recordKey.size() == 51 && recordKey.matches('^YXNzZXQA[A-Za-z0-9_-]{43}$'))
         );
     }
 

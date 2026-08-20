@@ -82,6 +82,7 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
   const lockName = `private-pro-sync:${options.uid}`;
 
   let lifecycleGeneration = 0;
+  let stoppingGeneration: number | null = null;
   let channel: BroadcastChannelPort | null = null;
   let started = false;
   let stopped = true;
@@ -100,11 +101,15 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
   let renewalPromise: Promise<void> | null = null;
 
   function isCurrent(generation: number): boolean {
-    return started && !stopped && lifecycleGeneration === generation;
+    return started && !stopped && stoppingGeneration === null && lifecycleGeneration === generation;
+  }
+
+  function canRememberFailure(generation: number): boolean {
+    return lifecycleGeneration === generation && (isCurrent(generation) || stoppingGeneration === generation);
   }
 
   function rememberFailure(generation: number, error: unknown, signal?: AbortSignal): void {
-    if (!isCurrent(generation) || coordinatorFailure || (signal?.aborted && isAbortError(error))) return;
+    if (!canRememberFailure(generation) || coordinatorFailure || (signal?.aborted && isAbortError(error))) return;
     coordinatorFailure = error;
   }
 
@@ -279,6 +284,7 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
     async start(nextRunLeader): Promise<void> {
       if (started) return;
       const generation = ++lifecycleGeneration;
+      stoppingGeneration = null;
       started = true;
       stopped = false;
       leader = false;
@@ -329,10 +335,9 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
 
     async stop(): Promise<void> {
       if (!started) return;
-      const failure = coordinatorFailure;
-      lifecycleGeneration++;
+      const generation = lifecycleGeneration;
+      stoppingGeneration = generation;
       stopped = true;
-      started = false;
       clearFallbackPollTimer();
       clearFallbackRenewTimer();
 
@@ -342,6 +347,15 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       const closingChannel = channel;
       const pending = [fallbackAttempt, leadership, webLockRequest, renewalPromise];
 
+      try { lockController?.abort(); } catch {}
+      try { leaderController?.abort(); } catch {}
+
+      await Promise.resolve();
+
+      const failure = coordinatorFailure;
+      lifecycleGeneration++;
+      stoppingGeneration = null;
+      started = false;
       leader = false;
       coordinatorFailure = null;
       runLeader = null;
@@ -355,8 +369,6 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       renewalPromise = null;
       channel = null;
 
-      try { lockController?.abort(); } catch {}
-      try { leaderController?.abort(); } catch {}
       try {
         if (closingChannel) {
           closingChannel.onmessage = null;

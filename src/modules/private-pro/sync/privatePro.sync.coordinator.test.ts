@@ -317,6 +317,55 @@ describe('Private Pro sync coordinator', () => {
     assert.equal(coordinator.isLeader(), false);
   });
 
+  test('reports a leader rejection already settled immediately before stop', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const leader = deferred<void>();
+    const failure = new Error('leader rejected before stop');
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    await coordinator.start(() => leader.promise);
+
+    leader.reject(failure);
+
+    await assert.rejects(coordinator.stop(), error => error === failure);
+    assert.equal(coordinator.isLeader(), false);
+  });
+
+  test('reports an acquire rejection already settled immediately before stop', async () => {
+    const scheduler = new ManualScheduler();
+    const failure = new Error('acquire rejected before stop');
+    const acquire = deferred<PrivateProCoordinatorLease | null>();
+    const leases: PrivateProCoordinatorLeasePort = {
+      acquireCoordinatorLease: () => acquire.promise,
+      renewCoordinatorLease: async () => null,
+      releaseCoordinatorLease: async () => {},
+    };
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    const starting = coordinator.start(async () => {});
+
+    acquire.reject(failure);
+
+    await assert.rejects(coordinator.stop(), error => error === failure);
+    await starting;
+  });
+
+  test('ignores a leader rejection after the stop checkpoint and preserves restart', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const leader = deferred<void>();
+    const started: string[] = [];
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    await coordinator.start(() => leader.promise);
+
+    await coordinator.stop();
+    leader.reject(new Error('leader rejected after stop checkpoint'));
+    await coordinator.start(leaderRunner(started, 'replacement'));
+    await settle();
+
+    assert.deepEqual(started, ['replacement:2']);
+    await coordinator.stop();
+  });
+
   test('broadcasts wake and signed-out signals without a workspace record payload', async () => {
     const received: string[] = [];
     const sender = createPrivateProSyncCoordinator(options('uid-a'));

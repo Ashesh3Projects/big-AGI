@@ -39,6 +39,16 @@ const WRITER_1 = '123e4567-e89b-42d3-a456-426614174011';
 const WRITER_2 = '123e4567-e89b-42d3-a456-426614174012';
 const ROOT_A = `users/${UID_A}/workspaces/v1`;
 
+const RECORD_KEY_BOUNDARIES = [
+  { recordType: 'credential-service', prefixLength: 25, outside: 'Q' },
+  { recordType: 'model-service', prefixLength: 18, outside: 'E' },
+  { recordType: 'persona', prefixLength: 10, outside: 'E' },
+  { recordType: 'folder', prefixLength: 9, outside: 'Q' },
+  { recordType: 'scratch', prefixLength: 10, outside: 'E' },
+  { recordType: 'chat-meta', prefixLength: 13, outside: 'Q' },
+  { recordType: 'chat-message', prefixLength: 17, outside: 'Q' },
+] as const satisfies readonly { recordType: PrivateProSyncRecordType; prefixLength: number; outside: string }[];
+
 const LEGACY_FIRESTORE_PATHS = [
   `users/${UID_A}/vault/data/records/encrypted-record`,
   `users/${UID_A}/chats/plaintext-chat`,
@@ -269,6 +279,56 @@ describe('Private Pro Firestore transaction invariants', () => {
         logicalId: `${recordType}-${index}`,
         mutationId: `123e4567-e89b-42d3-a456-426614174${String(50 + index).padStart(3, '0')}`,
       }));
+    }
+  });
+
+  test('denies every partial-family boundary character outside its fixed Base64URL class', async () => {
+    const firestore = approvedContext().firestore();
+    for (let index = 0; index < RECORD_KEY_BOUNDARIES.length; index++) {
+      const boundary = RECORD_KEY_BOUNDARIES[index];
+      const logicalId = `boundary-${boundary.recordType}`;
+      const validKey = privateProRecordKey(boundary.recordType, logicalId);
+      const invalidKey = `${validKey.slice(0, boundary.prefixLength)}${boundary.outside}${validKey.slice(boundary.prefixLength + 1)}`;
+      const mutationId = `123e4567-e89b-42d3-a456-426614174${String(70 + index).padStart(3, '0')}`;
+      const collectionName = boundary.recordType === 'asset' ? 'assets' : 'records';
+      const batch = writeBatch(firestore);
+      batch.set(doc(firestore, `${ROOT_A}/${collectionName}/${invalidKey}`), canonical({
+        recordType: boundary.recordType,
+        logicalId,
+        mutationId,
+      }));
+      batch.set(doc(firestore, `${ROOT_A}/mutationReceipts/${mutationId}`), receipt({
+        recordKey: invalidKey,
+        recordType: boundary.recordType,
+        logicalId,
+        mutationId,
+      }));
+      await assertFails(batch.commit());
+    }
+  });
+
+  test('denies model AQ boundary probe while settings and asset digest characters remain unrestricted', async () => {
+    const firestore = approvedContext().firestore();
+    const modelLogicalId = 'model-aq-probe';
+    const modelKey = privateProRecordKey('model-service', modelLogicalId);
+    const invalidModelKey = `${modelKey.slice(0, 18)}Q${modelKey.slice(19)}`;
+    const modelBatch = writeBatch(firestore);
+    modelBatch.set(doc(firestore, `${ROOT_A}/records/${invalidModelKey}`), canonical({
+      recordType: 'model-service', logicalId: modelLogicalId, mutationId: '123e4567-e89b-42d3-a456-426614174081',
+    }));
+    modelBatch.set(doc(firestore, `${ROOT_A}/mutationReceipts/123e4567-e89b-42d3-a456-426614174081`), receipt({
+      recordKey: invalidModelKey, recordType: 'model-service', logicalId: modelLogicalId,
+      mutationId: '123e4567-e89b-42d3-a456-426614174081',
+    }));
+    await assertFails(modelBatch.commit());
+
+    for (const [recordType, logicalId, mutationId] of [
+      ['settings', 'settings-digest-boundary', '123e4567-e89b-42d3-a456-426614174082'],
+      ['asset', 'asset-digest-boundary', '123e4567-e89b-42d3-a456-426614174083'],
+    ] as const) {
+      const validKey = privateProRecordKey(recordType, logicalId);
+      assert.match(validKey, recordType === 'settings' ? /^c2V0dGluZ3MA[A-Za-z0-9_-]{43}$/ : /^YXNzZXQA[A-Za-z0-9_-]{43}$/);
+      await assertSucceeds(validCreate(firestore, { recordType, logicalId, mutationId }));
     }
   });
 

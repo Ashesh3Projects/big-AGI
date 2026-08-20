@@ -136,3 +136,36 @@ GREEN:
 
 - Detached coordinator release/acquire/leader failures after stop are intentionally not returned to the stopped generation. Finite cleanup and stale-generation isolation take priority; same-turn rejection handlers prevent unhandled rejections.
 - Firebase emulator negative assertions continue to print expected permission/evaluation diagnostics for malformed documents.
+
+## Fix round 2
+
+### Findings addressed
+
+- Stop now marks the active generation as stopping before aborting controllers and clearing timers. The stopping generation cannot start or mutate leadership state, but its already-settled promise failures remain reportable.
+- Stop yields exactly one microtask checkpoint, snapshots any failure recorded for that stopping generation, then increments the generation, clears state, detaches all unbounded collaborators and releases, closes the channel, and returns or throws the snapshot.
+- Leader and acquire rejections settled immediately before stop are returned. Rejections after the checkpoint and generation invalidation are ignored and cannot affect restart.
+- Never-settling leader, release, Web Lock, acquire, renewal, and leadership work remain bounded by the single microtask checkpoint only.
+- Record-key structural validation now uses the exact fixed Base64URL boundary-bit classes and total lengths for every record family.
+- Every partial boundary family rejects a mutated character outside its class. The model-service `...AQ` probe is denied. Settings and asset retain an unrestricted next digest character because their type-plus-NUL prefix ends on a complete Base64 group.
+
+### TDD evidence
+
+RED:
+
+- The pre-stop leader rejection and acquire rejection tests both failed because stop invalidated the generation before their already-scheduled rejection handlers could record the error.
+- Round 1 prefix-only regexes admitted boundary characters outside the fixed codec bit classes.
+
+GREEN:
+
+- Coordinator focused suite: 23 passed, 0 failed.
+- Firebase emulator suite: 25 passed, 0 failed.
+- Focused coordinator, provider lifecycle, engine, reconciler, Firebase transport, and direct asset matrix: 158 passed, 0 failed.
+- Root TypeScript: exit 0.
+- Scoped ESLint: exit 0.
+- Diff check: exit 0 with only repository line-ending conversion warnings.
+
+### Self-review
+
+- The stopping generation is failure-reportable for one microtask only and is never leadership-active during that window.
+- Snapshotting happens before generation invalidation; all later callbacks see a stale generation.
+- Exact regexes match the provided verified codec boundaries without claiming logical-ID digest verification.
