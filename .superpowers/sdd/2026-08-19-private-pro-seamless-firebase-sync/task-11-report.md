@@ -180,6 +180,35 @@ The startup handoff is a single atomic boundary:
 
 None.
 
+## Fix round 5
+
+### Finding addressed
+
+Failed startup mutation recovery was owned only by one engine instance. Ordinary same-UID stop cleared the failed entry and its dirty local origin, so a replacement engine could hydrate cached state over the unpersisted local edit before Retry.
+
+### Design
+
+- The UID-scoped startup buffer now owns bounded failed entries by canonical record key alongside active and frozen startup state.
+- Ordinary engine stop retains failed entries in that buffer. A replacement engine imports them before cache hydration and reconstructs a dirty origin with no durable generation or mutation identity.
+- A newer live mutation removes the retained failure for its key. Successful or superseded conditional retry resolves the retained entry and prunes its version when no active, frozen, or failed state remains.
+- Confirmed sign-out and cross-UID destructive cleanup clear the old UID recovery owner. Ordinary same-UID release preserves it for remount.
+
+### RED evidence
+
+- The startup buffer had no failed-entry persistence API, so ordinary stop could not retain recovery state for another engine.
+- A real reconciler and IndexedDB remount regression showed the second engine started with an empty fresh startup batch and no retained dirty protection.
+
+### GREEN evidence
+
+- The same-UID remount regression proves cached state is not applied, the retained failure is rehydrated, and conditional Retry resolves it.
+- The destructive-clear regression proves ordinary stop preserves the failure while explicit clear removes failed and version state.
+- Final provider, engine, outbound, DB, reconciler, persistence, and cutover suite: 221 passed, 0 failed.
+- `npm run tscheck`, `npm run lint`, and `git diff --check`: exit 0.
+
+### Concerns
+
+None.
+
 ## Fix round 4
 
 Round 4 supersedes the round-3 recovery mechanism described below.

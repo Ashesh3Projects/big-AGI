@@ -7,7 +7,7 @@ import { activatePrivateProAssetPersistence, createPrivateProAssetLocalPort, dea
 import { createPrivateProAssetClient } from '../assets/privatePro.assets.client';
 import { usePrivateProAuth } from '../auth/ProviderPrivatePro';
 import { privateProClientConfig } from '../config/privatePro.config';
-import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, privateProManagedPersistenceOwnership, releasePrivateProManagedPersistence, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
+import { activatePrivateProManagedPersistence, clearPrivateProManagedPersistence, deactivatePrivateProManagedPersistence, isPrivateProRetainedPersistenceOwner, privateProManagedPersistenceOwnership, releasePrivateProManagedPersistence, type PrivateProPersistenceOwner } from '../persistence/privatePro.persistence';
 import { createPrivateProSyncCoordinator, type PrivateProSyncCoordinator } from './privatePro.sync.coordinator';
 import { privateProRecordKey } from './privatePro.sync.codec';
 import { privateProSyncDB } from './privatePro.sync.db';
@@ -35,13 +35,19 @@ export function createPrivateProStartupMutationBuffer(
   active(): boolean;
   start(): void;
   closeAndTake(): readonly PrivateProSyncStartupMutation[];
+  retainFailed(entry: PrivateProSyncStartupMutation): void;
+  failedEntries(): readonly PrivateProSyncStartupMutation[];
+  resolveFailed(key: string, version: number): void;
+  clearFailed(): void;
   noteLiveMutation(mutation: PrivateProSyncLocalMutation): void;
   isCurrent(entry: Pick<PrivateProSyncStartupMutation, 'key' | 'version'>): boolean;
   forget(key: string, version: number): void;
-  testOnlyStateSize(): { versions: number };
+  testOnlyStateSize(): { versions: number; failed: number };
   stop(): void;
 } {
   const mutations = new Map<string, PrivateProSyncStartupMutation>();
+  const frozen = new Map<string, PrivateProSyncStartupMutation>();
+  const failed = new Map<string, PrivateProSyncStartupMutation>();
   const versions = new Map<string, number>();
   let active = false;
   const unsubscribers: Array<() => void> = [];
@@ -54,6 +60,17 @@ export function createPrivateProStartupMutationBuffer(
     value => ({ ok: true, value }) as const,
     () => ({ ok: false }) as const,
   );
+  const cloneEntry = (entry: PrivateProSyncStartupMutation): PrivateProSyncStartupMutation => ({
+    ...entry,
+    mutation: structuredClone(entry.mutation),
+  });
+  const pruneVersion = (key: string, version: number) => {
+    if (versions.get(key) !== version) return;
+    if (mutations.get(key)?.version === version) return;
+    if (frozen.get(key)?.version === version) return;
+    if (failed.get(key)?.version === version) return;
+    versions.delete(key);
+  };
   const subscribe = () => {
     if (active) return;
     active = true;
@@ -61,6 +78,8 @@ export function createPrivateProStartupMutationBuffer(
       if (!active) return;
       const key = privateProStartupMutationKey(mutation);
       mutations.delete(key);
+      frozen.delete(key);
+      failed.delete(key);
       mutations.set(key, {
         key,
         version: nextVersion(key),
@@ -75,31 +94,50 @@ export function createPrivateProStartupMutationBuffer(
     closeAndTake: () => {
       active = false;
       unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
-      const frozen = [...mutations.values()].map(entry => ({
-        ...entry,
-        mutation: structuredClone(entry.mutation),
-      }));
+      const entries = [...mutations.values()].map(cloneEntry);
+      for (const entry of entries) frozen.set(entry.key, entry);
       mutations.clear();
-      return frozen;
+      return entries;
+    },
+    retainFailed: entry => {
+      if (versions.get(entry.key) !== entry.version) return;
+      const retained = cloneEntry(entry);
+      if (frozen.get(entry.key)?.version === entry.version) frozen.delete(entry.key);
+      failed.set(entry.key, retained);
+    },
+    failedEntries: () => [...failed.values()].map(cloneEntry),
+    resolveFailed: (key, version) => {
+      if (failed.get(key)?.version === version) failed.delete(key);
+      pruneVersion(key, version);
+    },
+    clearFailed: () => {
+      const entries = [...failed.values()];
+      failed.clear();
+      for (const entry of entries) pruneVersion(entry.key, entry.version);
     },
     noteLiveMutation: mutation => {
       const key = privateProStartupMutationKey(mutation);
       if (!versions.has(key)) return;
-      versions.delete(key);
       mutations.delete(key);
+      frozen.delete(key);
+      failed.delete(key);
+      versions.delete(key);
     },
     isCurrent: entry => versions.get(entry.key) === entry.version,
     forget: (key, version) => {
-      if (versions.get(key) === version) versions.delete(key);
       const mutation = mutations.get(key);
       if (mutation?.version === version) mutations.delete(key);
+      if (frozen.get(key)?.version === version) frozen.delete(key);
+      pruneVersion(key, version);
     },
-    testOnlyStateSize: () => ({ versions: versions.size }),
+    testOnlyStateSize: () => ({ versions: versions.size, failed: failed.size }),
     stop: () => {
       active = false;
       unsubscribers.splice(0).forEach(unsubscribe => unsubscribe());
+      const entries = [...mutations.values(), ...frozen.values()];
       mutations.clear();
-      versions.clear();
+      frozen.clear();
+      for (const entry of entries) pruneVersion(entry.key, entry.version);
     },
   };
 }
@@ -117,6 +155,7 @@ export async function preparePrivateProCrossUidTransition(dependencies: {
   waitForPreviousOwner?(owner: PrivateProPersistenceOwner): Promise<void>;
   deactivateAssets(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
   clearPrevious(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
+  afterClearPrevious?(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown> | unknown;
   beforeObserve(): void;
 }): Promise<void> {
   const { uid, previousOwnership } = dependencies;
@@ -128,6 +167,8 @@ export async function preparePrivateProCrossUidTransition(dependencies: {
   await dependencies.deactivateAssets(previousOwnership.uid, previousOwnership.owner);
   assertPrivateProPrepareCurrent(isCurrent);
   await dependencies.clearPrevious(previousOwnership.uid, previousOwnership.owner);
+  assertPrivateProPrepareCurrent(isCurrent);
+  await dependencies.afterClearPrevious?.(previousOwnership.uid, previousOwnership.owner);
   assertPrivateProPrepareCurrent(isCurrent);
   dependencies.beforeObserve();
 }
@@ -169,6 +210,8 @@ interface PrivateProSyncLifecycleDependencies {
   firebaseSignOut(): Promise<void>;
   reload(): void;
   pendingCount(): Promise<number>;
+  beforeClear?(): Promise<void> | void;
+  destroyRecovery?(): void;
 }
 
 export interface PrivateProSyncLifecycle {
@@ -209,10 +252,39 @@ interface PrivateProPersistencePrepareDependencies<T> {
   deactivateAssets(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
   releaseManaged?(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
   clearPrevious?(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
+  afterClearPrevious?(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown> | unknown;
   prepareAssets(): Promise<T>;
 }
 
 const privateProLifecycleOwnerStops = new Map<PrivateProPersistenceOwner, () => Promise<void>>();
+const privateProLifecycleOwnerDestructiveCleanups = new Map<PrivateProPersistenceOwner, () => void>();
+let privateProRetainedUidRecovery: (() => void) | null = null;
+
+function registerPrivateProLifecycleOwnerRecovery(owner: PrivateProPersistenceOwner, cleanup: () => void): void {
+  for (const [candidate, existing] of privateProLifecycleOwnerDestructiveCleanups) {
+    if (existing === cleanup) privateProLifecycleOwnerDestructiveCleanups.delete(candidate);
+  }
+  if (privateProRetainedUidRecovery === cleanup) privateProRetainedUidRecovery = null;
+  privateProLifecycleOwnerDestructiveCleanups.set(owner, cleanup);
+}
+
+function retainPrivateProLifecycleOwnerRecovery(owner: PrivateProPersistenceOwner): void {
+  const cleanup = privateProLifecycleOwnerDestructiveCleanups.get(owner);
+  if (cleanup) privateProRetainedUidRecovery = cleanup;
+}
+
+function destroyPrivateProLifecycleOwnerRecovery(owner: PrivateProPersistenceOwner): boolean {
+  const cleanup = isPrivateProRetainedPersistenceOwner(owner)
+    ? privateProRetainedUidRecovery
+    : privateProLifecycleOwnerDestructiveCleanups.get(owner);
+  if (!cleanup) return false;
+  for (const [candidate, existing] of privateProLifecycleOwnerDestructiveCleanups) {
+    if (existing === cleanup) privateProLifecycleOwnerDestructiveCleanups.delete(candidate);
+  }
+  if (privateProRetainedUidRecovery === cleanup) privateProRetainedUidRecovery = null;
+  cleanup();
+  return true;
+}
 
 export async function waitForPrivateProSyncLifecycleOwner(owner: PrivateProPersistenceOwner): Promise<void> {
   await privateProLifecycleOwnerStops.get(owner)?.().catch(() => {});
@@ -244,6 +316,8 @@ export async function preparePrivateProPersistenceOwner<T>(
       await dependencies.deactivateAssets(previousOwnership.uid, previousOwnership.owner);
       assertPrivateProPrepareCurrent(isCurrent);
       await (dependencies.clearPrevious ?? dependencies.deactivateManaged)(previousOwnership.uid, previousOwnership.owner);
+      assertPrivateProPrepareCurrent(isCurrent);
+      await dependencies.afterClearPrevious?.(previousOwnership.uid, previousOwnership.owner);
       assertPrivateProPrepareCurrent(isCurrent);
       dependencies.beforeObserve?.();
     }
@@ -295,6 +369,7 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
   let closing = false;
   let decisionInProgress = false;
   let decisionGate: { promise: Promise<void>; resolve: () => void } | null = null;
+  const destroyRecovery = dependencies.destroyRecovery ? () => dependencies.destroyRecovery?.() : null;
   const releaseOwner = (uid: string, owner: PrivateProPersistenceOwner) => {
     if (dependencies.release) return dependencies.release(uid, owner);
     if (dependencies.deactivate) return dependencies.deactivate(uid, owner);
@@ -422,6 +497,7 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
     latestAttempt = owner;
     owner.stopCallback = () => stopOwner(owner);
     privateProLifecycleOwnerStops.set(owner.owner, owner.stopCallback);
+    if (destroyRecovery) registerPrivateProLifecycleOwnerRecovery(owner.owner, destroyRecovery);
     owner.promise = Promise.resolve().then(() => runQueuedStart(owner));
     owner.promise.catch(() => {});
     return owner.promise;
@@ -508,6 +584,11 @@ export function createPrivateProSyncLifecycle(dependencies: PrivateProSyncLifecy
         if (currentOwner) cleanups.add(beginRelease(currentOwner, currentOwner.engine));
         for (const cleanup of cleanups) {
           try { await cleanup; } catch (error) { failure = rememberFailure(failure, error); }
+        }
+        let destroyedRecovery = false;
+        try { destroyedRecovery = currentOwner ? destroyPrivateProLifecycleOwnerRecovery(currentOwner.owner) : false; } catch (error) { failure = rememberFailure(failure, error); }
+        if (!destroyedRecovery) {
+          try { await dependencies.beforeClear?.(); } catch (error) { failure = rememberFailure(failure, error); }
         }
         try { await dependencies.clear(dependencies.uid); } catch (error) { failure = rememberFailure(failure, error); }
         try { await dependencies.firebaseSignOut(); } catch (error) { failure = rememberFailure(failure, error); }
@@ -633,6 +714,7 @@ function CrossUidPrivateProSyncAccount(props: {
       waitForPreviousOwner: waitForPrivateProSyncLifecycleOwner,
       deactivateAssets: deactivatePrivateProAssetPersistence,
       clearPrevious: uidToClear => clearPrivateProManagedPersistence(uidToClear, privateProSyncDB, clearPrivateProManagedRuntimeStores),
+      afterClearPrevious: (_uidToClear, ownerToClear) => destroyPrivateProLifecycleOwnerRecovery(ownerToClear),
       beforeObserve: () => startupBuffer.start(),
     }).then(() => {
       if (current) setPhase('ready');
@@ -732,6 +814,10 @@ function createProductionLifecycle(
     mutation => privateProStartupDurableGeneration(uid, mutation),
   ),
 ): PrivateProSyncLifecycle {
+  const destroyStartupRecovery = () => {
+    startupBuffer.stop();
+    startupBuffer.clearFailed();
+  };
   const lifecycle = createPrivateProSyncLifecycle({
     uid,
     statusStore,
@@ -749,6 +835,7 @@ function createProductionLifecycle(
           deactivatePrivateProManagedPersistence(uidToDeactivate, ownerToDeactivate, clearPrivateProManagedRuntimeStores),
         releaseManaged: releasePrivateProManagedPersistence,
         clearPrevious: uidToClear => clearPrivateProManagedPersistence(uidToClear, privateProSyncDB, clearPrivateProManagedRuntimeStores),
+        afterClearPrevious: (_uidToClear, ownerToClear) => destroyPrivateProLifecycleOwnerRecovery(ownerToClear),
         deactivateAssets: deactivatePrivateProAssetPersistence,
         async prepareAssets() {
           const local = createPrivateProAssetLocalPort(uid, privateProSyncDB);
@@ -783,9 +870,13 @@ function createProductionLifecycle(
     },
     release: async (_uid, owner) => {
       await deactivatePrivateProAssetPersistence(uid, owner);
-      await releasePrivateProManagedPersistence(uid, owner);
+      if (await releasePrivateProManagedPersistence(uid, owner)) retainPrivateProLifecycleOwnerRecovery(owner);
     },
     clear: uidToClear => clearPrivateProManagedPersistence(uidToClear, privateProSyncDB, clearPrivateProManagedRuntimeStores),
+    beforeClear: () => {
+      destroyStartupRecovery();
+    },
+    destroyRecovery: destroyStartupRecovery,
     firebaseSignOut,
     reload: () => window.location.reload(),
     pendingCount: () => privateProSyncDB.pendingCount(uid),

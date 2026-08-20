@@ -49,6 +49,10 @@ export interface PrivateProSyncStartupMutation {
 export interface PrivateProSyncStartupBuffer {
   active(): boolean;
   closeAndTake(): readonly PrivateProSyncStartupMutation[];
+  retainFailed?(entry: PrivateProSyncStartupMutation): void;
+  failedEntries?(): readonly PrivateProSyncStartupMutation[];
+  resolveFailed?(key: string, version: number): void;
+  clearFailed?(): void;
   noteLiveMutation?(mutation: PrivateProSyncLocalMutation): void;
   isCurrent?(entry: Pick<PrivateProSyncStartupMutation, 'key' | 'version'>): boolean;
   forget?(key: string, version: number): void;
@@ -258,8 +262,33 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     return refreshStatus(epoch, failedStartupMutations.size > 0);
   }
 
-  function forgetFailedStartupEntry(entry: PrivateProSyncStartupMutation): void {
+  function mutationProjectionKey(entry: PrivateProSyncStartupMutation): string {
+    return entry.mutation.kind === 'put' ? entry.mutation.record.projectionKey : entry.mutation.projectionKey;
+  }
+
+  function ensureFailedStartupOrigin(entry: PrivateProSyncStartupMutation): void {
+    if (localOrigins.has(entry.key)) return;
+    const projectionKey = mutationProjectionKey(entry);
+    localOrigins.set(entry.key, {
+      captureId: crypto.randomUUID(),
+      projectionKey,
+      editVersion: nextProjectionVersion(projectionKey),
+      generation: null,
+      mutationId: null,
+      dirty: true,
+    });
+  }
+
+  function retainFailedStartupEntry(entry: PrivateProSyncStartupMutation): void {
+    if (dependencies.startupBuffer?.isCurrent && !dependencies.startupBuffer.isCurrent(entry)) return;
+    dependencies.startupBuffer?.retainFailed?.(entry);
+    failedStartupMutations.set(entry.key, entry);
+    ensureFailedStartupOrigin(entry);
+  }
+
+  function resolveFailedStartupEntry(entry: PrivateProSyncStartupMutation): void {
     if (failedStartupMutations.get(entry.key) === entry) failedStartupMutations.delete(entry.key);
+    dependencies.startupBuffer?.resolveFailed?.(entry.key, entry.version);
     dependencies.startupBuffer?.forget?.(entry.key, entry.version);
   }
 
@@ -284,7 +313,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       if (dependencies.startupBuffer?.active()) return false;
       const identity = mutation.kind === 'put' ? mutation.record : mutation;
       const failed = failedStartupMutations.get(privateProRecordKey(identity.recordType, identity.logicalId));
-      if (failed) forgetFailedStartupEntry(failed);
+      if (failed) resolveFailedStartupEntry(failed);
       dependencies.startupBuffer?.noteLiveMutation?.(mutation);
       return true;
     },
@@ -320,7 +349,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     for (const entry of [...failedStartupMutations.values()]) {
       if (failedStartupMutations.get(entry.key) !== entry) continue;
       if (dependencies.startupBuffer?.isCurrent && !dependencies.startupBuffer.isCurrent(entry)) {
-        forgetFailedStartupEntry(entry);
+        resolveFailedStartupEntry(entry);
         continue;
       }
       const baseline = await entry.baselineGenerationResult;
@@ -331,7 +360,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     const attempts = eligible.map(({ entry, baseline }) => {
       if (failedStartupMutations.get(entry.key) !== entry) return Promise.resolve(null);
       if (dependencies.startupBuffer?.isCurrent && !dependencies.startupBuffer.isCurrent(entry)) {
-        forgetFailedStartupEntry(entry);
+        resolveFailedStartupEntry(entry);
         return Promise.resolve(null);
       }
       try {
@@ -348,7 +377,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       if (result.status === 'rejected') continue;
       if (result.value === null) continue;
       if (result.value.status === 'superseded') clearCaptureOrigin(result.value.notice);
-      forgetFailedStartupEntry(entry);
+      resolveFailedStartupEntry(entry);
     }
   }
 
@@ -453,6 +482,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       if (!isEpochActive(epoch)) return;
       if (dependencies.startupBuffer) {
         const frozen = dependencies.startupBuffer.closeAndTake();
+        for (const entry of dependencies.startupBuffer.failedEntries?.() ?? []) retainFailedStartupEntry(entry);
         if (!outbound.capture && frozen.length) throw new TypeError('Private Pro sync outbound capture is required during startup.');
         const captures = frozen.map(entry => {
           try {
@@ -471,7 +501,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
           }
           if (!isEpochActive(epoch)) continue;
           if (dependencies.startupBuffer.isCurrent && !dependencies.startupBuffer.isCurrent(entry)) continue;
-          failedStartupMutations.set(entry.key, entry);
+          retainFailedStartupEntry(entry);
         }
       }
       const cached = reconciler.applyCached(epoch, lifecycleAbort.signal);
@@ -530,9 +560,9 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
         const results = await Promise.allSettled(tasks);
         cacheTask = null;
         captures.clear();
+        for (const entry of failedStartupMutations.values()) dependencies.startupBuffer?.retainFailed?.(entry);
         localOrigins.clear();
         committedMarkers.clear();
-        for (const entry of failedStartupMutations.values()) dependencies.startupBuffer?.forget?.(entry.key, entry.version);
         failedStartupMutations.clear();
         if (statusStore.getState().retry === ownedRetry) statusStore.setState({ retry: null });
         const rejected = results.find((result): result is PromiseRejectedResult => result.status === 'rejected');

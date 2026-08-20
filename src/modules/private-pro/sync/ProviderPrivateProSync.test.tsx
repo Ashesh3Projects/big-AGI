@@ -83,13 +83,13 @@ describe('ProviderPrivateProSync', () => {
     buffer.start();
     emit(mutation('old'));
     const [frozen] = buffer.closeAndTake();
-    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 1 });
+    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 1, failed: 0 });
     assert.equal(buffer.isCurrent(frozen), true);
 
     buffer.noteLiveMutation(mutation('new'));
 
     assert.equal(buffer.isCurrent(frozen), false);
-    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 0 });
+    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 0, failed: 0 });
   });
 
   test('startup baseline rejection is handled in the observation turn', async () => {
@@ -128,7 +128,28 @@ describe('ProviderPrivateProSync', () => {
 
     for (let index = 0; index < 5_000; index++) buffer.noteLiveMutation(mutation(index));
 
-    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 0 });
+    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 0, failed: 0 });
+  });
+
+  test('ordinary stop preserves failed startup recovery until destructive clear', () => {
+    let emit: (mutation: PrivateProSyncLocalMutation) => void = () => assert.fail('Startup buffer listener was not installed.');
+    const serializer = { subscribe(listener: (mutation: PrivateProSyncLocalMutation) => void) { emit = listener; return () => { emit = () => {}; }; } } as PrivateProSyncSerializer<unknown>;
+    const buffer = createPrivateProStartupMutationBuffer([serializer]);
+    buffer.start();
+    emit({ kind: 'put', record: {
+      recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+      value: { value: 'local' }, referencedAssetIds: [],
+    } });
+    const [entry] = buffer.closeAndTake();
+    buffer.retainFailed(entry);
+
+    buffer.stop();
+
+    assert.deepEqual(buffer.failedEntries().map(failed => failed.mutation), [entry.mutation]);
+    assert.equal(buffer.isCurrent(entry), true);
+    buffer.clearFailed();
+    assert.deepEqual(buffer.failedEntries(), []);
+    assert.deepEqual(buffer.testOnlyStateSize(), { versions: 0, failed: 0 });
   });
 
   test('cross-UID cleanup error screen exposes retry and raw account sign-out', () => {
@@ -218,10 +239,14 @@ describe('ProviderPrivateProSync', () => {
       active: () => active,
       start: () => { active = true; order.push('buffer-start'); },
       closeAndTake: () => [],
+      retainFailed: () => {},
+      failedEntries: () => [],
+      resolveFailed: () => {},
+      clearFailed: () => {},
       noteLiveMutation: () => 1,
       isCurrent: () => true,
       forget: () => {},
-      testOnlyStateSize: () => ({ versions: 0 }),
+      testOnlyStateSize: () => ({ versions: 0, failed: 0 }),
       stop: () => { active = false; order.push('buffer-stop'); },
     });
 

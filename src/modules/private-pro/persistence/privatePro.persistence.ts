@@ -96,6 +96,10 @@ export function privateProManagedPersistenceOwnership(): { uid: string; owner: P
   return uid && managedPersistenceOwner ? { uid, owner: managedPersistenceOwner } : null;
 }
 
+export function isPrivateProRetainedPersistenceOwner(owner: PrivateProPersistenceOwner): boolean {
+  return owner === RETAINED_UID_OWNER;
+}
+
 export function clearPrivateProVolatilePortableState(): void {
   volatileLocalStorage.clear();
   volatilePersistStorage.clear();

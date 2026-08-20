@@ -15,6 +15,7 @@ import { privateProCanonicalJson, privateProContentHash, privateProRecordKey } f
 import { createPrivateProSyncCoordinator } from './privatePro.sync.coordinator';
 import { createPrivateProSyncOutbound } from './privatePro.sync.outbound';
 import { PrivateProSyncDB } from './privatePro.sync.db';
+import { createPrivateProStartupMutationBuffer } from './ProviderPrivateProSync';
 
 
 class FakeSerializer implements PrivateProSyncSerializer<unknown> {
@@ -722,6 +723,70 @@ describe('Private Pro sync engine', () => {
     assert.equal(conditionalCaptures, 1);
     assert.deepEqual(forgotten, [privateProRecordKey('settings', 'first'), privateProRecordKey('settings', 'second')]);
     await engine.stop();
+  });
+
+  test('same-UID remount rehydrates failed startup recovery before applying cached state', async (t) => {
+    const db = integrationDB(t);
+    const serializer = new FakeSerializer();
+    const recordKey = privateProRecordKey('settings', 'main');
+    const cachedPayload = privateProCanonicalJson({ value: 'cached' });
+    await db.commitRemoteRecord('uid-remount-recovery', {
+      recordType: 'settings', logicalId: 'main', recordKey, projectionKey: 'main', schemaVersion: 1,
+      payload: cachedPayload, contentHash: await privateProContentHash(cachedPayload), referencedAssetIds: [],
+    }, { revision: 1, mutationId: crypto.randomUUID(), deleted: false }, 1);
+    let applied = 0;
+    serializer.projection.apply = async () => { applied++; };
+    const startupBuffer = createPrivateProStartupMutationBuffer([serializer], async () => 0);
+    startupBuffer.start();
+    serializer.emit('unpersisted-local');
+    const firstEngine = createPrivateProSyncEngine({
+      uid: 'uid-remount-recovery', serializers: [serializer], startupBuffer,
+      transport: new FakeTransport(), db, runSuppressed: callback => callback(),
+      createOutbound: () => ({
+        start: async () => {}, capture: async () => { throw new Error('frozen capture failed'); },
+        retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+      }),
+    });
+
+    await firstEngine.start();
+    await settle();
+    assert.equal(applied, 0);
+    await firstEngine.stop();
+    assert.equal(startupBuffer.failedEntries().length, 1);
+
+    startupBuffer.start();
+    let conditionalCaptures = 0;
+    const secondEngine = createPrivateProSyncEngine({
+      uid: 'uid-remount-recovery', serializers: [serializer], startupBuffer,
+      transport: new FakeTransport(), db, runSuppressed: callback => callback(),
+      createOutbound: hooks => ({
+        start: async () => {}, capture: async () => assert.fail('Replacement startup batch must be empty.'),
+        captureIfGeneration: async mutation => {
+          conditionalCaptures++;
+          const identity = mutation.kind === 'put' ? mutation.record : mutation;
+          const notice = {
+            captureId: crypto.randomUUID(), kind: mutation.kind, recordType: identity.recordType,
+            logicalId: identity.logicalId, recordKey: privateProRecordKey(identity.recordType, identity.logicalId),
+            projectionKey: identity.projectionKey,
+          } as const;
+          hooks.onCapture(notice);
+          const durable = { ...notice, generation: 1, mutationId: crypto.randomUUID() };
+          hooks.onCaptured(durable);
+          return { status: 'captured', row: {} as never, notice: durable };
+        },
+        retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {}, stop: async () => {},
+      }),
+    });
+
+    await secondEngine.start();
+    await settle();
+
+    assert.equal(applied, 0);
+    assert.equal(secondEngine.testOnlyStartupRecoveryStateSize(), 1);
+    await secondEngine.retryNow();
+    assert.equal(conditionalCaptures, 1);
+    assert.deepEqual(startupBuffer.failedEntries(), []);
+    await secondEngine.stop();
   });
 
   test('superseded startup retry removes its temporary local origin', async () => {
