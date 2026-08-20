@@ -39,6 +39,7 @@ import {
   inspectRuntimeRoleManifest,
   inspectServiceAccountKeys,
   inspectServiceAccountIamRoles,
+  googleReadHeaders,
   EXPECTED_PRIVATE_PRO_BUCKET_CORS,
   type AuditFinding,
 } from './security-audit';
@@ -49,6 +50,13 @@ import * as securityAuditModule from './security-audit';
 function severities(findings: AuditFinding[]) {
   return findings.map(finding => finding.severity);
 }
+
+test('attributes Google management reads to the audited project', () => {
+  assert.deepEqual(googleReadHeaders('<token>', 'sample-project'), {
+    authorization: 'Bearer <token>',
+    'x-goog-user-project': 'sample-project',
+  });
+});
 
 const RESTORE_EVIDENCE_FAMILIES = [
   'accounts',
@@ -1019,6 +1027,11 @@ describe('private Pro security audit classifiers', () => {
       target: 'production',
       aliases: ['chatgpt.ashesh.dev', 'chatgpt.ashesh.dev'],
     })).some(finding => finding.severity === 'block'), true);
+    assert.equal(classifyDeployment(inspectDeployment({
+      readyState: 'READY',
+      target: 'production',
+      aliases: ['chatgpt.ashesh.dev', 'big-agi-pi-teal.vercel.app', 'big-agi-ashsec.vercel.app', 'big-agi-git-pro-ashsec.vercel.app'],
+    })).every(finding => finding.severity === 'pass'), true);
   });
 
   test('blocks an unrestricted browser API key', () => {
@@ -1187,6 +1200,15 @@ describe('private Pro security audit classifiers', () => {
       { name: 'projects/1/services/firestore.googleapis.com', enforcementMode: 'ENFORCED' },
     ] }, required), { required: 2, enforced: 2, missing: 0, unenforced: 0, unknown: 0 });
     assert.equal(classifyAppCheck({ required: 2, enforced: 2, missing: 0, unenforced: 0, unknown: 0 }).every(item => item.severity === 'pass'), true);
+  });
+
+  test('maps Firebase App Check service IDs used by the management API', () => {
+    const facts = inspectAppCheck({ services: [
+      { name: 'projects/1/services/identitytoolkit.googleapis.com', enforcementMode: 'ENFORCED' },
+      { name: 'projects/1/services/firestore.googleapis.com', enforcementMode: 'ENFORCED' },
+      { name: 'projects/1/services/firebasestorage.googleapis.com', enforcementMode: 'ENFORCED' },
+    ] });
+    assert.deepEqual(facts, { required: 3, enforced: 3, missing: 0, unenforced: 0, unknown: 0 });
   });
 
   test('blocks broad Admin SDK roles and reports counts only', () => {

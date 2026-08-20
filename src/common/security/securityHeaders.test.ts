@@ -13,6 +13,7 @@ test('private Pro emits the required browser security headers', () => {
   assert.equal(headers.get('x-frame-options'), 'DENY');
   assert.equal(headers.get('referrer-policy'), 'strict-origin-when-cross-origin', 'Firebase HTTP-referrer restrictions require an origin Referer without path or query leakage');
   assert.equal(headers.get('cross-origin-opener-policy'), 'same-origin-allow-popups');
+  assert.equal(headers.get('access-control-allow-origin'), 'https://chatgpt.ashesh.dev');
   assert.match(headers.get('permissions-policy') ?? '', /geolocation=\(\)/);
   assert.doesNotMatch(headers.get('content-security-policy') ?? '', /(?:^|\s)'unsafe-eval'(?:\s|;|$)/);
 });

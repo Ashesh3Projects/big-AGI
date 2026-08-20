@@ -45,8 +45,14 @@ const REQUIRED_BROWSER_API_SERVICES = new Set([
   'firestore.googleapis.com',
   'firebasestorage.googleapis.com',
 ]);
-const REQUIRED_APP_CHECK_SERVICES = new Set(['firebaseauth.googleapis.com', 'firestore.googleapis.com', 'storage.googleapis.com']);
+const REQUIRED_APP_CHECK_SERVICES = new Set(['identitytoolkit.googleapis.com', 'firestore.googleapis.com', 'firebasestorage.googleapis.com']);
 const ALLOWED_AUTH_DOMAINS = new Set(['chatgpt.ashesh.dev', 'big-agi-243b6.firebaseapp.com']);
+const ALLOWED_DEPLOYMENT_ALIASES = new Set([
+  'chatgpt.ashesh.dev',
+  'big-agi-pi-teal.vercel.app',
+  'big-agi-ashsec.vercel.app',
+  'big-agi-git-pro-ashsec.vercel.app',
+]);
 export const EXPECTED_PRIVATE_PRO_BUCKET_CORS = [{
   origin: ['https://chatgpt.ashesh.dev', 'https://big-agi-243b6.firebaseapp.com'],
   method: ['DELETE', 'GET', 'POST'],
@@ -1237,7 +1243,7 @@ export function inspectDeployment(value: unknown): DeploymentFacts {
     ready: deployment.readyState === 'READY',
     production: deployment.target === 'production',
     exactAliases: aliases.filter(alias => alias === 'chatgpt.ashesh.dev').length,
-    staleAliases: aliases.filter(alias => alias !== 'chatgpt.ashesh.dev').length,
+    staleAliases: aliases.filter(alias => !ALLOWED_DEPLOYMENT_ALIASES.has(alias)).length,
   };
 }
 
@@ -1803,14 +1809,18 @@ async function accessToken(): Promise<string> {
   return token;
 }
 
-async function collectGoogleJson(url: string): Promise<unknown> {
-  const response = await fetch(url, { headers: { authorization: `Bearer ${await accessToken()}` } });
+export function googleReadHeaders(token: string, projectId: string): Record<string, string> {
+  return { authorization: `Bearer ${token}`, 'x-goog-user-project': projectId };
+}
+
+async function collectGoogleJson(url: string, projectId: string): Promise<unknown> {
+  const response = await fetch(url, { headers: googleReadHeaders(await accessToken(), projectId) });
   if (!response.ok) throw new Error(`Google read failed with HTTP ${response.status}.`);
   return response.json() as Promise<unknown>;
 }
 
 async function collectAuthorizedDomains(projectId: string): Promise<AuthorizedDomainFacts> {
-  const value = await collectGoogleJson(`https://identitytoolkit.googleapis.com/v2/projects/${encodeURIComponent(projectId)}/config`);
+  const value = await collectGoogleJson(`https://identitytoolkit.googleapis.com/v2/projects/${encodeURIComponent(projectId)}/config`, projectId);
   return inspectAuthorizedDomains(value);
 }
 
@@ -1841,7 +1851,7 @@ async function collectBucketCors(storageBucket: string): Promise<BucketCorsFacts
 }
 
 async function collectAppCheck(projectId: string): Promise<AppCheckFacts> {
-  const value = await collectGoogleJson(`https://firebaseappcheck.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/services`);
+  const value = await collectGoogleJson(`https://firebaseappcheck.googleapis.com/v1/projects/${encodeURIComponent(projectId)}/services`, projectId);
   return inspectAppCheck(value);
 }
 

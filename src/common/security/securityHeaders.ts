@@ -105,5 +105,6 @@ export function privateProSecurityHeaders(): SecurityHeader[] {
     { key: 'Referrer-Policy', value: 'strict-origin-when-cross-origin' },
     { key: 'Permissions-Policy', value: PRIVATE_PRO_PERMISSIONS_POLICY },
     { key: 'Cross-Origin-Opener-Policy', value: 'same-origin-allow-popups' },
+    { key: 'Access-Control-Allow-Origin', value: 'https://chatgpt.ashesh.dev' },
   ];
 }
