@@ -278,7 +278,7 @@ export function createPrivateProAssetClient(
           cache: thumb && manifest.objects.thumb256 ? { thumb256: { mimeType: manifest.objects.thumb256.mimeType, base64: bytesBase64(thumb) } } : {},
         } as DBlobDBAsset;
         abortIfNeeded(signal);
-        await local.putHydratedAssetIfCurrent(value, snapshot);
+        await local.putHydratedAssetIfCurrent(value, snapshot, signal);
       }
     },
 

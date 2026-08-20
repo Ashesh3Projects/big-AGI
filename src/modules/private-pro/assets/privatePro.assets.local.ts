@@ -32,7 +32,12 @@ export interface PrivateProAssetLocalPort {
   listAssets(guard?: PrivateProAssetActivationGuard): Promise<DBlobDBAsset[]>;
   putAsset(asset: DBlobDBAsset, guard?: PrivateProAssetActivationGuard): Promise<void>;
   putHydratedAsset(asset: DBlobDBAsset, manifest: PrivateProAssetManifest, manifestHash: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
-  putHydratedAssetIfCurrent(asset: DBlobDBAsset, snapshot: PrivateProAssetHydrationSnapshot): Promise<boolean>;
+  putHydratedAssetIfCurrent(
+    asset: DBlobDBAsset,
+    snapshot: PrivateProAssetHydrationSnapshot,
+    signal?: AbortSignal,
+    guard?: PrivateProAssetActivationGuard,
+  ): Promise<boolean>;
   updateAsset(assetId: string, updates: Partial<DBlobDBAsset>, guard?: PrivateProAssetActivationGuard): Promise<boolean>;
   deleteAsset(assetId: string, guard?: PrivateProAssetActivationGuard): Promise<void>;
   clear(guard?: PrivateProAssetActivationGuard): Promise<void>;
@@ -155,19 +160,37 @@ export function createPrivateProAssetLocalPort(uid: string, db: PrivateProSyncDB
   const listeners = new Set<() => Promise<void> | void>();
   const emit = async () => { await Promise.all([...listeners].map(listener => listener())); };
   const assert = (guard?: PrivateProAssetActivationGuard) => guard?.assertActive();
-  const guardedTransaction = async <T>(guard: PrivateProAssetActivationGuard | undefined, callback: () => Promise<T>): Promise<T> => {
-    return db.transaction('rw', db.assets, async transaction => {
-      const abort = () => transaction.abort();
+  const abortError = () => new DOMException('Private Pro asset operation stopped.', 'AbortError');
+  const assertNotAborted = (signal?: AbortSignal) => { if (signal?.aborted) throw abortError(); };
+  const guardedTransaction = async <T>(
+    guard: PrivateProAssetActivationGuard | undefined,
+    callback: () => Promise<T>,
+    signal?: AbortSignal,
+  ): Promise<T> => {
+    let abortTransaction: (() => void) | null = null;
+    const transaction = db.transaction('rw', db.assets, async dexieTransaction => {
+      abortTransaction = () => dexieTransaction.abort();
+      const abort = abortTransaction;
       guard?.signal.addEventListener('abort', abort, { once: true });
-      try {
-        assert(guard);
-        const result = await callback();
-        assert(guard);
-        return result;
-      } finally {
-        guard?.signal.removeEventListener('abort', abort);
-      }
+      signal?.addEventListener('abort', abort, { once: true });
+      assert(guard);
+      assertNotAborted(signal);
+      const result = await callback();
+      assert(guard);
+      assertNotAborted(signal);
+      return result;
     });
+    try {
+      return await transaction;
+    } catch (error) {
+      if (signal?.aborted || guard?.signal.aborted) throw abortError();
+      throw error;
+    } finally {
+      if (abortTransaction) {
+        guard?.signal.removeEventListener('abort', abortTransaction);
+        signal?.removeEventListener('abort', abortTransaction);
+      }
+    }
   };
   const state = async (assetId: string, guard?: PrivateProAssetActivationGuard) => {
     assert(guard);
@@ -225,17 +248,21 @@ export function createPrivateProAssetLocalPort(uid: string, db: PrivateProSyncDB
         });
       });
     },
-    async putHydratedAssetIfCurrent(asset, snapshot) {
+    async putHydratedAssetIfCurrent(asset, snapshot, signal, guard) {
       let committed = false;
-      await db.transaction('rw', db.assets, async () => {
+      await guardedTransaction(guard, async () => {
         const current = await db.assets.get([uid, asset.id]);
+        assert(guard);
+        assertNotAborted(signal);
         if (!current || current.asset || current.contentGeneration !== snapshot.contentGeneration ||
             current.publishedContentGeneration !== snapshot.publishedContentGeneration ||
             current.publishedManifestHash !== snapshot.publishedManifestHash ||
             !current.manifest || privateProCanonicalJson(current.manifest) !== privateProCanonicalJson(snapshot.manifest)) return;
         committed = true;
+        assert(guard);
+        assertNotAborted(signal);
         await db.assets.put({ ...current, asset: structuredClone(asset), hydrationStatus: 'ready', updatedAtMs: Date.now() });
-      });
+      }, signal);
       return committed;
     },
     async updateAsset(assetId, updates, guard) {

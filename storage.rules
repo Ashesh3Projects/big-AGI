@@ -2,7 +2,61 @@ rules_version = '2';
 
 service firebase.storage {
   match /b/{bucket}/o {
-    // Encrypted assets use signed URLs or server-side Admin SDK access.
+    function account(uid) {
+      return firestore.get(/databases/(default)/documents/users/$(uid));
+    }
+
+    function currentAccount(uid) {
+      return request.auth != null
+        && request.auth.uid == uid
+        && currentClaims(uid);
+    }
+
+    function currentClaims(uid) {
+      return request.auth.token.keys().hasAll(['privatePro', 'privateProEpoch'])
+        && request.auth.token.privatePro == true
+        && request.auth.token.privateProEpoch is int
+        && currentAccountDocument(uid, request.auth.token.privateProEpoch);
+    }
+
+    function currentAccountDocument(uid, epoch) {
+      return firestore.exists(/databases/(default)/documents/users/$(uid))
+        && account(uid).data.keys().hasAll(['uid', 'active', 'accessEpoch'])
+        && account(uid).data.uid == uid
+        && account(uid).data.active == true
+        && account(uid).data.accessEpoch is int
+        && account(uid).data.accessEpoch == epoch;
+    }
+
+    function allowedMime(kind, contentType) {
+      return (kind == 'original' && contentType in [
+          'image/png', 'image/jpeg', 'image/webp', 'audio/mpeg', 'audio/wav'
+        ])
+        || (kind == 'thumb256' && contentType in ['image/webp', 'image/jpeg']);
+    }
+
+    function validWrite(uid, assetId, kind) {
+      return request.resource != null
+        && request.resource.size >= 0
+        && request.resource.size <= (kind == 'original' ? 67108864 : 2097152)
+        && allowedMime(kind, request.resource.contentType)
+        && request.resource.metadata.keys().hasAll(['uid', 'assetId', 'kind', 'sha256'])
+        && request.resource.metadata.keys().hasOnly(['uid', 'assetId', 'kind', 'sha256'])
+        && request.resource.metadata.uid == uid
+        && request.resource.metadata.assetId == assetId
+        && request.resource.metadata.kind == kind
+        && request.resource.metadata.sha256.matches('^[a-f0-9]{64}$');
+    }
+
+    match /users/{uid}/workspace-v1/assets/{assetId}/{kind} {
+      allow get: if currentAccount(uid) && kind in ['original', 'thumb256'];
+      allow create, update: if currentAccount(uid)
+        && kind in ['original', 'thumb256']
+        && validWrite(uid, assetId, kind);
+      allow delete: if currentAccount(uid) && kind in ['original', 'thumb256'];
+      allow list: if false;
+    }
+
     match /{path=**} {
       allow read, write: if false;
     }

@@ -54,7 +54,7 @@ export interface PrivateProFirestorePort {
   serverTimestamp(): unknown;
 }
 
-class FirebaseWebPrivateProFirestorePort implements PrivateProFirestorePort {
+export class FirebaseWebPrivateProFirestorePort implements PrivateProFirestorePort {
   constructor(private readonly firestore: Firestore) {}
 
   runTransaction<T>(callback: (transaction: PrivateProFirestoreTransactionPort) => Promise<T>): Promise<T> {
@@ -291,4 +291,8 @@ export function createPrivateProFirebaseSyncTransport(
       return () => { for (const unsubscribe of unsubscribes) unsubscribe(); };
     },
   };
+}
+
+export function createPrivateProFirebaseSyncTransportWithFirestore(uid: string, firestore: Firestore): PrivateProSyncTransport {
+  return createPrivateProFirebaseSyncTransport(uid, new FirebaseWebPrivateProFirestorePort(firestore));
 }

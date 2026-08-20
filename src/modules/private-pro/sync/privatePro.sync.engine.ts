@@ -125,7 +125,6 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
   let cacheTask: Promise<void> | null = null;
   const projectionTasks = new Set<Promise<unknown>>();
   const assetTasks = new Set<Promise<unknown>>();
-  let assetAbort = new AbortController();
   let lifecycleAbort = new AbortController();
   lifecycleAbort.abort();
 
@@ -269,7 +268,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     localOrigins, committedMarkers, projectionVersions, outbound, runSuppressed, isEpochActive, onError: report,
     onHydrate: (assetIds, epoch) => {
       if (!assetIds.length || !dependencies.assets || !isEpochActive(epoch)) return;
-      const signal = assetAbort.signal;
+      const signal = lifecycleAbort.signal;
       const hydration = dependencies.assets.hydrate(assetIds, signal);
       hydration.catch(() => {});
       const task = Promise.race([hydration, waitForAbort(signal)])
@@ -291,7 +290,7 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
     onError: report,
     onHydrate: (assetIds, epoch) => {
       if (!assetIds.length || !dependencies.assets || !isEpochActive(epoch)) return;
-      const signal = assetAbort.signal;
+      const signal = lifecycleAbort.signal;
       const hydration = dependencies.assets.hydrate(assetIds, signal);
       hydration.catch(() => {});
       const task = Promise.race([hydration, waitForAbort(signal)])
@@ -356,7 +355,6 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       if (started) return;
       if (stopTask) await stopTask;
       started = true;
-      assetAbort = new AbortController();
       lifecycleAbort = new AbortController();
       const epoch = ++lifecycleEpoch;
       eventQueue = Promise.resolve();
@@ -400,7 +398,6 @@ export function createPrivateProSyncEngine(dependencies: PrivateProSyncEngineDep
       lifecycleEpoch++;
       listenerEpoch++;
       closeListener();
-      assetAbort.abort();
       lifecycleAbort.abort();
       windowEvents?.removeEventListener('online', onOnline);
       windowEvents?.removeEventListener('offline', onOffline);

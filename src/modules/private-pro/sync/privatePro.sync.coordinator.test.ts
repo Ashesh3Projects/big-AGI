@@ -7,6 +7,9 @@ import {
   type PrivateProSyncCoordinatorOptions,
   type PrivateProSyncLeaderContext,
 } from './privatePro.sync.coordinator';
+import { createPrivateProSyncEngine } from './privatePro.sync.engine';
+import { createPrivateProSyncLifecycle } from './ProviderPrivateProSync';
+import { createPrivateProSyncStore } from './store-private-pro-sync';
 
 
 interface Deferred<T> {
@@ -137,6 +140,8 @@ class FakeLeasePort implements PrivateProCoordinatorLeasePort {
   private current: ({ expiresAtMs: number } & LeaseIdentity) | null = null;
   private ownerNumber = 0;
   private renewal: Deferred<ReturnType<FakeLeasePort['snapshot']> | null> | null = null;
+  private renewalIdentity: LeaseIdentity | null = null;
+  private releaseFailure: Error | null = null;
   readonly releases: LeaseIdentity[] = [];
   renewCalls = 0;
 
@@ -153,26 +158,43 @@ class FakeLeasePort implements PrivateProCoordinatorLeasePort {
   async renewCoordinatorLease(_uid: string, _name: string, fence: number, ownerToken: string, nowMs: number, leaseMs: number) {
     this.renewCalls++;
     if (!this.current || this.current.expiresAtMs <= nowMs || this.current.fence !== fence || this.current.ownerToken !== ownerToken) return null;
-    if (this.renewal) return this.renewal.promise;
+    if (this.renewal) {
+      this.renewalIdentity = { fence, ownerToken };
+      return this.renewal.promise;
+    }
     this.current.expiresAtMs = nowMs + leaseMs;
     return this.snapshot();
   }
 
   async releaseCoordinatorLease(_uid: string, _name: string, fence: number, ownerToken: string): Promise<void> {
     this.releases.push({ fence, ownerToken });
-    if (this.current?.fence === fence && this.current.ownerToken === ownerToken) this.current.expiresAtMs = 0;
+    if (this.current?.fence === fence && this.current.ownerToken === ownerToken) {
+      this.current.expiresAtMs = 0;
+      this.current.ownerToken = `released-${ownerToken}`;
+    }
+    const failure = this.releaseFailure;
+    this.releaseFailure = null;
+    if (failure) throw failure;
   }
 
   deferRenewal(): void {
     this.renewal = deferred();
+    this.renewalIdentity = this.current ? { fence: this.current.fence, ownerToken: this.current.ownerToken } : null;
+  }
+
+  failNextRelease(error: Error): void {
+    this.releaseFailure = error;
   }
 
   resolveRenewal(nowMs: number, leaseMs: number): void {
-    if (!this.renewal || !this.current) assert.fail('Expected a deferred renewal.');
-    const renewed = { ...this.current, expiresAtMs: nowMs + leaseMs };
-    this.current = renewed;
+    if (!this.renewal) assert.fail('Expected a deferred renewal.');
+    const requestedIdentity = this.renewalIdentity;
+    if (!requestedIdentity) assert.fail('Expected a deferred renewal identity.');
+    const renewed = { ...requestedIdentity, expiresAtMs: nowMs + leaseMs };
+    if (this.current?.fence === requestedIdentity.fence && this.current.ownerToken === requestedIdentity.ownerToken) this.current = renewed;
     this.renewal.resolve({ uid: 'uid', name: 'sync', ...renewed });
     this.renewal = null;
+    this.renewalIdentity = null;
   }
 
   isAvailable(nowMs: number): boolean {
@@ -334,6 +356,130 @@ describe('Private Pro sync coordinator', () => {
     assert.equal(coordinator.isLeader(), false);
     assert.equal(leases.isAvailable(scheduler.nowMs), true);
     assert.equal(scheduler.activeTimerCount(), 0);
+  });
+
+  test('a renewal that never settles cannot pin fallback stop or successor acquisition', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const started: string[] = [];
+    const first = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    const second = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+
+    await first.start(leaderRunner(started, 'first'));
+    leases.deferRenewal();
+    await scheduler.advance(5_000);
+    await second.start(leaderRunner(started, 'second'));
+
+    await Promise.race([
+      first.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('fallback stop waited for renewal')))),
+    ]);
+    await scheduler.advance(5_000);
+
+    assert.deepEqual(started, ['first:1', 'second:2']);
+    assert.deepEqual(leases.releases, [{ fence: 1, ownerToken: 'owner-1' }]);
+    assert.equal(second.isLeader(), true);
+    await second.stop();
+  });
+
+  test('a renewal that never settles cannot pin engine stop before a successor acquires', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const started: string[] = [];
+    const first = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    const second = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    const engine = createPrivateProSyncEngine({
+      uid: 'uid-a', serializers: [], db: { pendingCount: async () => 0 }, runSuppressed: callback => callback(),
+      transport: { write: async () => { throw new Error('unused'); }, listen: () => () => {} },
+      createOutbound: () => ({
+        start: () => first.start(leaderRunner(started, 'engine')),
+        retryNow: async () => {}, flushNow: async () => {}, wake: () => {}, handleCommitted: async () => {},
+        stop: () => first.stop(),
+      }),
+      createReconciler: () => ({ applyCached: async () => {}, handle: async () => {} }),
+    });
+
+    await engine.start();
+    leases.deferRenewal();
+    await scheduler.advance(5_000);
+    await second.start(leaderRunner(started, 'successor'));
+
+    await Promise.race([
+      engine.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('engine stop waited for renewal')))),
+    ]);
+    await scheduler.advance(5_000);
+
+    assert.deepEqual(started, ['engine:1', 'successor:2']);
+    assert.equal(second.isLeader(), true);
+    await second.stop();
+  });
+
+  test('never-settling renewals cannot pin remount or confirmed sign-out cleanup', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const started: string[] = [];
+    const cleanup: string[] = [];
+    let attempt = 0;
+    const lifecycle = createPrivateProSyncLifecycle({
+      uid: 'uid-a', statusStore: createPrivateProSyncStore(),
+      prepare: async () => {
+        const id = ++attempt;
+        const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+        return {
+          engine: {
+            start: () => coordinator.start(leaderRunner(started, `mount-${id}`)),
+            async retryNow() {}, async flushNow() { return { pending: 0 }; }, async pendingCount() { return 0; },
+            stop: () => coordinator.stop(),
+          },
+          coordinator,
+        };
+      },
+      release: async () => { cleanup.push('release'); },
+      clear: async () => { cleanup.push('clear'); },
+      firebaseSignOut: async () => { cleanup.push('auth'); },
+      reload: () => { cleanup.push('reload'); },
+      pendingCount: async () => 0,
+    });
+
+    await lifecycle.start();
+    leases.deferRenewal();
+    await scheduler.advance(5_000);
+    await Promise.race([
+      lifecycle.stop(),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('remount stop waited for renewal')))),
+    ]);
+    await lifecycle.start();
+    leases.deferRenewal();
+    await scheduler.advance(5_000);
+
+    await Promise.race([
+      lifecycle.signOut({ discardPending: true }),
+      new Promise<never>((_, reject) => setImmediate(() => reject(new Error('sign-out waited for renewal')))),
+    ]);
+    const successor = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    await successor.start(leaderRunner(started, 'post-signout'));
+
+    assert.deepEqual(started, ['mount-1:1', 'mount-2:2', 'post-signout:3']);
+    assert.deepEqual(cleanup, ['release', 'release', 'clear', 'auth', 'reload']);
+    await successor.stop();
+  });
+
+  test('a failed fenced release still finishes cleanup and permits a restart', async () => {
+    const scheduler = new ManualScheduler();
+    const leases = new FakeLeasePort();
+    const started: string[] = [];
+    const coordinator = createPrivateProSyncCoordinator(options('uid-a', { leases, ...scheduler }));
+    const failure = new Error('release failed');
+
+    await coordinator.start(leaderRunner(started, 'first'));
+    leases.failNextRelease(failure);
+    await assert.rejects(coordinator.stop(), error => error === failure);
+    assert.equal(scheduler.activeTimerCount(), 0);
+
+    await coordinator.start(leaderRunner(started, 'second'));
+    assert.deepEqual(started, ['first:1', 'second:2']);
+    await coordinator.stop();
   });
 
   test('takes over an expired fallback lease and rejects the stale fenced owner renewal', async () => {

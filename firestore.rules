@@ -2,8 +2,285 @@ rules_version = '2';
 
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Private Pro browser code uses authenticated server procedures. The Admin SDK
-    // bypasses these rules for account bootstrap, encrypted vault data, and assets.
+    function account(uid) {
+      return get(/databases/$(database)/documents/users/$(uid));
+    }
+
+    function currentAccount(uid) {
+      return request.auth != null
+        && request.auth.uid == uid
+        && currentClaims(uid);
+    }
+
+    function currentClaims(uid) {
+      return request.auth.token.keys().hasAll(['privatePro', 'privateProEpoch'])
+        && request.auth.token.privatePro == true
+        && request.auth.token.privateProEpoch is int
+        && currentAccountDocument(uid, request.auth.token.privateProEpoch);
+    }
+
+    function currentAccountDocument(uid, epoch) {
+      return exists(/databases/$(database)/documents/users/$(uid))
+        && account(uid).data.keys().hasAll(['uid', 'active', 'accessEpoch'])
+        && account(uid).data.uid == uid
+        && account(uid).data.active == true
+        && account(uid).data.accessEpoch is int
+        && account(uid).data.accessEpoch == epoch;
+    }
+
+    function validRecordKey(recordKey) {
+      return recordKey is string
+        && recordKey.size() >= 1
+        && recordKey.size() <= 1024
+        && recordKey.matches('^[A-Za-z0-9_-]+$');
+    }
+
+    function validRecordType(recordType) {
+      return recordType in [
+        'credential-service', 'model-service', 'settings', 'persona', 'folder',
+        'scratch', 'chat-meta', 'chat-message', 'asset'
+      ];
+    }
+
+    function validUuid(value) {
+      return value is string
+        && value.matches('^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[1-8][0-9A-Fa-f]{3}-[89AaBb][0-9A-Fa-f]{3}-[0-9A-Fa-f]{12}$');
+    }
+
+    function validHash(value) {
+      return value is string && value.matches('^[a-f0-9]{64}$');
+    }
+
+    function validIdentity(data) {
+      return data.keys().hasAll(['recordType', 'logicalId', 'schemaVersion', 'mutationId', 'writerId'])
+        && validRecordType(data.recordType)
+        && data.logicalId is string
+        && data.logicalId.size() >= 1
+        && data.logicalId.size() <= 512
+        && data.schemaVersion is int
+        && data.schemaVersion > 0
+        && validUuid(data.mutationId)
+        && validUuid(data.writerId);
+    }
+
+    function validPayload(data) {
+      return data.keys().hasAll(['payload', 'contentHash', 'deleted'])
+        && data.payload is string
+        && data.payload.size() <= 786432
+        && data.payload.matches('^[\\x00-\\x7F]*$')
+        && validHash(data.contentHash)
+        && (
+          (!data.deleted && data.payload.size() > 0)
+          || (data.deleted
+            && data.payload == ''
+            && data.contentHash == 'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+        );
+    }
+
+    function validCanonical(data) {
+      return data.keys().hasAll([
+          'recordType', 'logicalId', 'schemaVersion', 'payload', 'contentHash',
+          'revision', 'mutationId', 'writerId', 'deleted', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'recordType', 'logicalId', 'schemaVersion', 'payload', 'contentHash',
+          'revision', 'mutationId', 'writerId', 'deleted', 'updatedAt'
+        ])
+        && validIdentity(data)
+        && validPayload(data)
+        && data.revision is int
+        && data.revision > 0
+        && data.deleted is bool
+        && data.updatedAt == request.time;
+    }
+
+    function sameCanonicalIdentity(left, right) {
+      return left.recordType == right.recordType
+        && left.logicalId == right.logicalId
+        && left.schemaVersion == right.schemaVersion;
+    }
+
+    function receiptPath(uid, mutationId) {
+      return /databases/$(database)/documents/users/$(uid)/workspaces/v1/mutationReceipts/$(mutationId);
+    }
+
+    function tombstonePath(uid, recordKey) {
+      return /databases/$(database)/documents/users/$(uid)/workspaces/v1/tombstones/$(recordKey);
+    }
+
+    function canonicalPath(uid, recordType, recordKey) {
+      return recordType == 'asset'
+        ? /databases/$(database)/documents/users/$(uid)/workspaces/v1/assets/$(recordKey)
+        : /databases/$(database)/documents/users/$(uid)/workspaces/v1/records/$(recordKey);
+    }
+
+    function validReceiptLink(uid, recordKey, data) {
+      let path = receiptPath(uid, data.mutationId);
+      return existsAfter(path)
+        && getAfter(path).data.keys().hasAll([
+          'schemaVersion', 'mutationId', 'recordKey', 'recordType', 'logicalId',
+          'kind', 'contentHash', 'revision', 'writerId', 'committedAt'
+        ])
+        && getAfter(path).data.keys().hasOnly([
+          'schemaVersion', 'mutationId', 'recordKey', 'recordType', 'logicalId',
+          'kind', 'contentHash', 'revision', 'writerId', 'committedAt'
+        ])
+        && getAfter(path).data.schemaVersion == 1
+        && getAfter(path).data.mutationId == data.mutationId
+        && getAfter(path).data.recordKey == recordKey
+        && getAfter(path).data.recordType == data.recordType
+        && getAfter(path).data.logicalId == data.logicalId
+        && getAfter(path).data.kind == (data.deleted ? 'delete' : 'put')
+        && getAfter(path).data.contentHash == (data.deleted ? null : data.contentHash)
+        && getAfter(path).data.revision == data.revision
+        && getAfter(path).data.writerId == data.writerId
+        && getAfter(path).data.committedAt == request.time;
+    }
+
+    function validTombstoneLink(uid, recordKey, data) {
+      let path = tombstonePath(uid, recordKey);
+      return existsAfter(path)
+        && getAfter(path).data.keys().hasAll([
+          'recordKey', 'recordType', 'logicalId', 'deletedRevision',
+          'mutationId', 'writerId', 'deletedAt'
+        ])
+        && getAfter(path).data.keys().hasOnly([
+          'recordKey', 'recordType', 'logicalId', 'deletedRevision',
+          'mutationId', 'writerId', 'deletedAt'
+        ])
+        && getAfter(path).data.recordKey == recordKey
+        && getAfter(path).data.recordType == data.recordType
+        && getAfter(path).data.logicalId == data.logicalId
+        && getAfter(path).data.deletedRevision == data.revision
+        && getAfter(path).data.mutationId == data.mutationId
+        && getAfter(path).data.writerId == data.writerId
+        && getAfter(path).data.deletedAt == request.time;
+    }
+
+    function canCreateCanonical(uid, recordKey, assetCollection) {
+      let data = request.resource.data;
+      return currentAccount(uid)
+        && validRecordKey(recordKey)
+        && validCanonical(data)
+        && data.revision == 1
+        && !data.deleted
+        && (assetCollection == (data.recordType == 'asset'))
+        && !exists(tombstonePath(uid, recordKey))
+        && !existsAfter(tombstonePath(uid, recordKey))
+        && validReceiptLink(uid, recordKey, data);
+    }
+
+    function canUpdateCanonical(uid, recordKey, assetCollection) {
+      let data = request.resource.data;
+      return currentAccount(uid)
+        && validRecordKey(recordKey)
+        && validCanonical(data)
+        && (assetCollection == (data.recordType == 'asset'))
+        && sameCanonicalIdentity(resource.data, data)
+        && resource.data.deleted == false
+        && data.revision == resource.data.revision + 1
+        && !exists(tombstonePath(uid, recordKey))
+        && validReceiptLink(uid, recordKey, data)
+        && ((!data.deleted && !existsAfter(tombstonePath(uid, recordKey)))
+          || (data.deleted && validTombstoneLink(uid, recordKey, data)));
+    }
+
+    function validReceiptCreate(uid, mutationId) {
+      let data = request.resource.data;
+      return currentAccount(uid)
+        && data.keys().hasAll(['recordType', 'recordKey'])
+        && mutationId == data.mutationId
+        && validUuid(mutationId)
+        && validRecordKey(data.recordKey)
+        && validRecordType(data.recordType)
+        && data.keys().hasAll([
+          'schemaVersion', 'mutationId', 'recordKey', 'recordType', 'logicalId',
+          'kind', 'contentHash', 'revision', 'writerId', 'committedAt'
+        ])
+        && data.keys().hasOnly([
+          'schemaVersion', 'mutationId', 'recordKey', 'recordType', 'logicalId',
+          'kind', 'contentHash', 'revision', 'writerId', 'committedAt'
+        ])
+        && data.schemaVersion == 1
+        && data.logicalId is string
+        && data.logicalId.size() >= 1
+        && data.logicalId.size() <= 512
+        && data.kind in ['put', 'delete']
+        && ((data.kind == 'put' && validHash(data.contentHash)) || (data.kind == 'delete' && data.contentHash == null))
+        && data.revision is int
+        && data.revision > 0
+        && validUuid(data.writerId)
+        && data.committedAt == request.time
+        && existsAfter(canonicalPath(uid, data.recordType, data.recordKey))
+        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.recordType == data.recordType
+        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.logicalId == data.logicalId
+        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.mutationId == data.mutationId
+        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.writerId == data.writerId
+        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.revision == data.revision
+        && getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.deleted == (data.kind == 'delete')
+        && data.contentHash == (getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.deleted
+          ? null
+          : getAfter(canonicalPath(uid, data.recordType, data.recordKey)).data.contentHash);
+    }
+
+    function validTombstoneCreate(uid, recordKey) {
+      let data = request.resource.data;
+      return currentAccount(uid)
+        && data.keys().hasAll(['recordType'])
+        && recordKey == data.recordKey
+        && validRecordKey(recordKey)
+        && data.keys().hasAll([
+          'recordKey', 'recordType', 'logicalId', 'deletedRevision',
+          'mutationId', 'writerId', 'deletedAt'
+        ])
+        && data.keys().hasOnly([
+          'recordKey', 'recordType', 'logicalId', 'deletedRevision',
+          'mutationId', 'writerId', 'deletedAt'
+        ])
+        && validRecordType(data.recordType)
+        && data.logicalId is string
+        && data.logicalId.size() >= 1
+        && data.logicalId.size() <= 512
+        && data.deletedRevision is int
+        && data.deletedRevision > 0
+        && validUuid(data.mutationId)
+        && validUuid(data.writerId)
+        && data.deletedAt == request.time
+        && existsAfter(canonicalPath(uid, data.recordType, recordKey))
+        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.recordType == data.recordType
+        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.logicalId == data.logicalId
+        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.deleted == true
+        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.revision == data.deletedRevision
+        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.mutationId == data.mutationId
+        && getAfter(canonicalPath(uid, data.recordType, recordKey)).data.writerId == data.writerId;
+    }
+
+    match /users/{uid}/workspaces/v1/records/{recordKey} {
+      allow get, list: if currentAccount(uid);
+      allow create: if canCreateCanonical(uid, recordKey, false);
+      allow update: if canUpdateCanonical(uid, recordKey, false);
+      allow delete: if false;
+    }
+
+    match /users/{uid}/workspaces/v1/assets/{recordKey} {
+      allow get, list: if currentAccount(uid);
+      allow create: if canCreateCanonical(uid, recordKey, true);
+      allow update: if canUpdateCanonical(uid, recordKey, true);
+      allow delete: if false;
+    }
+
+    match /users/{uid}/workspaces/v1/mutationReceipts/{mutationId} {
+      allow get, list: if currentAccount(uid);
+      allow create: if validReceiptCreate(uid, mutationId);
+      allow update, delete: if false;
+    }
+
+    match /users/{uid}/workspaces/v1/tombstones/{recordKey} {
+      allow get, list: if currentAccount(uid);
+      allow create: if validTombstoneCreate(uid, recordKey);
+      allow update, delete: if false;
+    }
+
     match /{document=**} {
       allow read, write: if false;
     }

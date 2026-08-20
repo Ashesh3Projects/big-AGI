@@ -157,7 +157,7 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
 
   async function renewFallbackLease(lease: PrivateProCoordinatorLease, identity: LeaseIdentity): Promise<void> {
     if (stopped || !leader || !options.leases || !sameLeaseIdentity(fallbackIdentity, identity)) return;
-    renewalPromise = (async () => {
+    const attempt = (async () => {
       const renewed = await options.leases!.renewCoordinatorLease(
         options.uid,
         COORDINATOR_NAME,
@@ -177,13 +177,14 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       clearFallbackRenewTimer();
       leaderAbort?.abort();
     })();
+    renewalPromise = attempt;
     try {
-      await renewalPromise;
+      await attempt;
     } catch (error) {
       rememberFailure(error);
       if (sameLeaseIdentity(fallbackIdentity, identity)) leaderAbort?.abort();
     } finally {
-      renewalPromise = null;
+      if (renewalPromise === attempt) renewalPromise = null;
     }
   }
 
@@ -260,18 +261,24 @@ export function createPrivateProSyncCoordinator(options: PrivateProSyncCoordinat
       clearFallbackRenewTimer();
       webLockAbort?.abort();
       leaderAbort?.abort();
-      await fallbackAttempt;
-      await renewalPromise;
-      await leadership;
-      await releaseFallbackIdentity(fallbackIdentity);
-      await webLockRequest;
-      channel?.close();
+      const identity = fallbackIdentity;
+      fallbackLease = null;
+      fallbackIdentity = null;
+      const detachedRenewal = renewalPromise;
+      detachedRenewal?.catch(() => {});
+      renewalPromise = null;
+      let release: Promise<void>;
+      try { release = releaseFallbackIdentity(identity); } catch (error) { release = Promise.reject(error); }
+      release.catch(() => {});
+      try { await fallbackAttempt; } catch (error) { rememberFailure(error); }
+      try { await leadership; } catch (error) { rememberFailure(error); }
+      try { await release; } catch (error) { rememberFailure(error); }
+      try { await webLockRequest; } catch (error) { rememberFailure(error); }
+      try { channel?.close(); } catch (error) { rememberFailure(error); }
       channel = null;
       started = false;
       runLeader = null;
       webLockAbort = null;
-      fallbackLease = null;
-      fallbackIdentity = null;
       if (coordinatorFailure) throw coordinatorFailure;
     },
 

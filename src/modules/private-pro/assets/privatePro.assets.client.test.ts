@@ -2,9 +2,10 @@ import 'fake-indexeddb/auto';
 
 import assert from 'node:assert/strict';
 import { describe, mock, test, type TestContext } from 'node:test';
-import Dexie from 'dexie';
+import Dexie, { type Transaction } from 'dexie';
 
 import { DBlobAssetType, DBlobMimeType, type DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
+import { createPrivateProSyncEngine } from '../sync/privatePro.sync.engine';
 import { PrivateProSyncDB } from '../sync/privatePro.sync.db';
 import { PrivateProSyncTransportError } from '../sync/privatePro.sync.transport';
 import {
@@ -653,6 +654,77 @@ describe('Private Pro direct assets', () => {
 
     assert.deepEqual(await source.local.getAsset(asset.id), edited);
     assert.equal((await source.local.getAssetState(asset.id))?.contentGeneration, 2);
+  });
+
+  test('aborts hydration at the final CAS write and leaves a cleared asset absent', async (t) => {
+    const source = harness(t);
+    const asset = fixture('asset-hydrate-abort', false);
+    await source.local.putAsset(asset);
+    await source.client.ensureUploaded([asset.id]);
+    const manifest = await source.local.getManifest(asset.id);
+    assert.ok(manifest);
+    await source.local.deleteAsset(asset.id);
+    await source.local.putManifest(manifest);
+    const controller = new AbortController();
+    const abort = (_modifications: object, _key: unknown, _value: unknown, transaction: Transaction) => {
+      controller.abort();
+      transaction.abort();
+    };
+    source.db.assets.hook('updating').subscribe(abort);
+
+    await assert.rejects(source.client.hydrate([asset.id], controller.signal), { name: 'AbortError' });
+    source.db.assets.hook('updating').unsubscribe(abort);
+    await source.db.clearUid(UID);
+
+    assert.equal(await source.local.getAssetState(asset.id), undefined);
+  });
+
+  test('engine stop aborts hydration at the final CAS write before UID clear', async (t) => {
+    const source = harness(t);
+    const asset = fixture('asset-hydrate-engine-stop', false);
+    await source.local.putAsset(asset);
+    await source.client.ensureUploaded([asset.id]);
+    const manifest = await source.local.getManifest(asset.id);
+    assert.ok(manifest);
+    await source.local.deleteAsset(asset.id);
+    await source.local.putManifest(manifest);
+    const atFinalPut = deferred();
+    const releaseFinalPut = deferred();
+    const holdPut = () => {
+      atFinalPut.resolve();
+      return releaseFinalPut.promise;
+    };
+    source.db.assets.hook('updating').subscribe(holdPut);
+    let hydrate!: (assetIds: readonly string[], signal?: AbortSignal) => Promise<void>;
+    let triggerHydration!: () => void;
+    const engine = createPrivateProSyncEngine({
+      uid: UID,
+      serializers: [],
+      db: { pendingCount: async () => 0 },
+      transport: { write: async () => { throw new Error('unused'); }, listen: () => () => {} },
+      assets: { ensureUploaded: async () => {}, hydrate: (assetIds, signal) => hydrate(assetIds, signal) },
+      runSuppressed: callback => callback(),
+      createOutbound: () => ({
+        start: async () => {}, retryNow: async () => {}, flushNow: async () => {}, wake: () => {},
+        handleCommitted: async () => {}, stop: async () => {},
+      }),
+      createReconciler: hooks => {
+        triggerHydration = () => hooks.onHydrate?.([asset.id], 1);
+        return { applyCached: async () => {}, handle: async () => {} };
+      },
+    });
+    hydrate = source.client.hydrate.bind(source.client);
+    await engine.start();
+    triggerHydration();
+    await atFinalPut.promise;
+
+    await engine.stop();
+    await source.db.clearUid(UID);
+    releaseFinalPut.resolve();
+    await Promise.resolve();
+    source.db.assets.hook('updating').unsubscribe(holdPut);
+
+    assert.equal(await source.local.getAssetState(asset.id), undefined);
   });
 
   test('rejects a cross-account manifest without reading any object', async (t) => {

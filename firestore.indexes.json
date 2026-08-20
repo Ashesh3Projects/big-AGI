@@ -1,21 +1,4 @@
 {
-  "indexes": [
-    {
-      "collectionGroup": "assetReservations",
-      "queryScope": "COLLECTION",
-      "fields": [
-        { "fieldPath": "opaqueAssetId", "order": "ASCENDING" },
-        { "fieldPath": "status", "order": "ASCENDING" }
-      ]
-    },
-    {
-      "collectionGroup": "assetReservations",
-      "queryScope": "COLLECTION_GROUP",
-      "fields": [
-        { "fieldPath": "status", "order": "ASCENDING" },
-        { "fieldPath": "expiresAtMs", "order": "ASCENDING" }
-      ]
-    }
-  ],
+  "indexes": [],
   "fieldOverrides": []
 }
