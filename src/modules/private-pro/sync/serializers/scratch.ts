@@ -1,10 +1,10 @@
 import * as z from 'zod/v4';
 
 import {
-  scratchClipVaultApply,
-  scratchClipVaultReset,
-  scratchClipVaultSnapshot,
-  scratchClipVaultSubscribe,
+  scratchClipSyncApply,
+  scratchClipSyncReset,
+  scratchClipSyncSnapshot,
+  scratchClipSyncSubscribe,
 } from '~/common/layout/optima/scratchclip/store-scratchclip';
 
 import type { PrivateProSyncLogicalSerializer } from '../privatePro.sync.serializers';
@@ -29,10 +29,10 @@ export const privateProSyncScratchSerializer: PrivateProSyncLogicalSerializer<Sc
   logicalId: () => PRIVATE_PRO_SYNC_SCRATCH_ID,
   projectionKey: () => PRIVATE_PRO_SYNC_SCRATCH_ID,
   snapshot: () => {
-    const value = ScratchSchema.parse(scratchClipVaultSnapshot());
+    const value = ScratchSchema.parse(scratchClipSyncSnapshot());
     return value.history.length ? [{ logicalId: PRIVATE_PRO_SYNC_SCRATCH_ID, value }] : [];
   },
-  apply: (_logicalId, value) => scratchClipVaultApply(value),
-  remove: () => scratchClipVaultReset(),
-  subscribe: scratchClipVaultSubscribe,
+  apply: (_logicalId, value) => scratchClipSyncApply(value),
+  remove: () => scratchClipSyncReset(),
+  subscribe: scratchClipSyncSubscribe,
 };

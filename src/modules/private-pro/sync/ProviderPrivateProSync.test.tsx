@@ -39,6 +39,42 @@ function fakeEngine(options: { pending?: number } = {}) {
 }
 
 describe('ProviderPrivateProSync', () => {
+  test('production persistence prepare runs the global local cutover before managed and asset activation', async () => {
+    const order: string[] = [];
+
+    await preparePrivateProPersistenceOwner({
+      uid: 'uid-a', owner: Symbol('owner'), previousOwnership: null, isCurrent: () => true,
+      runLocalCutover: async () => { order.push('cutover'); },
+      activateManaged: async () => { order.push('activate-managed'); },
+      deactivateManaged: async () => {},
+      deactivateAssets: async () => {},
+      prepareAssets: async () => { order.push('activate-assets'); return 'prepared'; },
+    });
+
+    assert.deepEqual(order, ['cutover', 'activate-managed', 'activate-assets']);
+  });
+
+  test('failed local cutover prevents persistence activation and can be retried from the start', async () => {
+    let attempts = 0;
+    const order: string[] = [];
+    const dependencies = () => ({
+      uid: 'uid-a', owner: Symbol('owner'), previousOwnership: null, isCurrent: () => true,
+      runLocalCutover: async () => {
+        order.push(`cutover:${++attempts}`);
+        if (attempts === 1) throw new Error('raw local cleanup failure');
+      },
+      activateManaged: async () => { order.push('activate-managed'); },
+      deactivateManaged: async () => {},
+      deactivateAssets: async () => {},
+      prepareAssets: async () => { order.push('activate-assets'); return 'prepared'; },
+    });
+
+    await assert.rejects(preparePrivateProPersistenceOwner(dependencies()));
+    await preparePrivateProPersistenceOwner(dependencies());
+
+    assert.deepEqual(order, ['cutover:1', 'cutover:2', 'activate-managed', 'activate-assets']);
+  });
+
   test('production persistence prepare stops between cross-UID cleanup transitions when ownership is cancelled', async () => {
     const oldAssetCleanup = deferred<void>();
     let current = true;

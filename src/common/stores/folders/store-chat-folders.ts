@@ -161,27 +161,27 @@ export function getRotatingFolderColor(): string {
 }
 
 
-/// Private vault adapters
+/// Private sync adapters
 
-export function folderVaultSnapshot(): DFolder[] {
+export function folderSyncSnapshot(): DFolder[] {
   return structuredClone(useFolderStore.getState().folders);
 }
 
-export function folderVaultApply(folder: DFolder): void {
+export function folderSyncApply(folder: DFolder): void {
   const synced = structuredClone(folder);
   useFolderStore.setState(state => ({
     folders: [...state.folders.filter(existing => existing.id !== synced.id), synced],
   }));
 }
 
-export function folderVaultRemove(folderId: string): void {
+export function folderSyncRemove(folderId: string): void {
   useFolderStore.setState(state => ({ folders: state.folders.filter(folder => folder.id !== folderId) }));
 }
 
-export function folderVaultResetAll(): void {
+export function folderSyncResetAll(): void {
   useFolderStore.setState({ folders: [] });
 }
 
-export function folderVaultSubscribe(listener: () => void): () => void {
+export function folderSyncSubscribe(listener: () => void): () => void {
   return useFolderStore.subscribe(listener);
 }

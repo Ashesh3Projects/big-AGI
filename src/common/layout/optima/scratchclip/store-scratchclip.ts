@@ -130,24 +130,24 @@ export function useScratchClipVisibility() {
 }
 
 
-/// Private vault adapters
+/// Private sync adapters
 
-export interface ScratchClipVaultState {
+export interface ScratchClipSyncState {
   history: ClipboardHistoryItem[];
 }
 
-export function scratchClipVaultSnapshot(): ScratchClipVaultState {
+export function scratchClipSyncSnapshot(): ScratchClipSyncState {
   return { history: structuredClone(useScratchClipStore.getState().history) };
 }
 
-export function scratchClipVaultApply(value: ScratchClipVaultState): void {
+export function scratchClipSyncApply(value: ScratchClipSyncState): void {
   useScratchClipStore.setState({ history: structuredClone(value.history) });
 }
 
-export function scratchClipVaultReset(): void {
+export function scratchClipSyncReset(): void {
   useScratchClipStore.setState({ history: [] });
 }
 
-export function scratchClipVaultSubscribe(listener: () => void): () => void {
+export function scratchClipSyncSubscribe(listener: () => void): () => void {
   return useScratchClipStore.subscribe(listener);
 }

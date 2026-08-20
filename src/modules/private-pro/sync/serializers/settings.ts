@@ -1,12 +1,12 @@
 import * as z from 'zod/v4';
 
-import { themeVaultApply, themeVaultReset, themeVaultSnapshot, themeVaultSubscribe } from '~/common/stores/store-ui';
-import { asrxVaultApply, asrxVaultReset, asrxVaultSnapshot, asrxVaultSubscribe } from '~/modules/asrx/store-module-asrx';
+import { themeSyncApply, themeSyncReset, themeSyncSnapshot, themeSyncSubscribe } from '~/common/stores/store-ui';
+import { asrxSyncApply, asrxSyncReset, asrxSyncSnapshot, asrxSyncSubscribe } from '~/modules/asrx/store-module-asrx';
 import type { DASRxCredentialsAny, DASRxProfileAny } from '~/modules/asrx/asrx.types';
-import { googleVaultApply, googleVaultReset, googleVaultSnapshot, googleVaultSubscribe } from '~/modules/google/store-module-google';
-import { speexVaultApply, speexVaultReset, speexVaultSnapshot, speexVaultSubscribe } from '~/modules/speex/store-module-speex';
+import { googleSyncApply, googleSyncReset, googleSyncSnapshot, googleSyncSubscribe } from '~/modules/google/store-module-google';
+import { speexSyncApply, speexSyncReset, speexSyncSnapshot, speexSyncSubscribe } from '~/modules/speex/store-module-speex';
 import type { DSpeexCredentialsAny, DSpeexVoiceAny } from '~/modules/speex/speex.types';
-import { shareVaultApply, shareVaultReset, shareVaultSnapshot, shareVaultSubscribe } from '~/modules/trade/link/store-share-link';
+import { shareSyncApply, shareSyncReset, shareSyncSnapshot, shareSyncSubscribe } from '~/modules/trade/link/store-share-link';
 
 import type { PrivateProSyncLogicalSerializer } from '../privatePro.sync.serializers';
 import {
@@ -83,7 +83,7 @@ const ShareSettingsSchema = z.object({
   }).strict()),
 }).strict();
 
-export type SpeechVaultState = z.infer<typeof SpeechSettingsSchema>;
+export type SpeechSyncState = z.infer<typeof SpeechSettingsSchema>;
 
 const SettingsSchema = z.discriminatedUnion('group', [
   ThemeSettingsSchema,
@@ -128,7 +128,7 @@ function projectSpeexVoice(voice: DSpeexVoiceAny) {
   }
 }
 
-function projectASRxEngine(engine: ReturnType<typeof asrxVaultSnapshot>['engines'][string]) {
+function projectASRxEngine(engine: ReturnType<typeof asrxSyncSnapshot>['engines'][string]) {
   return ASRxEngineSchema.parse({
     engineId: engine.engineId, vendorType: engine.vendorType, label: engine.label, isAutoDetected: engine.isAutoDetected,
     isAutoLinked: engine.isAutoLinked, isDeleted: engine.isDeleted, credentials: projectCredentials(engine.credentials), profile: projectASRxProfile(engine.profile),
@@ -136,7 +136,7 @@ function projectASRxEngine(engine: ReturnType<typeof asrxVaultSnapshot>['engines
   });
 }
 
-function projectSpeexEngine(engine: ReturnType<typeof speexVaultSnapshot>['engines'][string]) {
+function projectSpeexEngine(engine: ReturnType<typeof speexSyncSnapshot>['engines'][string]) {
   return SpeexEngineSchema.parse({
     engineId: engine.engineId, vendorType: engine.vendorType, label: engine.label, isAutoDetected: engine.isAutoDetected,
     isAutoLinked: engine.isAutoLinked, isDeleted: engine.isDeleted, credentials: projectCredentials(engine.credentials), voice: projectSpeexVoice(engine.voice),
@@ -144,9 +144,9 @@ function projectSpeexEngine(engine: ReturnType<typeof speexVaultSnapshot>['engin
   });
 }
 
-function speechVaultSnapshot() {
-  const asrx = asrxVaultSnapshot();
-  const speex = speexVaultSnapshot();
+function speechSyncSnapshot() {
+  const asrx = asrxSyncSnapshot();
+  const speex = speexSyncSnapshot();
   return {
     asrx: { engines: Object.fromEntries(Object.entries(asrx.engines).map(([id, engine]) => [id, projectASRxEngine(engine)])), activeEngineId: asrx.activeEngineId },
     speex: { engines: Object.fromEntries(Object.entries(speex.engines).map(([id, engine]) => [id, projectSpeexEngine(engine)])), activeEngineId: speex.activeEngineId, ttsCharLimit: speex.ttsCharLimit },
@@ -154,20 +154,20 @@ function speechVaultSnapshot() {
 }
 
 
-export function speechVaultApply(value: Omit<SpeechVaultState, 'group'>): void {
+export function speechSyncApply(value: Omit<SpeechSyncState, 'group'>): void {
   const parsed = SpeechSettingsSchema.parse({ group: 'speech', ...value });
-  asrxVaultApply(parsed.asrx as unknown as ReturnType<typeof asrxVaultSnapshot>);
-  speexVaultApply(parsed.speex as unknown as ReturnType<typeof speexVaultSnapshot>);
+  asrxSyncApply(parsed.asrx as unknown as ReturnType<typeof asrxSyncSnapshot>);
+  speexSyncApply(parsed.speex as unknown as ReturnType<typeof speexSyncSnapshot>);
 }
 
-function speechVaultReset(): void {
-  asrxVaultReset();
-  speexVaultReset();
+function speechSyncReset(): void {
+  asrxSyncReset();
+  speexSyncReset();
 }
 
-function speechVaultSubscribe(listener: () => void): () => void {
-  const unsubAsrx = asrxVaultSubscribe(listener);
-  const unsubSpeex = speexVaultSubscribe(listener);
+function speechSyncSubscribe(listener: () => void): () => void {
+  const unsubAsrx = asrxSyncSubscribe(listener);
+  const unsubSpeex = speexSyncSubscribe(listener);
   return () => {
     unsubAsrx();
     unsubSpeex();
@@ -182,11 +182,11 @@ export const privateProSyncSettingsSerializer: PrivateProSyncLogicalSerializer<S
   logicalId: value => value.group,
   projectionKey: value => value.group,
   snapshot: () => {
-    const google = googleVaultSnapshot();
-    const speech = { group: 'speech', ...speechVaultSnapshot() } as const;
-    const share = shareVaultSnapshot();
+    const google = googleSyncSnapshot();
+    const speech = { group: 'speech', ...speechSyncSnapshot() } as const;
+    const share = shareSyncSnapshot();
     return [
-      { logicalId: PRIVATE_PRO_SYNC_SETTINGS_THEME_ID, value: ThemeSettingsSchema.parse({ group: 'theme', mode: themeVaultSnapshot() }) },
+      { logicalId: PRIVATE_PRO_SYNC_SETTINGS_THEME_ID, value: ThemeSettingsSchema.parse({ group: 'theme', mode: themeSyncSnapshot() }) },
       ...(google.googleCloudApiKey || google.googleCSEId || google.restrictToDomain
         ? [{ logicalId: PRIVATE_PRO_SYNC_SETTINGS_GOOGLE_ID, value: GoogleSettingsSchema.parse({ group: 'google-search', ...google }) }]
         : []),
@@ -201,24 +201,24 @@ export const privateProSyncSettingsSerializer: PrivateProSyncLogicalSerializer<S
   },
   apply: (_logicalId, value) => {
     switch (value.group) {
-      case 'theme': return themeVaultApply(value.mode);
-      case 'google-search': return googleVaultApply(value);
-      case 'speech': return speechVaultApply(value);
-      case 'share-credentials': return shareVaultApply(value);
+      case 'theme': return themeSyncApply(value.mode);
+      case 'google-search': return googleSyncApply(value);
+      case 'speech': return speechSyncApply(value);
+      case 'share-credentials': return shareSyncApply(value);
       default: return privateProPortableAppSettingsApply(PrivateProPortableAppSettingsSchema.parse(value));
     }
   },
   remove: logicalId => {
     switch (logicalId) {
-      case PRIVATE_PRO_SYNC_SETTINGS_THEME_ID: return themeVaultReset();
-      case PRIVATE_PRO_SYNC_SETTINGS_GOOGLE_ID: return googleVaultReset();
-      case PRIVATE_PRO_SYNC_SETTINGS_SPEECH_ID: return speechVaultReset();
-      case PRIVATE_PRO_SYNC_SETTINGS_SHARE_ID: return shareVaultReset();
+      case PRIVATE_PRO_SYNC_SETTINGS_THEME_ID: return themeSyncReset();
+      case PRIVATE_PRO_SYNC_SETTINGS_GOOGLE_ID: return googleSyncReset();
+      case PRIVATE_PRO_SYNC_SETTINGS_SPEECH_ID: return speechSyncReset();
+      case PRIVATE_PRO_SYNC_SETTINGS_SHARE_ID: return shareSyncReset();
       default: return privateProPortableAppSettingsReset(logicalId as Parameters<typeof privateProPortableAppSettingsReset>[0]);
     }
   },
   subscribe: listener => {
-    const unsubscribers = [themeVaultSubscribe(listener), googleVaultSubscribe(listener), speechVaultSubscribe(listener), shareVaultSubscribe(listener), privateProPortableAppSettingsSubscribe(listener)];
+    const unsubscribers = [themeSyncSubscribe(listener), googleSyncSubscribe(listener), speechSyncSubscribe(listener), shareSyncSubscribe(listener), privateProPortableAppSettingsSubscribe(listener)];
     return () => unsubscribers.forEach(unsubscribe => unsubscribe());
   },
 };

@@ -3,18 +3,18 @@ import { panesManagerResetPrivateProRuntime } from '../../../apps/chat/component
 import { liveFileResetPrivateProRuntime } from '~/common/livefile/store-live-file';
 import { loggerResetPrivateProRuntime } from '~/common/logger/store-logger';
 import { logicSherpaResetPrivateProRuntime } from '~/common/logic/store-logic-sherpa';
-import { scratchClipVaultReset } from '~/common/layout/optima/scratchclip/store-scratchclip';
+import { scratchClipSyncReset } from '~/common/layout/optima/scratchclip/store-scratchclip';
 import { chatSyncResetAll } from '~/common/stores/chat/store-chats';
-import { folderVaultResetAll } from '~/common/stores/folders/store-chat-folders';
+import { folderSyncResetAll } from '~/common/stores/folders/store-chat-folders';
 import { useModelsStore } from '~/common/stores/llms/store-llms';
 import { metricsResetPrivateProRuntime } from '~/common/stores/metrics/store-metrics';
 import { deviceResetPrivateProRuntime } from '~/common/stores/store-client';
-import { themeVaultReset } from '~/common/stores/store-ui';
+import { themeSyncReset } from '~/common/stores/store-ui';
 import { workspaceResetPrivateProRuntime } from '~/common/stores/workspace/store-client-workspace';
-import { asrxVaultReset } from '~/modules/asrx/store-module-asrx';
-import { googleVaultReset } from '~/modules/google/store-module-google';
-import { speexVaultReset } from '~/modules/speex/store-module-speex';
-import { shareVaultReset } from '~/modules/trade/link/store-share-link';
+import { asrxSyncReset } from '~/modules/asrx/store-module-asrx';
+import { googleSyncReset } from '~/modules/google/store-module-google';
+import { speexSyncReset } from '~/modules/speex/store-module-speex';
+import { shareSyncReset } from '~/modules/trade/link/store-share-link';
 
 import {
   PRIVATE_PRO_SYNC_SETTINGS_AI_ID,
@@ -41,14 +41,14 @@ export function clearPrivateProManagedRuntimeStores(): void {
   workspaceResetPrivateProRuntime();
   chatSyncResetAll();
   personaSyncResetAll();
-  folderVaultResetAll();
-  scratchClipVaultReset();
+  folderSyncResetAll();
+  scratchClipSyncReset();
   useModelsStore.setState({ llms: [], sources: [], confServiceId: null, modelAssignments: {} });
-  themeVaultReset();
-  googleVaultReset();
-  asrxVaultReset();
-  speexVaultReset();
-  shareVaultReset();
+  themeSyncReset();
+  googleSyncReset();
+  asrxSyncReset();
+  speexSyncReset();
+  shareSyncReset();
   for (const group of [
     PRIVATE_PRO_SYNC_SETTINGS_CALL_ID,
     PRIVATE_PRO_SYNC_SETTINGS_CHAT_ID,

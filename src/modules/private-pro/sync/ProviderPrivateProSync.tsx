@@ -13,6 +13,7 @@ import { createPrivateProSyncEngine, type PrivateProSyncEngine } from './private
 import { createPrivateProFirebaseSyncTransport } from './privatePro.sync.firebase';
 import { createPrivateProAssetSerializer, createPrivateProSyncSerializers } from './privatePro.sync.serializers';
 import { clearPrivateProManagedRuntimeStores } from './privatePro.sync.runtime';
+import { createPrivateProWorkspaceV1ProductionCutoverPort, runPrivateProWorkspaceV1LocalCutover } from './privatePro.sync.cutover';
 import { createPrivateProSyncStore, type PrivateProSyncStore } from './store-private-pro-sync';
 
 
@@ -68,6 +69,7 @@ interface PrivateProPersistencePrepareDependencies<T> {
   owner: PrivateProPersistenceOwner;
   previousOwnership: { uid: string; owner: PrivateProPersistenceOwner } | null;
   isCurrent(): boolean;
+  runLocalCutover?(): Promise<void>;
   waitForPreviousOwner?(owner: PrivateProPersistenceOwner): Promise<void>;
   activateManaged(uid: string, owner: PrivateProPersistenceOwner): Promise<void>;
   deactivateManaged(uid: string, owner: PrivateProPersistenceOwner): Promise<unknown>;
@@ -95,6 +97,11 @@ export async function preparePrivateProPersistenceOwner<T>(
   let managedActivated = false;
   let assetsActivated = false;
   try {
+    if (dependencies.runLocalCutover) {
+      assertPrivateProPrepareCurrent(isCurrent);
+      await dependencies.runLocalCutover();
+      assertPrivateProPrepareCurrent(isCurrent);
+    }
     if (previousOwnership) {
       assertPrivateProPrepareCurrent(isCurrent);
       await dependencies.waitForPreviousOwner?.(previousOwnership.owner);
@@ -458,6 +465,7 @@ function createProductionLifecycle(
         owner,
         previousOwnership,
         isCurrent,
+        runLocalCutover: async () => runPrivateProWorkspaceV1LocalCutover(await createPrivateProWorkspaceV1ProductionCutoverPort()),
         waitForPreviousOwner: waitForPrivateProSyncLifecycleOwner,
         activateManaged: activatePrivateProManagedPersistence,
         deactivateManaged: (uidToDeactivate, ownerToDeactivate) =>

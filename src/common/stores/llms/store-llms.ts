@@ -620,14 +620,14 @@ function _port_V3Options_to_V4Parameters_inline(llm: DLLM): void {
 }
 
 
-/// Private vault adapters
+/// Private sync adapters
 
-export interface ModelsVaultServiceState {
+export interface ModelsSyncServiceState {
   service: DModelsService<any>;
   models: DLLM[];
 }
 
-export function modelsVaultSnapshot(): ModelsVaultServiceState[] {
+export function modelsSyncSnapshot(): ModelsSyncServiceState[] {
   const { sources, llms } = useModelsStore.getState();
   return sources.map(service => ({
     service: structuredClone(service),
@@ -635,14 +635,14 @@ export function modelsVaultSnapshot(): ModelsVaultServiceState[] {
   }));
 }
 
-export function modelsVaultApplyService(service: DModelsService<any>): void {
+export function modelsSyncApplyService(service: DModelsService<any>): void {
   const synced = structuredClone(service);
   useModelsStore.setState(state => ({
     sources: [...state.sources.filter(existing => existing.id !== synced.id), synced],
   }));
 }
 
-export function modelsVaultApplyModels(serviceId: DModelsServiceId, models: DLLM[]): void {
+export function modelsSyncApplyModels(serviceId: DModelsServiceId, models: DLLM[]): void {
   const syncedModels = structuredClone(models);
   useModelsStore.setState(state => {
     const llms = [...state.llms.filter(llm => llm.sId !== serviceId), ...syncedModels];
@@ -650,26 +650,14 @@ export function modelsVaultApplyModels(serviceId: DModelsServiceId, models: DLLM
   });
 }
 
-export function modelsVaultRemoveModels(serviceId: DModelsServiceId): void {
+export function modelsSyncRemoveModels(serviceId: DModelsServiceId): void {
   useModelsStore.setState(state => {
     const llms = state.llms.filter(llm => llm.sId !== serviceId);
     return { llms, modelAssignments: llmsAssignmentsPruneStale(llms, state.modelAssignments) };
   });
 }
 
-export function modelsVaultApply(value: ModelsVaultServiceState): void {
-  const synced = structuredClone(value);
-  useModelsStore.setState(state => ({
-    sources: [...state.sources.filter(source => source.id !== synced.service.id), synced.service],
-    llms: [...state.llms.filter(llm => llm.sId !== synced.service.id), ...synced.models],
-    modelAssignments: llmsAssignmentsPruneStale(
-      [...state.llms.filter(llm => llm.sId !== synced.service.id), ...synced.models],
-      state.modelAssignments,
-    ),
-  }));
-}
-
-export function modelsVaultRemove(serviceId: DModelsServiceId): void {
+export function modelsSyncRemove(serviceId: DModelsServiceId): void {
   useModelsStore.setState(state => {
     const llms = state.llms.filter(llm => llm.sId !== serviceId);
     return {
@@ -681,6 +669,6 @@ export function modelsVaultRemove(serviceId: DModelsServiceId): void {
   });
 }
 
-export function modelsVaultSubscribe(listener: () => void): () => void {
+export function modelsSyncSubscribe(listener: () => void): () => void {
   return useModelsStore.subscribe(listener);
 }

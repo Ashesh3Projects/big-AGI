@@ -1,6 +1,6 @@
 import * as z from 'zod/v4';
 
-import { folderVaultApply, folderVaultRemove, folderVaultSnapshot, folderVaultSubscribe } from '~/common/stores/folders/store-chat-folders';
+import { folderSyncApply, folderSyncRemove, folderSyncSnapshot, folderSyncSubscribe } from '~/common/stores/folders/store-chat-folders';
 
 import type { PrivateProSyncLogicalSerializer } from '../privatePro.sync.serializers';
 
@@ -19,8 +19,8 @@ export const privateProSyncFolderSerializer: PrivateProSyncLogicalSerializer<Fol
   schema: FolderSchema,
   logicalId: value => value.id,
   projectionKey: value => value.id,
-  snapshot: () => folderVaultSnapshot().map(folder => ({ logicalId: folder.id, value: FolderSchema.parse(folder) })),
-  apply: (_logicalId, value) => folderVaultApply(value),
-  remove: folderVaultRemove,
-  subscribe: folderVaultSubscribe,
+  snapshot: () => folderSyncSnapshot().map(folder => ({ logicalId: folder.id, value: FolderSchema.parse(folder) })),
+  apply: (_logicalId, value) => folderSyncApply(value),
+  remove: folderSyncRemove,
+  subscribe: folderSyncSubscribe,
 };

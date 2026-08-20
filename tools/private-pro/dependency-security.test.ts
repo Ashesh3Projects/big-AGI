@@ -74,6 +74,13 @@ test('uses the approved patched private Pro dependency floors', () => {
   assert.equal(packageJson.engines.node, '^26.0.0 || ^24.0.0 || ^22.12.0');
 });
 
+test('does not ship the removed application crypto dependency', () => {
+  const removedPackage = ['hash', 'wasm'].join('-');
+  assert.equal(dependencyManifest.dependencies[removedPackage], undefined);
+  assert.equal(dependencyManifest.devDependencies[removedPackage], undefined);
+  assert.equal(packageLock.packages[`node_modules/${removedPackage}`], undefined);
+});
+
 test('pins audited transitive dependencies to compatible patched releases', () => {
   assert.deepEqual(dependencyManifest.overrides, {
     '@next/bundle-analyzer': {

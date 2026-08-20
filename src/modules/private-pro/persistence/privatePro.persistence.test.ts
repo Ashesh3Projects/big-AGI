@@ -181,9 +181,7 @@ describe('private Pro managed persistence gate', () => {
       ['common/components/3rdparty/PostHogAnalytics.tsx', 'excluded'],
       ['common/util/idbUtils.ts', 'portable-idb-infrastructure'],
       ['modules/dblobs/dblobs.db.ts', 'portable-asset-legacy'],
-      ['modules/private-pro/vault/privatePro.vault.db.ts', 'encrypted-vault'],
-      ['modules/private-pro/vault/privatePro.vault.device.ts', 'device-only'],
-      ['modules/private-pro/persistence/privatePro.persistence.ts', 'portable-gate'],
+      ['modules/private-pro/sync/privatePro.sync.cutover.ts', 'workspace-cutover'],
       ['modules/private-pro/sync/privatePro.sync.db.ts', 'managed-workspace'],
       ['modules/trade/BackupRestore.tsx', 'manual-export-only'],
     ] as const;

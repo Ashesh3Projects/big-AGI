@@ -71,24 +71,24 @@ export function hasNoChatLinkItems() {
 }
 
 
-/// Private vault adapters
+/// Private sync adapters
 
-export interface ShareVaultState {
+export interface ShareSyncState {
   chatLinkItems: SharedChatLinkItem[];
 }
 
-export function shareVaultSnapshot(): ShareVaultState {
+export function shareSyncSnapshot(): ShareSyncState {
   return { chatLinkItems: structuredClone(useShareLinkStore.getState().chatLinkItems) };
 }
 
-export function shareVaultApply(value: ShareVaultState): void {
+export function shareSyncApply(value: ShareSyncState): void {
   useShareLinkStore.setState({ chatLinkItems: structuredClone(value.chatLinkItems) });
 }
 
-export function shareVaultReset(): void {
+export function shareSyncReset(): void {
   useShareLinkStore.setState({ chatLinkItems: [] });
 }
 
-export function shareVaultSubscribe(listener: () => void): () => void {
+export function shareSyncSubscribe(listener: () => void): () => void {
   return useShareLinkStore.subscribe(listener);
 }

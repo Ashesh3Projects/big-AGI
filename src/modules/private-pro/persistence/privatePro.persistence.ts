@@ -74,6 +74,11 @@ function browserLocalStorage(): Storage | null {
   return typeof window === 'undefined' ? null : window.localStorage;
 }
 
+export function removePrivateProDurableLocalStorageItem(storage: Storage, key: string): void {
+  if (rawLocalStorageRemoveItem) rawLocalStorageRemoveItem(storage, key);
+  else storage.removeItem(key);
+}
+
 function cloneStorageValue<S>(value: StorageValue<S>): StorageValue<S> {
   return JSON.parse(JSON.stringify(value)) as StorageValue<S>;
 }
@@ -127,17 +132,6 @@ export async function releasePrivateProManagedPersistence(
   managedPersistenceOwner = RETAINED_UID_OWNER;
   return true;
 }
-
-/** @deprecated Removed with the encrypted vault runtime. */
-export function setPrivateProEncryptedPersistenceActive(active: boolean): void {
-  void activatePrivateProManagedPersistence(active ? '__legacy-vault__' : null, active ? setPrivateProEncryptedPersistenceActive : null);
-}
-
-/** @deprecated Removed with encrypted asset persistence. */
-export function markPrivateProPortableAssetEncrypted(_assetId: string): void {}
-
-/** @deprecated Removed with encrypted asset persistence. */
-export function privateProPortableAssetBeforeUnload(): undefined { return undefined; }
 
 export function createPrivateProPortableLocalStorage(
   getDurableStorage: () => Storage | null = browserLocalStorage,
@@ -279,27 +273,13 @@ export async function clearPrivateProManagedPersistence(
   const tasks: Promise<unknown>[] = [database.clearUid(uid)];
   if (typeof window !== 'undefined') {
     for (const key of [...PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS, ...PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS]) {
-      if (rawLocalStorageRemoveItem) rawLocalStorageRemoveItem(window.localStorage, key);
-      else window.localStorage.removeItem(key);
+      removePrivateProDurableLocalStorageItem(window.localStorage, key);
     }
     const { del } = await import('idb-keyval');
     const { clearPrivateProLegacyPlaintextDBlobPersistence } = await import('~/modules/dblobs/dblobs.db');
     tasks.push(...[...PRIVATE_PRO_PORTABLE_IDB_KEYS].map(key => del(key)), clearPrivateProLegacyPlaintextDBlobPersistence());
   }
   await Promise.all(tasks);
-}
-
-/** @deprecated Task 11 removes the remaining vault caller. */
-export async function clearPrivateProPlaintextPortablePersistence(): Promise<void> {
-  clearPrivateProVolatilePortableState();
-  if (typeof window === 'undefined') return;
-  for (const key of [...PRIVATE_PRO_PORTABLE_LOCAL_STORAGE_KEYS, ...PRIVATE_PRO_SENSITIVE_LOCAL_STORAGE_KEYS]) {
-    if (rawLocalStorageRemoveItem) rawLocalStorageRemoveItem(window.localStorage, key);
-    else window.localStorage.removeItem(key);
-  }
-  const { del } = await import('idb-keyval');
-  const { clearPrivateProPlaintextDBlobPersistence } = await import('~/modules/dblobs/dblobs.db');
-  await Promise.all([...PRIVATE_PRO_PORTABLE_IDB_KEYS].map(key => del(key)).concat(clearPrivateProPlaintextDBlobPersistence()));
 }
 
 function installPrivateProStoragePrototypeGate(): void {

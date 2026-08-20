@@ -1,13 +1,13 @@
 import * as z from 'zod/v4';
 
 import {
-  modelsVaultApplyModels,
-  modelsVaultApplyService,
-  modelsVaultRemove,
-  modelsVaultRemoveModels,
-  modelsVaultSnapshot,
-  modelsVaultSubscribe,
-  type ModelsVaultServiceState,
+  modelsSyncApplyModels,
+  modelsSyncApplyService,
+  modelsSyncRemove,
+  modelsSyncRemoveModels,
+  modelsSyncSnapshot,
+  modelsSyncSubscribe,
+  type ModelsSyncServiceState,
 } from '~/common/stores/llms/store-llms';
 import { DModelParameterRegistry, type DModelParameterId, type DModelParameterSpecAny, type DModelParameterValues } from '~/common/stores/llms/llms.parameters';
 import type { DModelPricing, DPricingChatGenerate } from '~/common/stores/llms/llms.pricing';
@@ -184,13 +184,13 @@ export const privateProSyncCredentialSerializer: PrivateProSyncLogicalSerializer
   schema: CredentialServiceSchema,
   logicalId: value => value.id,
   projectionKey: value => value.id,
-  snapshot: () => modelsVaultSnapshot().map(({ service }) => ({
+  snapshot: () => modelsSyncSnapshot().map(({ service }) => ({
     logicalId: service.id,
     value: CredentialServiceSchema.parse({ id: service.id, label: service.label, vId: service.vId, setup: projectServiceSetup(service.setup) }),
   })),
-  apply: (_logicalId, value) => modelsVaultApplyService(value as ModelsVaultServiceState['service']),
-  remove: modelsVaultRemove,
-  subscribe: modelsVaultSubscribe,
+  apply: (_logicalId, value) => modelsSyncApplyService(value as ModelsSyncServiceState['service']),
+  remove: modelsSyncRemove,
+  subscribe: modelsSyncSubscribe,
 };
 
 export const privateProSyncModelSerializer: PrivateProSyncLogicalSerializer<ModelServiceValue> = {
@@ -199,11 +199,11 @@ export const privateProSyncModelSerializer: PrivateProSyncLogicalSerializer<Mode
   schema: ModelServiceSchema,
   logicalId: value => value.serviceId,
   projectionKey: value => value.serviceId,
-  snapshot: () => modelsVaultSnapshot().filter(({ models }) => models.length > 0).map(({ service, models }) => ({
+  snapshot: () => modelsSyncSnapshot().filter(({ models }) => models.length > 0).map(({ service, models }) => ({
     logicalId: service.id,
     value: ModelServiceSchema.parse({ serviceId: service.id, models: models.map(projectModel) }),
   })),
-  apply: (logicalId, value) => modelsVaultApplyModels(logicalId, value.models as unknown as ModelsVaultServiceState['models']),
-  remove: modelsVaultRemoveModels,
-  subscribe: modelsVaultSubscribe,
+  apply: (logicalId, value) => modelsSyncApplyModels(logicalId, value.models as unknown as ModelsSyncServiceState['models']),
+  remove: modelsSyncRemoveModels,
+  subscribe: modelsSyncSubscribe,
 };

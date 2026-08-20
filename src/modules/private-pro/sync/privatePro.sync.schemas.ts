@@ -120,7 +120,6 @@ export const SyncChatMessageSchema = z.object({
   message: SyncMessageSchema,
 }).strict();
 
-// Compatibility-only shape for the legacy vault serializer pending its removal.
 export const SyncConversationSchema = z.object({
   schemaVersion: z.literal(1),
   conversation: z.object({

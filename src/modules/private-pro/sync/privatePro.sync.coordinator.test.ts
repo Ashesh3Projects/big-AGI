@@ -8,6 +8,7 @@ import {
   type PrivateProSyncLeaderContext,
 } from './privatePro.sync.coordinator';
 import { createPrivateProSyncEngine } from './privatePro.sync.engine';
+import type { PrivateProCoordinatorLease } from './privatePro.sync.db';
 import { createPrivateProSyncLifecycle } from './ProviderPrivateProSync';
 import { createPrivateProSyncStore } from './store-private-pro-sync';
 
