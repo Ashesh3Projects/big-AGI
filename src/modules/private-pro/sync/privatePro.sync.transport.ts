@@ -26,6 +26,7 @@ export interface PrivateProSyncWriteInput {
 export type PrivateProSyncWriteResult =
   | { status: 'accepted'; revision: number }
   | { status: 'already-committed'; revision: number }
+  | { status: 'already-absent' }
   | { status: 'conflict'; canonical: PrivateProSyncRemoteRecord }
   | { status: 'deleted'; canonical: PrivateProSyncRemoteRecord };
 

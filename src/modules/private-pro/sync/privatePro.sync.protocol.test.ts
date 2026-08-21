@@ -63,6 +63,15 @@ describe('Private Pro sync v1 protocol', () => {
     assert.equal([...left].every(character => character.charCodeAt(0) <= 0x7f), true);
   });
 
+  test('matches JSON serialization for undefined object fields and array items', () => {
+    assert.equal(
+      privateProCanonicalJson({ group: 'beam', gatherLlmId: undefined, rayLlmIds: ['model-1'] }),
+      '{"group":"beam","rayLlmIds":["model-1"]}',
+    );
+    assert.equal(privateProCanonicalJson(['model-1', undefined]), '["model-1",null]');
+    assert.throws(() => privateProCanonicalJson(undefined), /requires a JSON value/i);
+  });
+
   test('parses canonical JSON through its schema', () => {
     assert.deepEqual(privateProParseCanonicalJson('{"conversationId":"chat-1","created":1,"systemPurposeId":"system","updated":null}', SyncChatMetaSchema), {
       conversationId: 'chat-1',

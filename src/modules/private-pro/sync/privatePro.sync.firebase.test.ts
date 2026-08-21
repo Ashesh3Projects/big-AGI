@@ -275,6 +275,14 @@ describe('Private Pro direct Firebase sync transport', () => {
     assert.equal(firestore.writes.filter(write => write.path.includes('/tombstones/')).length, 1);
   });
 
+  test('treats a delete of a never-synced record as already absent', async () => {
+    const firestore = new FakeFirestore();
+    const input = putInput({ kind: 'delete', payload: '', contentHash: null });
+
+    assert.deepEqual(await createPrivateProFirebaseSyncTransport(UID, firestore).write(input), { status: 'already-absent' });
+    assert.equal(firestore.writes.length, 0);
+  });
+
   test('does not overwrite a pre-existing tombstone', async () => {
     const firestore = new FakeFirestore();
     const input = putInput({ kind: 'delete', baseRevision: 1, payload: '', contentHash: null });

@@ -66,16 +66,22 @@ function base64Url(bytes: Uint8Array): string {
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-function canonicalize(value: unknown): unknown {
+function canonicalize(value: unknown, arrayItem = false): unknown {
   if (value === null || typeof value === 'string' || typeof value === 'boolean') return value;
   if (typeof value === 'number') {
     if (!Number.isFinite(value)) throw new TypeError('Canonical JSON does not support non-finite numbers.');
     return value;
   }
-  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value === undefined) {
+    if (arrayItem) return null;
+    return undefined;
+  }
+  if (Array.isArray(value)) return value.map(item => canonicalize(item, true));
   if (typeof value === 'object') {
     const object = value as Record<string, unknown>;
-    return Object.fromEntries(Object.keys(object).sort().map(key => [key, canonicalize(object[key])]));
+    return Object.fromEntries(Object.keys(object).sort().flatMap(key =>
+      object[key] === undefined ? [] : [[key, canonicalize(object[key])]],
+    ));
   }
   throw new TypeError('Canonical JSON supports JSON values only.');
 }

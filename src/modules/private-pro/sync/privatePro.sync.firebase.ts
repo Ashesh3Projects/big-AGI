@@ -245,6 +245,7 @@ async function writeMutation(
       return { status: 'deleted', canonical: existing };
     }
     if (existing?.deleted) return { status: 'deleted', canonical: existing };
+    if (!existing && input.kind === 'delete' && input.baseRevision === 0) return { status: 'already-absent' };
     if ((existing?.revision ?? 0) !== input.baseRevision) {
       if (!existing) throw new TypeError('Private Pro sync missing canonical record conflicts with the requested base.');
       return { status: 'conflict', canonical: existing };

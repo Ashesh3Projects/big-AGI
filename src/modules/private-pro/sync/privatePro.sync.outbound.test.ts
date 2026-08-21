@@ -950,6 +950,21 @@ describe('Private Pro seamless sync outbound', () => {
     assert.deepEqual(await db.getRemoteBase(UID, pending.recordKey), { revision: 2, mutationId: '123e4567-e89b-42d3-a456-426614174002', deleted: true });
   });
 
+  test('drops a delete when the canonical record was never created', async (t) => {
+    const { outbound, transport, clock, db } = createHarness(t);
+    await outbound.start();
+    const pending = await outbound.capture({
+      kind: 'delete', recordType: 'settings', logicalId: 'main', projectionKey: 'main', schemaVersion: 1,
+    });
+    transport.results.push({ status: 'already-absent' });
+
+    await clock.advance(60_000);
+
+    assert.equal(await db.getOutbox(UID, pending.recordKey), null);
+    assert.equal(await db.getLocalRecord(UID, pending.recordKey), null);
+    assert.equal(await db.getRemoteBase(UID, pending.recordKey), null);
+  });
+
   test('uploads referenced assets before writing and releases an aborted lease immediately', async (t) => {
     const { outbound, transport, clock, db, assetCalls } = createHarness(t);
     const write = deferred<PrivateProSyncWriteResult>();

@@ -8,7 +8,7 @@ import type { DBlobDBAsset } from '~/modules/dblobs/dblobs.types';
 import type { PrivateProAssetManifest } from '../assets/privatePro.assets.schemas';
 
 
-export const PRIVATE_PRO_SYNC_DB_VERSION = 3;
+export const PRIVATE_PRO_SYNC_DB_VERSION = 4;
 
 function throwIfCaptureAborted(signal?: AbortSignal): void {
   if (signal?.aborted) throw captureAbortError();
@@ -179,10 +179,27 @@ export class PrivateProSyncDB extends Dexie {
       meta: '[uid+key], uid',
     };
     this.version(1).stores(storesV1);
-    this.version(PRIVATE_PRO_SYNC_DB_VERSION).stores({
+    const currentStores = {
       ...storesV1,
       assetUploadLeases: '[uid+assetId], uid, expiresAtMs, fence',
       assetCleanupDebt: '[uid+assetId], uid, nextAttemptAtMs, leaseUntilMs',
+    };
+    this.version(3).stores(currentStores);
+    this.version(PRIVATE_PRO_SYNC_DB_VERSION).stores(currentStores).upgrade(async transaction => {
+      const outbox = transaction.table<PrivateProOutboxState, [string, string]>('outbox');
+      const staleDeletes = await outbox.filter(row =>
+        row.blocked && row.errorCode === 'permission' && row.kind === 'delete' && row.baseRevision === 0,
+      ).toArray();
+      for (const row of staleDeletes) {
+        row.blocked = false;
+        row.errorCode = null;
+        row.dueAtMs = 0;
+        row.leaseUntilMs = null;
+        row.leaseToken = null;
+        row.leaseFence = null;
+        row.leasedGeneration = null;
+        await outbox.put(row);
+      }
     });
   }
 
@@ -686,6 +703,18 @@ export class PrivateProSyncDB extends Dexie {
       clearOutboxLease(pending);
       pending.errorCode = null;
       await this.outbox.put(pending);
+    });
+  }
+
+  async acknowledgeAbsent(uid: string, recordKey: string, sentGeneration: number, leaseToken: string, leaseFence: number, signal?: AbortSignal): Promise<void> {
+    await this.abortAwareTransaction([this.localRecords, this.outbox], signal, async () => {
+      const pending = await this.outbox.get([uid, recordKey]);
+      throwIfCaptureAborted(signal);
+      if (!this.matchesOutboxLease(pending, sentGeneration, leaseToken, leaseFence) || pending.generation !== sentGeneration) return;
+      await Promise.all([
+        this.localRecords.delete([uid, recordKey]),
+        this.outbox.delete([uid, recordKey]),
+      ]);
     });
   }
 

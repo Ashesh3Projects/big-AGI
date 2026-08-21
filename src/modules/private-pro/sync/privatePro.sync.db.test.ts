@@ -6,6 +6,7 @@ import { describe, test, type TestContext } from 'node:test';
 import Dexie from 'dexie';
 
 import {
+  PRIVATE_PRO_SYNC_DB_VERSION,
   PrivateProSyncDB,
   type PrivateProRemoteBaseState,
 } from './privatePro.sync.db';
@@ -49,6 +50,43 @@ async function seedUid(db: PrivateProSyncDB, uid: string): Promise<void> {
 
 
 describe('Private Pro seamless sync database', () => {
+  test('retries blocked permission deletes that never had a remote revision after upgrade', async (t) => {
+    const name = `private-pro-sync-upgrade-${crypto.randomUUID()}`;
+    const legacy = new Dexie(name);
+    legacy.version(3).stores({
+      localRecords: '[uid+recordKey], uid, recordType, projectionKey, generation, contentHash',
+      outbox: '[uid+recordKey], uid, dueAtMs, leaseUntilMs, blocked',
+      remoteBases: '[uid+recordKey], uid, revision, mutationId, deleted',
+      quarantine: '++id, uid, recordKey, createdAtMs',
+      assets: '[uid+assetId], uid, assetId, updatedAtMs',
+      leases: '[uid+name], uid, expiresAtMs, fence',
+      meta: '[uid+key], uid',
+      assetUploadLeases: '[uid+assetId], uid, expiresAtMs, fence',
+      assetCleanupDebt: '[uid+assetId], uid, nextAttemptAtMs, leaseUntilMs',
+    });
+    const stale = {
+      uid: UID_A, recordKey: 'stale-delete', recordType: 'settings', logicalId: 'stale-delete', projectionKey: 'stale-delete', schemaVersion: 1,
+      kind: 'delete', payload: '', contentHash: null, referencedAssetIds: [], mutationId: crypto.randomUUID(), generation: 1, baseRevision: 0,
+      dueAtMs: 1, retryAttempt: 0, leaseUntilMs: null, leaseToken: null, leaseFence: null, leasedGeneration: null, blocked: true, errorCode: 'permission',
+    } as const;
+    await legacy.open();
+    await legacy.table('localRecords').put({ ...stale, deleted: true, updatedAtMs: 1 });
+    await legacy.table('outbox').put(stale);
+    legacy.close();
+    const db = new PrivateProSyncDB(name);
+    t.after(async () => { db.close(); await Dexie.delete(name); });
+
+    assert.equal(PRIVATE_PRO_SYNC_DB_VERSION, 4);
+    await db.open();
+    assert.equal((await db.getLocalRecord(UID_A, stale.recordKey))?.deleted, true);
+    assert.deepEqual(await db.getOutbox(UID_A, stale.recordKey), {
+      ...stale,
+      blocked: false,
+      errorCode: null,
+      dueAtMs: 0,
+    });
+  });
+
   for (const kind of ['put', 'delete'] as const) {
     test(`aborts a local ${kind} transaction when capture ownership is cancelled during the final write`, async (t) => {
       const db = createDB(t);

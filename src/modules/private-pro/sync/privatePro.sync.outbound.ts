@@ -465,6 +465,17 @@ export function createPrivateProSyncOutbound(dependencies: PrivateProSyncOutboun
         });
         return;
       }
+      if (result.status === 'already-absent') {
+        if (!row.leaseToken || row.leaseFence === null || row.leasedGeneration === null) return;
+        await dependencies.db.acknowledgeAbsent(
+          dependencies.uid,
+          row.recordKey,
+          row.leasedGeneration,
+          row.leaseToken,
+          row.leaseFence,
+        );
+        return;
+      }
       if (result.status === 'deleted') {
         if (row.kind === 'delete') {
           await acknowledge(row, remoteBase(result.canonical), sentAtMs);
