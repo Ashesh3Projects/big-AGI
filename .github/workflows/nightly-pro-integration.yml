@@ -1,0 +1,387 @@
+name: Nightly upstream integration to Pro
+
+on:
+  workflow_dispatch:
+  schedule:
+    # GitHub schedules use UTC. 18:30 UTC is 00:00 IST.
+    - cron: '30 18 * * *'
+
+concurrency:
+  group: nightly-pro-integration
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  sync_main:
+    if: github.repository == 'Ashesh3Projects/big-AGI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    outputs:
+      automation_source_sha: ${{ steps.sync.outputs.automation_source_sha }}
+    steps:
+      - name: Checkout fork main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: main
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Rebuild fork main on upstream main
+        id: sync
+        env:
+          UPSTREAM_URL: https://github.com/enricoros/big-AGI.git
+        run: |
+          bash tools/automation/sync-upstream-main.sh
+          echo "automation_source_sha=$(git ls-remote origin refs/heads/main | cut -f1)" >> "$GITHUB_OUTPUT"
+
+  integrate:
+    needs: sync_main
+    if: github.repository == 'Ashesh3Projects/big-AGI'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    outputs:
+      has_upstream_changes: ${{ steps.prepare.outputs.has_upstream_changes }}
+    steps:
+      - name: Checkout Pro without credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: pro
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout trusted automation from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.sync_main.outputs.automation_source_sha }}
+          path: .trusted-automation
+          sparse-checkout: tools/automation/nightly-pro-integration.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Move trusted automation outside the workspace
+        run: |
+          cp .trusted-automation/tools/automation/nightly-pro-integration.ts "$RUNNER_TEMP/nightly-pro-integration.ts"
+          rm -rf .trusted-automation
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Install pinned Copilot CLI
+        run: npm install --global --ignore-scripts @github/copilot@1.0.80
+
+      - name: Record trusted Node path
+        id: node_bin
+        run: echo "path=$(command -v node)" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare upstream integration range
+        id: prepare
+        env:
+          AUTOMATION_SOURCE_SHA: ${{ needs.sync_main.outputs.automation_source_sha }}
+          UPSTREAM_URL: https://github.com/enricoros/big-AGI.git
+        run: node "$RUNNER_TEMP/nightly-pro-integration.ts" prepare
+
+      - name: Apply upstream commits without committing
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        run: node "$RUNNER_TEMP/nightly-pro-integration.ts" apply-minimal
+
+      - name: Remove repository credentials before Copilot
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        run: |
+          git config --local --unset-all http.https://github.com/.extraheader || true
+          git remote set-url origin https://github.com/${{ github.repository }}.git
+
+      - name: Resolve upstream conflicts with Copilot
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          trusted_node_bin="$(command -v node)"
+          trusted_runner_temp_identity="$(stat -Lc '%d:%i' -- "$RUNNER_TEMP")"
+          trusted_git_dir_identity="$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")"
+          GIT_HEAD_FILE="$(realpath "$(/usr/bin/git rev-parse --git-path HEAD)")"
+          trusted_git_head_b64="$(base64 -w0 "$GIT_HEAD_FILE")"
+          trusted_git_head_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$GIT_HEAD_FILE")")"
+          restore_trusted_file() {
+            local source_name="$1"
+            local target_name="$2"
+            local expected_parent_identity="${3:-$trusted_runner_temp_identity}"
+            local target
+            local target_parent
+            local temp
+            local expected_digest
+            local actual_digest
+            if [[ "$target_name" = /* ]]; then
+              target="$target_name"
+            else
+              target="$RUNNER_TEMP/$target_name"
+            fi
+            target_parent="$(dirname -- "$target")"
+            if [[ "$(stat -Lc '%d:%i' -- "$target_parent")" != "$expected_parent_identity" ]]; then
+              echo "Trusted target parent identity changed: $target_name" >&2
+              exit 1
+            fi
+            temp="$(mktemp "$target_parent/.nightly-restore.XXXXXX")"
+            printf '%s' "${!source_name}" | base64 --decode > "$temp"
+            expected_digest="$(printf '%s' "${!source_name}" | sha256sum | cut -d' ' -f1)"
+            actual_digest="$(base64 -w0 "$temp" | sha256sum | cut -d' ' -f1)"
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "Restored trusted file digest mismatch: $target_name" >&2
+              exit 1
+            fi
+            chmod 600 "$temp"
+            /usr/bin/mv -Tf -- "$temp" "$target"
+            test -f "$target"
+            test ! -L "$target"
+            test "$(base64 -w0 "$target" | sha256sum | cut -d' ' -f1)" = "$expected_digest"
+          }
+          copilot_home="$RUNNER_TEMP/copilot-home"
+          mkdir -p "$copilot_home"
+          trusted_coordinator_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-pro-integration.ts")"
+          trusted_commits_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-commits.txt")"
+          trusted_files_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-files.txt")"
+          trusted_conflict_prompt_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-copilot-conflict-prompt.txt")"
+          trusted_git_index_file="$(realpath "$(/usr/bin/git rev-parse --git-path index)")"
+          trusted_git_index_parent_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$trusted_git_index_file")")"
+          trusted_git_index_b64="$(base64 -w0 "$trusted_git_index_file")"
+          for attempt in $(seq 1 100); do
+            state="$(< "$RUNNER_TEMP/nightly-minimal-state.txt")"
+            if [[ "$state" == 'complete' ]]; then
+              break
+            fi
+            if [[ "$state" != conflict:* ]]; then
+              echo "Invalid minimal integration state: $state" >&2
+              exit 1
+            fi
+            trusted_state_b64="$(printf '%s\n' "$state" | base64 -w0)"
+            trusted_conflict_index_file="$(mktemp "$RUNNER_TEMP/nightly-copilot-index.XXXXXX")"
+            cp "$trusted_git_index_file" "$trusted_conflict_index_file"
+            env -i \
+              HOME="$copilot_home" \
+              PATH="$PATH" \
+              CI=true \
+              GIT_INDEX_FILE="$trusted_conflict_index_file" \
+              COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
+              copilot \
+              --prompt "$(< "$RUNNER_TEMP/nightly-copilot-conflict-prompt.txt")" \
+              --model gpt-5.6-sol \
+              --effort max \
+              --context long_context \
+              --mode autopilot \
+              --max-autopilot-continues 8 \
+              --no-ask-user \
+              --no-auto-update \
+              --no-custom-instructions \
+              --no-remote \
+              --no-remote-export \
+              --disable-builtin-mcps \
+              --yolo \
+              --secret-env-vars=COPILOT_GITHUB_TOKEN \
+              --silent
+            restore_trusted_file trusted_coordinator_b64 nightly-pro-integration.ts
+            restore_trusted_file trusted_commits_b64 nightly-upstream-commits.txt
+            restore_trusted_file trusted_files_b64 nightly-upstream-files.txt
+            restore_trusted_file trusted_conflict_prompt_b64 nightly-copilot-conflict-prompt.txt
+            restore_trusted_file trusted_state_b64 nightly-minimal-state.txt
+            restore_trusted_file trusted_git_head_b64 "$GIT_HEAD_FILE" "$trusted_git_head_identity"
+            if [[ "$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")" != "$trusted_git_dir_identity" ]]; then
+              echo 'Git directory identity changed during Copilot execution' >&2
+              exit 1
+            fi
+            GIT_INDEX_FILE="$trusted_conflict_index_file" "$trusted_node_bin" "$RUNNER_TEMP/nightly-pro-integration.ts" finish-minimal
+            restore_trusted_file trusted_git_index_b64 "$trusted_git_index_file" "$trusted_git_index_parent_identity"
+            cp "$trusted_conflict_index_file" "$trusted_git_index_file"
+            rm -f "$trusted_conflict_index_file"
+            trusted_git_index_b64="$(base64 -w0 "$trusted_git_index_file")"
+          done
+          test "$(< "$RUNNER_TEMP/nightly-minimal-state.txt")" = 'complete'
+
+      - name: Write minimal integration report with Copilot
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        env:
+          COPILOT_GITHUB_TOKEN: ${{ secrets.COPILOT_GITHUB_TOKEN }}
+        run: |
+          trusted_node_bin="$(command -v node)"
+          trusted_runner_temp_identity="$(stat -Lc '%d:%i' -- "$RUNNER_TEMP")"
+          trusted_git_dir_identity="$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")"
+          GIT_HEAD_FILE="$(realpath "$(/usr/bin/git rev-parse --git-path HEAD)")"
+          trusted_git_head_b64="$(base64 -w0 "$GIT_HEAD_FILE")"
+          trusted_git_head_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$GIT_HEAD_FILE")")"
+          restore_trusted_file() {
+            local source_name="$1"
+            local target_name="$2"
+            local expected_parent_identity="${3:-$trusted_runner_temp_identity}"
+            local target
+            local target_parent
+            local temp
+            local expected_digest
+            local actual_digest
+            if [[ "$target_name" = /* ]]; then
+              target="$target_name"
+            else
+              target="$RUNNER_TEMP/$target_name"
+            fi
+            target_parent="$(dirname -- "$target")"
+            if [[ "$(stat -Lc '%d:%i' -- "$target_parent")" != "$expected_parent_identity" ]]; then
+              echo "Trusted target parent identity changed: $target_name" >&2
+              exit 1
+            fi
+            temp="$(mktemp "$target_parent/.nightly-restore.XXXXXX")"
+            printf '%s' "${!source_name}" | base64 --decode > "$temp"
+            expected_digest="$(printf '%s' "${!source_name}" | sha256sum | cut -d' ' -f1)"
+            actual_digest="$(base64 -w0 "$temp" | sha256sum | cut -d' ' -f1)"
+            if [[ "$actual_digest" != "$expected_digest" ]]; then
+              echo "Restored trusted file digest mismatch: $target_name" >&2
+              exit 1
+            fi
+            chmod 600 "$temp"
+            /usr/bin/mv -Tf -- "$temp" "$target"
+            test -f "$target"
+            test ! -L "$target"
+            test "$(base64 -w0 "$target" | sha256sum | cut -d' ' -f1)" = "$expected_digest"
+          }
+          copilot_home="$RUNNER_TEMP/copilot-home-report"
+          mkdir -p "$copilot_home"
+          trusted_coordinator_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-pro-integration.ts")"
+          trusted_commits_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-commits.txt")"
+          trusted_files_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-upstream-files.txt")"
+          trusted_report_prompt_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-copilot-report-prompt.txt")"
+          trusted_state_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-minimal-state.txt")"
+          trusted_patch_hash_b64="$(base64 -w0 "$RUNNER_TEMP/nightly-minimal-patch.sha256")"
+          GIT_INDEX_FILE="$(realpath "$(/usr/bin/git rev-parse --git-path index)")"
+          trusted_git_index_parent_identity="$(stat -Lc '%d:%i' -- "$(dirname -- "$GIT_INDEX_FILE")")"
+          trusted_git_index_b64="$(base64 -w0 "$GIT_INDEX_FILE")"
+          trusted_workspace_status_b64="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all -- ':(exclude).nightly-*' | base64 -w0)"
+          env -i \
+            HOME="$copilot_home" \
+            PATH="$PATH" \
+            CI=true \
+            COPILOT_GITHUB_TOKEN="$COPILOT_GITHUB_TOKEN" \
+            copilot \
+            --prompt "$(< "$RUNNER_TEMP/nightly-copilot-report-prompt.txt")" \
+            --model gpt-5.6-sol \
+            --effort max \
+            --context long_context \
+            --mode autopilot \
+            --max-autopilot-continues 8 \
+            --no-ask-user \
+            --no-auto-update \
+            --no-custom-instructions \
+            --no-remote \
+            --no-remote-export \
+            --disable-builtin-mcps \
+            --yolo \
+            --secret-env-vars=COPILOT_GITHUB_TOKEN \
+            --share .nightly-copilot-session.md
+          restore_trusted_file trusted_coordinator_b64 nightly-pro-integration.ts
+          restore_trusted_file trusted_commits_b64 nightly-upstream-commits.txt
+          restore_trusted_file trusted_files_b64 nightly-upstream-files.txt
+          restore_trusted_file trusted_report_prompt_b64 nightly-copilot-report-prompt.txt
+          restore_trusted_file trusted_state_b64 nightly-minimal-state.txt
+          restore_trusted_file trusted_patch_hash_b64 nightly-minimal-patch.sha256
+          restore_trusted_file trusted_git_index_b64 "$GIT_INDEX_FILE" "$trusted_git_index_parent_identity"
+          restore_trusted_file trusted_git_head_b64 "$GIT_HEAD_FILE" "$trusted_git_head_identity"
+          if [[ "$(stat -Lc '%d:%i' -- "$(/usr/bin/git rev-parse --absolute-git-dir)")" != "$trusted_git_dir_identity" ]]; then
+            echo 'Git directory identity changed during Copilot execution' >&2
+            exit 1
+          fi
+          workspace_status_b64="$(/usr/bin/git status --porcelain=v1 -z --untracked-files=all -- ':(exclude).nightly-*' | base64 -w0)"
+          if [[ "$workspace_status_b64" != "$trusted_workspace_status_b64" ]]; then
+            echo 'Copilot modified the integration workspace during report generation' >&2
+            exit 1
+          fi
+
+      - name: Verify and package integration
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        env:
+          AUTOMATION_SOURCE_SHA: ${{ needs.sync_main.outputs.automation_source_sha }}
+          NODE_ENV: development
+          TRUSTED_NODE_BIN: ${{ steps.node_bin.outputs.path }}
+        run: |
+          "$TRUSTED_NODE_BIN" "$RUNNER_TEMP/nightly-pro-integration.ts" verify-package
+
+      - name: Upload verified integration package
+        if: steps.prepare.outputs.has_upstream_changes == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-pro-integration-package
+          path: |
+            .nightly-pro-integration.patch
+            .nightly-pro-integration-report.json
+            .nightly-pro-integration-manifest.json
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 1
+
+      - name: Upload Copilot transcript
+        if: always() && steps.prepare.outputs.has_upstream_changes == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nightly-pro-integration-transcript-${{ github.run_id }}
+          path: .nightly-copilot-session.md
+          if-no-files-found: ignore
+          include-hidden-files: true
+          retention-days: 14
+
+  publish:
+    needs: [sync_main, integrate]
+    if: github.repository == 'Ashesh3Projects/big-AGI' && needs.integrate.outputs.has_upstream_changes == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Checkout Pro for trusted publish
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: pro
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Checkout trusted automation from main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ needs.sync_main.outputs.automation_source_sha }}
+          path: .trusted-automation
+          sparse-checkout: tools/automation/nightly-pro-integration.ts
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .nvmrc
+
+      - name: Download verified integration package
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: nightly-pro-integration-package
+          path: .
+
+      - name: Configure git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+      - name: Commit and push Pro
+        env:
+          AUTOMATION_SOURCE_SHA: ${{ needs.sync_main.outputs.automation_source_sha }}
+        run: node .trusted-automation/tools/automation/nightly-pro-integration.ts publish
